@@ -17,7 +17,7 @@
 
 1. **无头工人**：CLI / CI / 作业系统里把任务跑完。
 2. **可嵌入运行时**：TUI、IDE、Web、SDK 共用同一个 agent 脑。
-3. **厂商可切换**：Pi 当前内建的全部聊天 provider 都能登录（OAuth）或用 API key 跑；解析顺序与 Pi 一致。
+3. **厂商可切换**：API key 一律按「stream 协议 + host」接入（一份 `env_api_key`，preset 只是数据）；OAuth 订阅登录 v1 只做 `kimi-coding` 与 `openai-codex`。解析顺序与 Pi 一致。
 
 成功标准：
 
@@ -25,7 +25,7 @@
 - 换 provider / 换模型不改 turn loop。
 - 新工具只注册进目录，不改循环。
 - 长任务能 compact、能中断、能在沙箱与审批下失败可恢复。
-- `/login` 对双通道厂商能选「账号订阅」或「API key」；凭证落盘后进程重启仍可用。
+- `kimi-coding` / `openai-codex` 能走账号订阅登录；其余厂商用 API key。凭证落盘后进程重启仍可用。
 
 ## 2. 非目标（v1）
 
@@ -38,6 +38,8 @@
 - 依赖 `@earendil-works/pi-ai` 作为运行时（契约与目录按 Pi **用 Rust 重写**进本仓库，保留 MIT 声明；不把 Pi 当黑盒 SDK）。
 - 实现 Gemini CLI / Antigravity（Pi 当前 HEAD 已无这两家）。
 - 浏览器内跑 OAuth callback（可后做；v1 以本机 HTTP callback + 粘贴 redirect / device code 为准，callback 跑在 Lato 进程内，不引入 Node）。
+- **其余 OAuth**：Anthropic Claude Pro/Max、GitHub Copilot、xAI SuperGrok、OpenRouter PKCE、Radius。这些 id 若出现在 catalog 里，v1 只走 API key（有 key 的）或等后续阶段。
+- **专用凭证解析**：Bedrock IAM/IRSA、Vertex ADC、Cloudflare account/gateway id。它们不是「协议 + host + env key」，放到阶段 3。
 
 ## 3. 已确认的设计决策
 
@@ -47,16 +49,16 @@
 | Loop | Codex 式：submission → 一 session 一 active turn → persist-then-execute 工具 → 再采样 |
 | 对外协议 | ACP（`session/new\|prompt\|cancel` + `session/request_permission`）；内部 queue-pair 不暴露 |
 | 工具目录 | Grok 式 `ToolKind` + 每步现装；MCP 默认 `search_tool` + `use_tool` |
-| Provider | 全抄 Pi `builtinProviders()`（40 家聊天）+ `llama.cpp` 扩展；login 与 API key 双通道 |
+| Provider | **API key = 数据**：`{ id, api, base_url, env }` preset + 唯一 `env_api_key`。**OAuth = 代码**：仅 `kimi-coding`、`openai-codex` |
 | 凭证 | 每 provider 一条；`type: api_key \| oauth`；存盘优先于环境变量；禁止刷新失败后静默回落 env |
 | 插件 | 目录包（skills / hooks / MCP），信任后才激活可执行部分 |
 | 执行与 UI | 工具只在 host 执行；客户端只渲染事件和回答审批 |
-| 语言 | **Rust**（Cargo workspace，edition 2024）。v1 不双语言。Pi 的 7 个 OAuth + 10 种 stream API 按同一契约在 `lato-ai` 重写；OS 沙箱 v1 用进程包装（macOS `sandbox-exec` / Linux `bwrap`），不自写 Landlock |
+| 语言 | **Rust**（Cargo workspace，edition 2024）。v1 不双语言。stream 方言在 `lato-ai` 按协议实现；OAuth 只移植 Kimi Code 与 OpenAI Codex。OS 沙箱 v1 用进程包装（macOS `sandbox-exec` / Linux `bwrap`），不自写 Landlock |
 | 状态目录 | `~/.lato/`（`auth.json` 0600，目录 0700） |
 
 Provider crate 必须保持「id / auth / api / models」边界：`lato-ai` 不得依赖 `lato-agent` / TUI；agent 只通过 `get_auth` 与 `stream` 使用 ai。
 
-Rust 代价（已接受）：阶段 2 的 OAuth 与多方言移植比 TypeScript 慢，**不因此缩小阶段 0–1 的 40 家注册表或三种 stream 方言**。
+禁止为每个 API key 厂商写一套 Provider 实现。新厂商 = 一行 preset（协议 + host + env + 模型表），不改 loop、不改 HTTP 客户端（除非要新方言）。
 
 ## 4. 总体架构
 
@@ -66,7 +68,9 @@ Client（headless CLI / 未来 TUI / IDE / Web / SDK）
         ▼
 Session host
   ├─ SessionActor（一会话一 actor，至多一个 active turn）
-  ├─ Models / Provider registry     ← Pi 契约，Rust 实现
+  ├─ Models / Provider registry
+  │     ├─ ApiKeyPreset 表（协议 + host + env）
+  │     └─ OAuth：kimi-coding / openai-codex
   ├─ CredentialStore (auth.json)
   ├─ ToolRegistry（每 step 现装）
   ├─ Plugin snapshot + Hook bus
@@ -80,6 +84,8 @@ Session host
 2. `ToolRegistry.dispatch(call)` → `ToolResult`
 3. ACP 事件流 / 反向 `request_permission`
 4. `CredentialStore.modify(provider_id, fn)` 唯一写凭证
+
+采样路径：`get_auth` 给出的 `base_url` + 该模型的 `api` 方言 → `stream`。loop 不知道这是 Groq 还是 DeepSeek。
 
 ## 5. Agent loop
 
@@ -157,6 +163,8 @@ v1 实现 `agent-client-protocol` 的 Agent 侧：
 
 权限提示的决策：允许一次 / 本 session 允许 / 拒绝 / 取消。客户端只回决策。
 
+`auth/login` 的方法列表按 provider 裁剪：`openai-codex` 只有 oauth；普通 API key preset 只有 api_key；`kimi-coding` 两者都有。
+
 ## 7. 工具系统
 
 ### 7.1 注册表
@@ -213,40 +221,47 @@ Hooks 事件（v1）：`SessionStart`、`SessionEnd`、`UserPromptSubmit`、`Pre
 
 MCP：stdio + streamable HTTP；工具名 `server__tool`。默认不把全部 MCP 工具展开进模型；`search_tool` 发现，`use_tool` 调用。配置了少量 server 时允许直接展开（session 选项）。
 
-## 8. Provider 层（契约全抄 Pi，Rust 实现）
+## 8. Provider 层
 
 ### 8.1 合同
 
-语义与 Pi `packages/ai` 一致；类型用 Rust 表达，不引入 TypeScript 运行时。
+语义对齐 Pi `packages/ai`，用 Rust 表达。API key 厂商不是 40 个类型，是一份 preset 数据 + 按 `api` 分发的 stream 实现。
 
 ```rust
-pub struct Provider {
+/// 一条 API key 厂商。实现上就是表里的一行。
+pub struct ApiKeyPreset {
     pub id: String,
     pub name: String,
-    pub base_url: Option<String>,
-    pub auth: ProviderAuth, // api_key 与 oauth 至少一项
-    // models() / refresh_models() / api: StreamImpl 或按 ModelApi 映射
+    pub api: ModelApi,          // 协议 / stream 方言
+    pub base_url: String,       // host
+    pub env: &'static [&'static str],
+    // models: 静态 catalog
 }
 
-pub struct ApiKeyAuth {
-    pub name: String,
-    // login(interaction) -> ApiKeyCredential（可选）
-    // resolve(input) -> Option<AuthResult>
+pub enum ModelApi {
+    OpenaiCompletions,
+    OpenaiResponses,
+    OpenaiCodexResponses,
+    AzureOpenaiResponses,
+    AnthropicMessages,
+    GoogleGenerativeAi,
+    GoogleVertex,
+    BedrockConverseStream,
+    MistralConversations,
+    PiMessages,
 }
 
-pub struct OAuthAuth {
-    pub name: String,
-    pub is_subscription: bool,
-    pub login_label: Option<String>,
-    // login(interaction) -> OAuthCredential
-    // refresh(credential, signal) -> OAuthCredential
-    // to_auth(credential) -> ModelAuth
-}
+/// OAuth 只为订阅登录存在。v1 仅 kimi-coding 与 openai-codex 实现此 trait。
+pub struct OAuthAuth { /* login / refresh / to_auth；UI 走 AuthInteraction */ }
 ```
 
 `AuthInteraction`：`prompt(secret|text|select|manual_code)` + `notify(auth_url|device_code|info|progress)`。UI 不进 provider。
 
-`Models::login(provider_id, LoginMethod::Oauth | LoginMethod::ApiKey, interaction)` 是唯一登录入口。OAuth-only 厂商禁止伪造 API key login。
+`Models::login(provider_id, LoginMethod::Oauth | LoginMethod::ApiKey, interaction)` 是唯一登录入口。
+
+- `openai-codex`：OAuth-only，禁止伪造 API key login。
+- 普通 preset：只有 `api_key`。
+- `kimi-coding`：双通道（OAuth 订阅 + `KIMI_API_KEY`）。
 
 ### 8.2 解析顺序（必须与 Pi 一致）
 
@@ -255,7 +270,7 @@ pub struct OAuthAuth {
 1. 调用方 runtime override（不落盘，给 CI）
 2. store 已有 `oauth` → 距过期 < 5 分钟则在 `modify` 锁内 refresh → `to_auth`
 3. store 已有 `api_key` → `resolve(credential)`
-4. store 空 → `api_key.resolve(None)` 扫环境 / ADC / IAM
+4. store 空 → `api_key.resolve(None)` 扫环境变量
 5. 都没有 → 未配置
 
 禁止：OAuth 刷新失败后改用 env key；store 类型与 handler 不匹配时改走另一通道。
@@ -266,8 +281,10 @@ pub struct OAuthAuth {
 
 ```json
 {
-  "xai": { "type": "oauth", "access": "...", "refresh": "...", "expires": 0 },
-  "anthropic": { "type": "api_key", "key": "sk-ant-..." }
+  "openai-codex": { "type": "oauth", "access": "...", "refresh": "...", "expires": 0 },
+  "kimi-coding": { "type": "oauth", "access": "...", "refresh": "...", "expires": 0 },
+  "openai": { "type": "api_key", "key": "sk-..." },
+  "xai": { "type": "api_key", "key": "$XAI_API_KEY" }
 }
 ```
 
@@ -275,11 +292,13 @@ pub struct OAuthAuth {
 
 ### 8.3 Stream 方言（真正要写的 HTTP）
 
+实现按 **协议** 分，不按厂商分。host 来自 preset 或 `get_auth` 的 `base_url`。
+
 | `model.api` | 用途 |
 |---|---|
-| `openai-completions` | 大多数 API-key 厂商、OpenRouter |
+| `openai-completions` | 大多数 API-key 厂商、OpenRouter、Groq、DeepSeek、自定义 OpenAI 兼容端 |
 | `openai-responses` | `openai`、`xai` |
-| `openai-codex-responses` | ChatGPT 订阅 Codex |
+| `openai-codex-responses` | 仅 `openai-codex`（ChatGPT 订阅） |
 | `azure-openai-responses` | Azure |
 | `anthropic-messages` | Anthropic、Kimi、MiniMax、部分 Copilot |
 | `google-generative-ai` | Gemini API |
@@ -288,62 +307,57 @@ pub struct OAuthAuth {
 | `mistral-conversations` | Mistral |
 | `pi-messages` | Radius |
 
-一个 provider 可对多种 `model.api` 做 map（Copilot、OpenCode、Fireworks）。
+一个 preset 只绑一种默认 `api`。用户自定义 endpoint（`models.json`）选一种 `api` + 一个 `base_url` + 一个 env 名，即成为新厂商。
 
-### 8.4 内建 provider 全集
+### 8.4 API key preset（协议 + host + env）
 
-来源：Pi `builtinProviders()`。v1 **全部注册**；实现按第 11 节分层，但 `/login` 与 `models/list` 从层 1 起就露出全部 id。
+v1 **用数据注册** Pi 里所有走 `envApiKeyAuth` 的 id。代码路径只有一条：读 key → 把 `Authorization`（或该方言要求的头）交给对应 `ModelApi` 的 `stream`，请求打到 `base_url`。
 
-**双通道（OAuth + API key）**
+ENV 名对齐 Pi `env-api-keys.ts`。共享 ENV 的对（`opencode`/`opencode-go`、`moonshotai`/`moonshotai-cn`、`qwen-token-plan`/`qwen-token-plan-individual`）必须分 id、分 catalog、分 host，但 **共用同一个 api key 实现**。
 
-| id | ENV | OAuth |
-|---|---|---|
-| `anthropic` | `ANTHROPIC_API_KEY`（另 `ANTHROPIC_AUTH_TOKEN`→Bearer） | Claude Pro/Max |
-| `github-copilot` | `COPILOT_GITHUB_TOKEN` | Copilot；可按 `availableModelIds` 过滤 |
-| `xai` | `XAI_API_KEY` | SuperGrok / X Premium，device code |
-| `kimi-coding` | `KIMI_API_KEY` | Kimi Code |
-| `openrouter` | `OPENROUTER_API_KEY` | PKCE，mint 用户 key |
-| `radius` | `RADIUS_API_KEY` | 动态目录 |
+preset 全集（实现时从 Pi HEAD 对表，日期写入 catalog 注释）：
 
-**仅 OAuth**
+`openai`、`azure-openai-responses`、`google`、`deepseek`、`nvidia`、`groq`、`cerebras`、`mistral`、`huggingface`、`fireworks`、`together`、`baseten`、`vercel-ai-gateway`、`zai`、`zai-coding-cn`、`opencode`、`opencode-go`、`ant-ling`、`minimax`、`minimax-cn`、`moonshotai`、`moonshotai-cn`、`qwen-token-plan`、`qwen-token-plan-individual`、`qwen-token-plan-cn`、`xiaomi`、`xiaomi-token-plan-cn`、`xiaomi-token-plan-ams`、`xiaomi-token-plan-sgp`、`xai`、`openrouter`、`kimi-coding`、`github-copilot`（仅 `COPILOT_GITHUB_TOKEN` 这条 key 路径）、`anthropic`（`ANTHROPIC_API_KEY`；`ANTHROPIC_AUTH_TOKEN` 按 Pi 改为 Bearer）。
 
-| id | 说明 |
-|---|---|
-| `openai-codex` | ChatGPT Plus/Pro。与平台 `openai` 分 id，禁止混 resolve |
+示例（形状，host 以 Pi 源码为准）：
 
-**标准 API key（`envApiKeyAuth`）**
+| id | api | host（示意） | env |
+|---|---|---|---|
+| `openai` | `openai-responses` | `https://api.openai.com/v1` | `OPENAI_API_KEY` |
+| `xai` | `openai-responses` | `https://api.x.ai/v1` | `XAI_API_KEY` |
+| `groq` | `openai-completions` | `https://api.groq.com/openai/v1` | `GROQ_API_KEY` |
+| `anthropic` | `anthropic-messages` | `https://api.anthropic.com` | `ANTHROPIC_API_KEY` |
+| `kimi-coding` | `anthropic-messages` | `https://api.kimi.com/coding` | `KIMI_API_KEY` |
+| `openrouter` | `openai-completions` | OpenRouter OpenAI 兼容根 | `OPENROUTER_API_KEY` |
 
-`openai`、`azure-openai-responses`、`google`、`deepseek`、`nvidia`、`groq`、`cerebras`、`mistral`、`huggingface`、`fireworks`、`together`、`baseten`、`vercel-ai-gateway`、`zai`、`zai-coding-cn`、`opencode`、`opencode-go`、`ant-ling`、`minimax`、`minimax-cn`、`moonshotai`、`moonshotai-cn`、`qwen-token-plan`、`qwen-token-plan-individual`、`qwen-token-plan-cn`、`xiaomi`、`xiaomi-token-plan-cn`、`xiaomi-token-plan-ams`、`xiaomi-token-plan-sgp`。
+`models.json` / CLI 覆盖：同一结构，用户自己填 `api` + `base_url` + env。`llama.cpp`（`LLAMA_BASE_URL` + `openai-completions`）也是这一行，只是模型列表要 `refresh_models`（阶段 4）。
 
-ENV 名对齐 Pi `env-api-keys.ts`。共享 ENV 的对（`opencode`/`opencode-go`、`moonshotai`/`moonshotai-cn`、`qwen-token-plan`/`qwen-token-plan-individual`）必须分 provider id、分 catalog。
+**不能塞进这张表的**（阶段 3）：`amazon-bedrock`、`google-vertex`（ADC）、`cloudflare-workers-ai`、`cloudflare-ai-gateway`、`radius` 动态目录。v1 的 `/login` 与 `models/list` **不要**把它们显示成可登录，除非该阶段已接线。
 
-**专用 ApiKeyAuth**
+图像 provider **v1 不做**。
 
-| id | resolve |
-|---|---|
-| `amazon-bedrock` | bearer / profile / IAM / ECS / IRSA |
-| `google-vertex` | API key 或 ADC（需 project + location） |
-| `cloudflare-workers-ai` | key + account id |
-| `cloudflare-ai-gateway` | 再加 gateway id |
+模型表：v1 嵌入移植自 Pi 的静态 catalog（注明来源与日期）。不在 v1 接 models.dev 自动爬取。
 
-**扩展（同一注册表）**
+### 8.5 OAuth（v1 仅两家）
 
-| id | 说明 |
-|---|---|
-| `llama.cpp` | `LLAMA_BASE_URL`，动态本地模型，`openai-completions` |
-| `models.json` 自定义 | 用户声明 api + baseUrl + env key 名 |
+| id | 方言 | host | 说明 |
+|---|---|---|---|
+| `kimi-coding` | `anthropic-messages` | `https://api.kimi.com/coding` | Kimi Code 订阅；可另走 `KIMI_API_KEY` |
+| `openai-codex` | `openai-codex-responses` | `https://chatgpt.com/backend-api` | ChatGPT Plus/Pro。与平台 `openai` **分 id**，禁止混 resolve |
 
-图像：`openrouter` 图像 provider **v1 不做**（见非目标）；接口预留 `ImagesModels` 以免以后拆 auth。
+OAuth 实现按 Pi 行为用 Rust 重写，NOTICE 列出 MIT 来源：`kimi-coding`、`openai-codex`，外加它们用到的 `pkce` / callback / device-code 公共件。
 
-模型表：v1 嵌入移植自 Pi 的静态 catalog（注明来源与日期）。Radius / llama.cpp 除外，它们必须 `refresh_models`。不在 v1 接 models.dev 自动爬取。
+不移植：`anthropic`、`github-copilot`、`xai`、`openrouter`、`radius` 的 OAuth 文件。
 
-OAuth 实现（按 Pi 行为用 Rust 重写，NOTICE 列出 MIT 来源）：`anthropic`、`openai-codex`、`github-copilot`、`xai`、`kimi-coding`、`openrouter`、`radius`，外加 `pkce`、`device-code`。
+### 8.6 与 loop 的接法
 
-### 8.5 与 loop 的接法
+采样前：`auth = models.get_auth(model).await`，把 `api_key/headers/base_url` 交给 `api.stream`。工具层看不到 oauth vs key，也看不到厂商名。
 
-采样前：`auth = models.get_auth(model).await`，把 `api_key/headers/base_url` 交给 `provider.api.stream`。工具层看不到 oauth vs key。
+`/login`：
 
-`/login`：先选方法（账号 vs API key），再选 provider。单一方法的厂商跳过第一屏。无 TUI 时：`lato login <provider> --api-key` / `--oauth`。
+- 无 TUI：`lato login <id> --api-key` 或 `lato login <id> --oauth`
+- `--oauth` 仅 `kimi-coding` 与 `openai-codex` 合法
+- 交互式：先选 provider；若两家双通道再选方法；单一方法跳过第二屏
 
 ## 9. 权限、沙箱、信任
 
@@ -366,38 +380,42 @@ OAuth 实现（按 Pi 行为用 Rust 重写，NOTICE 列出 MIT 来源）：`ant
 
 ## 11. 分阶段交付
 
-阶段只表示**实现深度**，不表示从注册表里删厂商。
+阶段只表示**实现深度**。API key preset 可以早注册；OAuth 方法只在两家上广告。
 
 | 阶段 | 交付 |
 |---|---|
-| 0 内核 | ACP host、SessionActor、turn loop、CredentialStore、`create_provider`、解析顺序、headless 客户端 |
-| 1 标准 key | 先实现 `openai-completions`、`openai-responses`、`anthropic-messages`。注册表列入全部 40 个 id；**能真正发请求的是这三种方言上的厂商**（含 openai、xai 的 key 路径、anthropic 的 key 路径、OpenRouter、ZAI、Qwen、Moonshot、MiniMax、Groq 等）。`google` / `mistral` / `azure-openai-responses` 等要等本表方言落地后才可跑 |
-| 2 双通道 login | A+B 组七个 OAuth（stream 已在阶段 1 的沿用现成方言；`openai-codex-responses` 在本阶段补） |
+| 0 内核 | ACP host、SessionActor、turn loop、CredentialStore、`ApiKeyPreset` + `env_api_key`、解析顺序、headless 客户端 |
+| 1 标准 key | 实现 `openai-completions`、`openai-responses`、`anthropic-messages`。凡 preset.api 属于这三种的厂商都能真正发请求（openai、xai、OpenRouter、Anthropic key、Kimi key、ZAI、Qwen、Moonshot、MiniMax、Groq 等）。其余方言的 preset 可以出现在 catalog，但采样时明确报「方言未实现」 |
+| 2 订阅登录 | `kimi-coding` OAuth（stream 已有 `anthropic-messages`）+ `openai-codex` OAuth + `openai-codex-responses` |
 | 3 云特例 | 其余方言与专用 resolve：Bedrock、Vertex、Cloudflare、Azure、Gemini、Mistral |
-| 4 动态与本地 | Radius、llama.cpp、`models.json` |
+| 4 动态与本地 | llama.cpp `refresh_models`、`models.json` 自定义 host、Radius（若仍要） |
 | 5 产品面 | 只读 TUI 或 IDE ACP 客户端、插件目录、子代理 worktree、OS 沙箱收紧 |
 
-阶段 0–1 结束后应能：`lato login openai --api-key` + `lato -p "fix the tests"` 在仓库里改代码并跑测试。
+阶段 0–1 结束后应能：`lato login openai --api-key`（或 env `OPENAI_API_KEY` / `XAI_API_KEY` / `KIMI_API_KEY`）+ `lato -p "fix the tests"` 在仓库里改代码并跑测试。
+
+阶段 2 结束后应能：`lato login openai-codex --oauth` 与 `lato login kimi-coding --oauth`，订阅凭证落盘后同样跑任务。
 
 ## 12. 测试
 
 - Auth 解析：存盘 oauth / 存盘 key / 仅 env / override / 刷新失败不回落，用假 `CredentialStore`。
+- Preset：同一 `env_api_key` + 两种不同 `(api, base_url)` 打到不同 host（fixture），证明没有按厂商分叉实现。
 - Loop：fixture 流（模型先 tool 后文本）；取消时历史含未完成 call。
 - 工具：同文件并行编辑串行化。
-- Provider：每个 stream 方言至少一条录制的 HTTP fixture（VCR），不在 CI 打真网。
-- OAuth：device code / PKCE 用 mock token endpoint。
+- Provider：每个 **已实现** stream 方言至少一条录制的 HTTP fixture（VCR），不在 CI 打真网。
+- OAuth：仅 kimi-coding 与 openai-codex；PKCE/callback 用 mock token endpoint。
 - ACP：stdio 往返：prompt → tool permission → 完成。
+- 反例：`lato login xai --oauth` / `lato login anthropic --oauth` 必须拒绝。
 
 ## 13. 建议补充（对话里没拍板，建议写入范围或明确推迟）
 
-下面这些不影响「像 Codex 一样转、像 Pi 一样登录」，但自主跑和可维护性差很多。建议 **采纳带 \*** 的项进 v1，其余标明推迟。
+下面这些不影响「像 Codex 一样转、像 Pi 一样解析 key」，但自主跑和可维护性差很多。建议 **采纳带 \*** 的项进 v1，其余标明推迟。
 
-1. **\* Replay / eval 夹具。** 把 turn 输入、工具结果、最终 diff 存成 case，防止换模型或改 prompt 时回归。没有这项，40 家 provider 无法持续保证。
+1. **\* Replay / eval 夹具。** 把 turn 输入、工具结果、最终 diff 存成 case，防止换模型或改 prompt 时回归。
 2. **\* 输出截断策略。** 工具结果进模型有字节上限（Grok 20k 字符 / MCP 20k 字节量级），溢出落盘路径，模型只看到摘要。否则长日志会撑死 context。
 3. **\* 静止检测。** 同一工具同一参数连打 N 次则 EndTurn，避免 hook/goal 空转。
-4. **模型目录新鲜度。** v1 嵌入静态表即可；建议预留 `models-store.json` 缓存形状，阶段 4 再联网刷新。不预留的话 Radius 会逼着改存储。
-5. **Pi `auth.json` 只读导入。** 启动时若本仓库还没有凭证、但存在 `~/.pi/agent/auth.json`，可提示导入。方便迁移，不做默认同步双写。
-6. **代理与企业网。** Pi 认 `HTTP_PROXY` / `HTTPS_PROXY` / 凭证 `env`。国内厂商（ZAI CN、Moonshot CN、Qwen CN、Xiaomi CN）几乎必用。建议 v1 就读这些变量。
+4. **模型目录新鲜度。** v1 嵌入静态表即可；建议预留 `models-store.json` 缓存形状，阶段 4 再联网刷新。
+5. **Pi `auth.json` 只读导入。** 启动时若本仓库还没有凭证、但存在 `~/.pi/agent/auth.json`，可提示导入。方便迁移，不做默认同步双写。只导入 Lato 认识的通道（API key 各 id、以及两家 OAuth）。
+6. **代理与企业网。** 认 `HTTP_PROXY` / `HTTPS_PROXY`。国内厂商（ZAI CN、Moonshot CN、Qwen CN、Xiaomi CN）几乎必用。建议 v1 就读这些变量。
 7. **请求级缓存头。** Anthropic / OpenAI prompt cache 能明显降成本。可在对应 stream 方言里跟 Pi 一样做，不单开项目。
 8. **子代理隔离。** v1 允许同仓串行子代理；**worktree 隔离建议作为 v1.1 硬需求**，否则并行改代码会互相覆盖。
 9. **可观测性。** 至少：session id、provider、模型、input/output tokens、工具名、耗时，打到 stderr JSON 或本地日志。不上完整 OTEL 也可以。
@@ -405,7 +423,7 @@ OAuth 实现（按 Pi 行为用 Rust 重写，NOTICE 列出 MIT 来源）：`ant
 11. **许可证流程。** 按 Pi 契约重写的 OAuth/API 代码在 `NOTICE` 列出 MIT 来源与日期。Codex `apply_patch` 若移植需保留 Apache 声明（Grok 已这样标注）。
 12. **产品名与协议前缀。** 已定为 `lato` / `lato/` / `~/.lato/`，客户端与 crate 从一开始就用此 id，禁止再写 `harness` 占位。
 
-明确推迟：跨会话 memory、语音、图像生成、插件市场、多用户服务端、把 Codex 当 MCP server 再包一层。
+明确推迟：跨会话 memory、语音、图像生成、插件市场、多用户服务端、把 Codex 当 MCP server 再包一层、其余五家 OAuth。
 
 ## 14. 仓库布局
 
@@ -416,7 +434,7 @@ lato/                          # 本 git 仓库根；CLI package name = lato
   Cargo.toml                   # workspace + lato bin
   crates/
     lato-protocol/             # ACP 类型与 JSON-RPC
-    lato-ai/                   # Provider、auth、stream 方言、内建 catalog
+    lato-ai/                   # preset 表、env_api_key、stream 方言、两家 OAuth、catalog
     lato-agent/                # SessionActor、turn loop、compaction
     lato-tools/                # 内建工具、ToolRegistry
     lato-workspace/            # 文件系统、沙箱包装、审批
@@ -425,18 +443,21 @@ lato/                          # 本 git 仓库根；CLI package name = lato
 
 `lato-ai` 不得依赖 `lato-agent`。`lato-agent` 只通过 `get_auth` 与 `stream` 使用 `lato-ai`。CLI 通过 in-process ACP channel 调 host，不直连 `run_turn`。
 
+`lato-ai` 内部建议按协议拆模块（`api/openai_completions`、`api/anthropic_messages`、…），OAuth 只出现在 `auth/oauth/kimi_coding` 与 `auth/oauth/openai_codex`。preset 表是数据，不是每个厂商一个 `.rs`。
+
 ## 15. 开放问题
 
 已关闭：
 
 1. **产品短名**：`lato`（状态目录、ACP 扩展前缀、CLI 二进制、工具命名空间）。
 2. **语言**：Rust。代码目录 `innovation/lato`。
+3. **OAuth 范围**：v1 仅 `kimi-coding` 与 `openai-codex`。API key 按协议 + host 支持 catalog 内全部 env-key 厂商。
 
 仍待确认（未拍板则用默认）：
 
-3. **第 13 节带 \* 的三项**（replay、截断、静止检测）是否进 v1。默认按「进 v1」写。
-4. **是否只读导入 `~/.pi/agent/auth.json`。** 默认：提示导入，不自动。
+4. **第 13 节带 \*** 的三项（replay、截断、静止检测）是否进 v1。默认按「进 v1」写。
+5. **是否只读导入 `~/.pi/agent/auth.json`。** 默认：提示导入，不自动；且只导入 Lato 已支持的通道。
 
 ---
 
-审阅时请重点看：第 2 节非目标是否砍够、第 8.4 节 40 家是否都要出现在 v1 注册表、Rust workspace 布局是否接受。通过后下一份文档才是分阶段实现计划。
+审阅时请重点看：第 8.4 节 preset 是否真的「只分协议和 host」、第 8.5 节两家 OAuth 是否就是你要的登录面、阶段 1 vs 2 的成功标准。通过后下一份文档才是分阶段实现计划。
