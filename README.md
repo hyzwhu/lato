@@ -46,6 +46,16 @@ LATO_HOME=$(mktemp -d) cargo run -q -- -p "reply with hi only"
 
 Use a real catalog model by selecting `provider/model`. Credentials resolve in this order: runtime override, persisted OAuth, persisted API key, then provider environment variables.
 
+Built-in China-region OpenAI-compatible providers include:
+
+| Provider | Default model | Credential |
+|---|---|---|
+| `minimax-cn` | `MiniMax-M2.1` | `MINIMAX_API_KEY` |
+| `zhipu` | `glm-4.5` | `ZHIPU_API_KEY` (also accepts `BIGMODEL_API_KEY`/`ZAI_API_KEY`) |
+| `sensenova` | `SenseNova-V6-5-Pro` | `SENSENOVA_API_KEY` bearer token |
+
+They also appear in first-launch model selection. SenseNova accounts that expose only AK/SK must generate the platform bearer/JWT token first and supply that token; Lato does not store the secret pair or silently invent a signing scheme.
+
 ```bash
 export LATO_HOME="$HOME/.lato"
 lato login openai --api-key "$OPENAI_API_KEY"

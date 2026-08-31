@@ -215,6 +215,25 @@ fn a4_5_login_openai_api_key_writes_store() {
 }
 
 #[test]
+fn china_providers_accept_api_key_login() {
+    for provider in ["minimax-cn", "zhipu", "sensenova"] {
+        let d = tempfile::tempdir().unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_lato"))
+            .env("LATO_HOME", d.path())
+            .args(["login", provider, "--api-key", "secret"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{provider}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let store = std::fs::read_to_string(d.path().join("auth.json")).unwrap();
+        assert!(store.contains(provider));
+    }
+}
+
+#[test]
 fn a4_4_cli_rejects_xai_oauth() {
     let d = tempfile::tempdir().unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_lato"))

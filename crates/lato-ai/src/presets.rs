@@ -94,20 +94,32 @@ pub const API_KEY_PRESETS: &[ApiKeyPreset] = &[
         Some("https://open.bigmodel.cn/api/paas/v4"),
         &["ZAI_API_KEY"],
     ),
+    p(
+        "zhipu",
+        "Zhipu BigModel",
+        Some("https://open.bigmodel.cn/api/paas/v4"),
+        &["ZHIPU_API_KEY", "BIGMODEL_API_KEY", "ZAI_API_KEY"],
+    ),
     p("opencode", "OpenCode", None, &["OPENCODE_API_KEY"]),
     p("opencode-go", "OpenCode Go", None, &["OPENCODE_API_KEY"]),
     p("ant-ling", "Ant Ling", None, &["ANT_LING_API_KEY"]),
     p(
         "minimax",
         "MiniMax",
-        Some("https://api.minimax.io"),
+        Some("https://api.minimax.io/v1"),
         &["MINIMAX_API_KEY"],
     ),
     p(
         "minimax-cn",
         "MiniMax CN",
-        Some("https://api.minimaxi.com"),
+        Some("https://api.minimaxi.com/v1"),
         &["MINIMAX_API_KEY"],
+    ),
+    p(
+        "sensenova",
+        "SenseTime SenseNova",
+        Some("https://api.sensenova.cn/compatible-mode/v1"),
+        &["SENSENOVA_API_KEY"],
     ),
     p(
         "moonshotai",
@@ -217,5 +229,8 @@ mod tests {
             preset("moonshotai").unwrap().env,
             preset("moonshotai-cn").unwrap().env
         );
+        assert_eq!(preset("minimax-cn").unwrap().env, &["MINIMAX_API_KEY"]);
+        assert!(preset("zhipu").unwrap().env.contains(&"ZHIPU_API_KEY"));
+        assert_eq!(preset("sensenova").unwrap().env, &["SENSENOVA_API_KEY"]);
     }
 }

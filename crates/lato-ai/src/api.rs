@@ -333,6 +333,44 @@ mod tests {
     }
 
     #[test]
+    fn china_providers_use_openai_compatible_chat_completions() {
+        for (provider, id, expected_url) in [
+            (
+                "minimax-cn",
+                "MiniMax-M2.1",
+                "https://api.minimaxi.com/v1/chat/completions",
+            ),
+            (
+                "zhipu",
+                "glm-4.5",
+                "https://open.bigmodel.cn/api/paas/v4/chat/completions",
+            ),
+            (
+                "sensenova",
+                "SenseNova-V6-5-Pro",
+                "https://api.sensenova.cn/compatible-mode/v1/chat/completions",
+            ),
+        ] {
+            let model = lookup_model(provider, id).unwrap();
+            let request = build_request(
+                &model,
+                &auth(),
+                serde_json::json!({"messages":[],"tools":[]}),
+            )
+            .unwrap();
+            assert_eq!(request.url, expected_url);
+            assert_eq!(request.body["model"], id);
+            assert_eq!(request.body["stream"], true);
+            assert!(
+                request
+                    .headers
+                    .iter()
+                    .any(|(name, value)| name == "authorization" && value == "Bearer sk")
+            );
+        }
+    }
+
+    #[test]
     fn b1_3_openai_completions_shape() {
         let m = Model {
             provider: "groq",

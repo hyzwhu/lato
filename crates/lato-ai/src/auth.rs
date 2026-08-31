@@ -256,6 +256,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn china_provider_environment_keys_resolve_independently() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = CredentialStore::open(dir.path()).unwrap();
+        for (provider, variable) in [
+            ("minimax-cn", "MINIMAX_API_KEY"),
+            ("zhipu", "ZHIPU_API_KEY"),
+            ("sensenova", "SENSENOVA_API_KEY"),
+        ] {
+            let auth = get_auth(
+                &store,
+                provider,
+                &|name| (name == variable).then(|| format!("{provider}-secret")),
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                auth.api_key.as_deref(),
+                Some(format!("{provider}-secret").as_str())
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn stored_credential_type_mismatch_does_not_fall_back_to_env() {
         let dir = tempfile::tempdir().unwrap();
         let mut store = CredentialStore::open(dir.path()).unwrap();

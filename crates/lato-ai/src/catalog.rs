@@ -96,6 +96,30 @@ pub const CATALOG: &[Model] = &[
         base_url: Some("https://bedrock-runtime.us-east-1.amazonaws.com"),
     },
     Model {
+        provider: "minimax-cn",
+        id: "MiniMax-M2.1",
+        api: ModelApi::OpenaiCompletions,
+        base_url: Some("https://api.minimaxi.com/v1"),
+    },
+    Model {
+        provider: "minimax",
+        id: "MiniMax-M2.1",
+        api: ModelApi::OpenaiCompletions,
+        base_url: Some("https://api.minimax.io/v1"),
+    },
+    Model {
+        provider: "zhipu",
+        id: "glm-4.5",
+        api: ModelApi::OpenaiCompletions,
+        base_url: Some("https://open.bigmodel.cn/api/paas/v4"),
+    },
+    Model {
+        provider: "sensenova",
+        id: "SenseNova-V6-5-Pro",
+        api: ModelApi::OpenaiCompletions,
+        base_url: Some("https://api.sensenova.cn/compatible-mode/v1"),
+    },
+    Model {
         provider: "mistral",
         id: "mistral-large-latest",
         api: ModelApi::MistralConversations,
@@ -116,6 +140,19 @@ mod tests {
     fn e3_1_google_supported_after_dialect_connection() {
         let m = lookup_model("google", "gemini-2.0-flash").unwrap();
         assert!(phase0_supported(m.api));
+    }
+
+    #[test]
+    fn china_openai_compatible_models_are_advertised() {
+        for (provider, id) in [
+            ("minimax-cn", "MiniMax-M2.1"),
+            ("zhipu", "glm-4.5"),
+            ("sensenova", "SenseNova-V6-5-Pro"),
+        ] {
+            let model = lookup_model(provider, id).unwrap();
+            assert_eq!(model.api, ModelApi::OpenaiCompletions);
+            assert!(phase0_supported(model.api));
+        }
     }
 
     #[test]
