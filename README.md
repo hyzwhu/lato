@@ -16,7 +16,26 @@ Windows compile gate from macOS/Linux with the Rust target installed:
 cargo check --workspace --target x86_64-pc-windows-gnu
 ```
 
-## CLI smoke test
+## Interactive CLI
+
+Install once, then run `lato` without arguments:
+
+```bash
+cargo install --path .
+lato
+```
+
+On first launch Lato asks you to choose a model, then configures OAuth or securely reads an API key without echoing it. The selected model is saved in `~/.lato/config.json`; credentials are kept separately in the locked credential store. After setup, the same process maintains a multi-turn conversation.
+
+Interactive commands:
+
+```text
+/help     /clear     /model     /approve     /status     /exit
+```
+
+The workspace starts untrusted. You can grant workspace edits and commands for the process when prompted, or use `/approve` to authorize one mutating tool call.
+
+## Headless CLI smoke test
 
 The default phase fixture is offline and does not require a credential:
 
@@ -29,8 +48,8 @@ Use a real catalog model by selecting `provider/model`. Credentials resolve in t
 
 ```bash
 export LATO_HOME="$HOME/.lato"
-cargo run -q -- login openai --api-key "$OPENAI_API_KEY"
-cargo run -q -- -p --model openai/gpt-4.1 --sandbox workspace "inspect this repository and fix the tests"
+lato login openai --api-key "$OPENAI_API_KEY"
+lato -p --model openai/gpt-4.1 --sandbox workspace "inspect this repository and fix the tests"
 ```
 
 Custom OpenAI-compatible endpoints are read from `$LATO_HOME/models.json`:

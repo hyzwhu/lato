@@ -47,6 +47,13 @@ impl SessionTrust {
             approvals_once: Arc::new(AtomicUsize::new(0)),
         }
     }
+    pub fn for_interactive_auto(cwd: impl AsRef<Path>) -> Self {
+        let mut trust = Self::for_interactive(cwd, true);
+        trust.mode = ApprovalMode::Auto;
+        trust.sandbox = SandboxProfile::Workspace;
+        trust
+    }
+
     pub fn cwd_trusted(&self) -> bool {
         self.process_trusted.as_ref() == Some(&self.cwd)
     }

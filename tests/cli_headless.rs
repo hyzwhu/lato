@@ -160,6 +160,13 @@ fn a5_2_respects_lato_home() {
 }
 
 #[test]
+fn interactive_mode_requires_a_tty_when_no_arguments_are_given() {
+    let output = Command::new(env!("CARGO_BIN_EXE_lato")).output().unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("interactive mode requires a tty"));
+}
+
+#[test]
 fn a0_4_headless_ask_requires_tty() {
     let d = tempfile::tempdir().unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_lato"))

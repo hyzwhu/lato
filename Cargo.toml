@@ -27,6 +27,7 @@ serde_json = "1"
 dirs = "6"
 reqwest = "0.12"
 async-trait = "0.1"
+rpassword = "7"
 
 [dev-dependencies]
 tempfile = "3"
