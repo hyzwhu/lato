@@ -1,6 +1,6 @@
 use crate::{
     Auth, CONTEXT_HARD_LIMIT_BYTES, HttpRequestSpec, ModelApi, ModelStream, StreamPiece,
-    parse_stream_body, send_request,
+    http_client_for_url, parse_stream_body, send_request,
 };
 use async_trait::async_trait;
 use std::path::Path;
@@ -141,10 +141,11 @@ pub struct CustomHttpModelStream {
 
 impl CustomHttpModelStream {
     pub fn new(model: CustomModel, auth: Auth) -> Self {
+        let client = http_client_for_url(&model.base_url);
         Self {
             model,
             auth,
-            client: reqwest::Client::new(),
+            client,
         }
     }
 }

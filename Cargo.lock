@@ -728,6 +728,7 @@ dependencies = [
  "lato-protocol",
  "lato-tools",
  "lato-workspace",
+ "reqwest",
  "serde",
  "serde_json",
  "tempfile",

@@ -1,4 +1,4 @@
-use crate::{Auth, Model, build_request, send_request};
+use crate::{Auth, Model, build_request, http_client_for_url, send_request};
 use async_trait::async_trait;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock, mpsc};
@@ -102,10 +102,18 @@ pub struct HttpModelStream {
 
 impl HttpModelStream {
     pub fn new(model: Model, auth: Auth) -> Self {
+        let client = {
+            let url = auth
+                .base_url
+                .as_deref()
+                .or(model.base_url)
+                .unwrap_or_default();
+            http_client_for_url(url)
+        };
         Self {
             model,
             auth,
-            client: reqwest::Client::new(),
+            client,
         }
     }
 }

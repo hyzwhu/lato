@@ -2,8 +2,8 @@ use crate::{PromptKind, SessionActor, TranscriptStore};
 use lato_ai::{
     CATALOG, CredentialStore, CustomHttpModelStream, CustomModel, FakeModelStream, HttpModelStream,
     ModelStream, StreamPiece, SwitchableModelStream, api_key_login_allowed, custom_model_auth,
-    dialect_implemented, get_auth, load_models_json, lookup_model, oauth_allowed, phase0_supported,
-    store_oauth,
+    dialect_implemented, get_auth_refreshing, load_models_json, lookup_model, oauth_allowed,
+    phase0_supported, store_oauth,
 };
 use lato_mcp::{PluginOrigin, PluginPackage, discover_plugin};
 use lato_protocol::{JsonRpcReq, METHODS_IMPLEMENTED, PROTOCOL_VERSION, err, is_implemented, ok};
@@ -216,13 +216,30 @@ impl AcpHost {
                     None => return Some(err(id, -32000, "unknown model")),
                 }
                 if let Some(catalog_model) = lookup_model(provider, model) {
-                    if let Some(store) = &self.credentials
-                        && let Some(auth) =
-                            get_auth(store, provider, &|name| std::env::var(name).ok(), None).await
-                    {
-                        self.stream
-                            .set(Arc::new(HttpModelStream::new(catalog_model, auth)))
-                            .await;
+                    if let Some(store) = self.credentials.as_mut() {
+                        match get_auth_refreshing(
+                            store,
+                            provider,
+                            &|name| std::env::var(name).ok(),
+                            None,
+                            &reqwest::Client::new(),
+                        )
+                        .await
+                        {
+                            Ok(Some(auth)) => {
+                                self.stream
+                                    .set(Arc::new(HttpModelStream::new(catalog_model, auth)))
+                                    .await
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                return Some(err(
+                                    id,
+                                    -32000,
+                                    format!("oauth refresh failed: {error}"),
+                                ));
+                            }
+                        }
                     }
                 } else if let Some(custom) = self
                     .custom_models

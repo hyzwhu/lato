@@ -35,6 +35,104 @@ fn a1_1_stdio_acp_cli_initializes_and_rejects_session_load() {
 }
 
 #[test]
+fn e4_1_cli_custom_model_http_sse_end_to_end() {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let server = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let (mut socket, _) = loop {
+            match listener.accept() {
+                Ok(value) => break value,
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(10))
+                }
+                Err(error) => panic!("fixture accept failed: {error}"),
+            }
+        };
+        let mut request = [0u8; 32 * 1024];
+        let count = socket.read(&mut request).unwrap();
+        let request = String::from_utf8_lossy(&request[..count]);
+        assert!(request.starts_with("POST /v1/chat/completions"));
+        assert!(
+            request
+                .to_lowercase()
+                .contains("authorization: bearer local-secret")
+        );
+        let body =
+            "data: {\"choices\":[{\"delta\":{\"content\":\"custom-ok\"}}]}\n\ndata: [DONE]\n\n";
+        write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+    });
+    let d = tempfile::tempdir().unwrap();
+    std::fs::write(d.path().join("models.json"), format!(
+        r#"{{"models":[{{"provider":"local","id":"qwen","api":"openai-completions","base_url":"http://{address}/v1","env":"LOCAL_KEY"}}]}}"#
+    )).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_lato"))
+        .env("LATO_HOME", d.path())
+        .env("LOCAL_KEY", "local-secret")
+        .args(["-p", "--model", "local/qwen", "say custom-ok"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    server.join().unwrap();
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "custom-ok");
+}
+
+#[test]
+fn b1_6_headless_http_model_tool_loop_edits_workspace_offline_fixture() {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        for turn in 0..2 {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = [0u8; 64 * 1024];
+            let count = socket.read(&mut request).unwrap();
+            let request = String::from_utf8_lossy(&request[..count]);
+            assert!(request.contains("search_replace"));
+            let body = if turn == 0 {
+                "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"edit-1\",\"function\":{\"name\":\"search_replace\",\"arguments\":\"{\\\"path\\\":\\\"code.txt\\\",\\\"old\\\":\\\"broken\\\",\\\"new\\\":\\\"fixed\\\"}\"}}]}}]}\n\ndata: [DONE]\n\n"
+            } else {
+                "data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\n\ndata: [DONE]\n\n"
+            };
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+        }
+    });
+    let d = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(d.path().join("code.txt"), "broken").unwrap();
+    std::fs::write(home.path().join("models.json"), format!(
+        r#"{{"models":[{{"provider":"fixture","id":"coder","api":"openai-completions","base_url":"http://{address}/v1","env":"FIXTURE_KEY"}}]}}"#
+    )).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_lato"))
+        .current_dir(d.path())
+        .env("LATO_HOME", home.path())
+        .env("FIXTURE_KEY", "key")
+        .args(["-p", "--model", "fixture/coder", "fix code.txt"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    server.join().unwrap();
+    assert_eq!(
+        std::fs::read_to_string(d.path().join("code.txt")).unwrap(),
+        "fixed"
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "done");
+}
+
+#[test]
 fn a5_1_headless_prompt_fake_model() {
     let d = tempfile::tempdir().unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_lato"))

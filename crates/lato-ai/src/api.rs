@@ -160,6 +160,27 @@ fn bearer_headers(auth: &Auth) -> Vec<(String, String)> {
     headers
 }
 
+pub fn http_client_for_url(url: &str) -> reqwest::Client {
+    let loopback = url::Url::parse(url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_string))
+        .is_some_and(|host| {
+            host.eq_ignore_ascii_case("localhost")
+                || host
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| ip.is_loopback())
+        });
+    let builder = reqwest::Client::builder();
+    if loopback {
+        builder
+            .no_proxy()
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    } else {
+        builder.build().unwrap_or_else(|_| reqwest::Client::new())
+    }
+}
+
 pub async fn send_request(
     client: &reqwest::Client,
     spec: &HttpRequestSpec,
@@ -238,6 +259,66 @@ mod tests {
         let b = build_request(&xai, &auth(), serde_json::json!([])).unwrap();
         assert_eq!(a.url, "https://api.groq.com/openai/v1/chat/completions");
         assert_eq!(b.url, "https://api.x.ai/v1/responses");
+    }
+
+    async fn roundtrip_fixture(spec: HttpRequestSpec) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (captured_tx, captured_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .unwrap();
+            let mut bytes = vec![0u8; 64 * 1024];
+            let count = socket.read(&mut bytes).unwrap();
+            captured_tx
+                .send(String::from_utf8_lossy(&bytes[..count]).into_owned())
+                .unwrap();
+            let body =
+                "data: {\"choices\":[{\"delta\":{\"content\":\"fixture\"}}]}\n\ndata: [DONE]\n\n";
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+        });
+        let mut local = spec;
+        let path = url::Url::parse(&local.url).unwrap().path().to_string();
+        local.url = format!("http://{address}{path}");
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let response = send_request(&client, &local).await.unwrap();
+        assert!(response.contains("fixture"));
+        captured_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn b1_3_three_dialects_http_vcr_roundtrip_offline() {
+        let models = [
+            Model {
+                provider: "groq",
+                id: "llama",
+                api: ModelApi::OpenaiCompletions,
+                base_url: Some("https://fixture/v1"),
+            },
+            lookup_model("openai", "gpt-4.1").unwrap(),
+            lookup_model("kimi-coding", "kimi-k2").unwrap(),
+        ];
+        for model in models {
+            let request = build_request(
+                &model,
+                &auth(),
+                serde_json::json!([{"role":"user","content":"hi"}]),
+            )
+            .unwrap();
+            let captured = roundtrip_fixture(request).await;
+            assert!(captured.starts_with("POST "));
+            assert!(captured.contains(model.id));
+            if model.api == ModelApi::AnthropicMessages {
+                assert!(captured.to_lowercase().contains("x-api-key: sk"));
+            } else {
+                assert!(captured.to_lowercase().contains("authorization: bearer sk"));
+            }
+        }
     }
 
     #[test]

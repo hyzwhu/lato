@@ -1,8 +1,8 @@
 use lato_agent::default_fake_stream;
 use lato_ai::{
     AuthInteraction, AuthNotice, CredentialStore, CustomHttpModelStream, HttpModelStream,
-    ModelStream, api_key_login_allowed, custom_model_auth, get_auth, load_models_json, login_oauth,
-    lookup_model, oauth_allowed, store_oauth,
+    ModelStream, api_key_login_allowed, custom_model_auth, get_auth_refreshing, load_models_json,
+    login_oauth, lookup_model, oauth_allowed, store_oauth,
 };
 use lato_workspace::{SandboxProfile, SessionTrust};
 use std::{io::IsTerminal, path::PathBuf, sync::Arc};
@@ -83,20 +83,33 @@ async fn prompt(args: &[String]) -> i32 {
             return 2;
         };
         if let Some(model) = lookup_model(provider, model_id) {
-            let store = match CredentialStore::open(&lato_home()) {
+            let mut store = match CredentialStore::open(&lato_home()) {
                 Ok(store) => store,
                 Err(e) => {
                     eprintln!("error: {e}");
                     return 1;
                 }
             };
-            let Some(auth) =
-                get_auth(&store, provider, &|name| std::env::var(name).ok(), None).await
-            else {
-                eprintln!(
-                    "error: no credential configured for {provider}; run lato login {provider}"
-                );
-                return 1;
+            let auth = match get_auth_refreshing(
+                &mut store,
+                provider,
+                &|name| std::env::var(name).ok(),
+                None,
+                &reqwest::Client::new(),
+            )
+            .await
+            {
+                Ok(Some(auth)) => auth,
+                Ok(None) => {
+                    eprintln!(
+                        "error: no credential configured for {provider}; run lato login {provider}"
+                    );
+                    return 1;
+                }
+                Err(error) => {
+                    eprintln!("error: oauth refresh failed for {provider}: {error}");
+                    return 1;
+                }
             };
             Arc::new(HttpModelStream::new(model, auth))
         } else {
@@ -153,7 +166,7 @@ async fn login(args: &[String]) -> i32 {
                 provider,
                 "mock-access",
                 "mock-refresh",
-                4_102_444_800,
+                4_102_444_800_000,
             )
             .unwrap();
             println!("oauth logged in {provider}");

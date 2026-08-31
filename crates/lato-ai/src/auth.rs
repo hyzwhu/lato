@@ -8,6 +8,57 @@ pub struct Auth {
     pub base_url: Option<String>,
 }
 
+pub async fn get_auth_refreshing(
+    store: &mut CredentialStore,
+    provider_id: &str,
+    env: &dyn Fn(&str) -> Option<String>,
+    override_key: Option<String>,
+    client: &reqwest::Client,
+) -> Result<Option<Auth>, String> {
+    if let Some(key) = override_key {
+        return Ok(Some(Auth {
+            api_key: Some(key),
+            ..Default::default()
+        }));
+    }
+    if let Some(Credential::Oauth {
+        access,
+        refresh,
+        expires,
+    }) = store.get(provider_id)
+    {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+        if expires - now < 5 * 60 * 1000 {
+            let tokens = crate::refresh_oauth_token(provider_id, &refresh, client).await?;
+            let next_refresh = if tokens.refresh.is_empty() {
+                refresh
+            } else {
+                tokens.refresh
+            };
+            store_oauth(
+                store,
+                provider_id,
+                &tokens.access,
+                &next_refresh,
+                tokens.expires,
+            )
+            .map_err(|e| e.to_string())?;
+            return Ok(Some(Auth {
+                api_key: Some(tokens.access),
+                ..Default::default()
+            }));
+        }
+        return Ok(Some(Auth {
+            api_key: Some(access),
+            ..Default::default()
+        }));
+    }
+    Ok(get_auth(store, provider_id, env, None).await)
+}
+
 pub async fn get_auth(
     store: &CredentialStore,
     provider_id: &str,
@@ -22,14 +73,15 @@ pub async fn get_auth(
     }
     if let Some(c) = store.get(provider_id) {
         return match c {
-            Credential::Oauth { access, .. } => Some(Auth {
+            Credential::Oauth { access, .. } if oauth_allowed(provider_id) => Some(Auth {
                 api_key: Some(access),
                 ..Default::default()
             }),
-            Credential::ApiKey { key } => Some(Auth {
+            Credential::ApiKey { key } if api_key_login_allowed(provider_id) => Some(Auth {
                 api_key: Some(resolve_key(&key, env)),
                 ..Default::default()
             }),
+            _ => None,
         };
     }
     for name in env_names(provider_id) {
@@ -201,6 +253,25 @@ mod tests {
         assert!(!oauth_allowed("openrouter"));
         assert!(oauth_allowed("kimi-coding"));
         assert!(oauth_allowed("openai-codex"));
+    }
+
+    #[tokio::test]
+    async fn stored_credential_type_mismatch_does_not_fall_back_to_env() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = CredentialStore::open(dir.path()).unwrap();
+        store
+            .modify(|entries| {
+                entries.insert(
+                    "openai-codex".into(),
+                    json!({"type":"api_key","key":"invalid"}),
+                );
+            })
+            .unwrap();
+        assert!(
+            get_auth(&store, "openai-codex", &|_| Some("env".into()), None)
+                .await
+                .is_none()
+        );
     }
 
     #[test]
