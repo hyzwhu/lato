@@ -1,6 +1,6 @@
 use crate::{
     Auth, CONTEXT_HARD_LIMIT_BYTES, HttpRequestSpec, ModelApi, ModelStream, StreamPiece,
-    http_client_for_url, parse_stream_body, send_request,
+    http_client_for_url, stream_http_request,
 };
 use async_trait::async_trait;
 use std::path::Path;
@@ -162,13 +162,7 @@ impl ModelStream for CustomHttpModelStream {
             return Err("context exceeds hard limit; compact required".into());
         }
         let request = build_custom_request(&self.model, &self.auth, context)?;
-        let body = send_request(&self.client, &request).await?;
-        for piece in parse_stream_body(&body) {
-            tx.send(piece)
-                .await
-                .map_err(|_| "stream receiver closed".to_string())?;
-        }
-        Ok(())
+        stream_http_request(&self.client, &request, tx).await
     }
 }
 

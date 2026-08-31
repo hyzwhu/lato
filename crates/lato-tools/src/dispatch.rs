@@ -111,6 +111,13 @@ pub async fn dispatch(
     }
 }
 
+pub fn requires_approval(name: &str) -> bool {
+    matches!(
+        name.strip_prefix("Lato:").unwrap_or(name),
+        "search_replace" | "run_terminal_command" | "spawn_subagent"
+    )
+}
+
 fn require_mutating_approval(trust: &SessionTrust) -> Result<(), String> {
     match trust.mode {
         ApprovalMode::Always | ApprovalMode::Auto => Ok(()),

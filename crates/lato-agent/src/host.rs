@@ -1,4 +1,4 @@
-use crate::{PromptKind, SessionActor, TranscriptStore};
+use crate::{PromptKind, SessionActor, ToolApproval, TranscriptStore};
 use lato_ai::{
     CATALOG, CredentialStore, CustomHttpModelStream, CustomModel, FakeModelStream, HttpModelStream,
     ModelStream, StreamPiece, SwitchableModelStream, api_key_login_allowed, custom_model_auth,
@@ -25,6 +25,7 @@ pub struct AcpHost {
     credentials: Option<CredentialStore>,
     custom_models: Vec<CustomModel>,
     plugins: Vec<PluginPackage>,
+    tool_approval: Option<Arc<dyn ToolApproval>>,
 }
 
 impl AcpHost {
@@ -33,6 +34,16 @@ impl AcpHost {
         trust: SessionTrust,
         updates: tokio::sync::mpsc::UnboundedSender<serde_json::Value>,
         stream: Arc<dyn ModelStream>,
+    ) -> Self {
+        Self::new_with_approval(cwd, trust, updates, stream, None)
+    }
+
+    pub fn new_with_approval(
+        cwd: PathBuf,
+        trust: SessionTrust,
+        updates: tokio::sync::mpsc::UnboundedSender<serde_json::Value>,
+        stream: Arc<dyn ModelStream>,
+        tool_approval: Option<Arc<dyn ToolApproval>>,
     ) -> Self {
         let stream = Arc::new(SwitchableModelStream::new(stream));
         let lato_home = std::env::var_os("LATO_HOME").map(PathBuf::from);
@@ -62,6 +73,7 @@ impl AcpHost {
             credentials,
             custom_models,
             plugins,
+            tool_approval,
         }
     }
     pub async fn handle(&mut self, req: JsonRpcReq) -> Option<serde_json::Value> {
@@ -81,15 +93,18 @@ impl AcpHost {
                     .as_millis();
                 let sid = format!("s{now}-{}", self.next_id);
                 self.next_id += 1;
-                self.sessions.insert(
+                let actor = SessionActor::new(
+                    self.stream.clone(),
+                    self.locks.clone(),
+                    self.trust.clone(),
+                    self.cwd.clone(),
+                )
+                .with_interactive_events(
+                    self.updates.clone(),
                     sid.clone(),
-                    SessionActor::new(
-                        self.stream.clone(),
-                        self.locks.clone(),
-                        self.trust.clone(),
-                        self.cwd.clone(),
-                    ),
+                    self.tool_approval.clone(),
                 );
+                self.sessions.insert(sid.clone(), actor);
                 Some(ok(id, serde_json::json!({"sessionId": sid})))
             }
             "session/prompt" => {
@@ -171,6 +186,11 @@ impl AcpHost {
                         self.locks.clone(),
                         self.trust.clone(),
                         self.cwd.clone(),
+                    )
+                    .with_interactive_events(
+                        self.updates.clone(),
+                        sid.to_string(),
+                        self.tool_approval.clone(),
                     );
                     if let Some(store) = &self.transcripts {
                         match store.load(sid) {

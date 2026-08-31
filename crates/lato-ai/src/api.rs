@@ -181,10 +181,10 @@ pub fn http_client_for_url(url: &str) -> reqwest::Client {
     }
 }
 
-pub async fn send_request(
+pub async fn send_request_response(
     client: &reqwest::Client,
     spec: &HttpRequestSpec,
-) -> Result<String, String> {
+) -> Result<reqwest::Response, String> {
     let method = reqwest::Method::from_bytes(spec.method.as_bytes()).map_err(|e| e.to_string())?;
     let mut last_error = String::new();
     for attempt in 0..3 {
@@ -195,10 +195,10 @@ pub async fn send_request(
         match req.json(&spec.body).send().await {
             Ok(resp) => {
                 let status = resp.status();
-                let text = resp.text().await.map_err(|e| e.to_string())?;
                 if status.is_success() {
-                    return Ok(text);
+                    return Ok(resp);
                 }
+                let text = resp.text().await.map_err(|e| e.to_string())?;
                 last_error = format!("http {status}: {text}");
                 if !retryable_status(status.as_u16()) {
                     return Err(last_error);
@@ -219,6 +219,17 @@ pub async fn send_request(
     Err(format!(
         "sampling failed after 3 transient attempts: {last_error}"
     ))
+}
+
+pub async fn send_request(
+    client: &reqwest::Client,
+    spec: &HttpRequestSpec,
+) -> Result<String, String> {
+    send_request_response(client, spec)
+        .await?
+        .text()
+        .await
+        .map_err(|error| error.to_string())
 }
 
 fn retryable_status(status: u16) -> bool {

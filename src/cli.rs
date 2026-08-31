@@ -1,10 +1,19 @@
-use lato_agent::default_fake_stream;
+use lato_agent::{ToolApproval, default_fake_stream};
 use lato_ai::{
     AuthInteraction, AuthNotice, CATALOG, CredentialStore, CustomHttpModelStream, HttpModelStream,
     ModelStream, api_key_login_allowed, custom_model_auth, get_auth_refreshing, load_models_json,
     login_oauth, lookup_model, oauth_allowed, phase0_supported, store_oauth,
 };
-use lato_workspace::{SandboxProfile, SessionTrust};
+use lato_workspace::{ApprovalMode, SandboxProfile, SessionTrust};
+use rustyline::{
+    CompletionType, Config, Context, Editor, Helper,
+    completion::{Completer, Pair},
+    error::ReadlineError,
+    highlight::Highlighter,
+    hint::Hinter,
+    history::DefaultHistory,
+    validate::Validator,
+};
 use std::{
     io::{IsTerminal, Write},
     path::PathBuf,
@@ -14,6 +23,60 @@ use std::{
 #[derive(serde::Serialize, serde::Deserialize)]
 struct CliSettings {
     default_model: String,
+}
+
+const INTERACTIVE_COMMANDS: &[&str] = &[
+    "/help", "/clear", "/model", "/approve", "/status", "/exit", "/quit",
+];
+
+struct LatoLineHelper;
+impl Helper for LatoLineHelper {}
+impl Validator for LatoLineHelper {}
+impl Highlighter for LatoLineHelper {}
+impl Hinter for LatoLineHelper {
+    type Hint = String;
+}
+impl Completer for LatoLineHelper {
+    type Candidate = Pair;
+    fn complete(
+        &self,
+        line: &str,
+        _position: usize,
+        _context: &Context<'_>,
+    ) -> rustyline::Result<(usize, Vec<Pair>)> {
+        if !line.starts_with('/') {
+            return Ok((0, Vec::new()));
+        }
+        Ok((
+            0,
+            INTERACTIVE_COMMANDS
+                .iter()
+                .filter(|command| command.starts_with(line))
+                .map(|command| Pair {
+                    display: (*command).to_string(),
+                    replacement: (*command).to_string(),
+                })
+                .collect(),
+        ))
+    }
+}
+
+struct ConsoleToolApproval;
+
+#[async_trait::async_trait]
+impl ToolApproval for ConsoleToolApproval {
+    async fn approve(&self, name: &str, arguments: &serde_json::Value) -> bool {
+        let name = name.to_string();
+        let arguments = arguments.to_string();
+        tokio::task::spawn_blocking(move || {
+            println!("\nTool request: {name}\n  {arguments}");
+            read_line("Allow this tool call? [y/N] ")
+                .map(|answer| matches!(answer.to_ascii_lowercase().as_str(), "y" | "yes"))
+                .unwrap_or(false)
+        })
+        .await
+        .unwrap_or(false)
+    }
 }
 
 pub async fn run(args: Vec<String>) -> i32 {
@@ -174,18 +237,48 @@ async fn interactive() -> i32 {
         SessionTrust::for_interactive(&cwd, false)
     };
     let approval = trust.clone();
-    let mut client =
-        match crate::client::InteractiveAcpClient::new(cwd.clone(), trust, stream).await {
-            Ok(client) => client,
-            Err(error) => {
-                eprintln!("error: {error}");
-                return 1;
-            }
-        };
+    let inline_approval: Option<Arc<dyn ToolApproval>> = (approval.mode == ApprovalMode::Ask)
+        .then(|| Arc::new(ConsoleToolApproval) as Arc<dyn ToolApproval>);
+    let mut client = match crate::client::InteractiveAcpClient::new_with_approval(
+        cwd.clone(),
+        trust,
+        stream,
+        inline_approval,
+    )
+    .await
+    {
+        Ok(client) => client,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return 1;
+        }
+    };
+    let history_path = home.join("history");
+    let config = Config::builder()
+        .completion_type(CompletionType::List)
+        .build();
+    let mut editor = match Editor::<LatoLineHelper, DefaultHistory>::with_config(config) {
+        Ok(editor) => editor,
+        Err(error) => {
+            eprintln!("error: initialize line editor: {error}");
+            return 1;
+        }
+    };
+    editor.set_helper(Some(LatoLineHelper));
+    let _ = editor.load_history(&history_path);
     println!("Model: {selection}\nWorkspace: {}\n", cwd.display());
     loop {
-        let input = match read_line("lato> ") {
-            Ok(input) => input,
+        let input = match editor.readline("lato> ") {
+            Ok(input) => input.trim().to_string(),
+            Err(ReadlineError::Interrupted) => {
+                println!("^C");
+                continue;
+            }
+            Err(ReadlineError::Eof) => {
+                let _ = editor.save_history(&history_path);
+                println!("Goodbye.");
+                return 0;
+            }
             Err(error) => {
                 eprintln!("error: {error}");
                 return 1;
@@ -194,6 +287,8 @@ async fn interactive() -> i32 {
         if input.is_empty() {
             continue;
         }
+        let _ = editor.add_history_entry(input.as_str());
+        let _ = editor.save_history(&history_path);
         match input.as_str() {
             "/exit" | "/quit" => {
                 println!("Goodbye.");
@@ -201,7 +296,7 @@ async fn interactive() -> i32 {
             }
             "/help" => {
                 println!(
-                    "/help       show commands\n/clear      start a fresh conversation\n/model      configure the default model for the next run\n/approve    allow one mutating tool call\n/status     show model and workspace\n/exit       quit"
+                    "/help       show commands\n/clear      start a fresh conversation\n/model      configure the default model for the next run\n/approve    pre-approve one mutating tool call\n/status     show model and workspace\n/exit       quit\n\nUse Up/Down for history and Tab to complete slash commands."
                 );
                 continue;
             }
@@ -238,7 +333,27 @@ async fn interactive() -> i32 {
         }
         print!("Lato: ");
         let _ = std::io::stdout().flush();
-        match client.send(input).await {
+        let mut streamed = false;
+        let result = client
+            .send_streaming(input, |event| {
+                if let Some(delta) = event
+                    .pointer("/params/delta")
+                    .and_then(|value| value.as_str())
+                {
+                    streamed = true;
+                    print!("{delta}");
+                    let _ = std::io::stdout().flush();
+                } else if event["method"] == "session/tool_call"
+                    && let Some(name) = event
+                        .pointer("/params/name")
+                        .and_then(|value| value.as_str())
+                {
+                    println!("\n[tool] {name}");
+                }
+            })
+            .await;
+        match result {
+            Ok(_text) if streamed => println!("\n"),
             Ok(text) => println!("{text}\n"),
             Err(error) => eprintln!("\nerror: {error}\n"),
         }

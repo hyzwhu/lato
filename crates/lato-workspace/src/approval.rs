@@ -60,6 +60,9 @@ impl SessionTrust {
     pub fn allow_once(&self) {
         self.approvals_once.fetch_add(1, Ordering::Release);
     }
+    pub fn has_allow_once(&self) -> bool {
+        self.approvals_once.load(Ordering::Acquire) > 0
+    }
     pub fn consume_allow_once(&self) -> bool {
         self.approvals_once
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {

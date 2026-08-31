@@ -28,6 +28,7 @@ dirs = "6"
 reqwest = "0.12"
 async-trait = "0.1"
 rpassword = "7"
+rustyline = "17"
 
 [dev-dependencies]
 tempfile = "3"

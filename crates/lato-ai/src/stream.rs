@@ -1,4 +1,4 @@
-use crate::{Auth, Model, build_request, http_client_for_url, send_request};
+use crate::{Auth, Model, build_request, http_client_for_url, send_request_response};
 use async_trait::async_trait;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock, mpsc};
@@ -130,14 +130,49 @@ impl ModelStream for HttpModelStream {
             return Err("context exceeds hard limit; compact required".into());
         }
         let request = build_request(&self.model, &self.auth, context)?;
-        let body = send_request(&self.client, &request).await?;
-        for piece in parse_stream_body(&body) {
+        stream_http_request(&self.client, &request, tx).await
+    }
+}
+
+pub async fn stream_http_request(
+    client: &reqwest::Client,
+    request: &crate::HttpRequestSpec,
+    tx: mpsc::Sender<StreamPiece>,
+) -> Result<(), String> {
+    let mut response = send_request_response(client, request).await?;
+    let mut body = String::new();
+    let mut line_start = 0usize;
+    while let Some(chunk) = response.chunk().await.map_err(|error| error.to_string())? {
+        body.push_str(&String::from_utf8_lossy(&chunk));
+        while let Some(relative_end) = body[line_start..].find('\n') {
+            let line_end = line_start + relative_end;
+            for piece in parse_stream_body(&body[line_start..line_end]) {
+                if matches!(piece, StreamPiece::Text(_)) {
+                    tx.send(piece)
+                        .await
+                        .map_err(|_| "stream receiver closed".to_string())?;
+                }
+            }
+            line_start = line_end + 1;
+        }
+    }
+    if line_start < body.len() {
+        for piece in parse_stream_body(&body[line_start..]) {
+            if matches!(piece, StreamPiece::Text(_)) {
+                tx.send(piece)
+                    .await
+                    .map_err(|_| "stream receiver closed".to_string())?;
+            }
+        }
+    }
+    for piece in parse_stream_body(&body) {
+        if matches!(piece, StreamPiece::ToolCall { .. }) {
             tx.send(piece)
                 .await
                 .map_err(|_| "stream receiver closed".to_string())?;
         }
-        Ok(())
     }
+    Ok(())
 }
 
 pub fn parse_stream_body(body: &str) -> Vec<StreamPiece> {
@@ -315,6 +350,47 @@ pub fn parse_stream_body(body: &str) -> Vec<StreamPiece> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn http_stream_emits_first_delta_before_response_finishes() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = [0u8; 8192];
+            let _ = socket.read(&mut request).unwrap();
+            let first = "data: {\"choices\":[{\"delta\":{\"content\":\"first\"}}]}\n\n";
+            let second =
+                "data: {\"choices\":[{\"delta\":{\"content\":\"second\"}}]}\n\ndata: [DONE]\n\n";
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{first}", first.len() + second.len()).unwrap();
+            socket.flush().unwrap();
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            socket.write_all(second.as_bytes()).unwrap();
+        });
+        let base_url: &'static str = Box::leak(format!("http://{address}/v1").into_boxed_str());
+        let stream = HttpModelStream::new(
+            Model {
+                provider: "fixture",
+                id: "model",
+                api: crate::ModelApi::OpenaiCompletions,
+                base_url: Some(base_url),
+            },
+            Auth {
+                api_key: Some("key".into()),
+                ..Default::default()
+            },
+        );
+        let (tx, mut rx) = mpsc::channel(4);
+        let task = tokio::spawn(async move { stream.stream(1, serde_json::json!([]), tx).await });
+        let first = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(first, StreamPiece::Text(text) if text == "first"));
+        task.await.unwrap().unwrap();
+        assert!(matches!(rx.recv().await, Some(StreamPiece::Text(text)) if text == "second"));
+    }
+
     #[tokio::test]
     async fn a2_6_oversize_fails_without_truncate() {
         let fake = FakeModelStream::new(vec![]);

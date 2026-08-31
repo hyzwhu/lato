@@ -25,7 +25,7 @@ cargo install --path .
 lato
 ```
 
-On first launch Lato asks you to choose a model, then configures OAuth or securely reads an API key without echoing it. The selected model is saved in `~/.lato/config.json`; credentials are kept separately in the locked credential store. After setup, the same process maintains a multi-turn conversation.
+On first launch Lato asks you to choose a model, then configures OAuth or securely reads an API key without echoing it. The selected model is saved in `~/.lato/config.json`; credentials are kept separately in the locked credential store. After setup, the same process maintains a multi-turn conversation and renders HTTP/SSE model deltas as they arrive.
 
 Interactive commands:
 
@@ -33,7 +33,7 @@ Interactive commands:
 /help     /clear     /model     /approve     /status     /exit
 ```
 
-The workspace starts untrusted. You can grant workspace edits and commands for the process when prompted, or use `/approve` to authorize one mutating tool call.
+The line editor persists history in `~/.lato/history`; Up/Down navigate it and Tab completes slash commands. The workspace starts untrusted. Mutating tool calls display their name and arguments and request approval exactly at the execution boundary. You can instead trust the workspace for the process or use `/approve` to pre-authorize one call.
 
 ## Headless CLI smoke test
 

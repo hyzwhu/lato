@@ -1,4 +1,4 @@
-use lato_agent::AcpHost;
+use lato_agent::{AcpHost, ToolApproval};
 use lato_ai::ModelStream;
 use lato_protocol::JsonRpcReq;
 use lato_workspace::SessionTrust;
@@ -46,18 +46,20 @@ pub async fn run_prompt_over_acp_with_stream(
 
 pub struct InteractiveAcpClient {
     host: AcpHost,
+    updates: tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>,
     session_id: String,
     next_id: i32,
 }
 
 impl InteractiveAcpClient {
-    pub async fn new(
+    pub async fn new_with_approval(
         cwd: std::path::PathBuf,
         trust: SessionTrust,
         stream: Arc<dyn ModelStream>,
+        approval: Option<Arc<dyn ToolApproval>>,
     ) -> Result<Self, String> {
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut host = AcpHost::new(cwd, trust, tx, stream);
+        let (tx, updates) = tokio::sync::mpsc::unbounded_channel();
+        let mut host = AcpHost::new_with_approval(cwd, trust, tx, stream, approval);
         let _ = host
             .handle(req(1, "initialize", serde_json::json!({})))
             .await;
@@ -71,22 +73,35 @@ impl InteractiveAcpClient {
             .to_string();
         Ok(Self {
             host,
+            updates,
             session_id,
             next_id: 3,
         })
     }
 
-    pub async fn send(&mut self, text: String) -> Result<String, String> {
+    pub async fn send_streaming(
+        &mut self,
+        text: String,
+        mut on_event: impl FnMut(&serde_json::Value),
+    ) -> Result<String, String> {
         let id = self.take_id();
-        let response = self
-            .host
-            .handle(req(
-                id,
-                "session/prompt",
-                serde_json::json!({"sessionId": self.session_id, "text": text}),
-            ))
-            .await
-            .ok_or("no response")?;
+        let request = req(
+            id,
+            "session/prompt",
+            serde_json::json!({"sessionId": self.session_id, "text": text}),
+        );
+        let host = &mut self.host;
+        let updates = &mut self.updates;
+        let mut response_future = Box::pin(host.handle(request));
+        let response = loop {
+            tokio::select! {
+                response = &mut response_future => break response.ok_or("no response")?,
+                event = updates.recv() => if let Some(event) = event { on_event(&event); },
+            }
+        };
+        while let Ok(event) = updates.try_recv() {
+            on_event(&event);
+        }
         response_result_text(response)
     }
 

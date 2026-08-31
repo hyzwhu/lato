@@ -1,4 +1,5 @@
 use crate::HistoryItem;
+use async_trait::async_trait;
 use lato_ai::{CONTEXT_HARD_LIMIT_BYTES, ModelStream, StreamPiece};
 use lato_tools::{ToolCall, bound_tool_output, dispatch, v1_tool_definitions};
 use lato_workspace::{FileLocks, SessionTrust};
@@ -17,6 +18,11 @@ pub enum TurnOutcome {
     Replaced,
 }
 
+#[async_trait]
+pub trait ToolApproval: Send + Sync {
+    async fn approve(&self, name: &str, arguments: &serde_json::Value) -> bool;
+}
+
 pub struct SessionActor {
     active: bool,
     cancelled: bool,
@@ -25,6 +31,8 @@ pub struct SessionActor {
     locks: Arc<FileLocks>,
     trust: SessionTrust,
     cwd: PathBuf,
+    events: Option<(mpsc::UnboundedSender<serde_json::Value>, String)>,
+    tool_approval: Option<Arc<dyn ToolApproval>>,
     #[cfg(test)]
     pub(crate) on_after_persist: Option<Box<dyn Fn() + Send + Sync>>,
 }
@@ -44,10 +52,23 @@ impl SessionActor {
             locks,
             trust,
             cwd,
+            events: None,
+            tool_approval: None,
             #[cfg(test)]
             on_after_persist: None,
         }
     }
+    pub fn with_interactive_events(
+        mut self,
+        events: mpsc::UnboundedSender<serde_json::Value>,
+        session_id: String,
+        approval: Option<Arc<dyn ToolApproval>>,
+    ) -> Self {
+        self.events = Some((events, session_id));
+        self.tool_approval = approval;
+        self
+    }
+
     pub async fn prompt(&mut self, _kind: PromptKind, text: String) -> Result<TurnOutcome, String> {
         if self.active {
             self.cancelled = true;
@@ -74,7 +95,10 @@ impl SessionActor {
                 "messages": history_to_messages(&self.history),
                 "tools": v1_tool_definitions(),
             });
-            self.stream.stream(self.encoded_len(), context, tx).await?;
+            let stream = self.stream.clone();
+            let prompt_bytes = self.encoded_len();
+            let stream_task =
+                tokio::spawn(async move { stream.stream(prompt_bytes, context, tx).await });
             let mut saw_tool = false;
             while let Some(piece) = rx.recv().await {
                 if self.cancelled {
@@ -82,7 +106,12 @@ impl SessionActor {
                     return Ok(TurnOutcome::Cancelled);
                 }
                 match piece {
-                    StreamPiece::Text(t) => self.history.push(HistoryItem::AssistantText(t)),
+                    StreamPiece::Text(t) => {
+                        if let Some((events, session_id)) = &self.events {
+                            let _ = events.send(serde_json::json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":session_id,"delta":t}}));
+                        }
+                        self.history.push(HistoryItem::AssistantText(t));
+                    }
                     StreamPiece::ToolCall {
                         id,
                         name,
@@ -114,6 +143,21 @@ impl SessionActor {
                             self.active = false;
                             return Ok(TurnOutcome::Cancelled);
                         }
+                        if lato_tools::requires_approval(&name)
+                            && self.trust.mode == lato_workspace::ApprovalMode::Ask
+                            && !self.trust.has_allow_once()
+                        {
+                            let approved = match &self.tool_approval {
+                                Some(approval) => approval.approve(&name, &arguments).await,
+                                None => false,
+                            };
+                            if approved {
+                                self.trust.allow_once();
+                            }
+                        }
+                        if let Some((events, session_id)) = &self.events {
+                            let _ = events.send(serde_json::json!({"jsonrpc":"2.0","method":"session/tool_call","params":{"sessionId":session_id,"name":name,"arguments":arguments}}));
+                        }
                         let out = dispatch(
                             &self.locks,
                             &self.trust,
@@ -128,6 +172,7 @@ impl SessionActor {
                     }
                 }
             }
+            stream_task.await.map_err(|error| error.to_string())??;
             if !saw_tool {
                 self.active = false;
                 return Ok(TurnOutcome::Complete);
@@ -141,13 +186,18 @@ impl SessionActor {
         &self.history
     }
     pub fn latest_assistant_text(&self) -> String {
-        self.history
+        let mut parts = self
+            .history
             .iter()
+            .rev()
+            .take_while(|item| !matches!(item, HistoryItem::User(_)))
             .filter_map(|item| match item {
                 HistoryItem::AssistantText(text) => Some(text.as_str()),
                 _ => None,
             })
-            .collect()
+            .collect::<Vec<_>>();
+        parts.reverse();
+        parts.concat()
     }
     pub fn history_mut(&mut self) -> &mut Vec<HistoryItem> {
         &mut self.history
@@ -243,6 +293,69 @@ mod tests {
             SessionTrust::for_headless_prompt(&cwd),
             cwd,
         )
+    }
+
+    struct AllowTool;
+    #[async_trait]
+    impl ToolApproval for AllowTool {
+        async fn approve(&self, _name: &str, _arguments: &serde_json::Value) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn interactive_streams_deltas_and_approves_at_tool_boundary() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("a.txt"), "old").unwrap();
+        let (events, mut rx) = mpsc::unbounded_channel();
+        let mut actor = SessionActor::new(
+            Arc::new(FakeModelStream::new(vec![
+                vec![StreamPiece::ToolCall {
+                    id: "edit".into(),
+                    name: "search_replace".into(),
+                    arguments: json!({"path":"a.txt","old":"old","new":"new"}),
+                }],
+                vec![StreamPiece::Text("done".into())],
+            ])),
+            Arc::new(FileLocks::new()),
+            SessionTrust::for_interactive(d.path(), true),
+            d.path().to_path_buf(),
+        )
+        .with_interactive_events(events, "session".into(), Some(Arc::new(AllowTool)));
+        actor
+            .prompt(PromptKind::Start, "edit".into())
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(d.path().join("a.txt")).unwrap(),
+            "new"
+        );
+        let emitted = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+        assert!(
+            emitted
+                .iter()
+                .any(|event| event["method"] == "session/tool_call")
+        );
+        assert!(
+            emitted
+                .iter()
+                .any(|event| event.pointer("/params/delta") == Some(&json!("done")))
+        );
+    }
+
+    #[tokio::test]
+    async fn latest_assistant_text_is_only_the_current_turn() {
+        let d = tempfile::tempdir().unwrap();
+        let mut actor = actor(
+            vec![
+                vec![StreamPiece::Text("first".into())],
+                vec![StreamPiece::Text("second".into())],
+            ],
+            d.path().to_path_buf(),
+        );
+        actor.prompt(PromptKind::Start, "one".into()).await.unwrap();
+        actor.prompt(PromptKind::Start, "two".into()).await.unwrap();
+        assert_eq!(actor.latest_assistant_text(), "second");
     }
 
     #[tokio::test]
