@@ -5,6 +5,7 @@
 - 产品名：`lato`
 - 实现仓库：`/Users/huangyongzhao/Documents/work/innovation/lato`（后续代码只写这里；当前已是 `edition = "2024"` 的 bin crate，将扩成 Cargo workspace）
 - 验收文档：`docs/superpowers/specs/2026-08-31-lato-acceptance.md`（相对 lato 仓库根）。**测试与阶段完成判定以该文件为准**
+- 阶段 0 实现计划：`docs/superpowers/plans/2026-08-31-lato-phase-0.md`。执行该计划的 agent 不得把阶段 1+ 塞进同一次施工
 - 参照源码（2026-08-31 浅 clone）：
   - Codex：`/tmp/harness-src/codex`（`openai/codex`）
   - Grok Build：`/tmp/harness-src/grok-build`（`xai-org/grok-build`）
