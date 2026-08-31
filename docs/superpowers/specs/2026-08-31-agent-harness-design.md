@@ -18,6 +18,7 @@
 1. **无头工人**：CLI / CI / 作业系统里把任务跑完。
 2. **可嵌入运行时**：TUI、IDE、Web、SDK 共用同一个 agent 脑。
 3. **厂商可切换**：API key 一律按「`model.api`（协议）+ URL（host）」接入（一份 `env_api_key`，preset 只是数据）；OAuth 订阅登录 v1 只做 `kimi-coding` 与 `openai-codex`。解析顺序与 Pi 一致。
+4. **三平台**：macOS、Linux、**Windows 原生**（不是只支持 WSL）。路径、进程、默认 shell、状态目录、沙箱 profile 在三个 OS 上都是 v1 能力。
 
 成功标准：
 
@@ -40,6 +41,7 @@
 - 浏览器内跑 OAuth callback（可后做；v1 以本机 HTTP callback + 粘贴 redirect / device code 为准，callback 跑在 Lato 进程内，不引入 Node）。
 - **其余 OAuth**：Anthropic Claude Pro/Max、GitHub Copilot、xAI SuperGrok、OpenRouter PKCE、Radius。这些 id 若出现在 catalog 里，v1 只走 API key（有 key 的）或等后续阶段。
 - **专用凭证解析**：Bedrock IAM/IRSA、Vertex ADC、Cloudflare account/gateway id。它们不是「协议 + host + env key」，放到阶段 3。
+- 把 WSL 当作「已经支持 Windows」的替代方案（WSL 里跑的是 Linux 构建）。不把 Hyper-V Windows Sandbox 当 v1 默认沙箱。
 
 ## 3. 已确认的设计决策
 
@@ -53,8 +55,10 @@
 | 凭证 | 每 provider 一条；`type: api_key \| oauth`；存盘优先于环境变量；禁止刷新失败后静默回落 env |
 | 插件 | 目录包（skills / hooks / MCP），信任后才激活可执行部分 |
 | 执行与 UI | 工具只在 host 执行；客户端只渲染事件和回答审批 |
-| 语言 | **Rust**（Cargo workspace，edition 2024）。v1 不双语言。stream 方言在 `lato-ai` 按协议实现；OAuth 只移植 Kimi Code 与 OpenAI Codex。OS 沙箱 v1 用进程包装（macOS `sandbox-exec` / Linux `bwrap`），不自写 Landlock |
-| 状态目录 | `~/.lato/`（`auth.json` 0600，目录 0700） |
+| 语言 | **Rust**（Cargo workspace，edition 2024）。v1 不双语言。stream 方言在 `lato-ai` 按协议实现；OAuth 只移植 Kimi Code 与 OpenAI Codex |
+| 目标 OS | macOS、Linux、Windows 原生。CI 与测试默认覆盖这三者；功能除非标明 OS-specific，否则三端都要能跑 |
+| 沙箱 | 只罩 `run_terminal_command`。macOS：`sandbox-exec`；Linux：`bwrap`；Windows：Restricted Token + Job Object（对齐 Codex `RestrictedToken`）。不自写 Landlock，不把 Hyper-V Windows Sandbox 当默认依赖。失败则拒绝执行，禁止静默 unsandbox |
+| 状态目录 | 用户 home 下的 `.lato/`（Unix `~/.lato/`，Windows `%USERPROFILE%\.lato\`）。`auth.json` Unix 0600 / Windows ACL 仅当前用户；目录 Unix 0700 |
 
 Provider crate 必须保持「id / auth / api / models」边界：`lato-ai` 不得依赖 `lato-agent` / TUI；agent 只通过 `get_auth` 与 `stream` 使用 ai。
 
@@ -213,7 +217,7 @@ PreToolUse hook（deny / rewrite / ask）
 
 插件 = 目录，清单 `plugin.json`（兼容无清单的 `skills/` `hooks/` `.mcp.json` 约定）：
 
-- 发现顺序：CLI `--plugin-dir` → 项目 `.lato/plugins` → 用户 `~/.lato/plugins`
+- 发现顺序：CLI `--plugin-dir` → 项目 `.lato/plugins` → 用户 `$LATO_HOME/plugins`
 - 项目插件默认不信任；用户/CLI 自动信任
 - 未信任则不启动该插件的 hooks / MCP
 
@@ -278,7 +282,7 @@ pub struct OAuthAuth { /* login / refresh / to_auth；UI 走 AuthInteraction */ 
 
 每 provider **一条**凭证。Login 覆盖旧条目。Logout 删除后 env 才重新生效。
 
-`~/.lato/auth.json` 形状兼容 Pi，便于迁移：
+`$LATO_HOME/auth.json` 形状兼容 Pi，便于迁移：
 
 ```json
 {
@@ -375,17 +379,27 @@ OAuth 实现按 Pi 行为用 Rust 重写，NOTICE 列出 MIT 来源：`kimi-codi
 
 审批模式：`ask`（默认）、`auto`（策略允许的自动过）、`always`（无头 / CI）。Deny 规则与 hooks 在 always 下仍生效。
 
-沙箱 profile：`off` | `workspace`（可写 cwd + tmp）| `read-only`。v1 用 OS 包装实现，失败则拒绝执行而非静默 unsandbox。
+沙箱 profile：`off` | `workspace`（可写 cwd + tmp）| `read-only`。三平台都要实现这三档：
 
-工作区信任：首次在某目录跑要确认（对齐 Grok folder trust）。未信任则项目插件与项目 hooks 不加载。
+| OS | 包装 |
+|---|---|
+| macOS | `sandbox-exec`（seatbelt） |
+| Linux | `bwrap` |
+| Windows | Restricted Token + Job Object |
+
+某 profile 在当前 OS 起不来 → **拒绝该次 shell**，不得改成 `off` 继续跑。Windows 不是「先 unsandbox 凑合用」。
+
+默认 shell：Unix `bash` 或用户 `$SHELL`；Windows 为 PowerShell（`pwsh` 优先，否则 `powershell.exe`）。路径、引号、环境块按 OS 处理，禁止把 POSIX 路径假设写进工具层。
+
+工作区信任：首次在某目录跑要确认（对齐 Grok folder trust）。未信任则项目插件与项目 hooks 不加载。Windows 上按规范化绝对路径（含盘符、去掉 `\\?\` 前缀后的大小写折叠）做信任键。
 
 ## 10. 持久化
 
 | 数据 | 位置 |
 |---|---|
-| 凭证 | `~/.lato/auth.json` |
-| 用户配置 | `~/.lato/config.toml` |
-| 会话 | `~/.lato/sessions/<id>.jsonl`（可追加的 transcript） |
+| 凭证 | `$LATO_HOME/auth.json`（默认 Unix `~/.lato/`，Windows `%USERPROFILE%\.lato\`） |
+| 用户配置 | `$LATO_HOME/config.toml` |
+| 会话 | `$LATO_HOME/sessions/<id>.jsonl`（可追加的 transcript） |
 | 项目覆盖 | `<repo>/.lato/config.toml`、`AGENTS.md` |
 
 会话可 resume。v1 不做跨会话 memory / dream。
@@ -396,12 +410,12 @@ OAuth 实现按 Pi 行为用 Rust 重写，NOTICE 列出 MIT 来源：`kimi-codi
 
 | 阶段 | 交付 |
 |---|---|
-| 0 内核 | ACP host、SessionActor、turn loop、CredentialStore、`ApiKeyPreset` + `env_api_key`、解析顺序、headless 客户端。MCP / hooks / skills 为空操作，不进 ToolRouter 的工具不存在 |
+| 0 内核 | ACP host、SessionActor、turn loop、CredentialStore、`ApiKeyPreset` + `env_api_key`、解析顺序、headless 客户端。路径与默认 shell 按 OS 分支（含 Windows）。MCP / hooks / skills 为空操作，不进 ToolRouter 的工具不存在。沙箱 profile 可先 `off`，但 Windows 路径/进程必须已正确，不得只在 Unix 上能跑 |
 | 1 标准 key | 实现 `openai-completions`、`openai-responses`、`anthropic-messages`。`model.api` 属于这三种的都能真正发请求（openai、xai、OpenRouter、Anthropic key、Kimi key、ZAI、Qwen、Moonshot、MiniMax、Groq、Fireworks 中对应模型等）。其余 `model.api` 在 `models/list` 标 `supported: false`，采样拒绝 |
 | 2 订阅登录 | `kimi-coding` OAuth（stream 已有 `anthropic-messages`）+ `openai-codex` OAuth + `openai-codex-responses` |
 | 3 云特例 | 其余方言与专用 resolve：Bedrock、Vertex、Cloudflare、Azure、Gemini、Mistral |
 | 4 动态与本地 | llama.cpp `refresh_models`、`models.json` 自定义 host、Radius（若仍要） |
-| 5 产品面 | 只读 TUI 或 IDE ACP 客户端、插件目录、子代理 worktree、OS 沙箱收紧 |
+| 5 产品面 | 只读 TUI 或 IDE ACP 客户端、插件目录、子代理 worktree、三平台沙箱收紧（Windows Restricted Token 策略加严） |
 
 阶段 0–1 结束后应能：`lato login openai --api-key`（或 env `OPENAI_API_KEY` / `XAI_API_KEY` / `KIMI_API_KEY`）+ `lato -p "fix the tests"` 在仓库里改代码并跑测试。
 
@@ -413,7 +427,8 @@ OAuth 实现按 Pi 行为用 Rust 重写，NOTICE 列出 MIT 来源：`kimi-codi
 - Preset：同一 `env_api_key` + 两种不同 `(model.api, url)` 打到不同 host（fixture），证明没有按厂商分叉实现。同一 preset 下两种 `model.api` 时，已实现的能流、未实现的 `supported: false`。
 - 阶段 0：无 MCP 配置、无 hook 脚本时 turn 仍能跑完（空操作，不是报错）。
 - Loop：fixture 流（模型先 tool 后文本）；取消时历史含未完成 call。
-- 工具：同文件并行编辑串行化。
+- 工具：同文件并行编辑串行化。Windows 路径（盘符、反斜杠、长路径）与 PowerShell 引号有独立用例。
+- 沙箱：macOS seatbelt / Linux bwrap / Windows Restricted Token 各至少一条「workspace 下写 cwd 成功、写 cwd 外失败」；包装失败必须拒绝而非 unsandbox。
 - Provider：每个 **已实现** stream 方言至少一条录制的 HTTP fixture（VCR），不在 CI 打真网。
 - OAuth：仅 kimi-coding 与 openai-codex；PKCE/callback 用 mock token endpoint。
 - ACP：stdio 往返：prompt → tool permission → 完成。
@@ -468,11 +483,12 @@ lato/                          # 本 git 仓库根；CLI package name = lato
 4. **调度键**：协议在模型上（`model.api`），host 在模型或 preset 上；preset 不写死单一 `api`。
 5. **未落地方言**：`models/list` 带 `supported: false` / `reason: dialect_unimplemented`；采样与 `set_model` 拒绝；允许先存 API key。
 6. **阶段 0 空操作**：MCP 预热、skills 注入、hook bus 未实现前必须 no-op，不得阻塞 turn。
+7. **Windows**：v1 愿景含 Windows 原生（路径、shell、状态目录、沙箱 Restricted Token）。不是 WSL 替代。
 
 仍待确认（未拍板则用默认）：
 
-7. **第 13 节带 \*** 的三项（replay、截断、静止检测）是否进 v1。默认按「进 v1」写。
-8. **是否只读导入 `~/.pi/agent/auth.json`。** 默认：提示导入，不自动；且只导入 Lato 已支持的通道。
+8. **第 13 节带 \*** 的三项（replay、截断、静止检测）是否进 v1。默认按「进 v1」写。
+9. **是否只读导入 `~/.pi/agent/auth.json`。** 默认：提示导入，不自动；且只导入 Lato 已支持的通道。
 
 ---
 
