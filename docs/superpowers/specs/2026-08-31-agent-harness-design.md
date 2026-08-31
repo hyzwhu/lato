@@ -17,7 +17,7 @@
 
 1. **无头工人**：CLI / CI / 作业系统里把任务跑完。
 2. **可嵌入运行时**：TUI、IDE、Web、SDK 共用同一个 agent 脑。
-3. **厂商可切换**：API key 一律按「stream 协议 + host」接入（一份 `env_api_key`，preset 只是数据）；OAuth 订阅登录 v1 只做 `kimi-coding` 与 `openai-codex`。解析顺序与 Pi 一致。
+3. **厂商可切换**：API key 一律按「`model.api`（协议）+ URL（host）」接入（一份 `env_api_key`，preset 只是数据）；OAuth 订阅登录 v1 只做 `kimi-coding` 与 `openai-codex`。解析顺序与 Pi 一致。
 
 成功标准：
 
@@ -49,7 +49,7 @@
 | Loop | Codex 式：submission → 一 session 一 active turn → persist-then-execute 工具 → 再采样 |
 | 对外协议 | ACP（`session/new\|prompt\|cancel` + `session/request_permission`）；内部 queue-pair 不暴露 |
 | 工具目录 | Grok 式 `ToolKind` + 每步现装；MCP 默认 `search_tool` + `use_tool` |
-| Provider | **API key = 数据**：`{ id, api, base_url, env }` preset + 唯一 `env_api_key`。**OAuth = 代码**：仅 `kimi-coding`、`openai-codex` |
+| Provider | **API key = 数据**：preset `{ id, env, 可选 default_host }` + 模型上的 `api`/`base_url`；唯一 `env_api_key`。**OAuth = 代码**：仅 `kimi-coding`、`openai-codex` |
 | 凭证 | 每 provider 一条；`type: api_key \| oauth`；存盘优先于环境变量；禁止刷新失败后静默回落 env |
 | 插件 | 目录包（skills / hooks / MCP），信任后才激活可执行部分 |
 | 执行与 UI | 工具只在 host 执行；客户端只渲染事件和回答审批 |
@@ -58,7 +58,7 @@
 
 Provider crate 必须保持「id / auth / api / models」边界：`lato-ai` 不得依赖 `lato-agent` / TUI；agent 只通过 `get_auth` 与 `stream` 使用 ai。
 
-禁止为每个 API key 厂商写一套 Provider 实现。新厂商 = 一行 preset（协议 + host + env + 模型表），不改 loop、不改 HTTP 客户端（除非要新方言）。
+禁止为每个 API key 厂商写一套 Provider 实现。新厂商 = 一行 preset（env + 可选 default host + 模型表）；调度键是 **`model.api`（协议）+ URL（host）**，不改 loop、不改 HTTP 客户端（除非要新方言）。
 
 ## 4. 总体架构
 
@@ -69,7 +69,8 @@ Client（headless CLI / 未来 TUI / IDE / Web / SDK）
 Session host
   ├─ SessionActor（一会话一 actor，至多一个 active turn）
   ├─ Models / Provider registry
-  │     ├─ ApiKeyPreset 表（协议 + host + env）
+  │     ├─ ApiKeyPreset 表（id / env / 可选 default host）
+  │     ├─ 模型 catalog（每条有 api + 可选 base_url）
   │     └─ OAuth：kimi-coding / openai-codex
   ├─ CredentialStore (auth.json)
   ├─ ToolRegistry（每 step 现装）
@@ -85,7 +86,7 @@ Session host
 3. ACP 事件流 / 反向 `request_permission`
 4. `CredentialStore.modify(provider_id, fn)` 唯一写凭证
 
-采样路径：`get_auth` 给出的 `base_url` + 该模型的 `api` 方言 → `stream`。loop 不知道这是 Groq 还是 DeepSeek。
+采样路径：`model.api` 选 stream 实现，URL 取 `model.base_url` 否则 preset default host，再叠 `get_auth` 的 `base_url` 覆盖。loop 不知道这是 Groq 还是 DeepSeek。
 
 ## 5. Agent loop
 
@@ -118,6 +119,7 @@ Client session/prompt
 - **persist-then-execute。** 取消时历史里必须已有 tool call，不能丢洞。
 - **并行执行，串行同文件。** 写路径按 `file_path` / `path` / `target_file` 加锁。
 - **停止条件（全部一等公民）：** 模型无 tool call；用户取消；权限拒绝；预算 / max-turns；静止检测（同一工具调用连打超阈值）；Stop hook 未要求续跑；认证耗尽。
+- **阶段 0 允许空操作。** `run_turn` 图里的 MCP 预热、skills 注入、全部 hook 点在未实现前必须是 no-op（空 bus、不连 MCP、不注入技能），不得阻塞 turn。阶段 5 再换成真插件/MCP。未注册的 `spawn_subagent` / `web_*` 不进入该 step 的 ToolRouter。
 
 ### 5.2 上下文
 
@@ -228,14 +230,13 @@ MCP：stdio + streamable HTTP；工具名 `server__tool`。默认不把全部 MC
 语义对齐 Pi `packages/ai`，用 Rust 表达。API key 厂商不是 40 个类型，是一份 preset 数据 + 按 `api` 分发的 stream 实现。
 
 ```rust
-/// 一条 API key 厂商。实现上就是表里的一行。
+/// 一条 API key 厂商。实现上就是表里的一行。协议不写在 preset 上。
 pub struct ApiKeyPreset {
     pub id: String,
     pub name: String,
-    pub api: ModelApi,          // 协议 / stream 方言
-    pub base_url: String,       // host
+    pub default_base_url: Option<String>, // 可空：host 在模型上（Azure / OpenCode）
     pub env: &'static [&'static str],
-    // models: 静态 catalog
+    // models: 静态 catalog；每条 Model 带 api + 可选 base_url
 }
 
 pub enum ModelApi {
@@ -307,11 +308,15 @@ pub struct OAuthAuth { /* login / refresh / to_auth；UI 走 AuthInteraction */ 
 | `mistral-conversations` | Mistral |
 | `pi-messages` | Radius |
 
-一个 preset 只绑一种默认 `api`。用户自定义 endpoint（`models.json`）选一种 `api` + 一个 `base_url` + 一个 env 名，即成为新厂商。
+调度键是 **每条模型的 `model.api`**，不是 preset 上的单一 `api`。同一 preset 可以挂多种方言（Fireworks、OpenCode、Copilot）：阶段 1 只跑得通已实现的那几种，其余模型标不可用。
 
-### 8.4 API key preset（协议 + host + env）
+URL：`model.base_url` → 否则 `preset.default_base_url` → 否则 `get_auth` 覆盖。缺 URL 则该模型不可用。
 
-v1 **用数据注册** Pi 里所有走 `envApiKeyAuth` 的 id。代码路径只有一条：读 key → 把 `Authorization`（或该方言要求的头）交给对应 `ModelApi` 的 `stream`，请求打到 `base_url`。
+用户自定义 endpoint（`models.json`）仍是：选一种 `api` + 一个 `base_url` + 一个 env 名 + 模型列表。
+
+### 8.4 API key preset（env + 模型上的协议与 host）
+
+v1 **用数据注册** Pi 里所有走 `envApiKeyAuth` 的 id。代码路径只有一条：读 key → 按 **`model.api`** 选 stream → 请求打到该模型解析出的 URL。头由方言解释（例如 `anthropic-messages`：`apiKey` 走 `x-api-key`，已有 `headers` 则原样用，以覆盖 `ANTHROPIC_AUTH_TOKEN` Bearer）。
 
 ENV 名对齐 Pi `env-api-keys.ts`。共享 ENV 的对（`opencode`/`opencode-go`、`moonshotai`/`moonshotai-cn`、`qwen-token-plan`/`qwen-token-plan-individual`）必须分 id、分 catalog、分 host，但 **共用同一个 api key 实现**。
 
@@ -319,9 +324,9 @@ preset 全集（实现时从 Pi HEAD 对表，日期写入 catalog 注释）：
 
 `openai`、`azure-openai-responses`、`google`、`deepseek`、`nvidia`、`groq`、`cerebras`、`mistral`、`huggingface`、`fireworks`、`together`、`baseten`、`vercel-ai-gateway`、`zai`、`zai-coding-cn`、`opencode`、`opencode-go`、`ant-ling`、`minimax`、`minimax-cn`、`moonshotai`、`moonshotai-cn`、`qwen-token-plan`、`qwen-token-plan-individual`、`qwen-token-plan-cn`、`xiaomi`、`xiaomi-token-plan-cn`、`xiaomi-token-plan-ams`、`xiaomi-token-plan-sgp`、`xai`、`openrouter`、`kimi-coding`、`github-copilot`（仅 `COPILOT_GITHUB_TOKEN` 这条 key 路径）、`anthropic`（`ANTHROPIC_API_KEY`；`ANTHROPIC_AUTH_TOKEN` 按 Pi 改为 Bearer）。
 
-示例（形状，host 以 Pi 源码为准）：
+示例（形状，host / 每模型 `api` 以 Pi 源码为准）：
 
-| id | api | host（示意） | env |
+| id | 典型 model.api | default host（示意） | env |
 |---|---|---|---|
 | `openai` | `openai-responses` | `https://api.openai.com/v1` | `OPENAI_API_KEY` |
 | `xai` | `openai-responses` | `https://api.x.ai/v1` | `XAI_API_KEY` |
@@ -329,10 +334,17 @@ preset 全集（实现时从 Pi HEAD 对表，日期写入 catalog 注释）：
 | `anthropic` | `anthropic-messages` | `https://api.anthropic.com` | `ANTHROPIC_API_KEY` |
 | `kimi-coding` | `anthropic-messages` | `https://api.kimi.com/coding` | `KIMI_API_KEY` |
 | `openrouter` | `openai-completions` | OpenRouter OpenAI 兼容根 | `OPENROUTER_API_KEY` |
+| `fireworks` | 按模型：`openai-completions` 或 `anthropic-messages` | `https://api.fireworks.ai/inference` | `FIREWORKS_API_KEY` |
+| `opencode` | 按模型：最多四种方言 | 无 preset host（在模型上） | `OPENCODE_API_KEY` |
+| `azure-openai-responses` | `azure-openai-responses` | 无 preset host（部署 URL 在模型上） | `AZURE_OPENAI_API_KEY` |
+
+`github-copilot` 可留在表里走 `COPILOT_GITHUB_TOKEN`；v1 **不**做 Copilot OAuth，不要在 UI 上写成「支持 Copilot 订阅」。
 
 `models.json` / CLI 覆盖：同一结构，用户自己填 `api` + `base_url` + env。`llama.cpp`（`LLAMA_BASE_URL` + `openai-completions`）也是这一行，只是模型列表要 `refresh_models`（阶段 4）。
 
-**不能塞进这张表的**（阶段 3）：`amazon-bedrock`、`google-vertex`（ADC）、`cloudflare-workers-ai`、`cloudflare-ai-gateway`、`radius` 动态目录。v1 的 `/login` 与 `models/list` **不要**把它们显示成可登录，除非该阶段已接线。
+**不能塞进这张表的**（阶段 3）：`amazon-bedrock`、`google-vertex`（ADC）、`cloudflare-workers-ai`、`cloudflare-ai-gateway`、`radius` 动态目录。它们不出现在可登录列表，除非该阶段已接线。
+
+**方言未落地的模型：** 仍可出现在 `models/list`，但必须带 `supported: false` 与 `reason: dialect_unimplemented`（或等价字段）。`session/set_model` 与采样拒绝，错误信息指向所缺方言。允许 `lato login <id> --api-key` 先存 key。专用 resolve 未接线的 id 则连 login 都不提供。
 
 图像 provider **v1 不做**。
 
@@ -351,7 +363,7 @@ OAuth 实现按 Pi 行为用 Rust 重写，NOTICE 列出 MIT 来源：`kimi-codi
 
 ### 8.6 与 loop 的接法
 
-采样前：`auth = models.get_auth(model).await`，把 `api_key/headers/base_url` 交给 `api.stream`。工具层看不到 oauth vs key，也看不到厂商名。
+采样前：若 `model.api` 未实现则拒绝（与 `models/list.supported` 一致）。否则 `auth = models.get_auth(model).await`，把 `api_key/headers/base_url` 交给该方言的 `stream`。工具层看不到 oauth vs key，也看不到厂商名。
 
 `/login`：
 
@@ -380,12 +392,12 @@ OAuth 实现按 Pi 行为用 Rust 重写，NOTICE 列出 MIT 来源：`kimi-codi
 
 ## 11. 分阶段交付
 
-阶段只表示**实现深度**。API key preset 可以早注册；OAuth 方法只在两家上广告。
+阶段只表示**实现深度**。API key preset 可以早注册；OAuth 方法只在两家上广告；未实现方言的模型必须 `supported: false`。
 
 | 阶段 | 交付 |
 |---|---|
-| 0 内核 | ACP host、SessionActor、turn loop、CredentialStore、`ApiKeyPreset` + `env_api_key`、解析顺序、headless 客户端 |
-| 1 标准 key | 实现 `openai-completions`、`openai-responses`、`anthropic-messages`。凡 preset.api 属于这三种的厂商都能真正发请求（openai、xai、OpenRouter、Anthropic key、Kimi key、ZAI、Qwen、Moonshot、MiniMax、Groq 等）。其余方言的 preset 可以出现在 catalog，但采样时明确报「方言未实现」 |
+| 0 内核 | ACP host、SessionActor、turn loop、CredentialStore、`ApiKeyPreset` + `env_api_key`、解析顺序、headless 客户端。MCP / hooks / skills 为空操作，不进 ToolRouter 的工具不存在 |
+| 1 标准 key | 实现 `openai-completions`、`openai-responses`、`anthropic-messages`。`model.api` 属于这三种的都能真正发请求（openai、xai、OpenRouter、Anthropic key、Kimi key、ZAI、Qwen、Moonshot、MiniMax、Groq、Fireworks 中对应模型等）。其余 `model.api` 在 `models/list` 标 `supported: false`，采样拒绝 |
 | 2 订阅登录 | `kimi-coding` OAuth（stream 已有 `anthropic-messages`）+ `openai-codex` OAuth + `openai-codex-responses` |
 | 3 云特例 | 其余方言与专用 resolve：Bedrock、Vertex、Cloudflare、Azure、Gemini、Mistral |
 | 4 动态与本地 | llama.cpp `refresh_models`、`models.json` 自定义 host、Radius（若仍要） |
@@ -398,7 +410,8 @@ OAuth 实现按 Pi 行为用 Rust 重写，NOTICE 列出 MIT 来源：`kimi-codi
 ## 12. 测试
 
 - Auth 解析：存盘 oauth / 存盘 key / 仅 env / override / 刷新失败不回落，用假 `CredentialStore`。
-- Preset：同一 `env_api_key` + 两种不同 `(api, base_url)` 打到不同 host（fixture），证明没有按厂商分叉实现。
+- Preset：同一 `env_api_key` + 两种不同 `(model.api, url)` 打到不同 host（fixture），证明没有按厂商分叉实现。同一 preset 下两种 `model.api` 时，已实现的能流、未实现的 `supported: false`。
+- 阶段 0：无 MCP 配置、无 hook 脚本时 turn 仍能跑完（空操作，不是报错）。
 - Loop：fixture 流（模型先 tool 后文本）；取消时历史含未完成 call。
 - 工具：同文件并行编辑串行化。
 - Provider：每个 **已实现** stream 方言至少一条录制的 HTTP fixture（VCR），不在 CI 打真网。
@@ -451,13 +464,16 @@ lato/                          # 本 git 仓库根；CLI package name = lato
 
 1. **产品短名**：`lato`（状态目录、ACP 扩展前缀、CLI 二进制、工具命名空间）。
 2. **语言**：Rust。代码目录 `innovation/lato`。
-3. **OAuth 范围**：v1 仅 `kimi-coding` 与 `openai-codex`。API key 按协议 + host 支持 catalog 内全部 env-key 厂商。
+3. **OAuth 范围**：v1 仅 `kimi-coding` 与 `openai-codex`。API key 按 `model.api` + URL 支持 catalog 内全部 env-key 厂商。
+4. **调度键**：协议在模型上（`model.api`），host 在模型或 preset 上；preset 不写死单一 `api`。
+5. **未落地方言**：`models/list` 带 `supported: false` / `reason: dialect_unimplemented`；采样与 `set_model` 拒绝；允许先存 API key。
+6. **阶段 0 空操作**：MCP 预热、skills 注入、hook bus 未实现前必须 no-op，不得阻塞 turn。
 
 仍待确认（未拍板则用默认）：
 
-4. **第 13 节带 \*** 的三项（replay、截断、静止检测）是否进 v1。默认按「进 v1」写。
-5. **是否只读导入 `~/.pi/agent/auth.json`。** 默认：提示导入，不自动；且只导入 Lato 已支持的通道。
+7. **第 13 节带 \*** 的三项（replay、截断、静止检测）是否进 v1。默认按「进 v1」写。
+8. **是否只读导入 `~/.pi/agent/auth.json`。** 默认：提示导入，不自动；且只导入 Lato 已支持的通道。
 
 ---
 
-审阅时请重点看：第 8.4 节 preset 是否真的「只分协议和 host」、第 8.5 节两家 OAuth 是否就是你要的登录面、阶段 1 vs 2 的成功标准。通过后下一份文档才是分阶段实现计划。
+审阅时请重点看：第 8.1/8.3 节调度是否按 `model.api` + URL、第 8.5 节两家 OAuth、阶段 0 空操作与阶段 1 的 `supported: false`。通过后下一份文档才是分阶段实现计划。
