@@ -54,7 +54,7 @@ Built-in China-region OpenAI-compatible providers include:
 | `zhipu` | `glm-4.5` | `ZHIPU_API_KEY` (also accepts `BIGMODEL_API_KEY`/`ZAI_API_KEY`) |
 | `sensenova` | `SenseNova-V6-5-Pro` | `SENSENOVA_API_KEY` bearer token |
 
-They also appear in first-launch model selection. SenseNova accounts that expose only AK/SK must generate the platform bearer/JWT token first and supply that token; Lato does not store the secret pair or silently invent a signing scheme.
+They also appear in first-launch provider selection. After authentication, Lato calls the selected provider's authenticated `/models` endpoint and displays the returned model IDs. Successful lists are cached in `~/.lato/model-cache.json`, so newly released models can be selected without upgrading Lato. A 401/403 rejects setup; providers without a compatible listing endpoint fall back to the explicitly labelled built-in list. SenseNova accounts that expose only AK/SK must generate the platform bearer/JWT token first and supply that token; Lato does not store the secret pair or silently invent a signing scheme.
 
 ```bash
 export LATO_HOME="$HOME/.lato"

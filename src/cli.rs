@@ -1,8 +1,9 @@
 use lato_agent::{ToolApproval, default_fake_stream};
 use lato_ai::{
-    AuthInteraction, AuthNotice, CATALOG, CredentialStore, CustomHttpModelStream, HttpModelStream,
-    ModelStream, api_key_login_allowed, custom_model_auth, get_auth_refreshing, load_models_json,
-    login_oauth, lookup_model, oauth_allowed, phase0_supported, store_oauth,
+    AuthInteraction, AuthNotice, CATALOG, CredentialStore, CustomHttpModelStream, CustomModel,
+    HttpModelStream, ModelApi, ModelStream, api_key_login_allowed, custom_model_auth,
+    get_auth_refreshing, load_models_json, login_oauth, lookup_model, oauth_allowed,
+    phase0_supported, refresh_openai_compatible_models, store_oauth,
 };
 use lato_workspace::{ApprovalMode, SandboxProfile, SessionTrust};
 use rustyline::{
@@ -361,63 +362,82 @@ async fn interactive() -> i32 {
 }
 
 async fn configure_interactively(home: &std::path::Path) -> Result<String, String> {
-    let mut options: Vec<String> = CATALOG
+    let custom_models = load_models_json(&home.join("models.json")).unwrap_or_default();
+    let mut providers = CATALOG
         .iter()
         .filter(|model| phase0_supported(model.api))
         .filter(|model| api_key_login_allowed(model.provider) || oauth_allowed(model.provider))
-        .map(|model| format!("{}/{}", model.provider, model.id))
-        .collect();
-    if let Ok(custom) = load_models_json(&home.join("models.json")) {
-        options.extend(
-            custom
+        .map(|model| model.provider.to_string())
+        .chain(custom_models.iter().map(|model| model.provider.clone()))
+        .collect::<Vec<_>>();
+    providers.sort();
+    providers.dedup();
+    println!("Choose a provider:");
+    for (index, provider) in providers.iter().enumerate() {
+        println!("  {}) {provider}", index + 1);
+    }
+    let provider = choose_item("Provider: ", &providers, "provider")?;
+    let is_catalog_provider = CATALOG.iter().any(|model| model.provider == provider);
+    if is_catalog_provider {
+        ensure_provider_auth(home, &provider).await?;
+    }
+
+    let fallback = CATALOG
+        .iter()
+        .filter(|model| model.provider == provider && phase0_supported(model.api))
+        .map(|model| CustomModel {
+            provider: provider.clone(),
+            id: model.id.to_string(),
+            api: model.api,
+            base_url: model.base_url.unwrap_or_default().to_string(),
+            env: lato_ai::env_names(&provider)
+                .first()
+                .copied()
+                .unwrap_or("LATO_API_KEY")
+                .to_string(),
+        })
+        .chain(
+            custom_models
                 .into_iter()
-                .map(|model| format!("{}/{}", model.provider, model.id)),
-        );
-    }
-    options.sort();
-    options.dedup();
-    println!("Choose a model:");
-    for (index, model) in options.iter().enumerate() {
-        println!("  {}) {model}", index + 1);
-    }
-    let answer = read_line("Selection: ").map_err(|e| e.to_string())?;
-    let index: usize = answer
-        .parse()
-        .map_err(|_| "invalid model selection".to_string())?;
-    let selection = options
-        .get(index.saturating_sub(1))
-        .cloned()
-        .ok_or("invalid model selection")?;
-    let (provider, _) = selection.split_once('/').ok_or("invalid model")?;
-    if lookup_model(provider, selection.split_once('/').unwrap().1).is_some() {
-        let store = CredentialStore::open(home).map_err(|e| e.to_string())?;
-        if store.get(provider).is_none() && !provider_env_configured(provider) {
-            if oauth_allowed(provider) {
-                let method = read_line("Authentication: 1) OAuth  2) API key [1]: ")
-                    .map_err(|e| e.to_string())?;
-                if method.trim().is_empty() || method.trim() == "1" {
-                    let tokens =
-                        login_oauth(provider, &ConsoleAuthInteraction, &reqwest::Client::new())
-                            .await?;
-                    let mut store = CredentialStore::open(home).map_err(|e| e.to_string())?;
-                    store_oauth(
-                        &mut store,
-                        provider,
-                        &tokens.access,
-                        &tokens.refresh,
-                        tokens.expires,
-                    )
-                    .map_err(|e| e.to_string())?;
-                } else if api_key_login_allowed(provider) {
-                    save_interactive_api_key(home, provider)?;
-                } else {
-                    return Err(format!("API-key login is not supported for {provider}"));
-                }
-            } else {
-                save_interactive_api_key(home, provider)?;
+                .filter(|model| model.provider == provider),
+        )
+        .collect::<Vec<_>>();
+    let models = if is_catalog_provider {
+        match discover_provider_models(home, &provider).await {
+            Ok(models) if !models.is_empty() => {
+                println!("Fetched {} available models from {provider}.", models.len());
+                save_model_cache(home, &provider, &models)?;
+                models
+            }
+            Ok(_) => {
+                eprintln!("Provider returned an empty model list; using built-in fallback.");
+                fallback
+            }
+            Err(error) if error.contains("401") || error.contains("403") => {
+                return Err(format!(
+                    "{provider} rejected the credential while listing models: {error}"
+                ));
+            }
+            Err(error) => {
+                eprintln!(
+                    "Could not fetch models from {provider}: {error}\nUsing built-in fallback models."
+                );
+                fallback
             }
         }
+    } else {
+        fallback
+    };
+    let model_ids = models.into_iter().map(|model| model.id).collect::<Vec<_>>();
+    if model_ids.is_empty() {
+        return Err(format!("no models available for {provider}"));
     }
+    println!("Choose a model:");
+    for (index, model) in model_ids.iter().enumerate() {
+        println!("  {}) {model}", index + 1);
+    }
+    let model = choose_item("Model: ", &model_ids, "model")?;
+    let selection = format!("{provider}/{model}");
     save_settings(
         home,
         &CliSettings {
@@ -425,6 +445,102 @@ async fn configure_interactively(home: &std::path::Path) -> Result<String, Strin
         },
     )?;
     Ok(selection)
+}
+
+fn choose_item(prompt: &str, values: &[String], kind: &str) -> Result<String, String> {
+    let answer = read_line(prompt).map_err(|e| e.to_string())?;
+    let index: usize = answer
+        .parse()
+        .map_err(|_| format!("invalid {kind} selection"))?;
+    values
+        .get(index.saturating_sub(1))
+        .cloned()
+        .ok_or_else(|| format!("invalid {kind} selection"))
+}
+
+async fn ensure_provider_auth(home: &std::path::Path, provider: &str) -> Result<(), String> {
+    let store = CredentialStore::open(home).map_err(|e| e.to_string())?;
+    if store.get(provider).is_some() || provider_env_configured(provider) {
+        return Ok(());
+    }
+    if oauth_allowed(provider) {
+        let method =
+            read_line("Authentication: 1) OAuth  2) API key [1]: ").map_err(|e| e.to_string())?;
+        if method.trim().is_empty() || method.trim() == "1" {
+            let tokens =
+                login_oauth(provider, &ConsoleAuthInteraction, &reqwest::Client::new()).await?;
+            let mut store = CredentialStore::open(home).map_err(|e| e.to_string())?;
+            return store_oauth(
+                &mut store,
+                provider,
+                &tokens.access,
+                &tokens.refresh,
+                tokens.expires,
+            )
+            .map_err(|e| e.to_string());
+        }
+        if !api_key_login_allowed(provider) {
+            return Err(format!("API-key login is not supported for {provider}"));
+        }
+    }
+    save_interactive_api_key(home, provider)
+}
+
+async fn discover_provider_models(
+    home: &std::path::Path,
+    provider: &str,
+) -> Result<Vec<CustomModel>, String> {
+    let seed = CATALOG
+        .iter()
+        .find(|model| {
+            model.provider == provider
+                && matches!(
+                    model.api,
+                    ModelApi::OpenaiCompletions | ModelApi::OpenaiResponses
+                )
+        })
+        .ok_or("provider does not expose an OpenAI-compatible model listing")?;
+    let base_url = seed.base_url.ok_or("provider has no model-list base URL")?;
+    let mut store = CredentialStore::open(home).map_err(|e| e.to_string())?;
+    let auth = get_auth_refreshing(
+        &mut store,
+        provider,
+        &|name| std::env::var(name).ok(),
+        None,
+        &reqwest::Client::new(),
+    )
+    .await?
+    .ok_or_else(|| format!("no credential configured for {provider}"))?;
+    let env_name = lato_ai::env_names(provider)
+        .first()
+        .copied()
+        .unwrap_or("LATO_API_KEY");
+    refresh_openai_compatible_models(
+        provider,
+        seed.api,
+        base_url,
+        env_name,
+        auth.api_key.as_deref(),
+    )
+    .await
+}
+
+fn save_model_cache(
+    home: &std::path::Path,
+    provider: &str,
+    models: &[CustomModel],
+) -> Result<(), String> {
+    let path = home.join("model-cache.json");
+    let mut all = load_models_json(&path).unwrap_or_default();
+    all.retain(|model| model.provider != provider);
+    all.extend_from_slice(models);
+    let temporary = home.join("model-cache.json.tmp");
+    std::fs::write(
+        &temporary,
+        serde_json::to_vec_pretty(&serde_json::json!({"models":all})).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    std::fs::rename(temporary, path).map_err(|e| e.to_string())
 }
 
 fn save_interactive_api_key(home: &std::path::Path, provider: &str) -> Result<(), String> {
@@ -461,14 +577,34 @@ async fn configured_stream(selection: &str) -> Result<Arc<dyn ModelStream>, Stri
         .ok_or_else(|| format!("no credential configured for {provider}"))?;
         Ok(Arc::new(HttpModelStream::new(model, auth)))
     } else {
-        let custom = load_models_json(&lato_home().join("models.json"))
-            .map_err(|e| e.to_string())?
+        let home = lato_home();
+        if let Some(custom) = load_models_json(&home.join("models.json"))
+            .unwrap_or_default()
             .into_iter()
             .find(|model| model.provider == provider && model.id == model_id)
-            .ok_or_else(|| format!("unknown model {selection}"))?;
-        let auth = custom_model_auth(&custom, &|name| std::env::var(name).ok())
-            .ok_or_else(|| format!("environment variable {} is not configured", custom.env))?;
-        Ok(Arc::new(CustomHttpModelStream::new(custom, auth)))
+        {
+            let auth = custom_model_auth(&custom, &|name| std::env::var(name).ok())
+                .ok_or_else(|| format!("environment variable {} is not configured", custom.env))?;
+            return Ok(Arc::new(CustomHttpModelStream::new(custom, auth)));
+        }
+        let cached = load_models_json(&home.join("model-cache.json"))
+            .unwrap_or_default()
+            .into_iter()
+            .find(|model| model.provider == provider && model.id == model_id)
+            .ok_or_else(|| {
+                format!("unknown model {selection}; run /model to refresh provider models")
+            })?;
+        let mut store = CredentialStore::open(&home).map_err(|e| e.to_string())?;
+        let auth = get_auth_refreshing(
+            &mut store,
+            provider,
+            &|name| std::env::var(name).ok(),
+            None,
+            &reqwest::Client::new(),
+        )
+        .await?
+        .ok_or_else(|| format!("no credential configured for {provider}"))?;
+        Ok(Arc::new(CustomHttpModelStream::new(cached, auth)))
     }
 }
 

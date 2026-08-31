@@ -67,8 +67,8 @@ pub async fn refresh_openai_compatible_models(
     env_name: &str,
     api_key: Option<&str>,
 ) -> Result<Vec<CustomModel>, String> {
-    let mut request =
-        reqwest::Client::new().get(format!("{}/models", base_url.trim_end_matches('/')));
+    let client = http_client_for_url(base_url);
+    let mut request = client.get(format!("{}/models", base_url.trim_end_matches('/')));
     if let Some(key) = api_key {
         request = request.bearer_auth(key);
     }
@@ -192,6 +192,39 @@ mod tests {
         .unwrap();
         let req = build_custom_request(&models[0], &auth, serde_json::json!([])).unwrap();
         assert_eq!(req.url, "http://127.0.0.1:8080/v1/chat/completions");
+    }
+
+    #[tokio::test]
+    async fn provider_models_are_fetched_with_bearer_auth() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = [0u8; 8192];
+            let count = socket.read(&mut request).unwrap();
+            let request = String::from_utf8_lossy(&request[..count]);
+            assert!(request.starts_with("GET /v1/models"));
+            assert!(request.to_lowercase().contains("authorization: bearer key"));
+            let body = r#"{"data":[{"id":"live-a"},{"id":"live-b"}]}"#;
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+        });
+        let models = refresh_openai_compatible_models(
+            "minimax-cn",
+            ModelApi::OpenaiCompletions,
+            &format!("http://{address}/v1"),
+            "MINIMAX_API_KEY",
+            Some("key"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            models
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            ["live-a", "live-b"]
+        );
     }
 
     #[test]

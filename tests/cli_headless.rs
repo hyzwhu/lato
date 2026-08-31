@@ -35,6 +35,50 @@ fn a1_1_stdio_acp_cli_initializes_and_rejects_session_load() {
 }
 
 #[test]
+fn discovered_provider_model_cache_runs_with_persisted_provider_credential() {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        let mut request = [0u8; 32 * 1024];
+        let count = socket.read(&mut request).unwrap();
+        let request = String::from_utf8_lossy(&request[..count]);
+        assert!(request.contains("discovered-model"));
+        assert!(
+            request
+                .to_lowercase()
+                .contains("authorization: bearer saved-secret")
+        );
+        let body =
+            "data: {\"choices\":[{\"delta\":{\"content\":\"dynamic-ok\"}}]}\n\ndata: [DONE]\n\n";
+        write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+    });
+    let d = tempfile::tempdir().unwrap();
+    std::fs::write(d.path().join("model-cache.json"), format!(
+        r#"{{"models":[{{"provider":"minimax-cn","id":"discovered-model","api":"openai-completions","base_url":"http://{address}/v1","env":"MINIMAX_API_KEY"}}]}}"#
+    )).unwrap();
+    let login = Command::new(env!("CARGO_BIN_EXE_lato"))
+        .env("LATO_HOME", d.path())
+        .args(["login", "minimax-cn", "--api-key", "saved-secret"])
+        .output()
+        .unwrap();
+    assert!(login.status.success());
+    let output = Command::new(env!("CARGO_BIN_EXE_lato"))
+        .env("LATO_HOME", d.path())
+        .args(["-p", "--model", "minimax-cn/discovered-model", "hello"])
+        .output()
+        .unwrap();
+    server.join().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "dynamic-ok");
+}
+
+#[test]
 fn e4_1_cli_custom_model_http_sse_end_to_end() {
     use std::io::{Read, Write};
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
