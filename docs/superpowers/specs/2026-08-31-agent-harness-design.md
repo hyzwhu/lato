@@ -4,6 +4,7 @@
 - 状态：待审阅
 - 产品名：`lato`
 - 实现仓库：`/Users/huangyongzhao/Documents/work/innovation/lato`（后续代码只写这里；当前已是 `edition = "2024"` 的 bin crate，将扩成 Cargo workspace）
+- 验收文档：`docs/superpowers/specs/2026-08-31-lato-acceptance.md`（相对 lato 仓库根）。**测试与阶段完成判定以该文件为准**
 - 参照源码（2026-08-31 浅 clone）：
   - Codex：`/tmp/harness-src/codex`（`openai/codex`）
   - Grok Build：`/tmp/harness-src/grok-build`（`xai-org/grok-build`）
@@ -42,6 +43,7 @@
 - **其余 OAuth**：Anthropic Claude Pro/Max、GitHub Copilot、xAI SuperGrok、OpenRouter PKCE、Radius。这些 id 若出现在 catalog 里，v1 只走 API key（有 key 的）或等后续阶段。
 - **专用凭证解析**：Bedrock IAM/IRSA、Vertex ADC、Cloudflare account/gateway id。它们不是「协议 + host + env key」，放到阶段 3。
 - 把 WSL 当作「已经支持 Windows」的替代方案（WSL 里跑的是 Linux 构建）。不把 Hyper-V Windows Sandbox 当 v1 默认沙箱。
+- ACP `session/load`（v1 只用 `session/resume`）。
 
 ## 3. 已确认的设计决策
 
@@ -49,14 +51,17 @@
 |---|---|
 | 产品短名 | `lato`。CLI 二进制、ACP 扩展前缀、状态目录、工具命名空间都用此 id |
 | Loop | Codex 式：submission → 一 session 一 active turn → persist-then-execute 工具 → 再采样 |
-| 对外协议 | ACP（`session/new\|prompt\|cancel` + `session/request_permission`）；内部 queue-pair 不暴露 |
+| 对外协议 | ACP 最小集见第 6 节；内部 queue-pair 不暴露。登录与换模型不得另搞一套凭证语义 |
+| 无头 | `lato -p` 隐含 `approval_mode=always`，本进程视 cwd 为已信任，不阻塞 TTY。交互默认仍为 `ask` + 首次目录确认。Deny 在 always 下仍生效 |
+| Compact | 阶段 0–1 **不做** compact。超硬上限则 turn 失败，禁止悄悄 truncate。真正 compact 在 loop 稳定之后 |
+| 文件锁 | 写路径锁键 = 规范化绝对路径（Windows：去 `\\?\`、统一分隔符、大小写折叠）。与 folder-trust 键同一套规范化 |
 | 工具目录 | Grok 式 `ToolKind` + 每步现装；MCP 默认 `search_tool` + `use_tool` |
 | Provider | **API key = 数据**：preset `{ id, env, 可选 default_host }` + 模型上的 `api`/`base_url`；唯一 `env_api_key`。**OAuth = 代码**：仅 `kimi-coding`、`openai-codex` |
 | 凭证 | 每 provider 一条；`type: api_key \| oauth`；存盘优先于环境变量；禁止刷新失败后静默回落 env |
 | 插件 | 目录包（skills / hooks / MCP），信任后才激活可执行部分 |
 | 执行与 UI | 工具只在 host 执行；客户端只渲染事件和回答审批 |
 | 语言 | **Rust**（Cargo workspace，edition 2024）。v1 不双语言。stream 方言在 `lato-ai` 按协议实现；OAuth 只移植 Kimi Code 与 OpenAI Codex |
-| 目标 OS | macOS、Linux、Windows 原生。CI 与测试默认覆盖这三者；功能除非标明 OS-specific，否则三端都要能跑 |
+| 目标 OS | macOS、Linux、Windows 原生。功能除非标明 OS-specific，否则三端行为一致。CI：Unix 跑全部 UNIT；Windows PR 门禁至少覆盖路径规范化、默认 shell、无头 `-p`，沙箱接线后再加 Restricted Token 用例。细则见验收文档 F 节 |
 | 沙箱 | 只罩 `run_terminal_command`。macOS：`sandbox-exec`；Linux：`bwrap`；Windows：Restricted Token + Job Object（对齐 Codex `RestrictedToken`）。不自写 Landlock，不把 Hyper-V Windows Sandbox 当默认依赖。失败则拒绝执行，禁止静默 unsandbox |
 | 状态目录 | 用户 home 下的 `.lato/`（Unix `~/.lato/`，Windows `%USERPROFILE%\.lato\`）。`auth.json` Unix 0600 / Windows ACL 仅当前用户；目录 Unix 0700 |
 
@@ -121,9 +126,10 @@ Client session/prompt
 
 - **一 session 同时一个 active turn。** 新的 Start 可 abort 旧 turn（`TurnAbortReason::Replaced`）。Steer 把输入排进当前 turn，不开第二条模型循环。
 - **persist-then-execute。** 取消时历史里必须已有 tool call，不能丢洞。
-- **并行执行，串行同文件。** 写路径按 `file_path` / `path` / `target_file` 加锁。
+- **并行执行，串行同文件。** 写路径取 `file_path` / `path` / `target_file`，锁键为规范化绝对路径（见第 3 节）。不同拼写指向同一文件必须同一把锁。
 - **停止条件（全部一等公民）：** 模型无 tool call；用户取消；权限拒绝；预算 / max-turns；静止检测（同一工具调用连打超阈值）；Stop hook 未要求续跑；认证耗尽。
 - **阶段 0 允许空操作。** `run_turn` 图里的 MCP 预热、skills 注入、全部 hook 点在未实现前必须是 no-op（空 bus、不连 MCP、不注入技能），不得阻塞 turn。阶段 5 再换成真插件/MCP。未注册的 `spawn_subagent` / `web_*` 不进入该 step 的 ToolRouter。
+- **阶段 0–1 跳过 compact。** 图中「预 compact」在未实现前是空操作；上下文超过硬上限则 **失败该 turn**（可恢复错误），禁止 truncate 历史、禁止假装已经 compact。
 
 ### 5.2 上下文
 
@@ -136,7 +142,7 @@ Client session/prompt
 - 环境（cwd、shell、日期）
 - 对话历史（compaction 是唯一允许的历史改写）
 
-Compaction：token 过阈值或手动触发；写成显式任务，结果作为 summary + 有限回注，禁止悄悄 truncate。
+Compaction（实现后）：token 过阈值或手动触发；写成显式任务，结果作为 summary + 有限回注，禁止悄悄 truncate。阶段 0–1 未实现：超限即失败。
 
 ### 5.3 错误与重试
 
@@ -147,29 +153,34 @@ Compaction：token 过阈值或手动触发；写成显式任务，结果作为 
 
 ## 6. 客户端协议（ACP）
 
-v1 实现 `agent-client-protocol` 的 Agent 侧：
+v1 实现 Agent Client Protocol 的 Agent 侧。`initialize` 协商 `protocolVersion`（广告 v1 能力，不混用未实现的 v2 专有语义）。
+
+**必做：**
 
 | 方法 | 用途 |
 |---|---|
-| `initialize` / `authenticate` | 能力广告、鉴权方法列表 |
-| `session/new` `load` `list` `resume` `close` | 会话 |
+| `initialize` | 版本与 capabilities |
+| `session/new` | 新会话 |
 | `session/prompt` | 开 turn |
-| `session/cancel` | 中断 |
-| `session/set_model` | 换模型 |
-| 反向 `session/request_permission` | 审批 |
-| 通知 `session/update` | 文本、思考、tool_call、tool_result |
+| `session/cancel` | 中断（通知） |
+| `session/update` | 文本、思考、tool_call、tool_result（通知） |
+| `session/request_permission` | 反向审批 |
+| `session/list` | 可恢复会话列表 |
+| `session/resume` | 恢复；**不**重放全部历史通知 |
+| `session/close` | 关闭 |
+| `session/set_model` | 换模型（写入 capabilities；`supported: false` 必须拒绝） |
 
-扩展方法（v1 最小集，前缀 `lato/`）：
+**扩展（前缀 `lato/`）：** `lato/session/info`、`lato/models/list`、`lato/auth/login`、`lato/auth/logout`、`lato/auth/status`。`plugins/reload` 到阶段 5 再广告。
 
-- `session/info`、`models/list`
-- `auth/login`、`auth/logout`、`auth/status`（供无头与未来 TUI）
-- `plugins/reload`
+**v1 不做：** `session/load`（恢复只走 `session/resume`）、Codex `thread/start`、ACP v2 `session/set_config_option`。
 
-不在 v1 做 Codex `thread/start` JSON-RPC。headless CLI **必须**走同一 ACP（可 in-process channel），禁止再写一套直接调 `run_turn` 的旁路。
+若 `initialize` 的 `authMethods` 非空，ACP `authenticate` **必须**代理到与 `lato/auth/login` 同一 `CredentialStore` 与解析顺序。禁止第二套凭证。无 TTY 的登录只走 `lato/auth/login` / CLI。
 
-权限提示的决策：允许一次 / 本 session 允许 / 拒绝 / 取消。客户端只回决策。
+`lato/auth/login` 方法列表按 provider 裁剪：`openai-codex` 只有 oauth；普通 API key preset 只有 api_key；`kimi-coding` 两者都有。
 
-`auth/login` 的方法列表按 provider 裁剪：`openai-codex` 只有 oauth；普通 API key preset 只有 api_key；`kimi-coding` 两者都有。
+headless CLI **必须**走同一 ACP（可 in-process channel），禁止再写一套直接调 `run_turn` 的旁路。
+
+权限提示的决策：允许一次 / 本 session 允许 / 拒绝 / 取消。客户端只回决策。`lato -p` 不发阻塞式 `request_permission`（always）；deny 仍短路执行。
 
 ## 7. 工具系统
 
@@ -377,7 +388,9 @@ OAuth 实现按 Pi 行为用 Rust 重写，NOTICE 列出 MIT 来源：`kimi-codi
 
 ## 9. 权限、沙箱、信任
 
-审批模式：`ask`（默认）、`auto`（策略允许的自动过）、`always`（无头 / CI）。Deny 规则与 hooks 在 always 下仍生效。
+审批模式：`ask`（交互默认）、`auto`（策略允许的自动过）、`always`（`lato -p` / CI 隐含）。Deny 规则与 hooks 在 always 下仍生效。`always` 不得作为交互安装默认。
+
+`lato -p`：不提示 folder trust、不阻塞 TTY；cwd 仅本进程视为已信任（默认不把「永久信任」写入磁盘）。交互会话：未信任目录必须确认后才加载项目插件 / 项目 hooks。
 
 沙箱 profile：`off` | `workspace`（可写 cwd + tmp）| `read-only`。三平台都要实现这三档：
 
@@ -387,11 +400,11 @@ OAuth 实现按 Pi 行为用 Rust 重写，NOTICE 列出 MIT 来源：`kimi-codi
 | Linux | `bwrap` |
 | Windows | Restricted Token + Job Object |
 
-某 profile 在当前 OS 起不来 → **拒绝该次 shell**，不得改成 `off` 继续跑。Windows 不是「先 unsandbox 凑合用」。
+某 profile 在当前 OS 起不来 → **拒绝该次 shell**，不得改成 `off` 继续跑。Windows 不是「先 unsandbox 凑合用」。接线后的验收见验收文档 D 节。
 
 默认 shell：Unix `bash` 或用户 `$SHELL`；Windows 为 PowerShell（`pwsh` 优先，否则 `powershell.exe`）。路径、引号、环境块按 OS 处理，禁止把 POSIX 路径假设写进工具层。
 
-工作区信任：首次在某目录跑要确认（对齐 Grok folder trust）。未信任则项目插件与项目 hooks 不加载。Windows 上按规范化绝对路径（含盘符、去掉 `\\?\` 前缀后的大小写折叠）做信任键。
+工作区信任键与文件锁键同一套规范化（第 3 节）。Windows 上 `C:\Work\A`、`c:/work/a`、`\\?\C:\Work\A` 视为同一目录。
 
 ## 10. 持久化
 
@@ -410,29 +423,26 @@ OAuth 实现按 Pi 行为用 Rust 重写，NOTICE 列出 MIT 来源：`kimi-codi
 
 | 阶段 | 交付 |
 |---|---|
-| 0 内核 | ACP host、SessionActor、turn loop、CredentialStore、`ApiKeyPreset` + `env_api_key`、解析顺序、headless 客户端。路径与默认 shell 按 OS 分支（含 Windows）。MCP / hooks / skills 为空操作，不进 ToolRouter 的工具不存在。沙箱 profile 可先 `off`，但 Windows 路径/进程必须已正确，不得只在 Unix 上能跑 |
-| 1 标准 key | 实现 `openai-completions`、`openai-responses`、`anthropic-messages`。`model.api` 属于这三种的都能真正发请求（openai、xai、OpenRouter、Anthropic key、Kimi key、ZAI、Qwen、Moonshot、MiniMax、Groq、Fireworks 中对应模型等）。其余 `model.api` 在 `models/list` 标 `supported: false`，采样拒绝 |
-| 2 订阅登录 | `kimi-coding` OAuth（stream 已有 `anthropic-messages`）+ `openai-codex` OAuth + `openai-codex-responses` |
-| 3 云特例 | 其余方言与专用 resolve：Bedrock、Vertex、Cloudflare、Azure、Gemini、Mistral |
-| 4 动态与本地 | llama.cpp `refresh_models`、`models.json` 自定义 host、Radius（若仍要） |
-| 5 产品面 | 只读 TUI 或 IDE ACP 客户端、插件目录、子代理 worktree、三平台沙箱收紧（Windows Restricted Token 策略加严） |
+| 0 内核 | ACP 第 6 节最小集、SessionActor、turn loop、CredentialStore、`ApiKeyPreset` + `env_api_key`、解析顺序、headless CLI（走 ACP）。路径规范化与默认 shell 含 Windows。MCP / hooks / skills / compact 为空操作。ToolRouter 仅编码最小集。沙箱可 `off`。`-p` = always + 本进程信任 cwd。验收：验收文档 A 节 |
+| 1 标准 key | 三种方言 HTTP + VCR。验收文档 B 节 |
+| 2 订阅登录 | 两家 OAuth + `openai-codex-responses`。验收文档 C 节 |
+| 3 云特例 | 其余方言与专用 resolve。验收文档 E3 |
+| 4 动态与本地 | llama.cpp / `models.json`。验收文档 E4 |
+| 5 产品面 | 插件、worktree、沙箱收紧。验收文档 E5；沙箱接线后的 OS 用例见 D 节 |
 
-阶段 0–1 结束后应能：`lato login openai --api-key`（或 env `OPENAI_API_KEY` / `XAI_API_KEY` / `KIMI_API_KEY`）+ `lato -p "fix the tests"` 在仓库里改代码并跑测试。
+阶段 0–1 结束后应能：`lato login openai --api-key`（或 env `OPENAI_API_KEY` / `XAI_API_KEY` / `KIMI_API_KEY`）+ `lato -p "fix the tests"` 在仓库里改代码并跑测试。对应验收文档 B1-6（LIVE）与 B 节 UNIT。
 
-阶段 2 结束后应能：`lato login openai-codex --oauth` 与 `lato login kimi-coding --oauth`，订阅凭证落盘后同样跑任务。
+阶段 2 结束后应能：`lato login openai-codex --oauth` 与 `lato login kimi-coding --oauth`，订阅凭证落盘后同样跑任务。对应验收文档 C 节。
+
+**阶段完成 = 验收文档对应章节全部非 LIVE 编号 PASS。** 不以设计规格第 11 节叙述代替测试。
 
 ## 12. 测试
 
-- Auth 解析：存盘 oauth / 存盘 key / 仅 env / override / 刷新失败不回落，用假 `CredentialStore`。
-- Preset：同一 `env_api_key` + 两种不同 `(model.api, url)` 打到不同 host（fixture），证明没有按厂商分叉实现。同一 preset 下两种 `model.api` 时，已实现的能流、未实现的 `supported: false`。
-- 阶段 0：无 MCP 配置、无 hook 脚本时 turn 仍能跑完（空操作，不是报错）。
-- Loop：fixture 流（模型先 tool 后文本）；取消时历史含未完成 call。
-- 工具：同文件并行编辑串行化。Windows 路径（盘符、反斜杠、长路径）与 PowerShell 引号有独立用例。
-- 沙箱：macOS seatbelt / Linux bwrap / Windows Restricted Token 各至少一条「workspace 下写 cwd 成功、写 cwd 外失败」；包装失败必须拒绝而非 unsandbox。
-- Provider：每个 **已实现** stream 方言至少一条录制的 HTTP fixture（VCR），不在 CI 打真网。
-- OAuth：仅 kimi-coding 与 openai-codex；PKCE/callback 用 mock token endpoint。
-- ACP：stdio 往返：prompt → tool permission → 完成。
-- 反例：`lato login xai --oauth` / `lato login anthropic --oauth` 必须拒绝。
+测试用例、CI 矩阵、记录模板见：
+
+**`docs/superpowers/specs/2026-08-31-lato-acceptance.md`**
+
+本节省略重复。新增能力先加验收编号再写代码。与本文冲突时改规格并同步验收文档。
 
 ## 13. 建议补充（对话里没拍板，建议写入范围或明确推迟）
 
@@ -460,6 +470,7 @@ OAuth 实现按 Pi 行为用 Rust 重写，NOTICE 列出 MIT 来源：`kimi-codi
 ```text
 lato/                          # 本 git 仓库根；CLI package name = lato
   Cargo.toml                   # workspace + lato bin
+  docs/superpowers/specs/      # 设计规格 + 验收文档
   crates/
     lato-protocol/             # ACP 类型与 JSON-RPC
     lato-ai/                   # preset 表、env_api_key、stream 方言、两家 OAuth、catalog
@@ -482,14 +493,18 @@ lato/                          # 本 git 仓库根；CLI package name = lato
 3. **OAuth 范围**：v1 仅 `kimi-coding` 与 `openai-codex`。API key 按 `model.api` + URL 支持 catalog 内全部 env-key 厂商。
 4. **调度键**：协议在模型上（`model.api`），host 在模型或 preset 上；preset 不写死单一 `api`。
 5. **未落地方言**：`models/list` 带 `supported: false` / `reason: dialect_unimplemented`；采样与 `set_model` 拒绝；允许先存 API key。
-6. **阶段 0 空操作**：MCP 预热、skills 注入、hook bus 未实现前必须 no-op，不得阻塞 turn。
+6. **阶段 0 空操作**：MCP 预热、skills 注入、hook bus、compact 未实现前必须 no-op；超上下文上限则失败，不 truncate。
 7. **Windows**：v1 愿景含 Windows 原生（路径、shell、状态目录、沙箱 Restricted Token）。不是 WSL 替代。
+8. **无头**：`lato -p` = always + 本进程信任 cwd；交互默认 ask。
+9. **ACP 最小集**：第 6 节；不做 `session/load`；`authenticate` 若存在则代理到 `lato/auth/login`。
+10. **文件锁 / 信任键**：规范化绝对路径，Windows 大小写折叠。
+11. **验收**：`docs/superpowers/specs/2026-08-31-lato-acceptance.md`。
 
 仍待确认（未拍板则用默认）：
 
-8. **第 13 节带 \*** 的三项（replay、截断、静止检测）是否进 v1。默认按「进 v1」写。
-9. **是否只读导入 `~/.pi/agent/auth.json`。** 默认：提示导入，不自动；且只导入 Lato 已支持的通道。
+12. **第 13 节带 \*** 的三项（replay、截断、静止检测）是否进 v1。默认按「进 v1」写。
+13. **是否只读导入 `~/.pi/agent/auth.json`。** 默认：提示导入，不自动；且只导入 Lato 已支持的通道。
 
 ---
 
-审阅时请重点看：第 8.1/8.3 节调度是否按 `model.api` + URL、第 8.5 节两家 OAuth、阶段 0 空操作与阶段 1 的 `supported: false`。通过后下一份文档才是分阶段实现计划。
+阶段是否完成看验收文档，不看本节叙述。通过后下一份文档才是分阶段实现计划。
