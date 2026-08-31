@@ -1,5 +1,5 @@
 use crate::HistoryItem;
-use lato_ai::{CONTEXT_HARD_LIMIT_BYTES, FakeModelStream, StreamPiece};
+use lato_ai::{CONTEXT_HARD_LIMIT_BYTES, ModelStream, StreamPiece};
 use lato_tools::{ToolCall, dispatch};
 use lato_workspace::{FileLocks, SessionTrust};
 use std::{path::PathBuf, sync::Arc};
@@ -21,7 +21,7 @@ pub struct SessionActor {
     active: bool,
     cancelled: bool,
     history: Vec<HistoryItem>,
-    stream: Arc<FakeModelStream>,
+    stream: Arc<dyn ModelStream>,
     locks: Arc<FileLocks>,
     trust: SessionTrust,
     cwd: PathBuf,
@@ -31,7 +31,7 @@ pub struct SessionActor {
 
 impl SessionActor {
     pub fn new(
-        stream: Arc<FakeModelStream>,
+        stream: Arc<dyn ModelStream>,
         locks: Arc<FileLocks>,
         trust: SessionTrust,
         cwd: PathBuf,
@@ -63,7 +63,8 @@ impl SessionActor {
                 return Err("context exceeds hard limit; compact not implemented".into());
             }
             let (tx, mut rx) = mpsc::channel(16);
-            self.stream.stream(self.encoded_len(), tx).await?;
+            let context = serde_json::to_value(&self.history).map_err(|e| e.to_string())?;
+            self.stream.stream(self.encoded_len(), context, tx).await?;
             let mut saw_tool = false;
             while let Some(piece) = rx.recv().await {
                 if self.cancelled {
@@ -116,6 +117,15 @@ impl SessionActor {
     pub fn history(&self) -> &[HistoryItem] {
         &self.history
     }
+    pub fn latest_assistant_text(&self) -> String {
+        self.history
+            .iter()
+            .filter_map(|item| match item {
+                HistoryItem::AssistantText(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
     pub fn history_mut(&mut self) -> &mut Vec<HistoryItem> {
         &mut self.history
     }
@@ -124,12 +134,29 @@ impl SessionActor {
             .map(|v| v.len())
             .unwrap_or(usize::MAX)
     }
+
+    pub fn compact_explicit(
+        &mut self,
+        summary: String,
+        retain_recent: usize,
+    ) -> Result<(), String> {
+        if summary.trim().is_empty() {
+            return Err("compaction summary must not be empty".into());
+        }
+        let keep_from = self.history.len().saturating_sub(retain_recent);
+        let recent = self.history.split_off(keep_from);
+        self.history.clear();
+        self.history.push(HistoryItem::CompactionSummary(summary));
+        self.history.extend(recent);
+        Ok(())
+    }
 }
 fn noop_hooks() {}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lato_ai::FakeModelStream;
     use serde_json::json;
 
     fn actor(script: Vec<Vec<StreamPiece>>, cwd: PathBuf) -> SessionActor {
@@ -242,5 +269,22 @@ mod tests {
             .push(HistoryItem::User("x".repeat(CONTEXT_HARD_LIMIT_BYTES + 1)));
         let err = a.prompt(PromptKind::Start, "go".into()).await.unwrap_err();
         assert!(err.contains("compact"));
+    }
+
+    #[test]
+    fn explicit_compaction_writes_summary_and_retains_recent_history() {
+        let d = tempfile::tempdir().unwrap();
+        let mut a = actor(vec![], d.path().to_path_buf());
+        a.history_mut().extend([
+            HistoryItem::User("old".into()),
+            HistoryItem::AssistantText("answer".into()),
+            HistoryItem::User("recent".into()),
+        ]);
+        a.compact_explicit("summary of old conversation".into(), 1)
+            .unwrap();
+        assert!(
+            matches!(&a.history()[0], HistoryItem::CompactionSummary(v) if v.contains("summary"))
+        );
+        assert!(matches!(&a.history()[1], HistoryItem::User(v) if v == "recent"));
     }
 }

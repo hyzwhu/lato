@@ -4,7 +4,9 @@ pub mod kind;
 pub mod read;
 pub mod registry;
 pub mod shell;
+pub mod subagent;
 pub mod todo;
+pub mod web;
 
 pub use dispatch::*;
 pub use edit::*;
@@ -12,4 +14,6 @@ pub use kind::*;
 pub use read::*;
 pub use registry::*;
 pub use shell::*;
+pub use subagent::*;
 pub use todo::*;
+pub use web::*;

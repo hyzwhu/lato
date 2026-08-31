@@ -1,4 +1,6 @@
-use std::path::{Component, Path, PathBuf};
+#[cfg(not(windows))]
+use std::path::Component;
+use std::path::{Path, PathBuf};
 
 pub fn lock_key(path: impl AsRef<Path>) -> PathBuf {
     #[cfg(windows)]

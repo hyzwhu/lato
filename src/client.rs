@@ -1,19 +1,16 @@
-use lato_agent::{AcpHost, default_fake_stream};
-use lato_ai::{FakeModelStream, StreamPiece};
+use lato_agent::AcpHost;
+use lato_ai::ModelStream;
 use lato_protocol::JsonRpcReq;
 use lato_workspace::SessionTrust;
 use std::sync::Arc;
 
-pub async fn run_prompt_over_acp(
+pub async fn run_prompt_over_acp_with_stream(
     cwd: std::path::PathBuf,
     trust: SessionTrust,
     text: String,
-    script: Option<Vec<Vec<StreamPiece>>>,
+    stream: Arc<dyn ModelStream>,
 ) -> Result<String, String> {
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-    let stream: Arc<FakeModelStream> = script
-        .map(|s| Arc::new(FakeModelStream::new(s)))
-        .unwrap_or_else(default_fake_stream);
     let mut host = AcpHost::new(cwd, trust, tx, stream);
     let _ = host
         .handle(req(1, "initialize", serde_json::json!({})))
@@ -41,7 +38,10 @@ pub async fn run_prompt_over_acp(
             .to_string());
     }
     debug_assert!(host.prompts_via_acp > 0);
-    Ok("hi".into())
+    Ok(res["result"]["text"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string())
 }
 
 fn req(id: i32, method: &str, params: serde_json::Value) -> JsonRpcReq {

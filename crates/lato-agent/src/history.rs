@@ -11,4 +11,5 @@ pub enum HistoryItem {
         id: String,
         output: String,
     },
+    CompactionSummary(String),
 }

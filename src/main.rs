@@ -1,5 +1,6 @@
 mod cli;
 mod client;
+mod stdio;
 
 #[tokio::main]
 async fn main() {

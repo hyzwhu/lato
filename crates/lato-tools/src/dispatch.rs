@@ -122,4 +122,39 @@ mod tests {
         assert!(err.contains("denied"));
         assert_eq!(std::fs::read_to_string(p).unwrap(), "A=1");
     }
+
+    #[tokio::test]
+    async fn d1_6_host_read_and_edit_do_not_enter_shell_sandbox() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("source.txt"), "before").unwrap();
+        let locks = FileLocks::new();
+        let trust = SessionTrust::for_headless_prompt(d.path());
+        let read = dispatch(
+            &locks,
+            &trust,
+            d.path(),
+            ToolCall {
+                name: "read_file".into(),
+                arguments: serde_json::json!({"path":"source.txt"}),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(read, "before");
+        dispatch(
+            &locks,
+            &trust,
+            d.path(),
+            ToolCall {
+                name: "search_replace".into(),
+                arguments: serde_json::json!({"path":"source.txt","old":"before","new":"after"}),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(d.path().join("source.txt")).unwrap(),
+            "after"
+        );
+    }
 }

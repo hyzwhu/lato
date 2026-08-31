@@ -38,6 +38,33 @@ pub fn phase0_specs() -> Vec<ToolSpec> {
     ]
 }
 
+pub fn v1_specs() -> Vec<ToolSpec> {
+    let mut specs = phase0_specs();
+    specs.extend([
+        ToolSpec {
+            id: "Lato:spawn_subagent",
+            kind: ToolKind::Other,
+        },
+        ToolSpec {
+            id: "Lato:search_tool",
+            kind: ToolKind::Search,
+        },
+        ToolSpec {
+            id: "Lato:use_tool",
+            kind: ToolKind::Other,
+        },
+        ToolSpec {
+            id: "Lato:web_search",
+            kind: ToolKind::Search,
+        },
+        ToolSpec {
+            id: "Lato:web_fetch",
+            kind: ToolKind::Read,
+        },
+    ]);
+    specs
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
