@@ -1,9 +1,11 @@
 use crate::{PromptKind, SessionActor, TranscriptStore};
 use lato_ai::{
-    CATALOG, CredentialStore, CustomModel, FakeModelStream, ModelStream, StreamPiece,
-    api_key_login_allowed, dialect_implemented, load_models_json, lookup_model, oauth_allowed,
-    phase0_supported, store_oauth,
+    CATALOG, CredentialStore, CustomHttpModelStream, CustomModel, FakeModelStream, HttpModelStream,
+    ModelStream, StreamPiece, SwitchableModelStream, api_key_login_allowed, custom_model_auth,
+    dialect_implemented, get_auth, load_models_json, lookup_model, oauth_allowed, phase0_supported,
+    store_oauth,
 };
+use lato_mcp::{PluginOrigin, PluginPackage, discover_plugin};
 use lato_protocol::{JsonRpcReq, METHODS_IMPLEMENTED, PROTOCOL_VERSION, err, is_implemented, ok};
 use lato_workspace::{ApprovalMode, FileLocks, SessionTrust};
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
@@ -14,7 +16,7 @@ pub struct AcpHost {
     next_id: usize,
     cwd: PathBuf,
     trust: SessionTrust,
-    stream: Arc<dyn ModelStream>,
+    stream: Arc<SwitchableModelStream>,
     locks: Arc<FileLocks>,
     pub prompts_via_acp: usize,
     model: (String, String),
@@ -22,6 +24,7 @@ pub struct AcpHost {
     persisted: HashMap<String, usize>,
     credentials: Option<CredentialStore>,
     custom_models: Vec<CustomModel>,
+    plugins: Vec<PluginPackage>,
 }
 
 impl AcpHost {
@@ -31,6 +34,7 @@ impl AcpHost {
         updates: tokio::sync::mpsc::UnboundedSender<serde_json::Value>,
         stream: Arc<dyn ModelStream>,
     ) -> Self {
+        let stream = Arc::new(SwitchableModelStream::new(stream));
         let lato_home = std::env::var_os("LATO_HOME").map(PathBuf::from);
         let transcripts = lato_home
             .as_deref()
@@ -42,6 +46,7 @@ impl AcpHost {
             .as_deref()
             .and_then(|home| load_models_json(&home.join("models.json")).ok())
             .unwrap_or_default();
+        let plugins = discover_plugins(&cwd, lato_home.as_deref(), trust.cwd_trusted());
         Self {
             sessions: HashMap::new(),
             updates,
@@ -56,6 +61,7 @@ impl AcpHost {
             persisted: HashMap::new(),
             credentials,
             custom_models,
+            plugins,
         }
     }
     pub async fn handle(&mut self, req: JsonRpcReq) -> Option<serde_json::Value> {
@@ -99,7 +105,7 @@ impl AcpHost {
                     return Some(err(id, -32000, "unknown session"));
                 };
                 if self.trust.mode == ApprovalMode::Ask && text.contains("tool") {
-                    let _ = self.updates.send(serde_json::json!({"method":"session/request_permission","params":{"sessionId": sid}}));
+                    let _ = self.updates.send(serde_json::json!({"jsonrpc":"2.0","id":format!("permission-{sid}"),"method":"session/request_permission","params":{"sessionId": sid,"options":["allow_once","allow_session","deny","cancel"]}}));
                 }
                 match actor.prompt(PromptKind::Start, text).await {
                     Ok(_) => {
@@ -112,7 +118,7 @@ impl AcpHost {
                                 .insert(sid.to_string(), actor.history().len());
                         }
                         let text = actor.latest_assistant_text();
-                        let _ = self.updates.send(serde_json::json!({"method":"session/update","params":{"sessionId":sid,"text":text}}));
+                        let _ = self.updates.send(serde_json::json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":sid,"text":text}}));
                         Some(ok(id, serde_json::json!({"status":"complete","text":text})))
                     }
                     Err(e) => Some(err(id, -32000, e)),
@@ -124,19 +130,18 @@ impl AcpHost {
                     .as_ref()
                     .and_then(|p| p.get("sessionId"))
                     .and_then(|v| v.as_str())
+                    && let Some(a) = self.sessions.get_mut(sid)
                 {
-                    if let Some(a) = self.sessions.get_mut(sid) {
-                        a.cancel();
-                    }
+                    a.cancel();
                 }
                 Some(ok(id, serde_json::json!({"status":"cancelled"})))
             }
             "session/list" => {
                 let mut sessions: Vec<String> = self.sessions.keys().cloned().collect();
-                if let Some(store) = &self.transcripts {
-                    if let Ok(on_disk) = store.list() {
-                        sessions.extend(on_disk);
-                    }
+                if let Some(store) = &self.transcripts
+                    && let Ok(on_disk) = store.list()
+                {
+                    sessions.extend(on_disk);
                 }
                 sessions.sort();
                 sessions.dedup();
@@ -209,6 +214,26 @@ impl AcpHost {
                     Some(true) => {}
                     Some(false) => return Some(err(id, -32000, "dialect_unimplemented")),
                     None => return Some(err(id, -32000, "unknown model")),
+                }
+                if let Some(catalog_model) = lookup_model(provider, model) {
+                    if let Some(store) = &self.credentials
+                        && let Some(auth) =
+                            get_auth(store, provider, &|name| std::env::var(name).ok(), None).await
+                    {
+                        self.stream
+                            .set(Arc::new(HttpModelStream::new(catalog_model, auth)))
+                            .await;
+                    }
+                } else if let Some(custom) = self
+                    .custom_models
+                    .iter()
+                    .find(|entry| entry.provider == provider && entry.id == model)
+                    .cloned()
+                    && let Some(auth) = custom_model_auth(&custom, &|name| std::env::var(name).ok())
+                {
+                    self.stream
+                        .set(Arc::new(CustomHttpModelStream::new(custom, auth)))
+                        .await;
                 }
                 self.model = (provider.into(), model.into());
                 Some(ok(id, serde_json::json!({"supported": true})))
@@ -292,6 +317,20 @@ impl AcpHost {
                     Err(e) => Some(err(id, -32000, e.to_string())),
                 }
             }
+            "lato/plugins/reload" => {
+                let lato_home = std::env::var_os("LATO_HOME").map(PathBuf::from);
+                self.plugins =
+                    discover_plugins(&self.cwd, lato_home.as_deref(), self.trust.cwd_trusted());
+                Some(ok(
+                    id,
+                    serde_json::json!({
+                        "plugins":self.plugins.iter().map(|plugin| serde_json::json!({
+                            "root":plugin.root,"trusted":plugin.trusted,"hooksEnabled":plugin.hooks_enabled,
+                            "mcpEnabled":plugin.mcp_enabled,"skills":plugin.skills
+                        })).collect::<Vec<_>>()
+                    }),
+                ))
+            }
             "lato/auth/status" => {
                 let provider = req
                     .params
@@ -315,6 +354,35 @@ impl AcpHost {
             _ => Some(ok(id, serde_json::json!({"ok": true}))),
         }
     }
+}
+
+fn discover_plugins(
+    cwd: &std::path::Path,
+    lato_home: Option<&std::path::Path>,
+    project_trusted: bool,
+) -> Vec<PluginPackage> {
+    let mut plugins = Vec::new();
+    let locations = [
+        (cwd.join(".lato/plugins"), PluginOrigin::Project),
+        (
+            lato_home
+                .map(|home| home.join("plugins"))
+                .unwrap_or_default(),
+            PluginOrigin::User,
+        ),
+    ];
+    for (location, origin) in locations {
+        let Ok(entries) = std::fs::read_dir(location) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if let Ok(plugin) = discover_plugin(&entry.path(), origin, project_trusted) {
+                plugins.push(plugin);
+            }
+        }
+    }
+    plugins.sort_by(|a, b| a.root.cmp(&b.root));
+    plugins
 }
 
 pub fn default_fake_stream() -> Arc<dyn ModelStream> {
@@ -471,6 +539,25 @@ mod tests {
             .unwrap();
         assert!(ok.get("result").is_some());
     }
+    #[tokio::test]
+    async fn e5_1_plugins_reload_preserves_project_trust_boundary() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(d.path().join(".lato/plugins/demo/hooks")).unwrap();
+        let (tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let mut h = AcpHost::new(
+            d.path().to_path_buf(),
+            SessionTrust::for_interactive(d.path(), false),
+            tx,
+            default_fake_stream(),
+        );
+        let response = h
+            .handle(req(1, "lato/plugins/reload", serde_json::json!({})))
+            .await
+            .unwrap();
+        assert_eq!(response["result"]["plugins"][0]["trusted"], false);
+        assert_eq!(response["result"]["plugins"][0]["hooksEnabled"], false);
+    }
+
     #[tokio::test]
     async fn a4_6_acp_auth_status_uses_shared_store_without_secret() {
         let d = tempfile::tempdir().unwrap();

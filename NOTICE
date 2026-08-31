@@ -15,3 +15,8 @@ included or required by Lato.
 Where apply_patch-compatible behavior is introduced from OpenAI Codex, it remains subject to
 OpenAI Codex's Apache-2.0 notices. Phase-specific code must retain those notices alongside the
 implementation.
+
+Windows sandbox execution uses the MIT-licensed `zagens-windows-sandbox` crate:
+
+- Zagens Windows Sandbox, https://github.com/didclawapp-ai/zagens
+- Compiled only for Windows; provides Restricted Token, ACL, and Job Object enforcement.

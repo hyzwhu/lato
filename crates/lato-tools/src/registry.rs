@@ -49,6 +49,18 @@ pub fn phase0_tool_definitions() -> serde_json::Value {
     ])
 }
 
+pub fn v1_tool_definitions() -> serde_json::Value {
+    let mut definitions = phase0_tool_definitions()
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    definitions.extend([
+        serde_json::json!({"type":"function","function":{"name":"web_fetch","description":"Fetch a public HTTP(S) URL with SSRF protection","parameters":{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}}}),
+        serde_json::json!({"type":"function","function":{"name":"spawn_subagent","description":"Create an isolated git worktree for a subagent","parameters":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"]}}}),
+    ]);
+    serde_json::Value::Array(definitions)
+}
+
 pub fn v1_specs() -> Vec<ToolSpec> {
     let mut specs = phase0_specs();
     specs.extend([
@@ -92,5 +104,19 @@ mod tests {
             assert!(!ids.contains(&forbidden));
         }
         assert!(ids.contains(&"Lato:read_file"));
+    }
+
+    #[test]
+    fn e5_1_v1_tool_router_adds_only_connected_extended_tools() {
+        let definitions = v1_tool_definitions();
+        let names: Vec<_> = definitions
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool.pointer("/function/name").and_then(|v| v.as_str()))
+            .collect();
+        assert!(names.contains(&"web_fetch"));
+        assert!(names.contains(&"spawn_subagent"));
+        assert!(!names.contains(&"search_tool"));
     }
 }

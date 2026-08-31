@@ -71,10 +71,10 @@ impl TranscriptStore {
         let mut ids = Vec::new();
         for entry in fs::read_dir(&self.sessions_dir).map_err(|e| e.to_string())? {
             let path = entry.map_err(|e| e.to_string())?.path();
-            if path.extension().and_then(|v| v.to_str()) == Some("jsonl") {
-                if let Some(id) = path.file_stem().and_then(|v| v.to_str()) {
-                    ids.push(id.to_string());
-                }
+            if path.extension().and_then(|v| v.to_str()) == Some("jsonl")
+                && let Some(id) = path.file_stem().and_then(|v| v.to_str())
+            {
+                ids.push(id.to_string());
             }
         }
         ids.sort();

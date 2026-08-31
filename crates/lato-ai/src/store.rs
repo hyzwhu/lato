@@ -50,6 +50,7 @@ impl CredentialStore {
         let lock_path = self.path.with_extension("lock");
         let lock = fs::OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(lock_path)?;

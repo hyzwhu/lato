@@ -32,6 +32,7 @@ jobs:
       - run: cargo test --workspace a3_2_parallel_edit_spellings_serialized
       - run: cargo test --workspace a3_5_default_shell
       - run: cargo test --workspace a0_1_headless
+      - run: cargo test --workspace d1_4_windows_restricted_token_workspace_write_isolation
       - run: cargo test --workspace d1_5_missing_wrapper_refuses_without_off_fallback
       - run: cargo test --workspace
 

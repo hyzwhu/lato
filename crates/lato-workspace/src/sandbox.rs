@@ -53,7 +53,7 @@ pub fn wrap_shell_command_with(
             SandboxProfile::ReadOnly => "(version 1) (allow default) (deny file-write*)".into(),
             SandboxProfile::Off => unreachable!(),
         };
-        return Ok(SandboxCommand {
+        Ok(SandboxCommand {
             program: wrapper,
             args: vec![
                 "-p".into(),
@@ -62,7 +62,7 @@ pub fn wrap_shell_command_with(
                 "-lc".into(),
                 command.into(),
             ],
-        });
+        })
     }
 
     #[cfg(target_os = "linux")]
@@ -135,7 +135,16 @@ mod tests {
 
     #[test]
     fn d1_5_missing_wrapper_refuses_without_off_fallback() {
-        if cfg!(windows) {
+        #[cfg(windows)]
+        {
+            let err = wrap_shell_command_with(
+                SandboxProfile::Workspace,
+                Path::new("."),
+                "echo should-not-run",
+                None,
+            )
+            .unwrap_err();
+            assert!(err.contains("Restricted Token"));
             return;
         }
         let err = wrap_shell_command_with(

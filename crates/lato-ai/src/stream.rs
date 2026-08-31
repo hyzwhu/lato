@@ -1,6 +1,7 @@
 use crate::{Auth, Model, build_request, send_request};
 use async_trait::async_trait;
-use tokio::sync::{Mutex, mpsc};
+use std::sync::Arc;
+use tokio::sync::{Mutex, RwLock, mpsc};
 
 pub const CONTEXT_HARD_LIMIT_BYTES: usize = 512_000;
 
@@ -26,6 +27,34 @@ pub trait ModelStream: Send + Sync {
         context: serde_json::Value,
         tx: mpsc::Sender<StreamPiece>,
     ) -> Result<(), String>;
+}
+
+pub struct SwitchableModelStream {
+    inner: RwLock<Arc<dyn ModelStream>>,
+}
+
+impl SwitchableModelStream {
+    pub fn new(initial: Arc<dyn ModelStream>) -> Self {
+        Self {
+            inner: RwLock::new(initial),
+        }
+    }
+    pub async fn set(&self, stream: Arc<dyn ModelStream>) {
+        *self.inner.write().await = stream;
+    }
+}
+
+#[async_trait]
+impl ModelStream for SwitchableModelStream {
+    async fn stream(
+        &self,
+        prompt_bytes: usize,
+        context: serde_json::Value,
+        tx: mpsc::Sender<StreamPiece>,
+    ) -> Result<(), String> {
+        let stream = self.inner.read().await.clone();
+        stream.stream(prompt_bytes, context, tx).await
+    }
 }
 
 pub struct FakeModelStream {

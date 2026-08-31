@@ -16,6 +16,7 @@ pub const METHODS_IMPLEMENTED: &[&str] = &[
     "lato/auth/login",
     "lato/auth/logout",
     "lato/auth/status",
+    "lato/plugins/reload",
 ];
 
 pub fn is_implemented(method: &str) -> bool {

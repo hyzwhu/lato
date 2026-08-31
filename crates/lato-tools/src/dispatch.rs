@@ -1,5 +1,6 @@
 use crate::{
-    grep, list_dir, read_file, run_terminal_command_sandboxed, search_replace, todo_write,
+    create_subagent_worktree, grep, list_dir, read_file, run_terminal_command_sandboxed,
+    search_replace, todo_write, web_fetch,
 };
 use lato_workspace::{ApprovalMode, FileLocks, SessionTrust, deny_write};
 use serde_json::Value;
@@ -72,6 +73,26 @@ pub async fn dispatch(
                 .and_then(|v| v.as_str())
                 .ok_or("missing command")?;
             run_terminal_command_sandboxed(cmd, cwd, trust.sandbox).await
+        }
+        "web_fetch" => {
+            let url = call
+                .arguments
+                .get("url")
+                .and_then(|v| v.as_str())
+                .ok_or("missing url")?;
+            web_fetch(url, 20_000).await
+        }
+        "spawn_subagent" => {
+            require_mutating_approval(trust)?;
+            let session_id = call
+                .arguments
+                .get("session_id")
+                .or_else(|| call.arguments.get("sessionId"))
+                .and_then(|v| v.as_str())
+                .ok_or("missing session_id")?;
+            let root = cwd.join(".lato/worktrees");
+            let worktree = create_subagent_worktree(cwd, &root, session_id).await?;
+            Ok(serde_json::json!({"worktree":worktree.path,"branch":worktree.branch}).to_string())
         }
         "todo_write" => {
             let items: Vec<String> = call

@@ -46,12 +46,12 @@ fn walk(path: &Path, re: &Regex, out: &mut Vec<String>) -> Result<(), String> {
         for e in fs::read_dir(path).map_err(|e| e.to_string())? {
             walk(&e.map_err(|e| e.to_string())?.path(), re, out)?;
         }
-    } else if path.is_file() {
-        if let Ok(text) = fs::read_to_string(path) {
-            for (i, line) in text.lines().enumerate() {
-                if re.is_match(line) {
-                    out.push(format!("{}:{}:{}", path.display(), i + 1, line));
-                }
+    } else if path.is_file()
+        && let Ok(text) = fs::read_to_string(path)
+    {
+        for (i, line) in text.lines().enumerate() {
+            if re.is_match(line) {
+                out.push(format!("{}:{}:{}", path.display(), i + 1, line));
             }
         }
     }

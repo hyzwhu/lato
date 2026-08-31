@@ -1,6 +1,6 @@
 use crate::HistoryItem;
 use lato_ai::{CONTEXT_HARD_LIMIT_BYTES, ModelStream, StreamPiece};
-use lato_tools::{ToolCall, bound_tool_output, dispatch, phase0_tool_definitions};
+use lato_tools::{ToolCall, bound_tool_output, dispatch, v1_tool_definitions};
 use lato_workspace::{FileLocks, SessionTrust};
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 use tokio::sync::mpsc;
@@ -72,7 +72,7 @@ impl SessionActor {
             let (tx, mut rx) = mpsc::channel(16);
             let context = serde_json::json!({
                 "messages": history_to_messages(&self.history),
-                "tools": phase0_tool_definitions(),
+                "tools": v1_tool_definitions(),
             });
             self.stream.stream(self.encoded_len(), context, tx).await?;
             let mut saw_tool = false;
