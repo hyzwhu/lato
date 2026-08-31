@@ -31,6 +31,15 @@ pub fn build_request(
     if !dialect_implemented(model.api) {
         return Err("dialect_unimplemented".into());
     }
+    let context = messages;
+    let messages = context
+        .get("messages")
+        .cloned()
+        .unwrap_or_else(|| context.clone());
+    let openai_tools = context
+        .get("tools")
+        .cloned()
+        .unwrap_or_else(|| serde_json::Value::Array(vec![]));
     let base = auth
         .base_url
         .as_deref()
@@ -42,19 +51,19 @@ pub fn build_request(
             method: "POST",
             url: format!("{base}/chat/completions"),
             headers: bearer_headers(auth),
-            body: serde_json::json!({"model": model.id, "messages": messages, "stream": true}),
+            body: serde_json::json!({"model": model.id, "messages": messages, "tools":openai_tools, "stream": true}),
         }),
         ModelApi::OpenaiResponses | ModelApi::OpenaiCodexResponses => Ok(HttpRequestSpec {
             method: "POST",
             url: format!("{base}/responses"),
             headers: bearer_headers(auth),
-            body: serde_json::json!({"model": model.id, "input": messages, "stream": true}),
+            body: serde_json::json!({"model": model.id, "input": messages, "tools":responses_tools(openai_tools), "stream": true}),
         }),
         ModelApi::AzureOpenaiResponses => Ok(HttpRequestSpec {
             method: "POST",
             url: format!("{base}/responses?api-version=2025-04-01-preview"),
             headers: api_key_headers(auth),
-            body: serde_json::json!({"input": messages, "stream": true}),
+            body: serde_json::json!({"input": messages, "tools":responses_tools(openai_tools), "stream": true}),
         }),
         ModelApi::AnthropicMessages => {
             let mut headers = auth.headers.clone();
@@ -67,13 +76,13 @@ pub fn build_request(
                 method: "POST",
                 url: format!("{base}/v1/messages"),
                 headers,
-                body: serde_json::json!({"model": model.id, "messages": messages, "max_tokens": 4096, "stream": true}),
+                body: serde_json::json!({"model": model.id, "messages": messages, "tools":anthropic_tools(openai_tools), "max_tokens": 4096, "stream": true}),
             })
         }
         ModelApi::GoogleGenerativeAi => Ok(HttpRequestSpec {
             method: "POST",
             url: format!("{base}/v1beta/models/{}:streamGenerateContent", model.id),
-            headers: api_key_headers(auth),
+            headers: google_api_key_headers(auth),
             body: serde_json::json!({"contents": messages}),
         }),
         ModelApi::GoogleVertex => Ok(HttpRequestSpec {
@@ -95,10 +104,42 @@ pub fn build_request(
             method: "POST",
             url: format!("{base}/v1/conversations"),
             headers: bearer_headers(auth),
-            body: serde_json::json!({"model": model.id, "inputs": messages, "stream": true}),
+            body: serde_json::json!({"model": model.id, "inputs": messages, "tools":openai_tools, "stream": true}),
         }),
         ModelApi::PiMessages => Err("dialect_unimplemented".into()),
     }
+}
+
+fn responses_tools(openai_tools: serde_json::Value) -> serde_json::Value {
+    serde_json::Value::Array(openai_tools.as_array().into_iter().flatten().filter_map(|tool| {
+        let function = tool.get("function")?;
+        Some(serde_json::json!({
+            "type":"function",
+            "name":function.get("name")?,
+            "description":function.get("description").cloned().unwrap_or_default(),
+            "parameters":function.get("parameters").cloned().unwrap_or_else(|| serde_json::json!({"type":"object"}))
+        }))
+    }).collect())
+}
+
+fn anthropic_tools(openai_tools: serde_json::Value) -> serde_json::Value {
+    serde_json::Value::Array(openai_tools.as_array().into_iter().flatten().filter_map(|tool| {
+        let function = tool.get("function")?;
+        Some(serde_json::json!({
+            "name":function.get("name")?,
+            "description":function.get("description").cloned().unwrap_or_default(),
+            "input_schema":function.get("parameters").cloned().unwrap_or_else(|| serde_json::json!({"type":"object"}))
+        }))
+    }).collect())
+}
+
+fn google_api_key_headers(auth: &Auth) -> Vec<(String, String)> {
+    let mut headers = auth.headers.clone();
+    if let Some(k) = &auth.api_key {
+        headers.push(("x-goog-api-key".into(), k.clone()));
+    }
+    headers.push(("content-type".into(), "application/json".into()));
+    headers
 }
 
 fn api_key_headers(auth: &Auth) -> Vec<(String, String)> {
@@ -124,22 +165,43 @@ pub async fn send_request(
     spec: &HttpRequestSpec,
 ) -> Result<String, String> {
     let method = reqwest::Method::from_bytes(spec.method.as_bytes()).map_err(|e| e.to_string())?;
-    let mut req = client.request(method, &spec.url);
-    for (k, v) in &spec.headers {
-        req = req.header(k, v);
+    let mut last_error = String::new();
+    for attempt in 0..3 {
+        let mut req = client.request(method.clone(), &spec.url);
+        for (k, v) in &spec.headers {
+            req = req.header(k, v);
+        }
+        match req.json(&spec.body).send().await {
+            Ok(resp) => {
+                let status = resp.status();
+                let text = resp.text().await.map_err(|e| e.to_string())?;
+                if status.is_success() {
+                    return Ok(text);
+                }
+                last_error = format!("http {status}: {text}");
+                if !retryable_status(status.as_u16()) {
+                    return Err(last_error);
+                }
+            }
+            Err(error) => {
+                let retryable = error.is_timeout() || error.is_connect();
+                last_error = error.to_string();
+                if !retryable {
+                    return Err(last_error);
+                }
+            }
+        }
+        if attempt < 2 {
+            tokio::time::sleep(std::time::Duration::from_millis(100 * (1 << attempt))).await;
+        }
     }
-    let resp = req
-        .json(&spec.body)
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
-    let status = resp.status();
-    let text = resp.text().await.map_err(|e| e.to_string())?;
-    if status.is_success() {
-        Ok(text)
-    } else {
-        Err(format!("http {status}: {text}"))
-    }
+    Err(format!(
+        "sampling failed after 3 transient attempts: {last_error}"
+    ))
+}
+
+fn retryable_status(status: u16) -> bool {
+    status == 408 || status == 409 || status == 429 || status >= 500
 }
 
 #[cfg(test)]
@@ -153,6 +215,14 @@ mod tests {
             headers: vec![],
             base_url: None,
         }
+    }
+
+    #[test]
+    fn transient_retry_policy_is_bounded_to_retryable_statuses() {
+        assert!(retryable_status(429));
+        assert!(retryable_status(503));
+        assert!(!retryable_status(401));
+        assert!(!retryable_status(400));
     }
 
     #[test]

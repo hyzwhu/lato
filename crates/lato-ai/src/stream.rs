@@ -105,6 +105,8 @@ impl ModelStream for HttpModelStream {
 
 pub fn parse_stream_body(body: &str) -> Vec<StreamPiece> {
     let mut pieces = Vec::new();
+    let mut pending_tools: std::collections::HashMap<String, (String, String, String)> =
+        std::collections::HashMap::new();
     for raw in body.lines() {
         let raw = raw.trim();
         let data = raw.strip_prefix("data:").map(str::trim).unwrap_or(raw);
@@ -114,16 +116,136 @@ pub fn parse_stream_body(body: &str) -> Vec<StreamPiece> {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(data) else {
             continue;
         };
+        let event_type = value.get("type").and_then(|v| v.as_str()).unwrap_or("");
         if let Some(text) = value
             .pointer("/choices/0/delta/content")
             .and_then(|v| v.as_str())
-            .or_else(|| value.get("delta").and_then(|v| v.as_str()))
             .or_else(|| value.pointer("/delta/text").and_then(|v| v.as_str()))
+            .or_else(|| {
+                (event_type == "response.output_text.delta")
+                    .then(|| value.get("delta").and_then(|v| v.as_str()))
+                    .flatten()
+            })
         {
             pieces.push(StreamPiece::Text(text.into()));
         }
         if let Some(text) = value.get("text").and_then(|v| v.as_str()) {
             pieces.push(StreamPiece::Text(text.into()));
+        }
+        if event_type == "content_block_start" {
+            if let Some(block) = value
+                .get("content_block")
+                .filter(|v| v.get("type").and_then(|v| v.as_str()) == Some("tool_use"))
+            {
+                let key = value
+                    .get("index")
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| "0".into());
+                let id = block
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("call")
+                    .to_string();
+                let name = block
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let initial = block
+                    .get("input")
+                    .filter(|v| {
+                        !v.is_null() && v.as_object().is_none_or(|object| !object.is_empty())
+                    })
+                    .map(ToString::to_string)
+                    .unwrap_or_default();
+                pending_tools.insert(key, (id, name, initial));
+            }
+        } else if event_type == "content_block_delta" {
+            if let Some(partial) = value
+                .pointer("/delta/partial_json")
+                .and_then(|v| v.as_str())
+            {
+                let key = value
+                    .get("index")
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| "0".into());
+                if let Some((_, _, args)) = pending_tools.get_mut(&key) {
+                    args.push_str(partial);
+                }
+            }
+        } else if event_type == "content_block_stop" {
+            let key = value
+                .get("index")
+                .map(ToString::to_string)
+                .unwrap_or_else(|| "0".into());
+            if let Some((id, name, args)) = pending_tools.remove(&key) {
+                let arguments =
+                    serde_json::from_str(&args).unwrap_or_else(|_| serde_json::json!({}));
+                if !name.is_empty() {
+                    pieces.push(StreamPiece::ToolCall {
+                        id,
+                        name,
+                        arguments,
+                    });
+                }
+            }
+        } else if event_type == "response.output_item.added"
+            && value.pointer("/item/type").and_then(|v| v.as_str()) == Some("function_call")
+        {
+            let item = &value["item"];
+            let key = item
+                .get("id")
+                .or_else(|| item.get("call_id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("call")
+                .to_string();
+            pending_tools.insert(
+                key.clone(),
+                (
+                    item.get("call_id")
+                        .or_else(|| item.get("id"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("call")
+                        .into(),
+                    item.get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .into(),
+                    item.get("arguments")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .into(),
+                ),
+            );
+        } else if event_type == "response.function_call_arguments.delta" {
+            let key = value
+                .get("item_id")
+                .or_else(|| value.get("call_id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("call");
+            if let Some((_, _, args)) = pending_tools.get_mut(key) {
+                args.push_str(value.get("delta").and_then(|v| v.as_str()).unwrap_or(""));
+            }
+        } else if event_type == "response.function_call_arguments.done" {
+            let key = value
+                .get("item_id")
+                .or_else(|| value.get("call_id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("call");
+            if let Some((id, name, accumulated)) = pending_tools.remove(key) {
+                let raw = value
+                    .get("arguments")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(&accumulated);
+                let arguments = serde_json::from_str(raw).unwrap_or_else(|_| serde_json::json!({}));
+                if !name.is_empty() {
+                    pieces.push(StreamPiece::ToolCall {
+                        id,
+                        name,
+                        arguments,
+                    });
+                }
+            }
         }
         if let Some(call) = value.pointer("/choices/0/delta/tool_calls/0") {
             let id = call
@@ -165,6 +287,32 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.contains("compact"));
+    }
+
+    #[test]
+    fn b1_3_anthropic_tool_use_fixture_is_assembled() {
+        let fixture = concat!(
+            "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tool-1\",\"name\":\"read_file\",\"input\":{}}}\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\":\\\"a.txt\\\"}\"}}\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":1}\n"
+        );
+        let pieces = parse_stream_body(fixture);
+        assert!(
+            matches!(&pieces[0], StreamPiece::ToolCall { name, arguments, .. } if name == "read_file" && arguments["path"] == "a.txt")
+        );
+    }
+
+    #[test]
+    fn b1_3_openai_responses_function_call_fixture_is_assembled() {
+        let fixture = concat!(
+            "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"id\":\"item-1\",\"call_id\":\"call-1\",\"name\":\"grep\",\"arguments\":\"\"}}\n",
+            "data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"item-1\",\"delta\":\"{\\\"pattern\\\":\\\"TODO\\\"}\"}\n",
+            "data: {\"type\":\"response.function_call_arguments.done\",\"item_id\":\"item-1\"}\n"
+        );
+        let pieces = parse_stream_body(fixture);
+        assert!(
+            matches!(&pieces[0], StreamPiece::ToolCall { name, arguments, .. } if name == "grep" && arguments["pattern"] == "TODO")
+        );
     }
 
     #[test]

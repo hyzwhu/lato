@@ -1,14 +1,17 @@
 use lato_agent::default_fake_stream;
 use lato_ai::{
-    CredentialStore, HttpModelStream, ModelStream, api_key_login_allowed, get_auth, lookup_model,
-    oauth_allowed, store_oauth,
+    AuthInteraction, AuthNotice, CredentialStore, CustomHttpModelStream, HttpModelStream,
+    ModelStream, api_key_login_allowed, custom_model_auth, get_auth, load_models_json, login_oauth,
+    lookup_model, oauth_allowed, store_oauth,
 };
-use lato_workspace::SessionTrust;
+use lato_workspace::{SandboxProfile, SessionTrust};
 use std::{io::IsTerminal, path::PathBuf, sync::Arc};
 
 pub async fn run(args: Vec<String>) -> i32 {
     if args.is_empty() || args.iter().any(|a| a == "--help" || a == "-h") {
-        eprintln!("usage: lato -p [--ask] TEXT | lato login PROVIDER (--api-key KEY|--oauth)");
+        eprintln!(
+            "usage: lato -p [--ask] [--sandbox off|workspace|read-only] [--model provider/model] TEXT | lato acp | lato login PROVIDER (--api-key KEY|--oauth)"
+        );
         return 0;
     }
     if args[0] == "acp" {
@@ -30,6 +33,20 @@ async fn prompt(args: &[String]) -> i32 {
         eprintln!("error: --ask requires a tty");
         return 2;
     }
+    let sandbox = match args
+        .iter()
+        .position(|a| a == "--sandbox")
+        .and_then(|i| args.get(i + 1))
+        .map(String::as_str)
+    {
+        None | Some("off") => SandboxProfile::Off,
+        Some("workspace") => SandboxProfile::Workspace,
+        Some("read-only") => SandboxProfile::ReadOnly,
+        Some(other) => {
+            eprintln!("error: unknown sandbox profile {other}");
+            return 2;
+        }
+    };
     let model_arg = args
         .iter()
         .position(|a| a == "--model")
@@ -46,7 +63,7 @@ async fn prompt(args: &[String]) -> i32 {
         if arg == "--ask" {
             continue;
         }
-        if arg == "--model" {
+        if arg == "--model" || arg == "--sandbox" {
             skip = true;
             continue;
         }
@@ -54,33 +71,54 @@ async fn prompt(args: &[String]) -> i32 {
     }
     let text = text_parts.join(" ");
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let trust = if ask {
+    let mut trust = if ask {
         SessionTrust::for_interactive(&cwd, true)
     } else {
         SessionTrust::for_headless_prompt(&cwd)
     };
+    trust.sandbox = sandbox;
     let stream: Arc<dyn ModelStream> = if let Some(selection) = model_arg {
         let Some((provider, model_id)) = selection.split_once('/') else {
             eprintln!("error: --model must be provider/model");
             return 2;
         };
-        let Some(model) = lookup_model(provider, model_id) else {
-            eprintln!("error: unknown model {selection}");
-            return 1;
-        };
-        let store = match CredentialStore::open(&lato_home()) {
-            Ok(store) => store,
-            Err(e) => {
-                eprintln!("error: {e}");
+        if let Some(model) = lookup_model(provider, model_id) {
+            let store = match CredentialStore::open(&lato_home()) {
+                Ok(store) => store,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    return 1;
+                }
+            };
+            let Some(auth) =
+                get_auth(&store, provider, &|name| std::env::var(name).ok(), None).await
+            else {
+                eprintln!(
+                    "error: no credential configured for {provider}; run lato login {provider}"
+                );
                 return 1;
-            }
-        };
-        let Some(auth) = get_auth(&store, provider, &|name| std::env::var(name).ok(), None).await
-        else {
-            eprintln!("error: no credential configured for {provider}; run lato login {provider}");
-            return 1;
-        };
-        Arc::new(HttpModelStream::new(model, auth))
+            };
+            Arc::new(HttpModelStream::new(model, auth))
+        } else {
+            let path = lato_home().join("models.json");
+            let custom = load_models_json(&path).ok().and_then(|models| {
+                models
+                    .into_iter()
+                    .find(|model| model.provider == provider && model.id == model_id)
+            });
+            let Some(custom) = custom else {
+                eprintln!("error: unknown model {selection}");
+                return 1;
+            };
+            let Some(auth) = custom_model_auth(&custom, &|name| std::env::var(name).ok()) else {
+                eprintln!(
+                    "error: environment variable {} is not configured",
+                    custom.env
+                );
+                return 1;
+            };
+            Arc::new(CustomHttpModelStream::new(custom, auth))
+        }
     } else {
         default_fake_stream()
     };
@@ -121,8 +159,33 @@ async fn login(args: &[String]) -> i32 {
             println!("oauth logged in {provider}");
             return 0;
         }
-        eprintln!("error: oauth requires interactive/device flow; set LATO_MOCK_OAUTH=1 in tests");
-        return 1;
+        if !std::io::stdin().is_terminal() {
+            eprintln!(
+                "error: oauth CLI login requires a tty; use lato/auth/login from an ACP client"
+            );
+            return 2;
+        }
+        match login_oauth(provider, &ConsoleAuthInteraction, &reqwest::Client::new()).await {
+            Ok(tokens) => {
+                let mut store = CredentialStore::open(&home).unwrap();
+                if let Err(e) = store_oauth(
+                    &mut store,
+                    provider,
+                    &tokens.access,
+                    &tokens.refresh,
+                    tokens.expires,
+                ) {
+                    eprintln!("error: {e}");
+                    return 1;
+                }
+                println!("oauth logged in {provider}");
+                return 0;
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                return 1;
+            }
+        }
     }
     if let Some(i) = args.iter().position(|a| a == "--api-key") {
         if !api_key_login_allowed(provider) {
@@ -147,6 +210,36 @@ async fn login(args: &[String]) -> i32 {
     }
     eprintln!("error: expected --api-key or --oauth");
     2
+}
+
+struct ConsoleAuthInteraction;
+
+#[async_trait::async_trait]
+impl AuthInteraction for ConsoleAuthInteraction {
+    async fn notify(&self, notice: AuthNotice) {
+        match notice {
+            AuthNotice::AuthUrl(url) => eprintln!(
+                "Open this URL in your browser:\n{url}\nThen paste the full redirect URL."
+            ),
+            AuthNotice::DeviceCode {
+                code,
+                verification_url,
+            } => eprintln!("Open {verification_url} and enter code: {code}"),
+            AuthNotice::Info(message) | AuthNotice::Progress(message) => eprintln!("{message}"),
+        }
+    }
+
+    async fn redirect_url(&self) -> Result<String, String> {
+        tokio::task::spawn_blocking(|| {
+            let mut input = String::new();
+            std::io::stdin()
+                .read_line(&mut input)
+                .map_err(|e| e.to_string())?;
+            Ok(input.trim().to_string())
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
 }
 
 fn lato_home() -> PathBuf {

@@ -38,6 +38,17 @@ pub fn phase0_specs() -> Vec<ToolSpec> {
     ]
 }
 
+pub fn phase0_tool_definitions() -> serde_json::Value {
+    serde_json::json!([
+        {"type":"function","function":{"name":"read_file","description":"Read a UTF-8 file","parameters":{"type":"object","properties":{"path":{"type":"string"},"offset":{"type":"integer"},"limit":{"type":"integer"}},"required":["path"]}}},
+        {"type":"function","function":{"name":"list_dir","description":"List a directory","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}},
+        {"type":"function","function":{"name":"grep","description":"Search files with a regular expression","parameters":{"type":"object","properties":{"path":{"type":"string"},"pattern":{"type":"string"}},"required":["path","pattern"]}}},
+        {"type":"function","function":{"name":"search_replace","description":"Replace exactly one text occurrence","parameters":{"type":"object","properties":{"path":{"type":"string"},"old":{"type":"string"},"new":{"type":"string"}},"required":["path","old","new"]}}},
+        {"type":"function","function":{"name":"run_terminal_command","description":"Run a command in the workspace shell","parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}}},
+        {"type":"function","function":{"name":"todo_write","description":"Update the task list","parameters":{"type":"object","properties":{"items":{"type":"array","items":{"type":"string"}}},"required":["items"]}}}
+    ])
+}
+
 pub fn v1_specs() -> Vec<ToolSpec> {
     let mut specs = phase0_specs();
     specs.extend([

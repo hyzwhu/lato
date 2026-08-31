@@ -20,9 +20,6 @@ pub async fn run_terminal_command_sandboxed(
     let mut s = String::new();
     s.push_str(&String::from_utf8_lossy(&out.stdout));
     s.push_str(&String::from_utf8_lossy(&out.stderr));
-    if s.len() > 20_000 {
-        s.truncate(20_000);
-    }
     if out.status.success() {
         Ok(s)
     } else {

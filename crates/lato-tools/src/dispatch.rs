@@ -1,5 +1,7 @@
-use crate::{grep, list_dir, read_file, run_terminal_command, search_replace, todo_write};
-use lato_workspace::{FileLocks, SessionTrust, deny_write};
+use crate::{
+    grep, list_dir, read_file, run_terminal_command_sandboxed, search_replace, todo_write,
+};
+use lato_workspace::{ApprovalMode, FileLocks, SessionTrust, deny_write};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
@@ -10,7 +12,7 @@ pub struct ToolCall {
 
 pub async fn dispatch(
     locks: &FileLocks,
-    _trust: &SessionTrust,
+    trust: &SessionTrust,
     cwd: &Path,
     call: ToolCall,
 ) -> Result<String, String> {
@@ -44,6 +46,7 @@ pub async fn dispatch(
             if deny_write(&p) {
                 return Err("denied by write policy".into());
             }
+            require_mutating_approval(trust)?;
             let old = call
                 .arguments
                 .get("old")
@@ -61,13 +64,14 @@ pub async fn dispatch(
                 .map(|_| "ok".into())
         }
         "run_terminal_command" => {
+            require_mutating_approval(trust)?;
             let cmd = call
                 .arguments
                 .get("cmd")
                 .or_else(|| call.arguments.get("command"))
                 .and_then(|v| v.as_str())
                 .ok_or("missing command")?;
-            run_terminal_command(cmd, cwd).await
+            run_terminal_command_sandboxed(cmd, cwd, trust.sandbox).await
         }
         "todo_write" => {
             let items: Vec<String> = call
@@ -83,6 +87,14 @@ pub async fn dispatch(
             Ok(todo_write(&items).to_string())
         }
         _ => Err(format!("unknown tool {name}")),
+    }
+}
+
+fn require_mutating_approval(trust: &SessionTrust) -> Result<(), String> {
+    match trust.mode {
+        ApprovalMode::Always | ApprovalMode::Auto => Ok(()),
+        ApprovalMode::Ask if trust.consume_allow_once() => Ok(()),
+        ApprovalMode::Ask => Err("permission required before mutating tool execution".into()),
     }
 }
 
@@ -121,6 +133,32 @@ mod tests {
         .unwrap_err();
         assert!(err.contains("denied"));
         assert_eq!(std::fs::read_to_string(p).unwrap(), "A=1");
+    }
+
+    #[tokio::test]
+    async fn a1_4_ask_mode_mutation_waits_for_explicit_allow_once() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("file.txt"), "before").unwrap();
+        let locks = FileLocks::new();
+        let trust = SessionTrust::for_interactive(d.path(), true);
+        let call = || ToolCall {
+            name: "search_replace".into(),
+            arguments: serde_json::json!({"path":"file.txt","old":"before","new":"after"}),
+        };
+        let denied = dispatch(&locks, &trust, d.path(), call())
+            .await
+            .unwrap_err();
+        assert!(denied.contains("permission required"));
+        assert_eq!(
+            std::fs::read_to_string(d.path().join("file.txt")).unwrap(),
+            "before"
+        );
+        trust.allow_once();
+        dispatch(&locks, &trust, d.path(), call()).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(d.path().join("file.txt")).unwrap(),
+            "after"
+        );
     }
 
     #[tokio::test]

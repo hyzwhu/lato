@@ -1,8 +1,8 @@
 use crate::HistoryItem;
 use lato_ai::{CONTEXT_HARD_LIMIT_BYTES, ModelStream, StreamPiece};
-use lato_tools::{ToolCall, dispatch};
+use lato_tools::{ToolCall, bound_tool_output, dispatch, phase0_tool_definitions};
 use lato_workspace::{FileLocks, SessionTrust};
-use std::{path::PathBuf, sync::Arc};
+use std::{collections::HashMap, path::PathBuf, sync::Arc};
 use tokio::sync::mpsc;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -39,7 +39,7 @@ impl SessionActor {
         Self {
             active: false,
             cancelled: false,
-            history: Vec::new(),
+            history: vec![HistoryItem::System(build_world_state(&cwd))],
             stream,
             locks,
             trust,
@@ -57,13 +57,23 @@ impl SessionActor {
         self.cancelled = false;
         self.history.push(HistoryItem::User(text));
         noop_hooks();
+        let mut sampling_steps = 0usize;
+        let mut repeated_calls: HashMap<String, usize> = HashMap::new();
         loop {
+            sampling_steps += 1;
+            if sampling_steps > 50 {
+                self.active = false;
+                return Err("maximum sampling steps exceeded".into());
+            }
             if self.encoded_len() > CONTEXT_HARD_LIMIT_BYTES {
                 self.active = false;
                 return Err("context exceeds hard limit; compact not implemented".into());
             }
             let (tx, mut rx) = mpsc::channel(16);
-            let context = serde_json::to_value(&self.history).map_err(|e| e.to_string())?;
+            let context = serde_json::json!({
+                "messages": history_to_messages(&self.history),
+                "tools": phase0_tool_definitions(),
+            });
             self.stream.stream(self.encoded_len(), context, tx).await?;
             let mut saw_tool = false;
             while let Some(piece) = rx.recv().await {
@@ -79,6 +89,18 @@ impl SessionActor {
                         arguments,
                     } => {
                         saw_tool = true;
+                        let fingerprint = format!(
+                            "{name}:{}",
+                            serde_json::to_string(&arguments).unwrap_or_default()
+                        );
+                        let repeats = repeated_calls.entry(fingerprint).or_default();
+                        *repeats += 1;
+                        if *repeats > 3 {
+                            self.active = false;
+                            return Err(
+                                "stalled: identical tool call repeated more than 3 times".into()
+                            );
+                        }
                         self.history.push(HistoryItem::ToolCall {
                             id: id.clone(),
                             name: name.clone(),
@@ -100,6 +122,7 @@ impl SessionActor {
                         )
                         .await
                         .unwrap_or_else(|e| format!("ERROR: {e}"));
+                        let out = bound_tool_output(out, &self.cwd, &id).await?;
                         self.history
                             .push(HistoryItem::ToolResult { id, output: out });
                     }
@@ -152,6 +175,60 @@ impl SessionActor {
     }
 }
 fn noop_hooks() {}
+
+fn history_to_messages(history: &[HistoryItem]) -> serde_json::Value {
+    serde_json::Value::Array(history.iter().map(|item| match item {
+        HistoryItem::System(content) => serde_json::json!({"role":"system","content":content}),
+        HistoryItem::User(content) => serde_json::json!({"role":"user","content":content}),
+        HistoryItem::AssistantText(content) => serde_json::json!({"role":"assistant","content":content}),
+        HistoryItem::ToolCall { id, name, arguments } => serde_json::json!({
+            "role":"assistant","tool_calls":[{"id":id,"type":"function","function":{"name":name,"arguments":serde_json::to_string(arguments).unwrap_or_default()}}]
+        }),
+        HistoryItem::ToolResult { id, output } => serde_json::json!({"role":"tool","tool_call_id":id,"content":output}),
+        HistoryItem::CompactionSummary(content) => serde_json::json!({"role":"system","content":format!("Compaction summary:\n{content}")}),
+    }).collect())
+}
+
+fn build_world_state(cwd: &std::path::Path) -> String {
+    let mut text = format!(
+        "You are Lato, a coding agent. Work in the host workspace.\nCWD: {}\nShell: {}\nUnix time: {}",
+        cwd.display(),
+        lato_workspace::default_shell().to_string_lossy(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    );
+    let mut dirs = Vec::new();
+    let mut current = Some(cwd);
+    while let Some(dir) = current {
+        dirs.push(dir);
+        if dir.join(".git").exists() {
+            break;
+        }
+        current = dir.parent();
+    }
+    dirs.reverse();
+    for dir in dirs {
+        for name in ["AGENTS.md", "CLAUDE.md"] {
+            let path = dir.join(name);
+            if let Ok(contents) = std::fs::read_to_string(&path) {
+                const LIMIT: usize = 64 * 1024;
+                let mut boundary = contents.len().min(LIMIT);
+                while !contents.is_char_boundary(boundary) {
+                    boundary -= 1;
+                }
+                text.push_str(&format!(
+                    "\n\nInstructions from {}:\n{}",
+                    path.display(),
+                    &contents[..boundary]
+                ));
+                break;
+            }
+        }
+    }
+    text
+}
 
 #[cfg(test)]
 mod tests {
@@ -269,6 +346,47 @@ mod tests {
             .push(HistoryItem::User("x".repeat(CONTEXT_HARD_LIMIT_BYTES + 1)));
         let err = a.prompt(PromptKind::Start, "go".into()).await.unwrap_err();
         assert!(err.contains("compact"));
+    }
+
+    #[test]
+    fn world_state_injects_agents_chain_and_standard_messages() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("AGENTS.md"), "Use cargo test.").unwrap();
+        let a = actor(vec![], d.path().to_path_buf());
+        let messages = history_to_messages(a.history());
+        assert_eq!(messages[0]["role"], "system");
+        assert!(
+            messages[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("Use cargo test")
+        );
+        assert!(messages[0]["content"].as_str().unwrap().contains("CWD:"));
+    }
+
+    #[tokio::test]
+    async fn repeated_identical_tool_calls_trigger_stall_detection() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("a.txt"), "x").unwrap();
+        let call = StreamPiece::ToolCall {
+            id: "same".into(),
+            name: "read_file".into(),
+            arguments: json!({"path":"a.txt"}),
+        };
+        let mut a = actor(
+            vec![
+                vec![call.clone()],
+                vec![call.clone()],
+                vec![call.clone()],
+                vec![call],
+            ],
+            d.path().to_path_buf(),
+        );
+        let err = a
+            .prompt(PromptKind::Start, "loop".into())
+            .await
+            .unwrap_err();
+        assert!(err.contains("stalled"));
     }
 
     #[test]

@@ -1,5 +1,11 @@
-use crate::lock_key;
-use std::path::{Path, PathBuf};
+use crate::{SandboxProfile, lock_key};
+use std::{
+    path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ApprovalMode {
@@ -12,8 +18,10 @@ pub enum ApprovalMode {
 pub struct SessionTrust {
     pub mode: ApprovalMode,
     pub persist_trust: bool,
+    pub sandbox: SandboxProfile,
     process_trusted: Option<PathBuf>,
     cwd: PathBuf,
+    approvals_once: Arc<AtomicUsize>,
 }
 
 impl SessionTrust {
@@ -22,8 +30,10 @@ impl SessionTrust {
         Self {
             mode: ApprovalMode::Always,
             persist_trust: false,
+            sandbox: SandboxProfile::Off,
             process_trusted: Some(key.clone()),
             cwd: key,
+            approvals_once: Arc::new(AtomicUsize::new(0)),
         }
     }
     pub fn for_interactive(cwd: impl AsRef<Path>, trusted_on_disk: bool) -> Self {
@@ -31,12 +41,24 @@ impl SessionTrust {
         Self {
             mode: ApprovalMode::Ask,
             persist_trust: true,
+            sandbox: SandboxProfile::Off,
             process_trusted: trusted_on_disk.then(|| key.clone()),
             cwd: key,
+            approvals_once: Arc::new(AtomicUsize::new(0)),
         }
     }
     pub fn cwd_trusted(&self) -> bool {
         self.process_trusted.as_ref() == Some(&self.cwd)
+    }
+    pub fn allow_once(&self) {
+        self.approvals_once.fetch_add(1, Ordering::Release);
+    }
+    pub fn consume_allow_once(&self) -> bool {
+        self.approvals_once
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                count.checked_sub(1)
+            })
+            .is_ok()
     }
 }
 

@@ -1,6 +1,7 @@
 pub mod dispatch;
 pub mod edit;
 pub mod kind;
+pub mod output;
 pub mod read;
 pub mod registry;
 pub mod shell;
@@ -11,6 +12,7 @@ pub mod web;
 pub use dispatch::*;
 pub use edit::*;
 pub use kind::*;
+pub use output::*;
 pub use read::*;
 pub use registry::*;
 pub use shell::*;

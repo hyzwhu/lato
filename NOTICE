@@ -1,0 +1,17 @@
+Lato
+
+This product includes Rust reimplementations informed by the following MIT-licensed project:
+
+- Pi coding agent / @earendil-works/pi-ai
+  Copyright (c) Mario Zechner and contributors
+  Source snapshot reviewed: 2026-08-31
+  Upstream: https://github.com/earendil-works/pi
+  Relevant behavioral contracts: provider catalog, env API-key resolution, Kimi Coding OAuth,
+  OpenAI Codex OAuth, PKCE, local callback, and device-code interaction.
+
+The upstream software is licensed under the MIT License. No upstream JavaScript runtime is
+included or required by Lato.
+
+Where apply_patch-compatible behavior is introduced from OpenAI Codex, it remains subject to
+OpenAI Codex's Apache-2.0 notices. Phase-specific code must retain those notices alongside the
+implementation.

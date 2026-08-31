@@ -1,7 +1,8 @@
 use crate::{PromptKind, SessionActor, TranscriptStore};
 use lato_ai::{
-    CATALOG, CredentialStore, FakeModelStream, ModelStream, StreamPiece, api_key_login_allowed,
-    lookup_model, oauth_allowed, phase0_supported, store_oauth,
+    CATALOG, CredentialStore, CustomModel, FakeModelStream, ModelStream, StreamPiece,
+    api_key_login_allowed, dialect_implemented, load_models_json, lookup_model, oauth_allowed,
+    phase0_supported, store_oauth,
 };
 use lato_protocol::{JsonRpcReq, METHODS_IMPLEMENTED, PROTOCOL_VERSION, err, is_implemented, ok};
 use lato_workspace::{ApprovalMode, FileLocks, SessionTrust};
@@ -20,6 +21,7 @@ pub struct AcpHost {
     transcripts: Option<TranscriptStore>,
     persisted: HashMap<String, usize>,
     credentials: Option<CredentialStore>,
+    custom_models: Vec<CustomModel>,
 }
 
 impl AcpHost {
@@ -36,6 +38,10 @@ impl AcpHost {
         let credentials = lato_home
             .as_deref()
             .and_then(|home| CredentialStore::open(home).ok());
+        let custom_models = lato_home
+            .as_deref()
+            .and_then(|home| load_models_json(&home.join("models.json")).ok())
+            .unwrap_or_default();
         Self {
             sessions: HashMap::new(),
             updates,
@@ -49,6 +55,7 @@ impl AcpHost {
             transcripts,
             persisted: HashMap::new(),
             credentials,
+            custom_models,
         }
     }
     pub async fn handle(&mut self, req: JsonRpcReq) -> Option<serde_json::Value> {
@@ -190,19 +197,31 @@ impl AcpHost {
                     .or_else(|| p.get("modelId"))
                     .and_then(|v| v.as_str())
                     .unwrap_or("gpt-4.1");
-                let Some(m) = lookup_model(provider, model) else {
-                    return Some(err(id, -32000, "unknown model"));
-                };
-                if !phase0_supported(m.api) {
-                    return Some(err(id, -32000, "dialect_unimplemented"));
+                let supported = lookup_model(provider, model)
+                    .map(|model| phase0_supported(model.api))
+                    .or_else(|| {
+                        self.custom_models
+                            .iter()
+                            .find(|entry| entry.provider == provider && entry.id == model)
+                            .map(|entry| dialect_implemented(entry.api))
+                    });
+                match supported {
+                    Some(true) => {}
+                    Some(false) => return Some(err(id, -32000, "dialect_unimplemented")),
+                    None => return Some(err(id, -32000, "unknown model")),
                 }
                 self.model = (provider.into(), model.into());
                 Some(ok(id, serde_json::json!({"supported": true})))
             }
-            "lato/models/list" => Some(ok(
-                id,
-                serde_json::json!({"models": CATALOG.iter().map(|m| serde_json::json!({"provider":m.provider,"id":m.id,"supported":phase0_supported(m.api),"reason": if phase0_supported(m.api) { serde_json::Value::Null } else { serde_json::json!("dialect_unimplemented") }})).collect::<Vec<_>>() }),
-            )),
+            "lato/models/list" => {
+                let mut models = CATALOG.iter().map(|m| serde_json::json!({"provider":m.provider,"id":m.id,"supported":phase0_supported(m.api),"reason": if phase0_supported(m.api) { serde_json::Value::Null } else { serde_json::json!("dialect_unimplemented") }})).collect::<Vec<_>>();
+                models.extend(self.custom_models.iter().map(|m| serde_json::json!({
+                    "provider":m.provider,"id":m.id,"api":m.api,"baseUrl":m.base_url,
+                    "supported":dialect_implemented(m.api),
+                    "reason":if dialect_implemented(m.api) { serde_json::Value::Null } else { serde_json::json!("dialect_unimplemented") }
+                })));
+                Some(ok(id, serde_json::json!({"models":models})))
+            }
             "lato/session/info" => Some(ok(id, serde_json::json!({"cwd": self.cwd}))),
             "lato/auth/login" => {
                 let p = req.params.unwrap_or_default();
