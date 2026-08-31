@@ -85,14 +85,14 @@ pub const API_KEY_PRESETS: &[ApiKeyPreset] = &[
     p(
         "zai",
         "Z.AI",
-        Some("https://api.z.ai/api/paas/v4"),
+        Some("https://api.z.ai/api/coding/paas/v4"),
         &["ZAI_API_KEY"],
     ),
     p(
         "zai-coding-cn",
         "Z.AI Coding CN",
-        Some("https://open.bigmodel.cn/api/paas/v4"),
-        &["ZAI_API_KEY"],
+        Some("https://open.bigmodel.cn/api/coding/paas/v4"),
+        &["ZAI_CODING_CN_API_KEY"],
     ),
     p(
         "zhipu",
@@ -106,14 +106,14 @@ pub const API_KEY_PRESETS: &[ApiKeyPreset] = &[
     p(
         "minimax",
         "MiniMax",
-        Some("https://api.minimax.io/v1"),
+        Some("https://api.minimax.io/anthropic"),
         &["MINIMAX_API_KEY"],
     ),
     p(
         "minimax-cn",
         "MiniMax CN",
-        Some("https://api.minimaxi.com/v1"),
-        &["MINIMAX_API_KEY"],
+        Some("https://api.minimaxi.com/anthropic"),
+        &["MINIMAX_CN_API_KEY"],
     ),
     p(
         "sensenova",
@@ -229,8 +229,11 @@ mod tests {
             preset("moonshotai").unwrap().env,
             preset("moonshotai-cn").unwrap().env
         );
-        assert_eq!(preset("minimax-cn").unwrap().env, &["MINIMAX_API_KEY"]);
-        assert!(preset("zhipu").unwrap().env.contains(&"ZHIPU_API_KEY"));
+        assert_eq!(preset("minimax-cn").unwrap().env, &["MINIMAX_CN_API_KEY"]);
+        assert_eq!(
+            preset("zai-coding-cn").unwrap().env,
+            &["ZAI_CODING_CN_API_KEY"]
+        );
         assert_eq!(preset("sensenova").unwrap().env, &["SENSENOVA_API_KEY"]);
     }
 }

@@ -98,20 +98,32 @@ pub const CATALOG: &[Model] = &[
     Model {
         provider: "minimax-cn",
         id: "MiniMax-M2.1",
-        api: ModelApi::OpenaiCompletions,
-        base_url: Some("https://api.minimaxi.com/v1"),
+        api: ModelApi::AnthropicMessages,
+        base_url: Some("https://api.minimaxi.com/anthropic"),
     },
     Model {
         provider: "minimax",
         id: "MiniMax-M2.1",
+        api: ModelApi::AnthropicMessages,
+        base_url: Some("https://api.minimax.io/anthropic"),
+    },
+    Model {
+        provider: "zai",
+        id: "glm-4.5",
         api: ModelApi::OpenaiCompletions,
-        base_url: Some("https://api.minimax.io/v1"),
+        base_url: Some("https://api.z.ai/api/coding/paas/v4"),
+    },
+    Model {
+        provider: "zai-coding-cn",
+        id: "glm-4.5",
+        api: ModelApi::OpenaiCompletions,
+        base_url: Some("https://open.bigmodel.cn/api/coding/paas/v4"),
     },
     Model {
         provider: "zhipu",
         id: "glm-4.5",
         api: ModelApi::OpenaiCompletions,
-        base_url: Some("https://open.bigmodel.cn/api/paas/v4"),
+        base_url: Some("https://open.bigmodel.cn/api/coding/paas/v4"),
     },
     Model {
         provider: "sensenova",
@@ -143,14 +155,18 @@ mod tests {
     }
 
     #[test]
-    fn china_openai_compatible_models_are_advertised() {
-        for (provider, id) in [
-            ("minimax-cn", "MiniMax-M2.1"),
-            ("zhipu", "glm-4.5"),
-            ("sensenova", "SenseNova-V6-5-Pro"),
+    fn reference_china_models_are_advertised_with_provider_owned_protocols() {
+        for (provider, id, api) in [
+            ("minimax-cn", "MiniMax-M2.1", ModelApi::AnthropicMessages),
+            ("zai-coding-cn", "glm-4.5", ModelApi::OpenaiCompletions),
+            (
+                "sensenova",
+                "SenseNova-V6-5-Pro",
+                ModelApi::OpenaiCompletions,
+            ),
         ] {
             let model = lookup_model(provider, id).unwrap();
-            assert_eq!(model.api, ModelApi::OpenaiCompletions);
+            assert_eq!(model.api, api);
             assert!(phase0_supported(model.api));
         }
     }

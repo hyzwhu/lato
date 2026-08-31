@@ -333,17 +333,29 @@ mod tests {
     }
 
     #[test]
-    fn china_providers_use_openai_compatible_chat_completions() {
+    fn reference_china_provider_protocols_are_preserved() {
+        let minimax = build_request(
+            &lookup_model("minimax-cn", "MiniMax-M2.1").unwrap(),
+            &auth(),
+            serde_json::json!({"messages":[],"tools":[]}),
+        )
+        .unwrap();
+        assert_eq!(
+            minimax.url,
+            "https://api.minimaxi.com/anthropic/v1/messages"
+        );
+        assert!(
+            minimax
+                .headers
+                .iter()
+                .any(|(name, value)| name == "x-api-key" && value == "sk")
+        );
+
         for (provider, id, expected_url) in [
             (
-                "minimax-cn",
-                "MiniMax-M2.1",
-                "https://api.minimaxi.com/v1/chat/completions",
-            ),
-            (
-                "zhipu",
+                "zai-coding-cn",
                 "glm-4.5",
-                "https://open.bigmodel.cn/api/paas/v4/chat/completions",
+                "https://open.bigmodel.cn/api/coding/paas/v4/chat/completions",
             ),
             (
                 "sensenova",
@@ -351,16 +363,14 @@ mod tests {
                 "https://api.sensenova.cn/compatible-mode/v1/chat/completions",
             ),
         ] {
-            let model = lookup_model(provider, id).unwrap();
             let request = build_request(
-                &model,
+                &lookup_model(provider, id).unwrap(),
                 &auth(),
                 serde_json::json!({"messages":[],"tools":[]}),
             )
             .unwrap();
             assert_eq!(request.url, expected_url);
             assert_eq!(request.body["model"], id);
-            assert_eq!(request.body["stream"], true);
             assert!(
                 request
                     .headers

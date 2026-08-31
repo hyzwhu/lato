@@ -6,8 +6,9 @@ This product includes Rust reimplementations informed by the following MIT-licen
   Copyright (c) Mario Zechner and contributors
   Source snapshot reviewed: 2026-08-31
   Upstream: https://github.com/earendil-works/pi
-  Relevant behavioral contracts: provider catalog, env API-key resolution, Kimi Coding OAuth,
-  OpenAI Codex OAuth, PKCE, local callback, and device-code interaction.
+  Relevant behavioral contracts: provider-owned protocol/auth metadata, static-plus-remote catalog
+  overlays, provider-scoped model-store caching and ETag refresh, env API-key resolution, Kimi
+  Coding OAuth, OpenAI Codex OAuth, PKCE, local callback, and device-code interaction.
 
 The upstream software is licensed under the MIT License. No upstream JavaScript runtime is
 included or required by Lato.

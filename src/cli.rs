@@ -1,9 +1,10 @@
 use lato_agent::{ToolApproval, default_fake_stream};
 use lato_ai::{
     AuthInteraction, AuthNotice, CATALOG, CredentialStore, CustomHttpModelStream, CustomModel,
-    HttpModelStream, ModelApi, ModelStream, api_key_login_allowed, custom_model_auth,
-    get_auth_refreshing, load_models_json, login_oauth, lookup_model, oauth_allowed,
-    phase0_supported, refresh_openai_compatible_models, store_oauth,
+    HttpModelStream, ModelApi, ModelStream, ProviderModelsStore, api_key_login_allowed,
+    custom_model_auth, get_auth_refreshing, load_models_json, login_oauth, lookup_model,
+    oauth_allowed, phase0_supported, provider_spec, refresh_openai_compatible_models,
+    refresh_remote_provider_catalog, store_oauth,
 };
 use lato_workspace::{ApprovalMode, SandboxProfile, SessionTrust};
 use rustyline::{
@@ -405,15 +406,26 @@ async fn configure_interactively(home: &std::path::Path) -> Result<String, Strin
     let models = if is_catalog_provider {
         match discover_provider_models(home, &provider).await {
             Ok(models) if !models.is_empty() => {
-                println!("Fetched {} available models from {provider}.", models.len());
-                save_model_cache(home, &provider, &models)?;
-                models
+                println!("Fetched {} catalog models for {provider}.", models.len());
+                let mut merged = fallback.clone();
+                for model in models {
+                    if let Some(index) = merged.iter().position(|entry| entry.id == model.id) {
+                        merged[index] = model;
+                    } else {
+                        merged.push(model);
+                    }
+                }
+                merged
             }
             Ok(_) => {
                 eprintln!("Provider returned an empty model list; using built-in fallback.");
                 fallback
             }
-            Err(error) if error.contains("401") || error.contains("403") => {
+            Err(error)
+                if !provider_spec(&provider).is_some_and(|spec| spec.remote_catalog)
+                    && provider != "sensenova"
+                    && (error.contains("401") || error.contains("403")) =>
+            {
                 return Err(format!(
                     "{provider} rejected the credential while listing models: {error}"
                 ));
@@ -490,6 +502,19 @@ async fn discover_provider_models(
     home: &std::path::Path,
     provider: &str,
 ) -> Result<Vec<CustomModel>, String> {
+    if let Some(spec) = provider_spec(provider).filter(|spec| spec.remote_catalog) {
+        let catalog_base =
+            std::env::var("LATO_CATALOG_BASE_URL").unwrap_or_else(|_| "https://pi.dev".into());
+        return refresh_remote_provider_catalog(
+            spec,
+            &ProviderModelsStore::open(home),
+            &catalog_base,
+            false,
+        )
+        .await;
+    }
+
+    // Providers outside the translated reference registry retain explicit vendor discovery.
     let seed = CATALOG
         .iter()
         .find(|model| {
@@ -499,11 +524,11 @@ async fn discover_provider_models(
                     ModelApi::OpenaiCompletions | ModelApi::OpenaiResponses
                 )
         })
-        .ok_or("provider does not expose an OpenAI-compatible model listing")?;
+        .ok_or("provider has no dynamic model source")?;
     let base_url = seed.base_url.ok_or("provider has no model-list base URL")?;
-    let mut store = CredentialStore::open(home).map_err(|e| e.to_string())?;
+    let mut credentials = CredentialStore::open(home).map_err(|error| error.to_string())?;
     let auth = get_auth_refreshing(
-        &mut store,
+        &mut credentials,
         provider,
         &|name| std::env::var(name).ok(),
         None,
@@ -523,24 +548,6 @@ async fn discover_provider_models(
         auth.api_key.as_deref(),
     )
     .await
-}
-
-fn save_model_cache(
-    home: &std::path::Path,
-    provider: &str,
-    models: &[CustomModel],
-) -> Result<(), String> {
-    let path = home.join("model-cache.json");
-    let mut all = load_models_json(&path).unwrap_or_default();
-    all.retain(|model| model.provider != provider);
-    all.extend_from_slice(models);
-    let temporary = home.join("model-cache.json.tmp");
-    std::fs::write(
-        &temporary,
-        serde_json::to_vec_pretty(&serde_json::json!({"models":all})).map_err(|e| e.to_string())?,
-    )
-    .map_err(|e| e.to_string())?;
-    std::fs::rename(temporary, path).map_err(|e| e.to_string())
 }
 
 fn save_interactive_api_key(home: &std::path::Path, provider: &str) -> Result<(), String> {
@@ -587,9 +594,11 @@ async fn configured_stream(selection: &str) -> Result<Arc<dyn ModelStream>, Stri
                 .ok_or_else(|| format!("environment variable {} is not configured", custom.env))?;
             return Ok(Arc::new(CustomHttpModelStream::new(custom, auth)));
         }
-        let cached = load_models_json(&home.join("model-cache.json"))
-            .unwrap_or_default()
+        let cached = ProviderModelsStore::open(&home)
+            .read(provider)?
             .into_iter()
+            .flat_map(|entry| entry.models)
+            .chain(load_models_json(&home.join("model-cache.json")).unwrap_or_default())
             .find(|model| model.provider == provider && model.id == model_id)
             .ok_or_else(|| {
                 format!("unknown model {selection}; run /model to refresh provider models")

@@ -60,6 +60,14 @@ pub fn refresh_models_from_openai_response(
         .collect())
 }
 
+fn openai_compatible_models_url(provider: &str, base_url: &str) -> String {
+    if provider == "sensenova" {
+        "https://api.sensenova.cn/v1/llm/models".to_string()
+    } else {
+        format!("{}/models", base_url.trim_end_matches('/'))
+    }
+}
+
 pub async fn refresh_openai_compatible_models(
     provider: &str,
     api: ModelApi,
@@ -67,8 +75,9 @@ pub async fn refresh_openai_compatible_models(
     env_name: &str,
     api_key: Option<&str>,
 ) -> Result<Vec<CustomModel>, String> {
-    let client = http_client_for_url(base_url);
-    let mut request = client.get(format!("{}/models", base_url.trim_end_matches('/')));
+    let models_url = openai_compatible_models_url(provider, base_url);
+    let client = http_client_for_url(&models_url);
+    let mut request = client.get(models_url);
     if let Some(key) = api_key {
         request = request.bearer_auth(key);
     }
@@ -124,6 +133,20 @@ pub fn build_custom_request(
             headers: bearer(auth),
             body: serde_json::json!({"model":model.id,"input":messages,"tools":tools,"stream":true}),
         }),
+        ModelApi::AnthropicMessages => {
+            let mut headers = auth.headers.clone();
+            if let Some(key) = &auth.api_key {
+                headers.push(("x-api-key".into(), key.clone()));
+            }
+            headers.push(("anthropic-version".into(), "2023-06-01".into()));
+            headers.push(("content-type".into(), "application/json".into()));
+            Ok(HttpRequestSpec {
+                method: "POST",
+                url: format!("{}/v1/messages", model.base_url.trim_end_matches('/')),
+                headers,
+                body: serde_json::json!({"model":model.id,"messages":messages,"tools":anthropic_tools(tools),"max_tokens":4096,"stream":true}),
+            })
+        }
         _ => {
             // Static models cover the remaining dialect implementations; create a short-lived
             // equivalent request through the same protocol is intentionally rejected until its
@@ -131,6 +154,24 @@ pub fn build_custom_request(
             Err("custom model dialect unsupported".into())
         }
     }
+}
+
+fn anthropic_tools(tools: serde_json::Value) -> serde_json::Value {
+    serde_json::Value::Array(
+        tools
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|tool| {
+                let function = tool.get("function")?;
+                Some(serde_json::json!({
+                    "name": function.get("name")?,
+                    "description": function.get("description").cloned().unwrap_or_default(),
+                    "input_schema": function.get("parameters").cloned().unwrap_or_else(|| serde_json::json!({"type":"object"}))
+                }))
+            })
+            .collect(),
+    )
 }
 
 pub struct CustomHttpModelStream {
@@ -192,6 +233,21 @@ mod tests {
         .unwrap();
         let req = build_custom_request(&models[0], &auth, serde_json::json!([])).unwrap();
         assert_eq!(req.url, "http://127.0.0.1:8080/v1/chat/completions");
+    }
+
+    #[test]
+    fn sensenova_uses_platform_llm_models_endpoint() {
+        assert_eq!(
+            openai_compatible_models_url(
+                "sensenova",
+                "https://api.sensenova.cn/compatible-mode/v1"
+            ),
+            "https://api.sensenova.cn/v1/llm/models"
+        );
+        assert_eq!(
+            openai_compatible_models_url("minimax-cn", "https://api.minimaxi.com/v1"),
+            "https://api.minimaxi.com/v1/models"
+        );
     }
 
     #[tokio::test]

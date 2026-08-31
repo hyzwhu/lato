@@ -260,7 +260,7 @@ fn a4_5_login_openai_api_key_writes_store() {
 
 #[test]
 fn china_providers_accept_api_key_login() {
-    for provider in ["minimax-cn", "zhipu", "sensenova"] {
+    for provider in ["minimax-cn", "zai", "zai-coding-cn", "sensenova"] {
         let d = tempfile::tempdir().unwrap();
         let output = Command::new(env!("CARGO_BIN_EXE_lato"))
             .env("LATO_HOME", d.path())

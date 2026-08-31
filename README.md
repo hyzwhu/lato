@@ -46,15 +46,17 @@ LATO_HOME=$(mktemp -d) cargo run -q -- -p "reply with hi only"
 
 Use a real catalog model by selecting `provider/model`. Credentials resolve in this order: runtime override, persisted OAuth, persisted API key, then provider environment variables.
 
-Built-in China-region OpenAI-compatible providers include:
+Built-in China-region providers include:
 
-| Provider | Default model | Credential |
+| Provider | Protocol/base URL | Credential |
 |---|---|---|
-| `minimax-cn` | `MiniMax-M2.1` | `MINIMAX_API_KEY` |
-| `zhipu` | `glm-4.5` | `ZHIPU_API_KEY` (also accepts `BIGMODEL_API_KEY`/`ZAI_API_KEY`) |
-| `sensenova` | `SenseNova-V6-5-Pro` | `SENSENOVA_API_KEY` bearer token |
+| `minimax-cn` | Anthropic Messages, `https://api.minimaxi.com/anthropic` | `MINIMAX_CN_API_KEY` |
+| `minimax` | Anthropic Messages, `https://api.minimax.io/anthropic` | `MINIMAX_API_KEY` |
+| `zai-coding-cn` | OpenAI Completions, `https://open.bigmodel.cn/api/coding/paas/v4` | `ZAI_CODING_CN_API_KEY` |
+| `zai` | OpenAI Completions, `https://api.z.ai/api/coding/paas/v4` | `ZAI_API_KEY` |
+| `sensenova` | OpenAI-compatible | `SENSENOVA_API_KEY` bearer token |
 
-They also appear in first-launch provider selection. After authentication, Lato calls the selected provider's authenticated `/models` endpoint and displays the returned model IDs. Successful lists are cached in `~/.lato/model-cache.json`, so newly released models can be selected without upgrading Lato. A 401/403 rejects setup; providers without a compatible listing endpoint fall back to the explicitly labelled built-in list. SenseNova accounts that expose only AK/SK must generate the platform bearer/JWT token first and supply that token; Lato does not store the secret pair or silently invent a signing scheme.
+The first four definitions are Rust translations of the reference TypeScript provider factories. Their static catalog is overlaid by the reference-compatible remote catalog endpoint `/api/models/providers/{provider}` and persisted per provider in `~/.lato/models-store.json` with `checked_at`, `last_modified`, and `etag`; fresh cached catalogs are restored without network access. Lato does not blindly append `/models` to these providers. SenseNova is not defined by the reference registry and remains an explicit compatibility provider; it uses its platform model-list endpoint and falls back to the built-in model if listing is unavailable. Accounts that expose only AK/SK must generate the platform bearer/JWT token first.
 
 ```bash
 export LATO_HOME="$HOME/.lato"

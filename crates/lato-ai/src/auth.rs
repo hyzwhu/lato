@@ -260,8 +260,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = CredentialStore::open(dir.path()).unwrap();
         for (provider, variable) in [
-            ("minimax-cn", "MINIMAX_API_KEY"),
-            ("zhipu", "ZHIPU_API_KEY"),
+            ("minimax-cn", "MINIMAX_CN_API_KEY"),
+            ("zai-coding-cn", "ZAI_CODING_CN_API_KEY"),
             ("sensenova", "SENSENOVA_API_KEY"),
         ] {
             let auth = get_auth(
