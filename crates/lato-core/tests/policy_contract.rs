@@ -66,6 +66,15 @@ fn legacy_capability_and_side_effect_spellings_are_accepted() {
 }
 
 #[test]
+fn ambiguous_legacy_network_capability_is_rejected() {
+    assert!(serde_json::from_str::<ToolCapability>("\"network\"").is_err());
+    assert_eq!(
+        serde_json::from_str::<ToolCapability>("\"network_read\"").unwrap(),
+        ToolCapability::NetworkRead
+    );
+}
+
+#[test]
 fn policy_decision_has_stable_tagged_json() {
     let value = serde_json::to_value(lato_core::PolicyDecision::Deny(
         lato_core::PolicyDenial::new("policy.denied", "denied"),

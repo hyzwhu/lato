@@ -84,7 +84,6 @@ pub enum ToolCapability {
     FileWrite,
     #[serde(alias = "process")]
     ProcessSpawn,
-    #[serde(alias = "network")]
     NetworkRead,
     NetworkWrite,
     #[serde(alias = "task")]
