@@ -89,6 +89,14 @@ fn fingerprint_commits_to_every_exact_call_field() {
     changed.side_effect = SideEffect::ExternalMutation;
     variants.push(changed);
 
+    let mut changed = baseline.clone();
+    changed.mode = PolicyMode::Always;
+    variants.push(changed);
+
+    let mut changed = baseline.clone();
+    changed.project_trusted = false;
+    variants.push(changed);
+
     let mut changed = baseline;
     changed.sandbox.profile = SandboxProfile::ReadOnly;
     variants.push(changed);
@@ -119,6 +127,10 @@ fn fingerprint_sorts_and_deduplicates_capabilities() {
 fn fingerprint_is_lowercase_sha256() {
     let fingerprint = approval_fingerprint(&request()).unwrap();
 
+    assert_eq!(
+        fingerprint.0,
+        "b27261315f404186444f70967e521985e77f7af423cfba080e07b11d013644f1"
+    );
     assert_eq!(fingerprint.0.len(), 64);
     assert!(
         fingerprint
