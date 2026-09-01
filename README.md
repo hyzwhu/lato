@@ -97,6 +97,17 @@ cargo run -q -- login kimi-coding --oauth
 cargo run -q -- login openai-codex --oauth
 ```
 
+## Runtime architecture
+
+Lato is migrating to a typed Command/Event core without replacing the working CLI in one step.
+`lato-core` owns provider-independent IDs, errors, commands, events, and session invariants.
+`lato-runtime` owns the cancellable Tokio session loop and the `TurnDriver` boundary.
+The current ACP host remains the production path until the Phase 1B adapter is complete; this keeps
+headless, interactive, provider, tool, approval, and transcript behavior stable during migration.
+
+Copied or structurally derived upstream code is pinned in
+[`docs/superpowers/reference/lato-upstream-sources.md`](docs/superpowers/reference/lato-upstream-sources.md).
+
 ## Security
 
 - Headless `-p` uses process-local workspace trust and `approval_mode=always`; deny rules still apply.
