@@ -1,3 +1,4 @@
+pub mod catalog;
 pub mod dispatch;
 pub mod edit;
 pub mod kind;
@@ -9,6 +10,7 @@ pub mod subagent;
 pub mod todo;
 pub mod web;
 
+pub use catalog::*;
 pub use dispatch::*;
 pub use edit::*;
 pub use kind::*;
