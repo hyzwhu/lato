@@ -299,6 +299,7 @@ mod tests {
         assert_eq!(zai.base_url, "https://open.bigmodel.cn/api/coding/paas/v4");
         assert_eq!(zai.api, ModelApi::OpenaiCompletions);
         assert_eq!(zai.env, &["ZAI_CODING_CN_API_KEY"]);
+        assert!(!provider_spec("sensenova").unwrap().remote_catalog);
     }
 
     #[tokio::test]

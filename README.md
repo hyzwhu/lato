@@ -56,7 +56,7 @@ Built-in China-region providers include:
 | `zai` | OpenAI Completions, `https://api.z.ai/api/coding/paas/v4` | `ZAI_API_KEY` |
 | `sensenova` | OpenAI-compatible | `SENSENOVA_API_KEY` bearer token |
 
-The first four definitions are Rust translations of the reference TypeScript provider factories. Their static catalog is overlaid by the reference-compatible remote catalog endpoint `/api/models/providers/{provider}` and persisted per provider in `~/.lato/models-store.json` with `checked_at`, `last_modified`, and `etag`; fresh cached catalogs are restored without network access. Lato does not blindly append `/models` to these providers. SenseNova is not defined by the reference registry and remains an explicit compatibility provider; it uses its platform model-list endpoint and falls back to the built-in model if listing is unavailable. Accounts that expose only AK/SK must generate the platform bearer/JWT token first.
+The first four definitions are Rust translations of the reference TypeScript provider factories. Their static catalog is overlaid by the reference-compatible remote catalog endpoint `/api/models/providers/{provider}` and persisted per provider in `~/.lato/models-store.json` with `checked_at`, `last_modified`, and `etag`; fresh cached catalogs are restored without network access. Lato does not blindly append `/models` to these providers. SenseNova is not defined by the reference registry and remains an explicit static compatibility provider; Lato does not call an unverified model-list endpoint for it. Accounts that expose only AK/SK must generate the platform bearer/JWT token first.
 
 ```bash
 export LATO_HOME="$HOME/.lato"

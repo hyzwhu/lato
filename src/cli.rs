@@ -459,7 +459,9 @@ async fn configure_interactively(home: &std::path::Path) -> Result<String, Strin
                 .filter(|model| model.provider == provider),
         )
         .collect::<Vec<_>>();
-    let models = if is_catalog_provider {
+    let models = if !should_discover_provider_models(&provider) {
+        fallback
+    } else if is_catalog_provider {
         match discover_provider_models(home, &provider).await {
             Ok(models) if !models.is_empty() => {
                 println!("Fetched {} catalog models for {provider}.", models.len());
@@ -589,6 +591,10 @@ async fn save_interactive_oauth(home: &std::path::Path, provider: &str) -> Resul
         tokens.expires,
     )
     .map_err(|error| error.to_string())
+}
+
+fn should_discover_provider_models(provider: &str) -> bool {
+    provider_spec(provider).is_none_or(|spec| spec.remote_catalog)
 }
 
 async fn discover_provider_models(
@@ -880,7 +886,7 @@ fn lato_home() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::is_exit_command;
+    use super::{is_exit_command, should_discover_provider_models};
 
     #[test]
     fn interactive_exit_commands_accept_plain_slash_and_case_variants() {
@@ -888,5 +894,11 @@ mod tests {
             assert!(is_exit_command(command));
         }
         assert!(!is_exit_command("please exit after the task"));
+    }
+
+    #[test]
+    fn static_compatibility_provider_skips_unverified_model_discovery() {
+        assert!(!should_discover_provider_models("sensenova"));
+        assert!(should_discover_provider_models("minimax-cn"));
     }
 }

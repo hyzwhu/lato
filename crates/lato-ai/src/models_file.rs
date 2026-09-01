@@ -60,14 +60,6 @@ pub fn refresh_models_from_openai_response(
         .collect())
 }
 
-fn openai_compatible_models_url(provider: &str, base_url: &str) -> String {
-    if provider == "sensenova" {
-        "https://api.sensenova.cn/v1/llm/models".to_string()
-    } else {
-        format!("{}/models", base_url.trim_end_matches('/'))
-    }
-}
-
 pub async fn refresh_openai_compatible_models(
     provider: &str,
     api: ModelApi,
@@ -75,7 +67,7 @@ pub async fn refresh_openai_compatible_models(
     env_name: &str,
     api_key: Option<&str>,
 ) -> Result<Vec<CustomModel>, String> {
-    let models_url = openai_compatible_models_url(provider, base_url);
+    let models_url = format!("{}/models", base_url.trim_end_matches('/'));
     let client = http_client_for_url(&models_url);
     let mut request = client.get(models_url);
     if let Some(key) = api_key {
@@ -233,21 +225,6 @@ mod tests {
         .unwrap();
         let req = build_custom_request(&models[0], &auth, serde_json::json!([])).unwrap();
         assert_eq!(req.url, "http://127.0.0.1:8080/v1/chat/completions");
-    }
-
-    #[test]
-    fn sensenova_uses_platform_llm_models_endpoint() {
-        assert_eq!(
-            openai_compatible_models_url(
-                "sensenova",
-                "https://api.sensenova.cn/compatible-mode/v1"
-            ),
-            "https://api.sensenova.cn/v1/llm/models"
-        );
-        assert_eq!(
-            openai_compatible_models_url("minimax-cn", "https://api.minimaxi.com/v1"),
-            "https://api.minimaxi.com/v1/models"
-        );
     }
 
     #[tokio::test]
