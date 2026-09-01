@@ -219,7 +219,8 @@ Descriptor validation 拒绝：
 - input schema 不是 JSON object。
 - timeout 或输出上限为零。
 - 重复 capability。
-- replacement target 与 descriptor name 不同。
+
+replacement target 与 descriptor name 的一致性需要读取现有注册项，因此由 Catalog 注册验证处理，而不是 descriptor 的独立 shape validation。
 
 ### 5.3 Replacement
 
