@@ -77,12 +77,84 @@ fn runtime(root: &Path, calls: Arc<AtomicUsize>) -> lato_tools::ToolRuntime {
 }
 
 fn context(call_id: &str) -> ToolContext {
+    context_with_cancellation(call_id, CancellationToken::new())
+}
+
+fn context_with_cancellation(call_id: &str, cancellation: CancellationToken) -> ToolContext {
     ToolContext {
         session_id: SessionId::from("session-1"),
         turn_id: TurnId::from("turn-1"),
         call_id: ToolCallId::from(call_id),
-        cancellation: CancellationToken::new(),
+        cancellation,
         execution_grant: None,
+    }
+}
+
+#[tokio::test]
+async fn explicit_deny_never_invokes_the_tool() {
+    let root = tempfile::tempdir().unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let policy = Arc::new(PolicyEngine::new(Arc::new(ApprovalLedger::new(
+        Duration::from_secs(60),
+    ))));
+    let mut builder = ToolRuntimeBuilder::new(
+        policy,
+        PolicyScope {
+            workspace_root: root.path().to_path_buf(),
+            mode: PolicyMode::Always,
+            project_trusted: false,
+            sandbox_profile: SandboxProfile::Workspace,
+        },
+    );
+    builder
+        .register(Arc::new(UntrustedCountingTool {
+            calls: calls.clone(),
+        }))
+        .unwrap();
+    let runtime = builder.build().unwrap();
+    let prepared = runtime
+        .prepare(context("call-denied"), "unsafe", json!({}))
+        .unwrap();
+    assert!(matches!(
+        runtime.decision(&prepared),
+        PolicyDecision::Deny(denial) if denial.code == "policy.untrusted_extension"
+    ));
+    let error = runtime
+        .execute_without_approval_for_test(prepared)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "policy.untrusted_extension");
+    assert_eq!(calls.load(Ordering::Acquire), 0);
+}
+
+struct UntrustedCountingTool {
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl Tool for UntrustedCountingTool {
+    fn descriptor(&self) -> ToolDescriptor {
+        let mut descriptor = CountingTool {
+            calls: self.calls.clone(),
+        }
+        .descriptor();
+        descriptor.name = ToolName::parse("project:unsafe").unwrap();
+        descriptor.capabilities = vec![ToolCapability::ExtensionInvoke];
+        descriptor.side_effect = SideEffect::None;
+        descriptor.source.layer = ToolLayer::TrustedProject;
+        descriptor
+    }
+
+    async fn invoke(
+        &self,
+        context: ToolContext,
+        arguments: serde_json::Value,
+    ) -> Result<ToolOutput, lato_core::ToolError> {
+        CountingTool {
+            calls: self.calls.clone(),
+        }
+        .invoke(context, arguments)
+        .await
     }
 }
 
@@ -159,6 +231,40 @@ async fn grant_is_consumed_before_tool_invocation() {
     let error = runtime.execute(replay, grant).await.unwrap_err();
     assert_eq!(error.code, "policy.grant_consumed");
     assert_eq!(calls.load(Ordering::Acquire), 1);
+}
+
+#[tokio::test]
+async fn cancellation_after_prepare_consumes_grant_before_skipping_tool() {
+    let root = tempfile::tempdir().unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let runtime = runtime(root.path(), calls.clone());
+    let cancellation = CancellationToken::new();
+    let prepared = runtime
+        .prepare(
+            context_with_cancellation("call-cancelled", cancellation.clone()),
+            "write_file",
+            json!({"path":"a","contents":"x"}),
+        )
+        .unwrap();
+    let PolicyDecision::RequireApproval(request) = runtime.decision(&prepared) else {
+        panic!("write must require approval");
+    };
+    let grant = runtime.approve(request).unwrap();
+    cancellation.cancel();
+    let error = runtime.execute(prepared, grant.clone()).await.unwrap_err();
+    assert_eq!(error.code, "tool.cancelled");
+    assert_eq!(calls.load(Ordering::Acquire), 0);
+
+    let replay = runtime
+        .prepare(
+            context("call-cancelled"),
+            "write_file",
+            json!({"path":"a","contents":"x"}),
+        )
+        .unwrap();
+    let error = runtime.execute(replay, grant).await.unwrap_err();
+    assert_eq!(error.code, "policy.grant_consumed");
+    assert_eq!(calls.load(Ordering::Acquire), 0);
 }
 
 #[tokio::test]

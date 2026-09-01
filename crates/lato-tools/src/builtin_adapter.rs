@@ -4,7 +4,7 @@ use lato_core::{
     Retryability, SideEffect, Tool, ToolCancellation, ToolCapability, ToolConcurrency, ToolContext,
     ToolDescriptor, ToolError, ToolIdempotency, ToolLayer, ToolName, ToolOutput, ToolSource,
 };
-use lato_workspace::{FileLocks, SessionTrust};
+use lato_workspace::{ApprovalMode, FileLocks, SessionTrust, deny_write};
 use semver::Version;
 use serde_json::Value;
 use std::{path::PathBuf, sync::Arc};
@@ -44,16 +44,20 @@ impl Tool for LegacyDispatchTool {
         if context.cancellation.is_cancelled() {
             return Err(tool_error("tool.cancelled", "tool call was cancelled"));
         }
-        let content = dispatch(
-            &self.environment.locks,
-            &self.environment.trust,
-            &self.environment.cwd,
-            ToolCall {
-                name: self.legacy_name.clone(),
-                arguments,
-            },
-        )
-        .await
+        let content = if self.legacy_name == "write_file" {
+            invoke_compat_write_file(&self.environment, &arguments).await
+        } else {
+            dispatch(
+                &self.environment.locks,
+                &self.environment.trust,
+                &self.environment.cwd,
+                ToolCall {
+                    name: self.legacy_name.clone(),
+                    arguments,
+                },
+            )
+            .await
+        }
         .map_err(classify_legacy_error)?;
         if context.cancellation.is_cancelled() {
             return Err(tool_error("tool.cancelled", "tool call was cancelled"));
@@ -64,6 +68,44 @@ impl Tool for LegacyDispatchTool {
             truncated: false,
             artifact_path: None,
         })
+    }
+}
+
+async fn invoke_compat_write_file(
+    environment: &BuiltinToolEnvironment,
+    arguments: &Value,
+) -> Result<String, String> {
+    let raw_path = arguments
+        .get("path")
+        .and_then(Value::as_str)
+        .ok_or("missing path")?;
+    let path = PathBuf::from(raw_path);
+    let path = if path.is_absolute() {
+        path
+    } else {
+        environment.cwd.join(path)
+    };
+    if deny_write(&path) {
+        return Err("denied by write policy".into());
+    }
+    require_compat_mutating_approval(&environment.trust)?;
+    let contents = arguments
+        .get("contents")
+        .or_else(|| arguments.get("content"))
+        .and_then(Value::as_str)
+        .ok_or("missing contents")?;
+    let _guard = environment.locks.acquire(&path).await;
+    tokio::fs::write(path, contents)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok("ok".into())
+}
+
+fn require_compat_mutating_approval(trust: &SessionTrust) -> Result<(), String> {
+    match trust.mode {
+        ApprovalMode::Always | ApprovalMode::Auto => Ok(()),
+        ApprovalMode::Ask if trust.consume_allow_once() => Ok(()),
+        ApprovalMode::Ask => Err("permission required before mutating tool execution".into()),
     }
 }
 
