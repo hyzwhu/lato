@@ -2,10 +2,12 @@ use async_trait::async_trait;
 use lato_agent::{HistoryItem, LegacyTurnDriver, default_fake_stream};
 use lato_ai::{FakeModelStream, ModelStream, StreamPiece};
 use lato_core::{
-    Command, EventPayload, SessionId, StartBehavior, StartTurn, ToolCallId, TurnId, UserInput,
+    Command, EventPayload, PolicyMode, SandboxProfile, SessionId, StartBehavior, StartTurn,
+    ToolCallId, TurnId, UserInput,
 };
+use lato_policy::{ApprovalLedger, PolicyEngine};
 use lato_runtime::spawn_session;
-use lato_tools::ToolRuntimeBuilder;
+use lato_tools::{PolicyScope, ToolRuntimeBuilder};
 use lato_workspace::{FileLocks, SessionTrust};
 use std::{
     sync::{
@@ -99,7 +101,18 @@ fn driver_with_recording_tool(
 ) -> Arc<LegacyTurnDriver> {
     let cwd = std::env::current_dir().unwrap();
     let (updates_tx, _updates_rx) = mpsc::unbounded_channel();
-    let mut builder = ToolRuntimeBuilder::new();
+    let policy = Arc::new(PolicyEngine::new(Arc::new(ApprovalLedger::new(
+        Duration::from_secs(60),
+    ))));
+    let mut builder = ToolRuntimeBuilder::new(
+        policy,
+        PolicyScope {
+            workspace_root: cwd.clone(),
+            mode: PolicyMode::Always,
+            project_trusted: true,
+            sandbox_profile: SandboxProfile::Off,
+        },
+    );
     builder
         .register(Arc::new(RecordingTool { tx: recording_tx }))
         .unwrap();

@@ -1,7 +1,7 @@
 use lato_core::{SessionId, ToolCallId, ToolContext, TurnId};
 use lato_tools::{BuiltinToolEnvironment, builtin_tools};
 use lato_workspace::{FileLocks, SessionTrust};
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 use tokio_util::sync::CancellationToken;
 
 fn context(cancellation: CancellationToken) -> ToolContext {
@@ -12,6 +12,21 @@ fn context(cancellation: CancellationToken) -> ToolContext {
         cancellation,
         execution_grant: None,
     }
+}
+
+fn test_runtime_builder() -> lato_tools::ToolRuntimeBuilder {
+    let policy = Arc::new(lato_policy::PolicyEngine::new(Arc::new(
+        lato_policy::ApprovalLedger::new(Duration::from_secs(60)),
+    )));
+    lato_tools::ToolRuntimeBuilder::new(
+        policy,
+        lato_tools::PolicyScope {
+            workspace_root: std::env::current_dir().unwrap(),
+            mode: lato_core::PolicyMode::Always,
+            project_trusted: true,
+            sandbox_profile: lato_core::SandboxProfile::Off,
+        },
+    )
 }
 
 #[test]
@@ -202,7 +217,7 @@ fn fake_descriptor(
 
 #[tokio::test]
 async fn legacy_write_aliases_resolve_to_write_file() {
-    let mut builder = lato_tools::ToolRuntimeBuilder::new();
+    let mut builder = test_runtime_builder();
     builder
         .register(Arc::new(FakeTool {
             descriptor: fake_descriptor("builtin:write_file", lato_core::ToolLayer::Builtin, None),
@@ -227,7 +242,7 @@ async fn legacy_write_aliases_resolve_to_write_file() {
 #[tokio::test]
 async fn higher_layer_replaces_a_builtin_without_duplicate_advertisement() {
     let root = tempfile::tempdir().unwrap();
-    let mut builder = lato_tools::ToolRuntimeBuilder::new();
+    let mut builder = test_runtime_builder();
     builder
         .register_builtin_tools(BuiltinToolEnvironment {
             cwd: root.path().to_path_buf(),
@@ -276,7 +291,7 @@ async fn higher_layer_replaces_a_builtin_without_duplicate_advertisement() {
 
 #[test]
 fn different_namespaces_cannot_advertise_the_same_local_name() {
-    let mut builder = lato_tools::ToolRuntimeBuilder::new();
+    let mut builder = test_runtime_builder();
     for name in ["project:read", "session:read"] {
         builder
             .register(Arc::new(FakeTool {
@@ -308,14 +323,18 @@ async fn write_alias_consumes_allow_once_exactly_once() {
     })
     .unwrap();
 
-    runtime
-        .invoke(
+    let prepared = runtime
+        .prepare(
             context(CancellationToken::new()),
             "write",
             serde_json::json!({"path": "a.txt", "contents": "one"}),
         )
-        .await
         .unwrap();
+    let lato_core::PolicyDecision::RequireApproval(request) = runtime.decision(&prepared) else {
+        panic!("interactive write must require approval");
+    };
+    let grant = runtime.approve(request).unwrap();
+    runtime.execute(prepared, grant).await.unwrap();
     assert_eq!(
         std::fs::read_to_string(root.path().join("a.txt")).unwrap(),
         "one"
@@ -330,7 +349,7 @@ async fn write_alias_consumes_allow_once_exactly_once() {
         )
         .await
         .unwrap_err();
-    assert_eq!(error.code, "tool.policy_denied");
+    assert_eq!(error.code, "policy.approval_required");
     assert!(!root.path().join("b.txt").exists());
 }
 

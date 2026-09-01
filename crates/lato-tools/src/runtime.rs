@@ -2,18 +2,44 @@ use crate::{
     BuiltinAdapterError, BuiltinToolEnvironment, CatalogError, RegistrationOutcome, ToolCatalog,
     builtin_tools,
 };
-use lato_core::{Retryability, Tool, ToolContext, ToolDescriptor, ToolError, ToolName, ToolOutput};
+use lato_core::{
+    ApprovalFingerprint, ApprovalRequest, EnvironmentPolicy, ExecutionGrant, NetworkPolicy,
+    PolicyDecision, PolicyMode, PolicyRequest, Retryability, SandboxObligation, SandboxProfile,
+    Tool, ToolContext, ToolDescriptor, ToolError, ToolName, ToolOutput,
+};
+use lato_policy::{ApprovalLedger, PolicyEngine, approval_fingerprint, canonical_arguments};
 use serde_json::{Value, json};
-use std::{collections::BTreeMap, sync::Arc};
+use sha2::{Digest, Sha256};
+use std::{collections::BTreeMap, path::PathBuf, sync::Arc, time::Duration};
 
 pub struct ToolRuntime {
     catalog: ToolCatalog,
     wire_names: BTreeMap<String, ToolName>,
+    policy: Arc<PolicyEngine>,
+    scope: PolicyScope,
 }
 
-#[derive(Default)]
 pub struct ToolRuntimeBuilder {
     catalog: ToolCatalog,
+    policy: Arc<PolicyEngine>,
+    scope: PolicyScope,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PolicyScope {
+    pub workspace_root: PathBuf,
+    pub mode: PolicyMode,
+    pub project_trusted: bool,
+    pub sandbox_profile: SandboxProfile,
+}
+
+pub struct PreparedToolCall {
+    context: ToolContext,
+    tool: Arc<dyn Tool>,
+    arguments: Value,
+    request: PolicyRequest,
+    fingerprint: ApprovalFingerprint,
+    decision: PolicyDecision,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -31,8 +57,12 @@ pub enum RuntimeBuildError {
 }
 
 impl ToolRuntimeBuilder {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(policy: Arc<PolicyEngine>, scope: PolicyScope) -> Self {
+        Self {
+            catalog: ToolCatalog::new(),
+            policy,
+            scope,
+        }
     }
 
     pub fn register(&mut self, tool: Arc<dyn Tool>) -> Result<RegistrationOutcome, CatalogError> {
@@ -64,6 +94,8 @@ impl ToolRuntimeBuilder {
         Ok(ToolRuntime {
             catalog: self.catalog,
             wire_names,
+            policy: self.policy,
+            scope: self.scope,
         })
     }
 }
@@ -92,6 +124,25 @@ impl ToolRuntime {
         wire_name: &str,
         arguments: Value,
     ) -> Result<ToolOutput, ToolError> {
+        let prepared = self.prepare(context, wire_name, arguments)?;
+        match self.decision(&prepared).clone() {
+            PolicyDecision::Allow(grant) => self.execute(prepared, grant).await,
+            PolicyDecision::RequireApproval(_) => Err(policy_error(
+                "policy.approval_required",
+                "this tool call requires explicit approval",
+            )),
+            PolicyDecision::Deny(denial) => {
+                Err(policy_error(denial.code.clone(), denial.message.clone()))
+            }
+        }
+    }
+
+    pub fn prepare(
+        &self,
+        context: ToolContext,
+        wire_name: &str,
+        arguments: Value,
+    ) -> Result<PreparedToolCall, ToolError> {
         if context.cancellation.is_cancelled() {
             return Err(ToolError::new(
                 "tool.cancelled",
@@ -103,10 +154,120 @@ impl ToolRuntime {
         let Some(canonical) = self.resolve_wire_name(wire_name) else {
             return Err(not_found(wire_name));
         };
+        let Some(descriptor) = self.catalog.descriptor(&canonical).cloned() else {
+            return Err(not_found(wire_name));
+        };
         let Some(tool) = self.catalog.resolve(&canonical) else {
             return Err(not_found(wire_name));
         };
-        tool.invoke(context, arguments).await
+        let canonical_arguments = canonical_arguments(&arguments).map_err(|error| {
+            ToolError::new(
+                "policy.fingerprint_failed",
+                error.to_string(),
+                Retryability::Never,
+            )
+        })?;
+        let arguments = serde_json::from_slice(&canonical_arguments).map_err(|error| {
+            ToolError::new(
+                "tool.invalid_arguments",
+                error.to_string(),
+                Retryability::Never,
+            )
+        })?;
+        let sandbox = sandbox_obligation(&self.scope, &descriptor);
+        let request = PolicyRequest {
+            session_id: context.session_id.clone(),
+            turn_id: context.turn_id.clone(),
+            call_id: context.call_id.clone(),
+            tool_name: canonical,
+            arguments_digest: sha256_hex(&canonical_arguments),
+            capabilities: descriptor.capabilities,
+            side_effect: descriptor.side_effect,
+            mode: self.scope.mode,
+            project_trusted: self.scope.project_trusted,
+            sandbox,
+        };
+        let fingerprint = approval_fingerprint(&request).map_err(|error| {
+            ToolError::new(
+                "policy.fingerprint_failed",
+                error.to_string(),
+                Retryability::Never,
+            )
+        })?;
+        let decision = self.policy.evaluate(&request);
+        Ok(PreparedToolCall {
+            context,
+            tool,
+            arguments,
+            request,
+            fingerprint,
+            decision,
+        })
+    }
+
+    pub fn decision<'a>(&self, prepared: &'a PreparedToolCall) -> &'a PolicyDecision {
+        &prepared.decision
+    }
+
+    pub fn approve(&self, approval: &ApprovalRequest) -> Result<ExecutionGrant, ToolError> {
+        self.policy.approve(approval).map_err(policy_engine_error)
+    }
+
+    pub async fn execute(
+        &self,
+        prepared: PreparedToolCall,
+        grant: ExecutionGrant,
+    ) -> Result<ToolOutput, ToolError> {
+        if let PolicyDecision::Deny(denial) = &prepared.decision {
+            return Err(policy_error(denial.code.clone(), denial.message.clone()));
+        }
+        let recomputed = approval_fingerprint(&prepared.request).map_err(|error| {
+            ToolError::new(
+                "policy.fingerprint_failed",
+                error.to_string(),
+                Retryability::Never,
+            )
+        })?;
+        if recomputed != prepared.fingerprint {
+            return Err(policy_error(
+                "policy.grant_mismatch",
+                "the prepared tool call changed after authorization",
+            ));
+        }
+        self.policy
+            .consume(&grant, &prepared.fingerprint)
+            .map_err(policy_engine_error)?;
+        if prepared.context.cancellation.is_cancelled() {
+            return Err(ToolError::new(
+                "tool.cancelled",
+                "tool call was cancelled",
+                Retryability::Never,
+            ));
+        }
+        prepared
+            .tool
+            .invoke(
+                prepared.context.with_execution_grant(grant),
+                prepared.arguments,
+            )
+            .await
+    }
+
+    #[doc(hidden)]
+    pub async fn execute_without_approval_for_test(
+        &self,
+        prepared: PreparedToolCall,
+    ) -> Result<ToolOutput, ToolError> {
+        match prepared.decision.clone() {
+            PolicyDecision::Allow(grant) => self.execute(prepared, grant).await,
+            PolicyDecision::RequireApproval(_) => Err(policy_error(
+                "policy.grant_missing",
+                "the prepared tool call has no approval grant",
+            )),
+            PolicyDecision::Deny(ref denial) => {
+                Err(policy_error(denial.code.clone(), denial.message.clone()))
+            }
+        }
     }
 
     pub fn descriptor_for_wire_name(&self, wire_name: &str) -> Option<ToolDescriptor> {
@@ -132,9 +293,57 @@ impl ToolRuntime {
 pub fn builtin_tool_runtime(
     environment: BuiltinToolEnvironment,
 ) -> Result<Arc<ToolRuntime>, RuntimeBuildError> {
-    let mut builder = ToolRuntimeBuilder::new();
+    let scope = PolicyScope {
+        workspace_root: environment.cwd.clone(),
+        mode: match environment.trust.mode {
+            lato_workspace::ApprovalMode::Ask => PolicyMode::Ask,
+            lato_workspace::ApprovalMode::Auto => PolicyMode::Auto,
+            lato_workspace::ApprovalMode::Always => PolicyMode::Always,
+        },
+        project_trusted: environment.trust.cwd_trusted(),
+        sandbox_profile: match environment.trust.sandbox {
+            lato_workspace::SandboxProfile::Off => SandboxProfile::Off,
+            lato_workspace::SandboxProfile::Workspace => SandboxProfile::Workspace,
+            lato_workspace::SandboxProfile::ReadOnly => SandboxProfile::ReadOnly,
+        },
+    };
+    let policy = Arc::new(PolicyEngine::new(Arc::new(ApprovalLedger::new(
+        Duration::from_secs(60),
+    ))));
+    let mut builder = ToolRuntimeBuilder::new(policy, scope);
     builder.register_builtin_tools(environment)?;
     Ok(Arc::new(builder.build()?))
+}
+
+fn sandbox_obligation(scope: &PolicyScope, descriptor: &ToolDescriptor) -> SandboxObligation {
+    let mut obligation =
+        SandboxObligation::for_profile(scope.sandbox_profile, &scope.workspace_root);
+    if descriptor
+        .capabilities
+        .contains(&lato_core::ToolCapability::NetworkRead)
+    {
+        obligation.network = NetworkPolicy::PublicHttpsRead;
+    }
+    obligation.environment = EnvironmentPolicy::default();
+    obligation
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        write!(&mut encoded, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    encoded
+}
+
+fn policy_engine_error(error: lato_policy::PolicyError) -> ToolError {
+    policy_error(error.code(), error.to_string())
+}
+
+fn policy_error(code: impl Into<String>, message: impl Into<String>) -> ToolError {
+    ToolError::new(code, message, Retryability::Never)
 }
 
 fn not_found(wire_name: &str) -> ToolError {
