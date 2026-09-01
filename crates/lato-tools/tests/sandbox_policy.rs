@@ -7,8 +7,41 @@ use lato_tools::{
 };
 use lato_workspace::{FileLocks, HostSandboxBackend, SessionTrust};
 use serde_json::json;
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{ffi::OsString, path::PathBuf, sync::Arc, time::Duration};
 use tokio_util::sync::CancellationToken;
+
+struct EnvRestore {
+    previous: Vec<(&'static str, Option<OsString>)>,
+}
+
+impl EnvRestore {
+    fn set(vars: &[(&'static str, &str)]) -> Self {
+        let previous = vars
+            .iter()
+            .map(|(key, value)| {
+                let existing = std::env::var_os(key);
+                unsafe {
+                    std::env::set_var(key, value);
+                }
+                (*key, existing)
+            })
+            .collect();
+        Self { previous }
+    }
+}
+
+impl Drop for EnvRestore {
+    fn drop(&mut self) {
+        for (key, previous) in self.previous.drain(..) {
+            unsafe {
+                match previous {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+}
 
 fn context() -> ToolContext {
     ToolContext {
@@ -37,10 +70,20 @@ fn workspace_obligation_rejects_root_outside_workspace() {
 }
 
 #[test]
-fn off_is_accepted_only_when_obligation_profile_is_off() {
-    assert!(validate_sandbox_obligation(&SandboxObligation::off("/workspace")).is_ok());
+fn well_formed_workspace_and_read_only_obligations_are_accepted() {
     assert!(validate_sandbox_obligation(&SandboxObligation::workspace("/workspace")).is_ok());
     assert!(validate_sandbox_obligation(&SandboxObligation::read_only("/workspace")).is_ok());
+}
+
+#[test]
+fn off_is_accepted_only_when_obligation_profile_is_off() {
+    assert!(validate_sandbox_obligation(&SandboxObligation::off("/workspace")).is_ok());
+
+    let mut disguised = SandboxObligation::off("/workspace");
+    disguised.profile = SandboxProfile::Workspace;
+    disguised.writable_roots = vec![PathBuf::from("/tmp/outside")];
+    let error = validate_sandbox_obligation(&disguised).unwrap_err();
+    assert_eq!(error.code, "sandbox.unsupported");
 }
 
 #[tokio::test]
@@ -98,13 +141,13 @@ async fn process_tool_consumes_grant_sandbox_not_session_trust() {
 #[tokio::test]
 async fn grant_path_does_not_forward_secret_environment() {
     let workspace = tempfile::tempdir().unwrap();
-    unsafe {
-        std::env::set_var("LATO_TEST_TOKEN", "leaked-token-value");
-        std::env::set_var("LATO_TEST_SECRET", "leaked-secret-value");
-        std::env::set_var("LATO_TEST_PASSWORD", "leaked-password-value");
-        std::env::set_var("LATO_TEST_API_KEY", "leaked-api-key-value");
-        std::env::set_var("LATO_TEST_AUTHORIZATION", "leaked-authorization-value");
-    }
+    let _env = EnvRestore::set(&[
+        ("LATO_TEST_TOKEN", "leaked-token-value"),
+        ("LATO_TEST_SECRET", "leaked-secret-value"),
+        ("LATO_TEST_PASSWORD", "leaked-password-value"),
+        ("LATO_TEST_API_KEY", "leaked-api-key-value"),
+        ("LATO_TEST_AUTHORIZATION", "leaked-authorization-value"),
+    ]);
     let policy = Arc::new(PolicyEngine::new(Arc::new(ApprovalLedger::new(
         Duration::from_secs(60),
     ))));

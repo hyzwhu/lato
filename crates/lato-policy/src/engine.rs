@@ -1,4 +1,4 @@
-use crate::{ApprovalError, ApprovalLedger, approval_fingerprint};
+use crate::{ApprovalError, ApprovalLedger, approval_fingerprint, validate_sandbox_obligation};
 use lato_core::{
     ApprovalRequest, ExecutionGrant, PolicyDecision, PolicyDenial, PolicyMode, PolicyRequest,
     SideEffect, ToolCapability,
@@ -119,6 +119,9 @@ fn validate_request(request: &PolicyRequest) -> Result<(), PolicyError> {
 }
 
 fn denial(request: &PolicyRequest) -> Option<PolicyDenial> {
+    if let Err(denial) = validate_sandbox_obligation(&request.sandbox) {
+        return Some(denial);
+    }
     if !request.project_trusted
         && request
             .capabilities

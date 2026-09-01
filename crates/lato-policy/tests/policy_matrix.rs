@@ -221,6 +221,37 @@ fn approve_rejects_fabricated_or_now_denied_requests() {
 }
 
 #[test]
+fn evaluate_denies_invalid_sandbox_obligations() {
+    let engine = engine();
+
+    let mut read_only = request(
+        PolicyMode::Always,
+        vec![ToolCapability::FileRead],
+        SideEffect::ReadOnly,
+        true,
+    );
+    read_only.sandbox = SandboxObligation::read_only("/workspace");
+    read_only.sandbox.writable_roots = vec![PathBuf::from("/workspace")];
+    let PolicyDecision::Deny(denial) = engine.evaluate(&read_only) else {
+        panic!("read-only writable roots must be denied before a grant is issued");
+    };
+    assert_eq!(denial.code, "sandbox.unsupported");
+
+    let mut workspace = request(
+        PolicyMode::Always,
+        vec![ToolCapability::FileWrite],
+        SideEffect::WorkspaceMutation,
+        true,
+    );
+    workspace.sandbox = SandboxObligation::workspace("/workspace");
+    workspace.sandbox.writable_roots = vec![PathBuf::from("/tmp/outside")];
+    let PolicyDecision::Deny(denial) = engine.evaluate(&workspace) else {
+        panic!("workspace roots outside the workspace must be denied before a grant is issued");
+    };
+    assert_eq!(denial.code, "sandbox.unsupported");
+}
+
+#[test]
 fn policy_errors_have_stable_codes() {
     assert_eq!(
         PolicyError::ApprovalFingerprintMismatch.code(),
