@@ -1,4 +1,4 @@
-use crate::{PromptKind, SessionActor, ToolApproval, TranscriptStore};
+use crate::{RuntimePromptOutcome, RuntimeSession, ToolApproval, TranscriptStore};
 use lato_ai::{
     CATALOG, CredentialStore, CustomHttpModelStream, CustomModel, FakeModelStream, HttpModelStream,
     ModelStream, StreamPiece, SwitchableModelStream, api_key_login_allowed, custom_model_auth,
@@ -11,7 +11,7 @@ use lato_workspace::{ApprovalMode, FileLocks, SessionTrust};
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 pub struct AcpHost {
-    sessions: HashMap<String, SessionActor>,
+    sessions: HashMap<String, Arc<RuntimeSession>>,
     pub updates: tokio::sync::mpsc::UnboundedSender<serde_json::Value>,
     next_id: usize,
     cwd: PathBuf,
@@ -76,6 +76,19 @@ impl AcpHost {
             tool_approval,
         }
     }
+
+    fn make_runtime_session(&self, sid: &str) -> Arc<RuntimeSession> {
+        Arc::new(RuntimeSession::new(
+            sid.to_string(),
+            self.stream.clone(),
+            self.locks.clone(),
+            self.trust.clone(),
+            self.cwd.clone(),
+            self.updates.clone(),
+            self.tool_approval.clone(),
+        ))
+    }
+
     pub async fn handle(&mut self, req: JsonRpcReq) -> Option<serde_json::Value> {
         let id = req.id.clone();
         if !is_implemented(&req.method) {
@@ -93,18 +106,8 @@ impl AcpHost {
                     .as_millis();
                 let sid = format!("s{now}-{}", self.next_id);
                 self.next_id += 1;
-                let actor = SessionActor::new(
-                    self.stream.clone(),
-                    self.locks.clone(),
-                    self.trust.clone(),
-                    self.cwd.clone(),
-                )
-                .with_interactive_events(
-                    self.updates.clone(),
-                    sid.clone(),
-                    self.tool_approval.clone(),
-                );
-                self.sessions.insert(sid.clone(), actor);
+                let session = self.make_runtime_session(&sid);
+                self.sessions.insert(sid.clone(), session);
                 Some(ok(id, serde_json::json!({"sessionId": sid})))
             }
             "session/prompt" => {
@@ -116,27 +119,33 @@ impl AcpHost {
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
-                let Some(actor) = self.sessions.get_mut(sid) else {
+                let Some(session) = self.sessions.get(sid).cloned() else {
                     return Some(err(id, -32000, "unknown session"));
                 };
                 if self.trust.mode == ApprovalMode::Ask && text.contains("tool") {
                     let _ = self.updates.send(serde_json::json!({"jsonrpc":"2.0","id":format!("permission-{sid}"),"method":"session/request_permission","params":{"sessionId": sid,"options":["allow_once","allow_session","deny","cancel"]}}));
                 }
-                match actor.prompt(PromptKind::Start, text).await {
-                    Ok(_) => {
+                match session.prompt(text).await {
+                    Ok(RuntimePromptOutcome::Complete { text }) => {
+                        let history = session.history_snapshot().await;
                         if let Some(store) = &self.transcripts {
                             let start = *self.persisted.get(sid).unwrap_or(&0);
-                            if let Err(e) = store.append(sid, &actor.history()[start..]) {
-                                return Some(err(id, -32000, format!("persist transcript: {e}")));
+                            if let Err(error) = store.append(sid, &history[start..]) {
+                                return Some(err(
+                                    id,
+                                    -32000,
+                                    format!("persist transcript: {error}"),
+                                ));
                             }
-                            self.persisted
-                                .insert(sid.to_string(), actor.history().len());
+                            self.persisted.insert(sid.to_string(), history.len());
                         }
-                        let text = actor.latest_assistant_text();
                         let _ = self.updates.send(serde_json::json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":sid,"text":text}}));
                         Some(ok(id, serde_json::json!({"status":"complete","text":text})))
                     }
-                    Err(e) => Some(err(id, -32000, e)),
+                    Ok(RuntimePromptOutcome::Cancelled { .. }) => {
+                        Some(ok(id, serde_json::json!({"status":"cancelled","text":""})))
+                    }
+                    Err(error) => Some(err(id, -32000, error.to_string())),
                 }
             }
             "session/cancel" => {
@@ -145,9 +154,9 @@ impl AcpHost {
                     .as_ref()
                     .and_then(|p| p.get("sessionId"))
                     .and_then(|v| v.as_str())
-                    && let Some(a) = self.sessions.get_mut(sid)
+                    && let Some(session) = self.sessions.get(sid).cloned()
                 {
-                    a.cancel();
+                    let _ = session.cancel().await;
                 }
                 Some(ok(id, serde_json::json!({"status":"cancelled"})))
             }
@@ -168,8 +177,9 @@ impl AcpHost {
                     .as_ref()
                     .and_then(|p| p.get("sessionId"))
                     .and_then(|v| v.as_str())
+                    && let Some(session) = self.sessions.remove(sid)
                 {
-                    self.sessions.remove(sid);
+                    let _ = session.shutdown().await;
                 }
                 Some(ok(id, serde_json::json!({"closed": true})))
             }
@@ -181,22 +191,12 @@ impl AcpHost {
                     .and_then(|v| v.as_str())
                     .unwrap_or("s1");
                 if !self.sessions.contains_key(sid) {
-                    let mut actor = SessionActor::new(
-                        self.stream.clone(),
-                        self.locks.clone(),
-                        self.trust.clone(),
-                        self.cwd.clone(),
-                    )
-                    .with_interactive_events(
-                        self.updates.clone(),
-                        sid.to_string(),
-                        self.tool_approval.clone(),
-                    );
+                    let session = self.make_runtime_session(sid);
                     if let Some(store) = &self.transcripts {
                         match store.load(sid) {
                             Ok(history) => {
                                 self.persisted.insert(sid.into(), history.len());
-                                *actor.history_mut() = history;
+                                session.replace_history(history).await;
                             }
                             Err(e) if !e.contains("No such file") => {
                                 return Some(err(id, -32000, format!("resume transcript: {e}")));
@@ -204,7 +204,7 @@ impl AcpHost {
                             Err(_) => {}
                         }
                     }
-                    self.sessions.insert(sid.into(), actor);
+                    self.sessions.insert(sid.into(), session);
                 }
                 Some(ok(
                     id,
@@ -638,5 +638,31 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(e["error"]["code"], -32601);
+    }
+
+    #[tokio::test]
+    async fn runtime_resume_hydrates_transcript_history() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = TranscriptStore::open(directory.path()).unwrap();
+        store
+            .append(
+                "resume-1",
+                &[
+                    crate::HistoryItem::User("old".into()),
+                    crate::HistoryItem::AssistantText("answer".into()),
+                ],
+            )
+            .unwrap();
+        let mut host = host();
+        host.transcripts = Some(store);
+        host.handle(req(
+            1,
+            "session/resume",
+            serde_json::json!({"sessionId": "resume-1"}),
+        ))
+        .await
+        .unwrap();
+        let history = host.sessions["resume-1"].history_snapshot().await;
+        assert_eq!(history.len(), 2);
     }
 }
