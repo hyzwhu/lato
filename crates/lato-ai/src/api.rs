@@ -359,8 +359,8 @@ mod tests {
             ),
             (
                 "sensenova",
-                "SenseNova-V6-5-Pro",
-                "https://api.sensenova.cn/compatible-mode/v1/chat/completions",
+                "sensenova-6.8-flash-lite",
+                "https://token.sensenova.cn/v1/chat/completions",
             ),
         ] {
             let request = build_request(

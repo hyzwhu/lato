@@ -481,7 +481,6 @@ async fn configure_interactively(home: &std::path::Path) -> Result<String, Strin
             }
             Err(error)
                 if !provider_spec(&provider).is_some_and(|spec| spec.remote_catalog)
-                    && provider != "sensenova"
                     && (error.contains("401") || error.contains("403")) =>
             {
                 return Err(format!(
@@ -519,9 +518,16 @@ async fn configure_interactively(home: &std::path::Path) -> Result<String, Strin
 
 fn choose_item(prompt: &str, values: &[String], kind: &str) -> Result<String, String> {
     let answer = read_line(prompt).map_err(|e| e.to_string())?;
+    resolve_item(&answer, values, kind)
+}
+
+fn resolve_item(answer: &str, values: &[String], kind: &str) -> Result<String, String> {
+    if let Some(value) = values.iter().find(|value| value.as_str() == answer) {
+        return Ok(value.clone());
+    }
     let index: usize = answer
         .parse()
-        .map_err(|_| format!("invalid {kind} selection"))?;
+        .map_err(|_| format!("invalid {kind} selection: enter its number or exact name"))?;
     values
         .get(index.saturating_sub(1))
         .cloned()
@@ -594,7 +600,7 @@ async fn save_interactive_oauth(home: &std::path::Path, provider: &str) -> Resul
 }
 
 fn should_discover_provider_models(provider: &str) -> bool {
-    provider_spec(provider).is_none_or(|spec| spec.remote_catalog)
+    provider == "sensenova" || provider_spec(provider).is_none_or(|spec| spec.remote_catalog)
 }
 
 async fn discover_provider_models(
@@ -886,7 +892,7 @@ fn lato_home() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_exit_command, should_discover_provider_models};
+    use super::{is_exit_command, resolve_item, should_discover_provider_models};
 
     #[test]
     fn interactive_exit_commands_accept_plain_slash_and_case_variants() {
@@ -897,8 +903,18 @@ mod tests {
     }
 
     #[test]
-    fn static_compatibility_provider_skips_unverified_model_discovery() {
-        assert!(!should_discover_provider_models("sensenova"));
+    fn sensenova_uses_its_vendor_model_discovery_endpoint() {
+        assert!(should_discover_provider_models("sensenova"));
         assert!(should_discover_provider_models("minimax-cn"));
+    }
+
+    #[test]
+    fn model_choice_accepts_number_or_exact_model_id() {
+        let models = vec!["sensenova-6.8-flash-lite".to_string()];
+        assert_eq!(resolve_item("1", &models, "model").unwrap(), models[0]);
+        assert_eq!(
+            resolve_item("sensenova-6.8-flash-lite", &models, "model").unwrap(),
+            models[0]
+        );
     }
 }

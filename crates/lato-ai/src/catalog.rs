@@ -127,9 +127,9 @@ pub const CATALOG: &[Model] = &[
     },
     Model {
         provider: "sensenova",
-        id: "SenseNova-V6-5-Pro",
+        id: "sensenova-6.8-flash-lite",
         api: ModelApi::OpenaiCompletions,
-        base_url: Some("https://api.sensenova.cn/compatible-mode/v1"),
+        base_url: Some("https://token.sensenova.cn/v1"),
     },
     Model {
         provider: "mistral",
@@ -161,7 +161,7 @@ mod tests {
             ("zai-coding-cn", "glm-4.5", ModelApi::OpenaiCompletions),
             (
                 "sensenova",
-                "SenseNova-V6-5-Pro",
+                "sensenova-6.8-flash-lite",
                 ModelApi::OpenaiCompletions,
             ),
         ] {

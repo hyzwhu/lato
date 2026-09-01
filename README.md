@@ -54,9 +54,9 @@ Built-in China-region providers include:
 | `minimax` | Anthropic Messages, `https://api.minimax.io/anthropic` | `MINIMAX_API_KEY` |
 | `zai-coding-cn` | OpenAI Completions, `https://open.bigmodel.cn/api/coding/paas/v4` | `ZAI_CODING_CN_API_KEY` |
 | `zai` | OpenAI Completions, `https://api.z.ai/api/coding/paas/v4` | `ZAI_API_KEY` |
-| `sensenova` | OpenAI-compatible | `SENSENOVA_API_KEY` bearer token |
+| `sensenova` | OpenAI-compatible, `https://token.sensenova.cn/v1` | `SENSENOVA_API_KEY` bearer token |
 
-The first four definitions are Rust translations of the reference TypeScript provider factories. Their static catalog is overlaid by the reference-compatible remote catalog endpoint `/api/models/providers/{provider}` and persisted per provider in `~/.lato/models-store.json` with `checked_at`, `last_modified`, and `etag`; fresh cached catalogs are restored without network access. Lato does not blindly append `/models` to these providers. SenseNova is not defined by the reference registry and remains an explicit static compatibility provider; Lato does not call an unverified model-list endpoint for it. Accounts that expose only AK/SK must generate the platform bearer/JWT token first.
+The first four definitions are Rust translations of the reference TypeScript provider factories. Their static catalog is overlaid by the reference-compatible remote catalog endpoint `/api/models/providers/{provider}` and persisted per provider in `~/.lato/models-store.json` with `checked_at`, `last_modified`, and `etag`; fresh cached catalogs are restored without network access. Lato does not blindly append `/models` to these providers. SenseNova is not defined by the reference registry and remains an explicit compatibility provider based on its OpenAI SDK configuration. Lato sends the supplied token to `https://token.sensenova.cn/v1`, discovers models from `/models`, and samples from `/chat/completions`. This token API key is distinct from the legacy platform Access Key ID/Secret pair.
 
 ```bash
 export LATO_HOME="$HOME/.lato"

@@ -118,7 +118,7 @@ pub const API_KEY_PRESETS: &[ApiKeyPreset] = &[
     p(
         "sensenova",
         "SenseTime SenseNova",
-        Some("https://api.sensenova.cn/compatible-mode/v1"),
+        Some("https://token.sensenova.cn/v1"),
         &["SENSENOVA_API_KEY"],
     ),
     p(

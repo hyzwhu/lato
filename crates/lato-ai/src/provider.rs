@@ -53,12 +53,12 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         env: &["ZAI_CODING_CN_API_KEY"],
         remote_catalog: true,
     },
-    // SenseNova is not present in the reference provider registry. Keep it explicit and static
-    // instead of pretending that the reference catalog defines its protocol.
+    // SenseNova is not present in the reference provider registry. This explicit compatibility
+    // definition follows the provider's OpenAI SDK example and vendor model-list endpoint.
     ProviderSpec {
         id: "sensenova",
         name: "SenseTime SenseNova",
-        base_url: "https://api.sensenova.cn/compatible-mode/v1",
+        base_url: "https://token.sensenova.cn/v1",
         api: ModelApi::OpenaiCompletions,
         env: &["SENSENOVA_API_KEY"],
         remote_catalog: false,
@@ -300,6 +300,10 @@ mod tests {
         assert_eq!(zai.api, ModelApi::OpenaiCompletions);
         assert_eq!(zai.env, &["ZAI_CODING_CN_API_KEY"]);
         assert!(!provider_spec("sensenova").unwrap().remote_catalog);
+        assert_eq!(
+            provider_spec("sensenova").unwrap().base_url,
+            "https://token.sensenova.cn/v1"
+        );
     }
 
     #[tokio::test]
