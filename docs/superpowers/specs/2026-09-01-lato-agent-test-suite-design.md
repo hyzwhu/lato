@@ -23,6 +23,8 @@
 - [OpenAI：Introducing upgrades to Codex](https://openai.com/index/introducing-upgrades-to-codex/)：将沙箱、网络隔离、代码与数据外泄风险纳入 Coding Agent 的安全边界。
 - [Anthropic：Quantifying infrastructure noise in agentic coding evals](https://www.anthropic.com/engineering/infrastructure-noise)：固定并记录 CPU、内存、超时、网络和依赖缓存，避免把基础设施故障误判为 Agent 能力变化。
 
+最终用例必须优先由公开 benchmark 的具体 task/instance 派生，并保留 benchmark 名、原任务 ID 和直接链接。只有 Lato 的 CLI、Provider、ACP、批准、沙箱和会话契约可使用 `Lato-native` 用例；这些用例必须与外部来源型用例分开统计。
+
 ## 3. Lato 当前测试面
 
 根据当前代码结构，最终用例必须覆盖：
