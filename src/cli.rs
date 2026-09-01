@@ -1,3 +1,4 @@
+use lato::doctor::{self, DoctorDependencies, DoctorOptions, LiveProbe};
 use lato_agent::{ApprovalRequest, ToolApproval, default_fake_stream};
 use lato_ai::{
     AuthInteraction, AuthNotice, CATALOG, CredentialStore, CustomHttpModelStream, CustomModel,
@@ -20,6 +21,7 @@ use std::{
     io::{IsTerminal, Write},
     path::PathBuf,
     sync::Arc,
+    time::Duration,
 };
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -95,9 +97,12 @@ pub async fn run(args: Vec<String>) -> i32 {
     }
     if args.iter().any(|a| a == "--help" || a == "-h") {
         println!(
-            "usage: lato\n       lato -p [--ask] [--sandbox off|workspace|read-only] [--model provider/model] TEXT\n       lato acp\n       lato login PROVIDER (--api-key KEY|--oauth)\n\nRun without arguments for the interactive coding CLI."
+            "usage: lato\n       lato -p [--ask] [--sandbox off|workspace|read-only] [--model provider/model] TEXT\n       lato acp\n       lato login PROVIDER (--api-key KEY|--oauth)\n       lato doctor [--json] [--strict] [--live]\n\nRun without arguments for the interactive coding CLI."
         );
         return 0;
+    }
+    if args[0] == "doctor" {
+        return doctor_cmd(&args[1..]).await;
     }
     if args[0] == "acp" {
         return crate::stdio::run().await;
@@ -110,6 +115,75 @@ pub async fn run(args: Vec<String>) -> i32 {
     }
     eprintln!("error: unknown command");
     2
+}
+
+struct CatalogLiveProbe;
+
+#[async_trait::async_trait]
+impl LiveProbe for CatalogLiveProbe {
+    async fn probe(&self) -> Result<String, String> {
+        let count = CATALOG.len();
+        if count == 0 {
+            return Err("built-in catalog is empty".into());
+        }
+        let url = CATALOG
+            .iter()
+            .find_map(|model| model.base_url)
+            .ok_or_else(|| "built-in catalog has no endpoint".to_string())?;
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(4))
+            .build()
+            .map_err(|error| error.to_string())?;
+        let status = client
+            .get(url)
+            .send()
+            .await
+            .map_err(|error| error.to_string())?
+            .status();
+        Ok(format!(
+            "built-in catalog has {count} models; {url} returned {status}"
+        ))
+    }
+}
+
+async fn doctor_cmd(args: &[String]) -> i32 {
+    let mut json = false;
+    let mut strict = false;
+    let mut live = false;
+    for arg in args {
+        match arg.as_str() {
+            "--json" if !json => json = true,
+            "--strict" if !strict => strict = true,
+            "--live" if !live => live = true,
+            "--json" | "--strict" | "--live" => {
+                eprintln!("error: unknown command");
+                return 2;
+            }
+            _ => {
+                eprintln!("error: unknown command");
+                return 2;
+            }
+        }
+    }
+    let workspace = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let deps = DoctorDependencies {
+        home: lato_home(),
+        workspace,
+        live_probe: Arc::new(CatalogLiveProbe),
+    };
+    let report = doctor::run(DoctorOptions { live }, &deps).await;
+    if json {
+        match serde_json::to_string_pretty(&report) {
+            Ok(body) => println!("{body}"),
+            Err(error) => {
+                eprintln!("error: {error}");
+                return 1;
+            }
+        }
+    } else {
+        println!("{}", doctor::render_human(&report));
+    }
+    doctor::exit_code(&report, strict)
 }
 
 async fn prompt(args: &[String]) -> i32 {

@@ -35,6 +35,17 @@ Interactive commands:
 
 The line editor persists history in `~/.lato/history`; Up/Down navigate it and Tab completes slash commands. Enter `exit`, `quit`, `/exit`, or `/quit` to leave; Ctrl-C exits both at the input prompt and while a model is streaming. Selecting a provider with an existing credential offers to reuse it, replace its API key, or re-run OAuth. `/login` always replaces the current provider credential and immediately rebuilds the model client in a fresh conversation. The workspace starts untrusted. Mutating tool calls display their name and arguments and request approval exactly at the execution boundary. You can instead trust the workspace for the process or use `/approve` to pre-authorize one call.
 
+## Doctor
+
+```bash
+lato doctor
+lato doctor --json
+lato doctor --strict
+lato doctor --live
+```
+
+Default `lato doctor` is offline: it does not contact providers or submit a prompt completion. It reports binary/platform, Lato home, config parsing, selected-model catalog presence, credential presence (not values), ToolCatalog construction, a fixed PolicyEngine self-test, sandbox readiness, and project/plugin trust. `--json` prints a `schema_version: 1` report on stdout. Warnings keep exit status 0; errors return 1. `--strict` upgrades warnings to failure. `--live` is the only Doctor mode allowed to use the network; it runs a bounded catalog/connectivity probe and does not submit an ordinary prompt completion.
+
 ## Headless CLI smoke test
 
 The default phase fixture is offline and does not require a credential:
@@ -126,9 +137,11 @@ Copied or structurally derived upstream code is pinned in
 
 - Headless `-p` uses process-local workspace trust and `approval_mode=always`; deny rules still apply.
 - Interactive sessions default to `ask` and mutating tools require an explicit approval token.
-- Shell sandbox profiles are `off`, `workspace`, and `read-only`. A missing wrapper fails closed.
+- Approvals are bound to an exact-call fingerprint (canonical tool identity, arguments, capabilities, side effect, sandbox obligation, and call IDs). Grants are short-lived, single-use, and cannot be replayed.
+- Shell sandbox profiles are `off`, `workspace`, and `read-only`. A missing or unusable wrapper fails closed and never degrades into unsandboxed process execution.
 - File reads/edits execute in the host; only shell commands enter the OS sandbox.
 - Project plugin hooks and MCP processes remain disabled until the project is trusted.
 - `web_fetch` rejects loopback, private, link-local, and non-HTTP(S) destinations.
+- Doctor output is redacted; credential values and seeded secrets must not appear in human or JSON reports.
 
 See `docs/superpowers/specs/2026-08-31-lato-acceptance.md` for the authoritative acceptance matrix. LIVE provider and subscription tests require real credentials and are not run in PR CI.

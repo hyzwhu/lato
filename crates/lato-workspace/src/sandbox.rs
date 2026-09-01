@@ -101,15 +101,14 @@ impl SandboxBackend for HostSandboxBackend {
         command: &str,
     ) -> Result<SandboxCommand, SandboxError> {
         validate_host_obligation(obligation)?;
-        if obligation.profile != SandboxProfile::Off {
-            if let Some(wrapper) = &self.wrapper_override {
-                if !wrapper.is_file() {
-                    return Err(SandboxError::unavailable(format!(
-                        "sandbox wrapper unavailable: {}",
-                        wrapper.display()
-                    )));
-                }
-            }
+        if obligation.profile != SandboxProfile::Off
+            && let Some(wrapper) = &self.wrapper_override
+            && !wrapper.is_file()
+        {
+            return Err(SandboxError::unavailable(format!(
+                "sandbox wrapper unavailable: {}",
+                wrapper.display()
+            )));
         }
         wrap_shell_command_with(
             obligation.profile,

@@ -6,11 +6,21 @@ use lato::doctor::{
 use lato_ai::CredentialStore;
 use std::{
     ffi::OsString,
+    path::Path,
+    process::Output,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
 };
+
+fn lato(args: &[&str], home: &Path) -> Output {
+    std::process::Command::new(env!("CARGO_BIN_EXE_lato"))
+        .args(args)
+        .env("LATO_HOME", home)
+        .output()
+        .unwrap()
+}
 
 const SECRET: &str = "doctor-super-secret-7319";
 
@@ -103,14 +113,7 @@ async fn default_doctor_is_offline_and_redacts_seeded_secrets() {
         workspace: workspace.path().to_path_buf(),
         live_probe: probe.clone(),
     };
-    let report = run(
-        DoctorOptions {
-            live: false,
-            ..DoctorOptions::default()
-        },
-        &deps,
-    )
-    .await;
+    let report = run(DoctorOptions { live: false }, &deps).await;
     let human = render_human(&report);
     let json = serde_json::to_string(&report).unwrap();
 
@@ -152,4 +155,68 @@ fn exit_code_keeps_warnings_at_zero_unless_strict() {
     };
     assert_eq!(exit_code(&error, false), 1);
     assert_eq!(exit_code(&error, true), 1);
+}
+
+#[test]
+fn doctor_json_reports_schema_version_and_tool_catalog() {
+    let home = tempfile::tempdir().unwrap();
+    let output = lato(&["doctor", "--json"], home.path());
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["schema_version"], 1);
+    assert!(
+        report["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["id"] == "tool_catalog")
+    );
+}
+
+#[test]
+fn doctor_unknown_flags_return_two() {
+    let home = tempfile::tempdir().unwrap();
+    let unknown = lato(&["doctor", "--unknown"], home.path());
+    assert_eq!(unknown.status.code(), Some(2));
+    let duplicate = lato(&["doctor", "--json", "--json"], home.path());
+    assert_eq!(duplicate.status.code(), Some(2));
+}
+
+#[test]
+fn doctor_warnings_are_zero_unless_strict() {
+    let home = tempfile::tempdir().unwrap();
+    let ordinary = lato(&["doctor"], home.path());
+    assert_eq!(
+        ordinary.status.code(),
+        Some(0),
+        "stderr={}",
+        String::from_utf8_lossy(&ordinary.stderr)
+    );
+    let strict = lato(&["doctor", "--strict"], home.path());
+    assert_eq!(
+        strict.status.code(),
+        Some(1),
+        "stderr={}",
+        String::from_utf8_lossy(&strict.stderr)
+    );
+}
+
+#[test]
+fn help_lists_all_four_doctor_forms() {
+    let home = tempfile::tempdir().unwrap();
+    let output = lato(&["--help"], home.path());
+    assert!(output.status.success());
+    let help = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        help.contains("lato doctor [--json] [--strict] [--live]"),
+        "help={help}"
+    );
+    assert!(help.contains("lato doctor"));
+    assert!(help.contains("--json"));
+    assert!(help.contains("--strict"));
+    assert!(help.contains("--live"));
 }
