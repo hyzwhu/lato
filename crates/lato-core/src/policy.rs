@@ -16,9 +16,10 @@ pub struct ApprovalFingerprint(pub String);
 #[serde(transparent)]
 pub struct GrantId(pub u64);
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum SandboxProfile {
+    #[default]
     Off,
     Workspace,
     ReadOnly,

@@ -52,31 +52,43 @@ impl Tool for LegacyDispatchTool {
             .execution_grant
             .as_ref()
             .ok_or_else(|| tool_error("policy.grant_missing", "tool execution grant is missing"))?;
-        let content = if self.legacy_name == "write_file" {
-            if matches!(
-                self.descriptor.side_effect,
-                SideEffect::WorkspaceMutation | SideEffect::ExternalMutation
-            ) {
-                self.environment.trust.allow_once();
+        let content = match self.legacy_name.as_str() {
+            "write_file" => {
+                if matches!(
+                    self.descriptor.side_effect,
+                    SideEffect::WorkspaceMutation | SideEffect::ExternalMutation
+                ) {
+                    self.environment.trust.allow_once();
+                }
+                invoke_compat_write_file(&self.environment, grant, &arguments).await
             }
-            invoke_compat_write_file(&self.environment, grant, &arguments).await
-        } else {
-            if matches!(
-                self.descriptor.side_effect,
-                SideEffect::WorkspaceMutation | SideEffect::ExternalMutation
-            ) {
-                self.environment.trust.allow_once();
+            "run_terminal_command" => {
+                if matches!(
+                    self.descriptor.side_effect,
+                    SideEffect::WorkspaceMutation | SideEffect::ExternalMutation
+                ) {
+                    self.environment.trust.allow_once();
+                }
+                invoke_compat_run_terminal(&self.environment, grant, &arguments).await
             }
-            dispatch(
-                &self.environment.locks,
-                &self.environment.trust,
-                &self.environment.cwd,
-                ToolCall {
-                    name: self.legacy_name.clone(),
-                    arguments,
-                },
-            )
-            .await
+            _ => {
+                if matches!(
+                    self.descriptor.side_effect,
+                    SideEffect::WorkspaceMutation | SideEffect::ExternalMutation
+                ) {
+                    self.environment.trust.allow_once();
+                }
+                dispatch(
+                    &self.environment.locks,
+                    &self.environment.trust,
+                    &self.environment.cwd,
+                    ToolCall {
+                        name: self.legacy_name.clone(),
+                        arguments,
+                    },
+                )
+                .await
+            }
         }
         .map_err(classify_legacy_error)?;
         if context.cancellation.is_cancelled() {
@@ -128,6 +140,20 @@ async fn invoke_compat_write_file(
         .await
         .map_err(|error| error.to_string())?;
     Ok("ok".into())
+}
+
+async fn invoke_compat_run_terminal(
+    environment: &BuiltinToolEnvironment,
+    grant: &ExecutionGrant,
+    arguments: &Value,
+) -> Result<String, String> {
+    let cmd = arguments
+        .get("cmd")
+        .or_else(|| arguments.get("command"))
+        .and_then(Value::as_str)
+        .ok_or("missing command")?;
+    require_compat_mutating_approval(&environment.trust)?;
+    crate::run_terminal_command_with_obligation(cmd, &environment.cwd, &grant.sandbox).await
 }
 
 fn validate_write_obligation(obligation: &SandboxObligation, path: &Path) -> Result<(), String> {
@@ -396,12 +422,25 @@ fn metadata(name: &str) -> Result<ToolMetadata, BuiltinAdapterError> {
 fn classify_legacy_error(message: String) -> ToolError {
     let code = if message.starts_with("missing ") {
         "tool.invalid_arguments"
+    } else if let Some(code) = sandbox_error_code(&message) {
+        code
     } else if message.contains("permission required") || message.contains("denied by") {
         "tool.policy_denied"
     } else {
         "tool.execution_failed"
     };
     tool_error(code, message)
+}
+
+fn sandbox_error_code(message: &str) -> Option<&'static str> {
+    const CODES: [&str; 3] = [
+        "sandbox.unavailable",
+        "sandbox.unsupported",
+        "sandbox.preparation_failed",
+    ];
+    CODES
+        .into_iter()
+        .find(|code| message.starts_with(code) || message.contains(code))
 }
 
 fn tool_error(code: &str, message: impl Into<String>) -> ToolError {

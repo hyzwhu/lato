@@ -1,4 +1,7 @@
-use lato_workspace::{SandboxProfile, wrap_shell_command};
+use lato_core::SandboxObligation;
+use lato_workspace::{
+    HostSandboxBackend, SandboxBackend, SandboxCommand, SandboxProfile, wrap_shell_command,
+};
 use std::path::Path;
 
 pub async fn run_terminal_command(cmd: &str, cwd: &Path) -> Result<String, String> {
@@ -15,9 +18,43 @@ pub async fn run_terminal_command_sandboxed(
         return run_windows_restricted(cmd, cwd, profile).await;
     }
     let wrapped = wrap_shell_command(profile, cwd, cmd)?;
-    let out = tokio::process::Command::new(&wrapped.program)
-        .args(&wrapped.args)
-        .current_dir(cwd)
+    spawn_wrapped(wrapped, cwd, None).await
+}
+
+pub async fn run_terminal_command_with_obligation(
+    cmd: &str,
+    cwd: &Path,
+    obligation: &SandboxObligation,
+) -> Result<String, String> {
+    run_terminal_command_with_backend(cmd, cwd, obligation, &HostSandboxBackend::new()).await
+}
+
+pub async fn run_terminal_command_with_backend(
+    cmd: &str,
+    cwd: &Path,
+    obligation: &SandboxObligation,
+    backend: &dyn SandboxBackend,
+) -> Result<String, String> {
+    let wrapped = backend
+        .prepare(obligation, cmd)
+        .map_err(|error| format!("{}: {error}", error.code()))?;
+    spawn_wrapped(wrapped, cwd, Some(obligation)).await
+}
+
+async fn spawn_wrapped(
+    wrapped: SandboxCommand,
+    cwd: &Path,
+    obligation: Option<&SandboxObligation>,
+) -> Result<String, String> {
+    let mut command = tokio::process::Command::new(&wrapped.program);
+    command.args(&wrapped.args).current_dir(cwd);
+    if let Some(obligation) = obligation {
+        command.env_clear();
+        for (key, value) in child_environment(obligation) {
+            command.env(key, value);
+        }
+    }
+    let out = command
         .output()
         .await
         .map_err(|e| format!("sandbox launch failed: {e}"))?;
@@ -29,6 +66,62 @@ pub async fn run_terminal_command_sandboxed(
     } else {
         Err(format!("command failed ({:?}): {s}", out.status.code()))
     }
+}
+
+fn child_environment(obligation: &SandboxObligation) -> Vec<(String, String)> {
+    std::env::vars()
+        .filter(|(key, _)| is_allowed_env(key, &obligation.environment.allowed_keys))
+        .collect()
+}
+
+fn is_allowed_env(name: &str, extra: &[String]) -> bool {
+    if is_secret_env_name(name) {
+        return false;
+    }
+    const SAFE_ENV_KEYS: &[&str] = &[
+        "PATH",
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "TMPDIR",
+        "TEMP",
+        "TMP",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "TERM",
+        "SHELL",
+        "TZ",
+        "PWD",
+        "SystemRoot",
+        "SYSTEMROOT",
+        "windir",
+        "WINDIR",
+        "COMSPEC",
+        "ComSpec",
+        "PATHEXT",
+        "USERPROFILE",
+        "USERNAME",
+        "HOMEDRIVE",
+        "HOMEPATH",
+        "OS",
+        "SystemDrive",
+    ];
+    SAFE_ENV_KEYS
+        .iter()
+        .any(|key| key.eq_ignore_ascii_case(name))
+        || extra
+            .iter()
+            .any(|key| key.eq_ignore_ascii_case(name) && !is_secret_env_name(key))
+}
+
+fn is_secret_env_name(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    upper.contains("TOKEN")
+        || upper.contains("SECRET")
+        || upper.contains("PASSWORD")
+        || upper.contains("API_KEY")
+        || upper.contains("AUTHORIZATION")
 }
 
 #[cfg(windows)]
