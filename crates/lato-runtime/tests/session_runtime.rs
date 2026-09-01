@@ -5,7 +5,10 @@ use lato_core::{
 use lato_runtime::{TurnControl, TurnDriver, TurnEventEmitter, TurnRequest, spawn_session};
 use std::{
     future::pending,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 use tokio::sync::oneshot;
 use tokio::time::{Duration, timeout};
@@ -43,6 +46,57 @@ impl TurnDriver for BlockingDriver {
                 final_text: format!("steered:{}", steer.expect("steering channel closed").text),
             }),
         }
+    }
+}
+
+struct StaleEventDriver {
+    runs: AtomicUsize,
+    first_emitter_tx: Mutex<Option<oneshot::Sender<TurnEventEmitter>>>,
+}
+
+#[async_trait]
+impl TurnDriver for StaleEventDriver {
+    async fn run(
+        &self,
+        _request: TurnRequest,
+        mut control: TurnControl,
+        events: TurnEventEmitter,
+    ) -> Result<TurnOutput, lato_core::AgentError> {
+        if self.runs.fetch_add(1, Ordering::SeqCst) == 0 {
+            let sent = self
+                .first_emitter_tx
+                .lock()
+                .expect("first emitter mutex poisoned")
+                .take()
+                .expect("first emitter sender already taken")
+                .send(events);
+            assert!(sent.is_ok(), "first emitter receiver closed");
+        }
+        tokio::select! {
+            _ = control.cancellation.cancelled() => Ok(TurnOutput { final_text: String::new() }),
+            steer = control.steering.recv() => Ok(TurnOutput {
+                final_text: format!("steered:{}", steer.expect("steering channel closed").text),
+            }),
+        }
+    }
+}
+
+struct BurstDriver;
+
+#[async_trait]
+impl TurnDriver for BurstDriver {
+    async fn run(
+        &self,
+        _request: TurnRequest,
+        _control: TurnControl,
+        events: TurnEventEmitter,
+    ) -> Result<TurnOutput, lato_core::AgentError> {
+        for index in 0..300 {
+            events.model_delta(format!("delta-{index}"))?;
+        }
+        Ok(TurnOutput {
+            final_text: "done".into(),
+        })
     }
 }
 
@@ -277,4 +331,175 @@ async fn dropping_the_last_handle_aborts_the_driver_and_closes_its_event_bus() {
         .model_delta("after shutdown")
         .expect_err("closed runtime event bus should reject driver events");
     assert_eq!(error.code, "runtime.event_bus_closed");
+}
+
+#[tokio::test]
+async fn reject_mode_does_not_start_a_second_turn() {
+    let session = spawn_session("session-reject".into(), Arc::new(BlockingDriver));
+    session
+        .submit(Command::StartTurn(StartTurn {
+            input: UserInput::text("first"),
+            behavior: StartBehavior::Reject,
+        }))
+        .await
+        .unwrap();
+    let error = session
+        .submit(Command::StartTurn(StartTurn {
+            input: UserInput::text("second"),
+            behavior: StartBehavior::Reject,
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "runtime.invalid_transition");
+}
+
+#[tokio::test]
+async fn cancel_targets_the_active_turn_and_emits_user_reason() {
+    let session = spawn_session("session-cancel".into(), Arc::new(BlockingDriver));
+    let mut events = session.subscribe();
+    session
+        .submit(Command::StartTurn(StartTurn {
+            input: UserInput::text("wait"),
+            behavior: StartBehavior::Reject,
+        }))
+        .await
+        .unwrap();
+    let started = next_event(&mut events).await;
+    let turn_started = next_event(&mut events).await;
+    let turn_id = turn_started.turn_id.unwrap();
+    assert!(matches!(started.payload, EventPayload::SessionStarted));
+    session
+        .submit(Command::CancelTurn { turn_id })
+        .await
+        .unwrap();
+    assert_eq!(
+        next_event(&mut events).await.payload,
+        EventPayload::TurnCancelled {
+            reason: CancelReason::User,
+        },
+    );
+}
+
+#[tokio::test]
+async fn shutdown_stops_the_session_and_rejects_future_commands() {
+    let session = spawn_session("session-stop".into(), Arc::new(BlockingDriver));
+    let mut events = session.subscribe();
+    session
+        .submit(Command::StartTurn(StartTurn {
+            input: UserInput::text("wait"),
+            behavior: StartBehavior::Reject,
+        }))
+        .await
+        .unwrap();
+    assert!(matches!(
+        next_event(&mut events).await.payload,
+        EventPayload::SessionStarted
+    ));
+    assert!(matches!(
+        next_event(&mut events).await.payload,
+        EventPayload::TurnStarted
+    ));
+    session.submit(Command::Shutdown).await.unwrap();
+    assert_eq!(
+        next_event(&mut events).await.payload,
+        EventPayload::TurnCancelled {
+            reason: CancelReason::Shutdown,
+        },
+    );
+    assert!(matches!(
+        next_event(&mut events).await.payload,
+        EventPayload::SessionStopped
+    ));
+    let error = session
+        .submit(Command::StartTurn(StartTurn {
+            input: UserInput::text("after stop"),
+            behavior: StartBehavior::Reject,
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "runtime.command_bus_closed");
+}
+
+#[tokio::test]
+async fn stale_driver_events_from_a_replaced_turn_are_ignored() {
+    let (first_emitter_tx, first_emitter_rx) = oneshot::channel();
+    let driver = StaleEventDriver {
+        runs: AtomicUsize::new(0),
+        first_emitter_tx: Mutex::new(Some(first_emitter_tx)),
+    };
+    let session = spawn_session("session-stale".into(), Arc::new(driver));
+    let mut events = session.subscribe();
+    session
+        .submit(Command::StartTurn(StartTurn {
+            input: UserInput::text("first"),
+            behavior: StartBehavior::Reject,
+        }))
+        .await
+        .unwrap();
+    let stale_emitter = timeout(Duration::from_secs(1), first_emitter_rx)
+        .await
+        .expect("first driver did not expose its emitter")
+        .expect("first driver dropped its emitter sender");
+    session
+        .submit(Command::StartTurn(StartTurn {
+            input: UserInput::text("second"),
+            behavior: StartBehavior::Replace,
+        }))
+        .await
+        .unwrap();
+
+    loop {
+        let event = next_event(&mut events).await;
+        if matches!(event.payload, EventPayload::TurnStarted) && event.sequence > 2 {
+            break;
+        }
+    }
+    stale_emitter
+        .model_delta("stale")
+        .expect("session should still accept driver messages");
+    session
+        .submit(Command::SteerTurn(UserInput::text("finish")))
+        .await
+        .unwrap();
+
+    loop {
+        match next_event(&mut events).await.payload {
+            EventPayload::ModelDelta { text } => panic!("stale event leaked: {text}"),
+            EventPayload::TurnCompleted(output) => {
+                assert_eq!(output.final_text, "steered:finish");
+                break;
+            }
+            _ => {}
+        }
+    }
+}
+
+#[tokio::test]
+async fn slow_subscribers_observe_bounded_event_lag() {
+    let session = spawn_session("session-lag".into(), Arc::new(BurstDriver));
+    let mut lagged_events = session.subscribe();
+    let mut completion_events = session.subscribe();
+    session
+        .submit(Command::StartTurn(StartTurn {
+            input: UserInput::text("burst"),
+            behavior: StartBehavior::Reject,
+        }))
+        .await
+        .unwrap();
+
+    loop {
+        let event = next_event(&mut completion_events).await;
+        if matches!(event.payload, EventPayload::TurnCompleted(_)) {
+            break;
+        }
+    }
+
+    let lagged = timeout(Duration::from_secs(1), lagged_events.recv())
+        .await
+        .expect("lag check timed out")
+        .expect_err("slow subscriber should receive a bounded lag signal");
+    assert!(matches!(
+        lagged,
+        tokio::sync::broadcast::error::RecvError::Lagged(skipped) if skipped > 0
+    ));
 }
