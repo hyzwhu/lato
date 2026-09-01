@@ -94,21 +94,16 @@ impl PolicyEngine {
         &self,
         grant: &ExecutionGrant,
         expected: &lato_core::ApprovalFingerprint,
+        request: &PolicyRequest,
     ) -> Result<(), PolicyError> {
         self.ledger
             .consume(grant, expected)
             .map_err(PolicyError::Approval)?;
-        self.sink.emit(PolicyEvent {
-            kind: PolicyEventKind::ApprovalConsumed,
-            session_id: None,
-            turn_id: None,
-            call_id: None,
-            tool_name: None,
-            argument_digest: Some(expected.0.clone()),
-            code: Some("allow".into()),
-            elapsed_ms: None,
-            output_bytes: None,
-        });
+        self.sink.emit(event(
+            PolicyEventKind::ApprovalConsumed,
+            request,
+            Some("allow".into()),
+        ));
         Ok(())
     }
 

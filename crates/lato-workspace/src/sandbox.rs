@@ -88,6 +88,13 @@ impl SandboxBackend for HostSandboxBackend {
                 SandboxReadiness::Unavailable
             };
         }
+        #[cfg(windows)]
+        {
+            // Production Windows non-Off prepare reports sandbox.unsupported
+            // (Restricted Token executor is not wired into this backend).
+            return SandboxReadiness::Unsupported;
+        }
+        #[cfg(not(windows))]
         if default_wrapper().is_file() {
             platform_readiness()
         } else {
@@ -131,6 +138,7 @@ fn platform_readiness() -> SandboxReadiness {
     }
 }
 
+#[cfg(not(windows))]
 fn default_wrapper() -> PathBuf {
     #[cfg(target_os = "macos")]
     {

@@ -103,6 +103,43 @@ async fn missing_wrapper_does_not_execute_workspace_command() {
 }
 
 #[tokio::test]
+async fn read_only_grant_cannot_search_replace_a_file_into_existence() {
+    let workspace = tempfile::tempdir().unwrap();
+    let policy = Arc::new(PolicyEngine::new(Arc::new(ApprovalLedger::new(
+        Duration::from_secs(60),
+    ))));
+    let mut builder = ToolRuntimeBuilder::new(
+        policy,
+        PolicyScope {
+            workspace_root: workspace.path().to_path_buf(),
+            mode: PolicyMode::Always,
+            project_trusted: true,
+            sandbox_profile: SandboxProfile::ReadOnly,
+        },
+    );
+    builder
+        .register_builtin_tools(BuiltinToolEnvironment {
+            cwd: workspace.path().to_path_buf(),
+            locks: Arc::new(FileLocks::new()),
+            trust: SessionTrust::for_headless_prompt(workspace.path()),
+        })
+        .unwrap();
+    let runtime = builder.build().unwrap();
+    let created = workspace.path().join("created.txt");
+    let error = runtime
+        .invoke(
+            context(),
+            "search_replace",
+            json!({"path": "created.txt", "old": "old", "new": "new"}),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "tool.policy_denied");
+    assert!(error.message.contains("read-only"), "{}", error.message);
+    assert!(!created.exists());
+}
+
+#[tokio::test]
 async fn process_tool_consumes_grant_sandbox_not_session_trust() {
     let workspace = tempfile::tempdir().unwrap();
     let mut trust = SessionTrust::for_headless_prompt(workspace.path());

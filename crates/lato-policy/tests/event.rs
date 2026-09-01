@@ -138,7 +138,7 @@ fn engine_emits_evaluated_requested_consumed_and_denied_without_raw_arguments() 
     };
     let grant = engine.approve(&approval).unwrap();
     engine
-        .consume(&grant, &approval_fingerprint(&write).unwrap())
+        .consume(&grant, &approval_fingerprint(&write).unwrap(), &write)
         .unwrap();
 
     let denied = request(
@@ -158,6 +158,35 @@ fn engine_emits_evaluated_requested_consumed_and_denied_without_raw_arguments() 
     assert!(kinds.contains(&PolicyEventKind::ApprovalRequested));
     assert!(kinds.contains(&PolicyEventKind::ApprovalConsumed));
     assert!(kinds.contains(&PolicyEventKind::Denied));
+
+    let consumed = events
+        .iter()
+        .find(|event| event.kind == PolicyEventKind::ApprovalConsumed)
+        .unwrap();
+    assert_eq!(
+        consumed.session_id.as_ref().map(SessionId::as_str),
+        Some("session-1")
+    );
+    assert_eq!(
+        consumed.turn_id.as_ref().map(TurnId::as_str),
+        Some("turn-1")
+    );
+    assert_eq!(
+        consumed.call_id.as_ref().map(ToolCallId::as_str),
+        Some("call-1")
+    );
+    assert_eq!(
+        consumed.tool_name.as_ref().map(ToolName::as_str),
+        Some("builtin:test")
+    );
+    assert_eq!(
+        consumed.argument_digest.as_deref(),
+        Some(write.arguments_digest.as_str())
+    );
+    assert_ne!(
+        consumed.argument_digest.as_deref(),
+        Some(grant.fingerprint.0.as_str())
+    );
 
     let denied_event = events
         .iter()

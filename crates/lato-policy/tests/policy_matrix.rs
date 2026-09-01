@@ -93,9 +93,9 @@ fn always_and_auto_issue_internal_grants_for_mutation() {
             panic!("{mode:?} must issue an automatic execution grant");
         };
         let expected = approval_fingerprint(&request).unwrap();
-        assert_eq!(engine.consume(&grant, &expected), Ok(()));
+        assert_eq!(engine.consume(&grant, &expected, &request), Ok(()));
         assert_eq!(
-            engine.consume(&grant, &expected),
+            engine.consume(&grant, &expected, &request),
             Err(PolicyError::Approval(
                 lato_policy::ApprovalError::ConsumedOrMissing
             ))
@@ -181,7 +181,7 @@ fn approve_recomputes_the_fingerprint_and_rejects_tampering() {
     let grant = engine.approve(&approval).unwrap();
     let expected = approval_fingerprint(&original_request).unwrap();
     assert_eq!(grant.fingerprint, expected);
-    assert_eq!(engine.consume(&grant, &expected), Ok(()));
+    assert_eq!(engine.consume(&grant, &expected, &original_request), Ok(()));
 }
 
 #[test]

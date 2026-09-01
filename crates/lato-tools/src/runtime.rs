@@ -270,7 +270,7 @@ impl ToolRuntime {
             ));
         }
         self.policy
-            .consume(&grant, &prepared.fingerprint)
+            .consume(&grant, &prepared.fingerprint, &prepared.request)
             .map_err(policy_engine_error)?;
         if prepared.context.cancellation.is_cancelled() {
             let error = ToolError::new(

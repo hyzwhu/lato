@@ -1,4 +1,4 @@
-use crate::{ToolCall, dispatch, v1_tool_definitions};
+use crate::{ToolCall, create_subagent_worktree, dispatch, search_replace, v1_tool_definitions};
 use async_trait::async_trait;
 use lato_core::{
     ExecutionGrant, Retryability, SandboxObligation, SandboxProfile, SideEffect, Tool,
@@ -61,6 +61,24 @@ impl Tool for LegacyDispatchTool {
                     self.environment.trust.allow_once();
                 }
                 invoke_compat_write_file(&self.environment, grant, &arguments).await
+            }
+            "search_replace" => {
+                if matches!(
+                    self.descriptor.side_effect,
+                    SideEffect::WorkspaceMutation | SideEffect::ExternalMutation
+                ) {
+                    self.environment.trust.allow_once();
+                }
+                invoke_compat_search_replace(&self.environment, grant, &arguments).await
+            }
+            "spawn_subagent" => {
+                if matches!(
+                    self.descriptor.side_effect,
+                    SideEffect::WorkspaceMutation | SideEffect::ExternalMutation
+                ) {
+                    self.environment.trust.allow_once();
+                }
+                invoke_compat_spawn_subagent(&self.environment, grant, &arguments).await
             }
             "run_terminal_command" => {
                 if matches!(
@@ -140,6 +158,60 @@ async fn invoke_compat_write_file(
         .await
         .map_err(|error| error.to_string())?;
     Ok("ok".into())
+}
+
+async fn invoke_compat_search_replace(
+    environment: &BuiltinToolEnvironment,
+    grant: &ExecutionGrant,
+    arguments: &Value,
+) -> Result<String, String> {
+    let raw_path = arguments
+        .get("path")
+        .and_then(Value::as_str)
+        .ok_or("missing path")?;
+    let path = PathBuf::from(raw_path);
+    let path = if path.is_absolute() {
+        path
+    } else {
+        environment.cwd.join(path)
+    };
+    if deny_write(&path) {
+        return Err("denied by write policy".into());
+    }
+    let obligation = &grant.sandbox;
+    validate_write_obligation(obligation, &path)?;
+    require_compat_mutating_approval(&environment.trust)?;
+    let old = arguments
+        .get("old")
+        .or_else(|| arguments.get("oldText"))
+        .and_then(Value::as_str)
+        .ok_or("missing old")?;
+    let new = arguments
+        .get("new")
+        .or_else(|| arguments.get("newText"))
+        .and_then(Value::as_str)
+        .ok_or("missing new")?;
+    search_replace(&environment.locks, &path, old, new)
+        .await
+        .map(|_| "ok".into())
+}
+
+async fn invoke_compat_spawn_subagent(
+    environment: &BuiltinToolEnvironment,
+    grant: &ExecutionGrant,
+    arguments: &Value,
+) -> Result<String, String> {
+    let session_id = arguments
+        .get("session_id")
+        .or_else(|| arguments.get("sessionId"))
+        .and_then(Value::as_str)
+        .ok_or("missing session_id")?;
+    let root = environment.cwd.join(".lato/worktrees");
+    let path = root.join(session_id);
+    validate_write_obligation(&grant.sandbox, &path)?;
+    require_compat_mutating_approval(&environment.trust)?;
+    let worktree = create_subagent_worktree(&environment.cwd, &root, session_id).await?;
+    Ok(serde_json::json!({"worktree": worktree.path, "branch": worktree.branch}).to_string())
 }
 
 async fn invoke_compat_run_terminal(
@@ -438,11 +510,41 @@ fn sandbox_error_code(message: &str) -> Option<&'static str> {
         "sandbox.unsupported",
         "sandbox.preparation_failed",
     ];
-    CODES
-        .into_iter()
-        .find(|code| message.starts_with(code) || message.contains(code))
+    CODES.into_iter().find(|code| {
+        message
+            .strip_prefix(code)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with(':') || rest.starts_with(' '))
+    })
 }
 
 fn tool_error(code: &str, message: impl Into<String>) -> ToolError {
     ToolError::new(code, message, Retryability::Never)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sandbox_error_code_uses_structured_prefixes_not_command_output() {
+        assert_eq!(
+            sandbox_error_code("sandbox.unavailable: wrapper missing"),
+            Some("sandbox.unavailable")
+        );
+        assert_eq!(
+            sandbox_error_code("sandbox.unsupported: windows Restricted Token"),
+            Some("sandbox.unsupported")
+        );
+        assert_eq!(
+            sandbox_error_code("sandbox.preparation_failed: policy compile"),
+            Some("sandbox.preparation_failed")
+        );
+        assert_eq!(
+            classify_legacy_error(
+                "command failed (1): the process printed sandbox.unavailable in stdout".into()
+            )
+            .code,
+            "tool.execution_failed"
+        );
+    }
 }

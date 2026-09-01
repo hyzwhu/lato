@@ -11,6 +11,32 @@ fn missing_wrapper_backend() -> HostSandboxBackend {
 }
 
 #[test]
+fn production_windows_non_off_readiness_matches_prepare_unsupported() {
+    let temp = tempfile::tempdir().unwrap();
+    let backend = HostSandboxBackend::new();
+    let readiness = backend.readiness(SandboxProfile::Workspace);
+    let prepare = backend.prepare(&workspace_obligation(temp.path()), "echo forbidden");
+    #[cfg(windows)]
+    {
+        assert_eq!(readiness, SandboxReadiness::Unsupported);
+        assert_eq!(prepare.unwrap_err().code(), "sandbox.unsupported");
+        assert!(!temp.path().join("forbidden").exists());
+    }
+    #[cfg(not(windows))]
+    match readiness {
+        SandboxReadiness::Ready => {
+            let _ = prepare;
+        }
+        SandboxReadiness::Unavailable => {
+            assert_eq!(prepare.unwrap_err().code(), "sandbox.unavailable");
+        }
+        SandboxReadiness::Unsupported => {
+            assert_eq!(prepare.unwrap_err().code(), "sandbox.unsupported");
+        }
+    }
+}
+
+#[test]
 fn missing_wrapper_is_unavailable_and_does_not_run() {
     let temp = tempfile::tempdir().unwrap();
     let backend = missing_wrapper_backend();
