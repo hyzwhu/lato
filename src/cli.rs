@@ -274,8 +274,9 @@ async fn interactive() -> i32 {
         let input = match editor.readline("lato> ") {
             Ok(input) => input.trim().to_string(),
             Err(ReadlineError::Interrupted) => {
-                println!("^C");
-                continue;
+                let _ = editor.save_history(&history_path);
+                println!("^C\nGoodbye.");
+                return 0;
             }
             Err(ReadlineError::Eof) => {
                 let _ = editor.save_history(&history_path);
@@ -293,7 +294,7 @@ async fn interactive() -> i32 {
         let _ = editor.add_history_entry(input.as_str());
         let _ = editor.save_history(&history_path);
         match input.as_str() {
-            "/exit" | "/quit" => {
+            command if is_exit_command(command) => {
                 println!("Goodbye.");
                 return 0;
             }
@@ -380,27 +381,37 @@ async fn interactive() -> i32 {
         }
         print!("Lato: ");
         let _ = std::io::stdout().flush();
-        let mut streamed = false;
-        let result = client
-            .send_streaming(input, |event| {
-                if let Some(delta) = event
-                    .pointer("/params/delta")
+        let streamed = std::cell::Cell::new(false);
+        let response = client.send_streaming(input, |event| {
+            if let Some(delta) = event
+                .pointer("/params/delta")
+                .and_then(|value| value.as_str())
+            {
+                streamed.set(true);
+                print!("{delta}");
+                let _ = std::io::stdout().flush();
+            } else if event["method"] == "session/tool_call"
+                && let Some(name) = event
+                    .pointer("/params/name")
                     .and_then(|value| value.as_str())
-                {
-                    streamed = true;
-                    print!("{delta}");
-                    let _ = std::io::stdout().flush();
-                } else if event["method"] == "session/tool_call"
-                    && let Some(name) = event
-                        .pointer("/params/name")
-                        .and_then(|value| value.as_str())
-                {
-                    println!("\n[tool] {name}");
+            {
+                println!("\n[tool] {name}");
+            }
+        });
+        tokio::pin!(response);
+        let result = tokio::select! {
+            result = &mut response => result,
+            signal = tokio::signal::ctrl_c() => {
+                let _ = editor.save_history(&history_path);
+                match signal {
+                    Ok(()) => println!("\n^C\nGoodbye."),
+                    Err(error) => eprintln!("\nerror: Ctrl-C handler failed: {error}"),
                 }
-            })
-            .await;
+                return 0;
+            }
+        };
         match result {
-            Ok(_text) if streamed => println!("\n"),
+            Ok(_text) if streamed.get() => println!("\n"),
             Ok(text) => println!("{text}\n"),
             Err(error) => eprintln!("\nerror: {error}\n"),
         }
@@ -734,6 +745,13 @@ fn save_settings(home: &std::path::Path, settings: &CliSettings) -> Result<(), S
     std::fs::rename(temporary, path).map_err(|e| e.to_string())
 }
 
+fn is_exit_command(command: &str) -> bool {
+    matches!(
+        command.to_ascii_lowercase().as_str(),
+        "exit" | "quit" | "/exit" | "/quit"
+    )
+}
+
 fn read_line(prompt: &str) -> std::io::Result<String> {
     print!("{prompt}");
     std::io::stdout().flush()?;
@@ -858,4 +876,17 @@ fn lato_home() -> PathBuf {
                 .unwrap_or_else(|| PathBuf::from("."))
                 .join(".lato")
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_exit_command;
+
+    #[test]
+    fn interactive_exit_commands_accept_plain_slash_and_case_variants() {
+        for command in ["exit", "quit", "/exit", "/quit", "EXIT"] {
+            assert!(is_exit_command(command));
+        }
+        assert!(!is_exit_command("please exit after the task"));
+    }
 }
