@@ -1,9 +1,9 @@
 use crate::{RuntimePromptOutcome, RuntimeSession, ToolApproval, TranscriptStore};
 use lato_ai::{
     CATALOG, CredentialStore, CustomHttpModelStream, CustomModel, FakeModelStream, HttpModelStream,
-    ModelStream, StreamPiece, SwitchableModelStream, api_key_login_allowed, custom_model_auth,
-    dialect_implemented, get_auth_refreshing, load_models_json, lookup_model, oauth_allowed,
-    phase0_supported, store_oauth,
+    ModelStream, StreamPiece, SwitchableModelStream, adapt_model_stream, api_key_login_allowed,
+    custom_model_auth, dialect_implemented, get_auth_refreshing, load_models_json, lookup_model,
+    oauth_allowed, phase0_supported, store_oauth,
 };
 use lato_mcp::{PluginOrigin, PluginPackage, discover_plugin};
 use lato_protocol::{JsonRpcReq, METHODS_IMPLEMENTED, PROTOCOL_VERSION, err, is_implemented, ok};
@@ -247,9 +247,19 @@ impl AcpHost {
                         .await
                         {
                             Ok(Some(auth)) => {
-                                self.stream
-                                    .set(Arc::new(HttpModelStream::new(catalog_model, auth)))
-                                    .await
+                                let raw: Arc<dyn ModelStream> =
+                                    Arc::new(HttpModelStream::new(catalog_model, auth));
+                                let adapted = match adapt_model_stream(provider, model, raw) {
+                                    Ok(adapted) => adapted,
+                                    Err(error) => {
+                                        return Some(err(
+                                            id,
+                                            -32000,
+                                            format!("invalid model selection: {error}"),
+                                        ));
+                                    }
+                                };
+                                self.stream.set(adapted).await
                             }
                             Ok(None) => {}
                             Err(error) => {
@@ -268,9 +278,19 @@ impl AcpHost {
                     .cloned()
                     && let Some(auth) = custom_model_auth(&custom, &|name| std::env::var(name).ok())
                 {
-                    self.stream
-                        .set(Arc::new(CustomHttpModelStream::new(custom, auth)))
-                        .await;
+                    let raw: Arc<dyn ModelStream> =
+                        Arc::new(CustomHttpModelStream::new(custom, auth));
+                    let adapted = match adapt_model_stream(provider, model, raw) {
+                        Ok(adapted) => adapted,
+                        Err(error) => {
+                            return Some(err(
+                                id,
+                                -32000,
+                                format!("invalid model selection: {error}"),
+                            ));
+                        }
+                    };
+                    self.stream.set(adapted).await;
                 }
                 self.model = (provider.into(), model.into());
                 Some(ok(id, serde_json::json!({"supported": true})))
@@ -431,6 +451,14 @@ pub fn default_fake_stream() -> Arc<dyn ModelStream> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn acp_model_constructors_cross_the_canonical_model_port_boundary() {
+        let source = include_str!("host.rs");
+        let boundary_call = ["adapt_model_stream", "(provider, model"].concat();
+        assert_eq!(source.matches(&boundary_call).count(), 2);
+    }
+
     fn req(id: i32, method: &str, params: serde_json::Value) -> JsonRpcReq {
         JsonRpcReq {
             jsonrpc: "2.0".into(),

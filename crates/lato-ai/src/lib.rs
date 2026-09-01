@@ -12,6 +12,7 @@ pub mod stream;
 pub use api::*;
 pub use auth::*;
 pub use catalog::*;
+pub use model_port_adapter::*;
 pub use models_file::*;
 pub use oauth::*;
 pub use presets::*;
