@@ -1,4 +1,4 @@
-use lato_agent::{ToolApproval, default_fake_stream};
+use lato_agent::{ApprovalRequest, ToolApproval, default_fake_stream};
 use lato_ai::{
     AuthInteraction, AuthNotice, CATALOG, CredentialStore, CustomHttpModelStream, CustomModel,
     HttpModelStream, ModelApi, ModelStream, ProviderModelsStore, adapt_model_stream,
@@ -67,11 +67,15 @@ struct ConsoleToolApproval;
 
 #[async_trait::async_trait]
 impl ToolApproval for ConsoleToolApproval {
-    async fn approve(&self, name: &str, arguments: &serde_json::Value) -> bool {
-        let name = name.to_string();
-        let arguments = arguments.to_string();
+    async fn approve(&self, request: &ApprovalRequest) -> bool {
+        let tool = request.request.tool_name.to_string();
+        let capabilities = format!("{:?}", request.request.capabilities);
+        let side_effect = format!("{:?}", request.request.side_effect);
+        let summary = request.summary.clone();
         tokio::task::spawn_blocking(move || {
-            println!("\nTool request: {name}\n  {arguments}");
+            println!(
+                "\nTool request: {tool}\n  capabilities: {capabilities}\n  side effect: {side_effect}\n  {summary}"
+            );
             read_line("Allow this tool call? [y/N] ")
                 .map(|answer| matches!(answer.to_ascii_lowercase().as_str(), "y" | "yes"))
                 .unwrap_or(false)

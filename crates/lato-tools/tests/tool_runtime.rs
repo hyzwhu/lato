@@ -140,8 +140,32 @@ async fn write_adapter_rejects_missing_execution_grant() {
         )
         .await
         .unwrap_err();
-    assert_eq!(error.code, "tool.policy_denied");
+    assert_eq!(error.code, "policy.grant_missing");
     assert!(!root.path().join("missing-grant.txt").exists());
+}
+
+#[tokio::test]
+async fn read_adapter_rejects_missing_execution_grant() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("a.txt"), "secret").unwrap();
+    let tools = builtin_tools(BuiltinToolEnvironment {
+        cwd: root.path().to_path_buf(),
+        locks: Arc::new(FileLocks::new()),
+        trust: SessionTrust::for_headless_prompt(root.path()),
+    })
+    .unwrap();
+    let read = tools
+        .into_iter()
+        .find(|tool| tool.descriptor().name.as_str() == "builtin:read_file")
+        .unwrap();
+    let error = read
+        .invoke(
+            context(CancellationToken::new()),
+            serde_json::json!({"path":"a.txt"}),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "policy.grant_missing");
 }
 
 #[tokio::test]
@@ -513,7 +537,6 @@ fn different_namespaces_cannot_advertise_the_same_local_name() {
 async fn write_alias_consumes_allow_once_exactly_once() {
     let root = tempfile::tempdir().unwrap();
     let trust = SessionTrust::for_interactive(root.path(), true);
-    trust.allow_once();
     let runtime = lato_tools::builtin_tool_runtime(BuiltinToolEnvironment {
         cwd: root.path().to_path_buf(),
         locks: Arc::new(FileLocks::new()),

@@ -48,14 +48,25 @@ impl Tool for LegacyDispatchTool {
         if context.cancellation.is_cancelled() {
             return Err(tool_error("tool.cancelled", "tool call was cancelled"));
         }
+        let grant = context
+            .execution_grant
+            .as_ref()
+            .ok_or_else(|| tool_error("policy.grant_missing", "tool execution grant is missing"))?;
         let content = if self.legacy_name == "write_file" {
-            invoke_compat_write_file(
-                &self.environment,
-                context.execution_grant.as_ref(),
-                &arguments,
-            )
-            .await
+            if matches!(
+                self.descriptor.side_effect,
+                SideEffect::WorkspaceMutation | SideEffect::ExternalMutation
+            ) {
+                self.environment.trust.allow_once();
+            }
+            invoke_compat_write_file(&self.environment, grant, &arguments).await
         } else {
+            if matches!(
+                self.descriptor.side_effect,
+                SideEffect::WorkspaceMutation | SideEffect::ExternalMutation
+            ) {
+                self.environment.trust.allow_once();
+            }
             dispatch(
                 &self.environment.locks,
                 &self.environment.trust,
@@ -82,7 +93,7 @@ impl Tool for LegacyDispatchTool {
 
 async fn invoke_compat_write_file(
     environment: &BuiltinToolEnvironment,
-    grant: Option<&ExecutionGrant>,
+    grant: &ExecutionGrant,
     arguments: &Value,
 ) -> Result<String, String> {
     let raw_path = arguments
@@ -98,9 +109,7 @@ async fn invoke_compat_write_file(
     if deny_write(&path) {
         return Err("denied by write policy".into());
     }
-    let obligation = grant
-        .map(|grant| &grant.sandbox)
-        .ok_or("denied by policy: execution grant missing")?;
+    let obligation = &grant.sandbox;
     validate_write_obligation(obligation, &path)?;
     require_compat_mutating_approval(&environment.trust)?;
     let contents = arguments

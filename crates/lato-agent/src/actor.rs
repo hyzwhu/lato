@@ -1,7 +1,10 @@
 use crate::HistoryItem;
 use async_trait::async_trait;
 use lato_ai::{CONTEXT_HARD_LIMIT_BYTES, ModelStream, StreamPiece};
-use lato_core::{SessionId, ToolCallId, ToolContext, TurnId};
+pub use lato_core::ApprovalRequest;
+use lato_core::{
+    PolicyDecision, Retryability, SessionId, ToolCallId, ToolContext, ToolError, TurnId,
+};
 use lato_tools::{BuiltinToolEnvironment, ToolRuntime, bound_tool_output, builtin_tool_runtime};
 use lato_workspace::{FileLocks, SessionTrust};
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
@@ -22,7 +25,7 @@ pub enum TurnOutcome {
 
 #[async_trait]
 pub trait ToolApproval: Send + Sync {
-    async fn approve(&self, name: &str, arguments: &serde_json::Value) -> bool;
+    async fn approve(&self, request: &ApprovalRequest) -> bool;
 }
 
 pub struct SessionActor {
@@ -31,7 +34,7 @@ pub struct SessionActor {
     history: Vec<HistoryItem>,
     stream: Arc<dyn ModelStream>,
     _locks: Arc<FileLocks>,
-    trust: SessionTrust,
+    _trust: SessionTrust,
     cwd: PathBuf,
     tool_runtime: Arc<ToolRuntime>,
     session_id: SessionId,
@@ -74,7 +77,7 @@ impl SessionActor {
             history: vec![HistoryItem::System(build_world_state(&cwd))],
             stream,
             _locks: locks,
-            trust,
+            _trust: trust,
             cwd,
             tool_runtime,
             session_id: SessionId::from("local-session"),
@@ -191,21 +194,6 @@ impl SessionActor {
                             self.active = false;
                             return Ok(TurnOutcome::Cancelled);
                         }
-                        if lato_tools::requires_approval(&name)
-                            && self.trust.mode == lato_workspace::ApprovalMode::Ask
-                            && !self.trust.has_allow_once()
-                        {
-                            let approved = match &self.tool_approval {
-                                Some(approval) => approval.approve(&name, &arguments).await,
-                                None => false,
-                            };
-                            if approved {
-                                self.trust.allow_once();
-                            }
-                        }
-                        if let Some((events, session_id)) = &self.events {
-                            let _ = events.send(serde_json::json!({"jsonrpc":"2.0","method":"session/tool_call","params":{"sessionId":session_id,"name":name,"arguments":arguments}}));
-                        }
                         let call_id = ToolCallId::parse(id.clone()).unwrap_or_else(|_| {
                             self.next_local_call += 1;
                             ToolCallId::from(format!("local-tool-call-{}", self.next_local_call))
@@ -218,10 +206,47 @@ impl SessionActor {
                             execution_grant: None,
                         };
                         let tool_runtime = self.tool_runtime.clone();
-                        let invocation = tool_runtime.invoke(context, &name, arguments).await;
+                        let authorization =
+                            match tool_runtime.prepare(context, &name, arguments.clone()) {
+                                Ok(prepared) => match tool_runtime.decision(&prepared).clone() {
+                                    PolicyDecision::Allow(grant) => Ok((prepared, grant)),
+                                    PolicyDecision::RequireApproval(request) => {
+                                        let approved = match &self.tool_approval {
+                                            Some(approval) => approval.approve(&request).await,
+                                            None => false,
+                                        };
+                                        if approved {
+                                            tool_runtime
+                                                .approve(&request)
+                                                .map(|grant| (prepared, grant))
+                                        } else {
+                                            Err(ToolError::new(
+                                                "policy.approval_denied",
+                                                "tool approval denied by user",
+                                                Retryability::Never,
+                                            ))
+                                        }
+                                    }
+                                    PolicyDecision::Deny(denial) => Err(ToolError::new(
+                                        denial.code,
+                                        denial.message,
+                                        Retryability::Never,
+                                    )),
+                                },
+                                Err(error) => Err(error),
+                            };
+                        if let Some((events, session_id)) = &self.events {
+                            let _ = events.send(serde_json::json!({"jsonrpc":"2.0","method":"session/tool_call","params":{"sessionId":session_id,"name":name,"arguments":arguments}}));
+                        }
+                        let invocation = match authorization {
+                            Ok((prepared, grant)) => tool_runtime.execute(prepared, grant).await,
+                            Err(error) => Err(error),
+                        };
                         let out = invocation
                             .map(|output| output.content)
-                            .unwrap_or_else(|error| format!("ERROR: {}", error.message));
+                            .unwrap_or_else(|error| {
+                                format!("ERROR [{}]: {}", error.code, error.message)
+                            });
                         let out = bound_tool_output(out, &self.cwd, &id).await?;
                         self.history
                             .push(HistoryItem::ToolResult { id, output: out });
@@ -340,7 +365,20 @@ fn build_world_state(cwd: &std::path::Path) -> String {
 mod tests {
     use super::*;
     use lato_ai::FakeModelStream;
+    use lato_core::{
+        ApprovalRequest, PolicyMode, SandboxProfile, SideEffect, Tool, ToolCancellation,
+        ToolCapability, ToolConcurrency, ToolDescriptor, ToolIdempotency, ToolLayer, ToolName,
+        ToolOutput, ToolSource,
+    };
+    use lato_policy::{ApprovalLedger, PolicyEngine};
+    use lato_tools::{PolicyScope, ToolRuntimeBuilder};
+    use semver::Version;
     use serde_json::json;
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use std::time::Duration;
 
     fn actor(script: Vec<Vec<StreamPiece>>, cwd: PathBuf) -> SessionActor {
         SessionActor::new(
@@ -354,9 +392,193 @@ mod tests {
     struct AllowTool;
     #[async_trait]
     impl ToolApproval for AllowTool {
-        async fn approve(&self, _name: &str, _arguments: &serde_json::Value) -> bool {
+        async fn approve(&self, _request: &ApprovalRequest) -> bool {
             true
         }
+    }
+
+    struct RecordingApproval {
+        decisions: Mutex<Vec<bool>>,
+        requests: Mutex<Vec<ApprovalRequest>>,
+    }
+
+    impl RecordingApproval {
+        fn new(decisions: Vec<bool>) -> Self {
+            Self {
+                decisions: Mutex::new(decisions.into_iter().rev().collect()),
+                requests: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ToolApproval for RecordingApproval {
+        async fn approve(&self, request: &ApprovalRequest) -> bool {
+            self.requests.lock().unwrap().push(request.clone());
+            self.decisions.lock().unwrap().pop().unwrap_or(false)
+        }
+    }
+
+    struct RenamedWriteTool(Arc<AtomicUsize>);
+
+    #[async_trait]
+    impl Tool for RenamedWriteTool {
+        fn descriptor(&self) -> ToolDescriptor {
+            ToolDescriptor {
+                name: ToolName::parse("custom:rename_anything").unwrap(),
+                version: Version::new(1, 0, 0),
+                description: "renamed write-capable test tool".into(),
+                input_schema: json!({"type":"object"}),
+                capabilities: vec![ToolCapability::FileWrite],
+                side_effect: SideEffect::WorkspaceMutation,
+                concurrency: ToolConcurrency::Serial,
+                idempotency: ToolIdempotency::NonIdempotent,
+                timeout_ms: 1_000,
+                max_output_bytes: 1_024,
+                cancellation: ToolCancellation::Cooperative,
+                source: ToolSource {
+                    layer: ToolLayer::User,
+                    id: "test.renamed-write".into(),
+                    replacement: None,
+                },
+            }
+        }
+
+        async fn invoke(
+            &self,
+            context: ToolContext,
+            _arguments: serde_json::Value,
+        ) -> Result<ToolOutput, lato_core::ToolError> {
+            assert!(context.execution_grant.is_some());
+            self.0.fetch_add(1, Ordering::AcqRel);
+            Ok(ToolOutput {
+                content: "written".into(),
+                metadata: json!({}),
+                truncated: false,
+                artifact_path: None,
+            })
+        }
+    }
+
+    fn actor_with_renamed_write_tool(
+        script: Vec<Vec<StreamPiece>>,
+        cwd: PathBuf,
+        calls: Arc<AtomicUsize>,
+        approval: Arc<dyn ToolApproval>,
+    ) -> SessionActor {
+        let policy = Arc::new(PolicyEngine::new(Arc::new(ApprovalLedger::new(
+            Duration::from_secs(60),
+        ))));
+        let mut builder = ToolRuntimeBuilder::new(
+            policy,
+            PolicyScope {
+                workspace_root: cwd.clone(),
+                mode: PolicyMode::Ask,
+                project_trusted: true,
+                sandbox_profile: SandboxProfile::Workspace,
+            },
+        );
+        builder.register(Arc::new(RenamedWriteTool(calls))).unwrap();
+        let (events, _rx) = mpsc::unbounded_channel();
+        SessionActor::new_with_tool_runtime(
+            Arc::new(FakeModelStream::new(script)),
+            Arc::new(FileLocks::new()),
+            SessionTrust::for_interactive(&cwd, true),
+            cwd,
+            Arc::new(builder.build().unwrap()),
+        )
+        .with_interactive_events(events, "session-renamed".into(), Some(approval))
+    }
+
+    #[tokio::test]
+    async fn renamed_write_capability_triggers_generic_approval() {
+        let d = tempfile::tempdir().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let approval = Arc::new(RecordingApproval::new(vec![true]));
+        let mut actor = actor_with_renamed_write_tool(
+            vec![
+                vec![StreamPiece::ToolCall {
+                    id: "write-one".into(),
+                    name: "rename_anything".into(),
+                    arguments: json!({"target":"alpha"}),
+                }],
+                vec![StreamPiece::Text("done".into())],
+            ],
+            d.path().to_path_buf(),
+            calls.clone(),
+            approval.clone(),
+        );
+        actor.prompt(PromptKind::Start, "go".into()).await.unwrap();
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+        let requests = approval.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].request.tool_name.as_str(),
+            "custom:rename_anything"
+        );
+        assert_eq!(
+            requests[0].request.capabilities,
+            vec![ToolCapability::FileWrite]
+        );
+    }
+
+    #[tokio::test]
+    async fn denied_generic_approval_does_not_invoke_tool() {
+        let d = tempfile::tempdir().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut actor = actor_with_renamed_write_tool(
+            vec![
+                vec![StreamPiece::ToolCall {
+                    id: "write-denied".into(),
+                    name: "rename_anything".into(),
+                    arguments: json!({"target":"alpha"}),
+                }],
+                vec![StreamPiece::Text("done".into())],
+            ],
+            d.path().to_path_buf(),
+            calls.clone(),
+            Arc::new(RecordingApproval::new(vec![false])),
+        );
+        actor.prompt(PromptKind::Start, "go".into()).await.unwrap();
+        assert_eq!(calls.load(Ordering::Acquire), 0);
+        assert!(actor.history().iter().any(|item| matches!(
+            item,
+            HistoryItem::ToolResult { output, .. } if output.contains("policy.approval_denied")
+        )));
+    }
+
+    #[tokio::test]
+    async fn approval_for_one_argument_set_cannot_authorize_another() {
+        let d = tempfile::tempdir().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let approval = Arc::new(RecordingApproval::new(vec![true, false]));
+        let mut actor = actor_with_renamed_write_tool(
+            vec![
+                vec![StreamPiece::ToolCall {
+                    id: "write-first".into(),
+                    name: "rename_anything".into(),
+                    arguments: json!({"target":"alpha"}),
+                }],
+                vec![StreamPiece::ToolCall {
+                    id: "write-second".into(),
+                    name: "rename_anything".into(),
+                    arguments: json!({"target":"beta"}),
+                }],
+                vec![StreamPiece::Text("done".into())],
+            ],
+            d.path().to_path_buf(),
+            calls.clone(),
+            approval.clone(),
+        );
+        actor.prompt(PromptKind::Start, "go".into()).await.unwrap();
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+        let requests = approval.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_ne!(requests[0].fingerprint, requests[1].fingerprint);
+        assert_ne!(
+            requests[0].request.arguments_digest,
+            requests[1].request.arguments_digest
+        );
     }
 
     #[tokio::test]
