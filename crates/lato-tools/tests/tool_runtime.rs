@@ -268,6 +268,56 @@ async fn workspace_write_rejects_symlink_parent_escape() {
     assert!(!outside.path().join("escape.txt").exists());
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn workspace_write_rejects_dangling_symlink_leaf() {
+    let workspace = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let outside_file = outside.path().join("created.txt");
+    std::os::unix::fs::symlink(&outside_file, workspace.path().join("linked-file")).unwrap();
+    let runtime = lato_tools::builtin_tool_runtime(BuiltinToolEnvironment {
+        cwd: workspace.path().to_path_buf(),
+        locks: Arc::new(FileLocks::new()),
+        trust: SessionTrust::for_interactive_auto(workspace.path()),
+    })
+    .unwrap();
+    let error = runtime
+        .invoke(
+            context(CancellationToken::new()),
+            "write_file",
+            serde_json::json!({"path":"linked-file","contents":"escape"}),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "tool.policy_denied");
+    assert!(!outside_file.exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn workspace_write_rejects_dangling_symlink_parent() {
+    let workspace = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let outside_dir = outside.path().join("not-created");
+    std::os::unix::fs::symlink(&outside_dir, workspace.path().join("linked-dir")).unwrap();
+    let runtime = lato_tools::builtin_tool_runtime(BuiltinToolEnvironment {
+        cwd: workspace.path().to_path_buf(),
+        locks: Arc::new(FileLocks::new()),
+        trust: SessionTrust::for_interactive_auto(workspace.path()),
+    })
+    .unwrap();
+    let error = runtime
+        .invoke(
+            context(CancellationToken::new()),
+            "write_file",
+            serde_json::json!({"path":"linked-dir/created.txt","contents":"escape"}),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "tool.policy_denied");
+    assert!(!outside_dir.join("created.txt").exists());
+}
+
 #[tokio::test]
 async fn read_only_write_is_denied_without_modifying_target() {
     let workspace = tempfile::tempdir().unwrap();

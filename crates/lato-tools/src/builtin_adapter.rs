@@ -131,6 +131,11 @@ fn validate_write_obligation(obligation: &SandboxObligation, path: &Path) -> Res
     }
 
     let target = lexical_normalize(path)?;
+    let lexical_workspace = lexical_normalize(&obligation.workspace_root)?;
+    if !target.starts_with(&lexical_workspace) {
+        return Err("denied by workspace sandbox policy".into());
+    }
+    reject_symlink_components(&lexical_workspace, &target)?;
     let workspace = canonical_existing(&obligation.workspace_root)?;
     let target_ancestor = canonical_nearest_existing(&target)?;
     if !target_ancestor.starts_with(&workspace) {
@@ -153,6 +158,30 @@ fn validate_write_obligation(obligation: &SandboxObligation, path: &Path) -> Res
         return Err("denied by writable-roots sandbox policy".into());
     }
     Ok(())
+}
+
+fn reject_symlink_components(workspace: &Path, target: &Path) -> Result<(), String> {
+    let relative = target
+        .strip_prefix(workspace)
+        .map_err(|_| "denied by workspace sandbox policy".to_owned())?;
+    let mut current = workspace.to_path_buf();
+    reject_symlink_if_present(&current)?;
+    for component in relative.components() {
+        current.push(component.as_os_str());
+        reject_symlink_if_present(&current)?;
+    }
+    Ok(())
+}
+
+fn reject_symlink_if_present(path: &Path) -> Result<(), String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            Err("denied by workspace sandbox policy: symlink in write path".into())
+        }
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err("denied by workspace sandbox policy: path metadata unavailable".into()),
+    }
 }
 
 fn lexical_normalize(path: &Path) -> Result<PathBuf, String> {
