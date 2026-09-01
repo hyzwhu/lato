@@ -7,22 +7,32 @@ use lato_core::{
     PolicyDecision, PolicyMode, PolicyRequest, Retryability, SandboxObligation, SandboxProfile,
     Tool, ToolContext, ToolDescriptor, ToolError, ToolName, ToolOutput,
 };
-use lato_policy::{ApprovalLedger, PolicyEngine, approval_fingerprint, canonical_arguments};
+use lato_policy::{
+    ApprovalLedger, NoopPolicyEventSink, PolicyEngine, PolicyEvent, PolicyEventKind,
+    PolicyEventSink, approval_fingerprint, canonical_arguments,
+};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::{collections::BTreeMap, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 pub struct ToolRuntime {
     catalog: ToolCatalog,
     wire_names: BTreeMap<String, ToolName>,
     policy: Arc<PolicyEngine>,
     scope: PolicyScope,
+    sink: Arc<dyn PolicyEventSink>,
 }
 
 pub struct ToolRuntimeBuilder {
     catalog: ToolCatalog,
     policy: Arc<PolicyEngine>,
     scope: PolicyScope,
+    sink: Arc<dyn PolicyEventSink>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -62,7 +72,13 @@ impl ToolRuntimeBuilder {
             catalog: ToolCatalog::new(),
             policy,
             scope,
+            sink: Arc::new(NoopPolicyEventSink),
         }
+    }
+
+    pub fn with_sink(mut self, sink: Arc<dyn PolicyEventSink>) -> Self {
+        self.sink = sink;
+        self
     }
 
     pub fn register(&mut self, tool: Arc<dyn Tool>) -> Result<RegistrationOutcome, CatalogError> {
@@ -96,6 +112,7 @@ impl ToolRuntimeBuilder {
             wire_names,
             policy: self.policy,
             scope: self.scope,
+            sink: self.sink,
         })
     }
 }
@@ -127,12 +144,30 @@ impl ToolRuntime {
         let prepared = self.prepare(context, wire_name, arguments)?;
         match self.decision(&prepared).clone() {
             PolicyDecision::Allow(grant) => self.execute(prepared, grant).await,
-            PolicyDecision::RequireApproval(_) => Err(policy_error(
-                "policy.approval_required",
-                "this tool call requires explicit approval",
-            )),
+            PolicyDecision::RequireApproval(_) => {
+                let error = policy_error(
+                    "policy.approval_required",
+                    "this tool call requires explicit approval",
+                );
+                self.emit_tool(
+                    PolicyEventKind::ToolFailed,
+                    &prepared.request,
+                    Some(error.code.clone()),
+                    None,
+                    None,
+                );
+                Err(error)
+            }
             PolicyDecision::Deny(denial) => {
-                Err(policy_error(denial.code.clone(), denial.message.clone()))
+                let error = policy_error(denial.code.clone(), denial.message.clone());
+                self.emit_tool(
+                    PolicyEventKind::ToolFailed,
+                    &prepared.request,
+                    Some(error.code.clone()),
+                    None,
+                    None,
+                );
+                Err(error)
             }
         }
     }
@@ -238,19 +273,58 @@ impl ToolRuntime {
             .consume(&grant, &prepared.fingerprint)
             .map_err(policy_engine_error)?;
         if prepared.context.cancellation.is_cancelled() {
-            return Err(ToolError::new(
+            let error = ToolError::new(
                 "tool.cancelled",
                 "tool call was cancelled",
                 Retryability::Never,
-            ));
+            );
+            self.emit_tool(
+                PolicyEventKind::ToolFailed,
+                &prepared.request,
+                Some(error.code.clone()),
+                None,
+                None,
+            );
+            return Err(error);
         }
-        prepared
+        self.emit_tool(
+            PolicyEventKind::ToolStarted,
+            &prepared.request,
+            None,
+            None,
+            None,
+        );
+        let started = Instant::now();
+        let result = prepared
             .tool
             .invoke(
                 prepared.context.with_execution_grant(grant),
                 prepared.arguments,
             )
-            .await
+            .await;
+        let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        match result {
+            Ok(output) => {
+                self.emit_tool(
+                    PolicyEventKind::ToolCompleted,
+                    &prepared.request,
+                    Some("ok".into()),
+                    Some(elapsed_ms),
+                    Some(output.content.len()),
+                );
+                Ok(output)
+            }
+            Err(error) => {
+                self.emit_tool(
+                    PolicyEventKind::ToolFailed,
+                    &prepared.request,
+                    Some(error.code.clone()),
+                    Some(elapsed_ms),
+                    None,
+                );
+                Err(error)
+            }
+        }
     }
 
     #[doc(hidden)]
@@ -273,6 +347,27 @@ impl ToolRuntime {
     pub fn descriptor_for_wire_name(&self, wire_name: &str) -> Option<ToolDescriptor> {
         let canonical = self.resolve_wire_name(wire_name)?;
         self.catalog.descriptor(&canonical).cloned()
+    }
+
+    fn emit_tool(
+        &self,
+        kind: PolicyEventKind,
+        request: &lato_core::PolicyRequest,
+        code: Option<String>,
+        elapsed_ms: Option<u64>,
+        output_bytes: Option<usize>,
+    ) {
+        self.sink.emit(PolicyEvent {
+            kind,
+            session_id: Some(request.session_id.clone()),
+            turn_id: Some(request.turn_id.clone()),
+            call_id: Some(request.call_id.clone()),
+            tool_name: Some(request.tool_name.clone()),
+            argument_digest: Some(request.arguments_digest.clone()),
+            code,
+            elapsed_ms,
+            output_bytes,
+        });
     }
 
     fn resolve_wire_name(&self, wire_name: &str) -> Option<ToolName> {

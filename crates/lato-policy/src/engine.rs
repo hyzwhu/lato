@@ -1,4 +1,7 @@
-use crate::{ApprovalError, ApprovalLedger, approval_fingerprint, validate_sandbox_obligation};
+use crate::{
+    ApprovalError, ApprovalLedger, NoopPolicyEventSink, PolicyEvent, PolicyEventKind,
+    PolicyEventSink, approval_fingerprint, validate_sandbox_obligation,
+};
 use lato_core::{
     ApprovalRequest, ExecutionGrant, PolicyDecision, PolicyDenial, PolicyMode, PolicyRequest,
     SideEffect, ToolCapability,
@@ -36,46 +39,33 @@ impl PolicyError {
     }
 }
 
-#[derive(Debug)]
 pub struct PolicyEngine {
     ledger: Arc<ApprovalLedger>,
+    sink: Arc<dyn PolicyEventSink>,
+}
+
+impl std::fmt::Debug for PolicyEngine {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PolicyEngine")
+            .field("ledger", &self.ledger)
+            .finish_non_exhaustive()
+    }
 }
 
 impl PolicyEngine {
     pub fn new(ledger: Arc<ApprovalLedger>) -> Self {
-        Self { ledger }
+        Self::with_sink(ledger, Arc::new(NoopPolicyEventSink))
+    }
+
+    pub fn with_sink(ledger: Arc<ApprovalLedger>, sink: Arc<dyn PolicyEventSink>) -> Self {
+        Self { ledger, sink }
     }
 
     pub fn evaluate(&self, request: &PolicyRequest) -> PolicyDecision {
-        if let Err(error) = validate_request(request) {
-            return PolicyDecision::Deny(PolicyDenial::new(error.code(), error.to_string()));
-        }
-        if let Some(denial) = denial(request) {
-            return PolicyDecision::Deny(denial);
-        }
-
-        let fingerprint = match approval_fingerprint(request) {
-            Ok(fingerprint) => fingerprint,
-            Err(_) => {
-                return PolicyDecision::Deny(PolicyDenial::new(
-                    "policy.fingerprint_failed",
-                    "could not bind authorization to the exact tool call",
-                ));
-            }
-        };
-
-        if requires_human_approval(request) {
-            return PolicyDecision::RequireApproval(ApprovalRequest {
-                request: request.clone(),
-                fingerprint,
-                summary: approval_summary(request),
-            });
-        }
-
-        match self.ledger.issue(fingerprint, request.sandbox.clone()) {
-            Ok(grant) => PolicyDecision::Allow(grant),
-            Err(error) => PolicyDecision::Deny(PolicyDenial::new(error.code(), error.to_string())),
-        }
+        let decision = self.evaluate_inner(request);
+        self.emit_decision(request, &decision);
+        decision
     }
 
     pub fn approve(&self, approval: &ApprovalRequest) -> Result<ExecutionGrant, PolicyError> {
@@ -107,7 +97,91 @@ impl PolicyEngine {
     ) -> Result<(), PolicyError> {
         self.ledger
             .consume(grant, expected)
-            .map_err(PolicyError::Approval)
+            .map_err(PolicyError::Approval)?;
+        self.sink.emit(PolicyEvent {
+            kind: PolicyEventKind::ApprovalConsumed,
+            session_id: None,
+            turn_id: None,
+            call_id: None,
+            tool_name: None,
+            argument_digest: Some(expected.0.clone()),
+            code: Some("allow".into()),
+            elapsed_ms: None,
+            output_bytes: None,
+        });
+        Ok(())
+    }
+
+    fn evaluate_inner(&self, request: &PolicyRequest) -> PolicyDecision {
+        if let Err(error) = validate_request(request) {
+            return PolicyDecision::Deny(PolicyDenial::new(error.code(), error.to_string()));
+        }
+        if let Some(denial) = denial(request) {
+            return PolicyDecision::Deny(denial);
+        }
+
+        let fingerprint = match approval_fingerprint(request) {
+            Ok(fingerprint) => fingerprint,
+            Err(_) => {
+                return PolicyDecision::Deny(PolicyDenial::new(
+                    "policy.fingerprint_failed",
+                    "could not bind authorization to the exact tool call",
+                ));
+            }
+        };
+
+        if requires_human_approval(request) {
+            return PolicyDecision::RequireApproval(ApprovalRequest {
+                request: request.clone(),
+                fingerprint,
+                summary: approval_summary(request),
+            });
+        }
+
+        match self.ledger.issue(fingerprint, request.sandbox.clone()) {
+            Ok(grant) => PolicyDecision::Allow(grant),
+            Err(error) => PolicyDecision::Deny(PolicyDenial::new(error.code(), error.to_string())),
+        }
+    }
+
+    fn emit_decision(&self, request: &PolicyRequest, decision: &PolicyDecision) {
+        let code = match decision {
+            PolicyDecision::Allow(_) => "allow",
+            PolicyDecision::RequireApproval(_) => "require_approval",
+            PolicyDecision::Deny(denial) => denial.code.as_str(),
+        };
+        self.sink.emit(event(
+            PolicyEventKind::Evaluated,
+            request,
+            Some(code.to_owned()),
+        ));
+        match decision {
+            PolicyDecision::RequireApproval(_) => self.sink.emit(event(
+                PolicyEventKind::ApprovalRequested,
+                request,
+                Some("policy.approval_required".into()),
+            )),
+            PolicyDecision::Deny(denial) => self.sink.emit(event(
+                PolicyEventKind::Denied,
+                request,
+                Some(denial.code.clone()),
+            )),
+            PolicyDecision::Allow(_) => {}
+        }
+    }
+}
+
+fn event(kind: PolicyEventKind, request: &PolicyRequest, code: Option<String>) -> PolicyEvent {
+    PolicyEvent {
+        kind,
+        session_id: Some(request.session_id.clone()),
+        turn_id: Some(request.turn_id.clone()),
+        call_id: Some(request.call_id.clone()),
+        tool_name: Some(request.tool_name.clone()),
+        argument_digest: Some(request.arguments_digest.clone()),
+        code,
+        elapsed_ms: None,
+        output_bytes: None,
     }
 }
 

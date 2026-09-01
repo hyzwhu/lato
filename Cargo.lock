@@ -761,6 +761,9 @@ dependencies = [
  "dirs",
  "lato-agent",
  "lato-ai",
+ "lato-core",
+ "lato-mcp",
+ "lato-policy",
  "lato-protocol",
  "lato-tools",
  "lato-workspace",
@@ -855,6 +858,7 @@ name = "lato-policy"
 version = "0.1.0"
 dependencies = [
  "lato-core",
+ "regex",
  "serde",
  "serde_json",
  "sha2",
