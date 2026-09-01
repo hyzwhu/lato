@@ -278,6 +278,22 @@ fn china_providers_accept_api_key_login() {
 }
 
 #[test]
+fn api_key_login_can_replace_an_existing_credential() {
+    let d = tempfile::tempdir().unwrap();
+    for key in ["old-secret", "new-secret"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_lato"))
+            .env("LATO_HOME", d.path())
+            .args(["login", "minimax-cn", "--api-key", key])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+    }
+    let store = std::fs::read_to_string(d.path().join("auth.json")).unwrap();
+    assert!(store.contains("new-secret"));
+    assert!(!store.contains("old-secret"));
+}
+
+#[test]
 fn a4_4_cli_rejects_xai_oauth() {
     let d = tempfile::tempdir().unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_lato"))

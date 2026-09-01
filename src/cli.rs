@@ -28,7 +28,7 @@ struct CliSettings {
 }
 
 const INTERACTIVE_COMMANDS: &[&str] = &[
-    "/help", "/clear", "/model", "/approve", "/status", "/exit", "/quit",
+    "/help", "/clear", "/model", "/login", "/approve", "/status", "/exit", "/quit",
 ];
 
 struct LatoLineHelper;
@@ -238,6 +238,7 @@ async fn interactive() -> i32 {
     } else {
         SessionTrust::for_interactive(&cwd, false)
     };
+    let session_trust = trust.clone();
     let approval = trust.clone();
     let inline_approval: Option<Arc<dyn ToolApproval>> = (approval.mode == ApprovalMode::Ask)
         .then(|| Arc::new(ConsoleToolApproval) as Arc<dyn ToolApproval>);
@@ -245,7 +246,7 @@ async fn interactive() -> i32 {
         cwd.clone(),
         trust,
         stream,
-        inline_approval,
+        inline_approval.clone(),
     )
     .await
     {
@@ -298,7 +299,7 @@ async fn interactive() -> i32 {
             }
             "/help" => {
                 println!(
-                    "/help       show commands\n/clear      start a fresh conversation\n/model      configure the default model for the next run\n/approve    pre-approve one mutating tool call\n/status     show model and workspace\n/exit       quit\n\nUse Up/Down for history and Tab to complete slash commands."
+                    "/help       show commands\n/clear      start a fresh conversation\n/model      choose and switch model\n/login      replace credential for the current provider\n/approve    pre-approve one mutating tool call\n/status     show model and workspace\n/exit       quit\n\nUse Up/Down for history and Tab to complete slash commands."
                 );
                 continue;
             }
@@ -311,9 +312,53 @@ async fn interactive() -> i32 {
             }
             "/model" => {
                 match configure_interactively(&home).await {
-                    Ok(new_selection) => println!(
-                        "Saved {new_selection}. Restart Lato to switch the current conversation."
-                    ),
+                    Ok(new_selection) => match configured_stream(&new_selection).await {
+                        Ok(stream) => match crate::client::InteractiveAcpClient::new_with_approval(
+                            cwd.clone(),
+                            session_trust.clone(),
+                            stream,
+                            inline_approval.clone(),
+                        )
+                        .await
+                        {
+                            Ok(new_client) => {
+                                client = new_client;
+                                selection = new_selection;
+                                println!("Switched to {selection}; started a fresh conversation.");
+                            }
+                            Err(error) => eprintln!("error: {error}"),
+                        },
+                        Err(error) => eprintln!("error: {error}"),
+                    },
+                    Err(error) => eprintln!("error: {error}"),
+                }
+                continue;
+            }
+            "/login" => {
+                let Some((provider, _)) = selection.split_once('/') else {
+                    eprintln!("error: invalid current model");
+                    continue;
+                };
+                match configure_provider_auth(&home, provider, true).await {
+                    Ok(()) => match configured_stream(&selection).await {
+                        Ok(stream) => match crate::client::InteractiveAcpClient::new_with_approval(
+                            cwd.clone(),
+                            session_trust.clone(),
+                            stream,
+                            inline_approval.clone(),
+                        )
+                        .await
+                        {
+                            Ok(new_client) => {
+                                client = new_client;
+                                println!(
+                                    "Credential replaced for {provider}; started a fresh conversation."
+                                );
+                            }
+                            Err(error) => eprintln!("error: {error}"),
+                        },
+                        Err(error) => eprintln!("error: {error}"),
+                    },
                     Err(error) => eprintln!("error: {error}"),
                 }
                 continue;
@@ -380,7 +425,7 @@ async fn configure_interactively(home: &std::path::Path) -> Result<String, Strin
     let provider = choose_item("Provider: ", &providers, "provider")?;
     let is_catalog_provider = CATALOG.iter().any(|model| model.provider == provider);
     if is_catalog_provider {
-        ensure_provider_auth(home, &provider).await?;
+        configure_provider_auth(home, &provider, false).await?;
     }
 
     let fallback = CATALOG
@@ -470,32 +515,69 @@ fn choose_item(prompt: &str, values: &[String], kind: &str) -> Result<String, St
         .ok_or_else(|| format!("invalid {kind} selection"))
 }
 
-async fn ensure_provider_auth(home: &std::path::Path, provider: &str) -> Result<(), String> {
-    let store = CredentialStore::open(home).map_err(|e| e.to_string())?;
-    if store.get(provider).is_some() || provider_env_configured(provider) {
-        return Ok(());
-    }
-    if oauth_allowed(provider) {
-        let method =
-            read_line("Authentication: 1) OAuth  2) API key [1]: ").map_err(|e| e.to_string())?;
-        if method.trim().is_empty() || method.trim() == "1" {
-            let tokens =
-                login_oauth(provider, &ConsoleAuthInteraction, &reqwest::Client::new()).await?;
-            let mut store = CredentialStore::open(home).map_err(|e| e.to_string())?;
-            return store_oauth(
-                &mut store,
-                provider,
-                &tokens.access,
-                &tokens.refresh,
-                tokens.expires,
-            )
-            .map_err(|e| e.to_string());
+async fn configure_provider_auth(
+    home: &std::path::Path,
+    provider: &str,
+    force_replace: bool,
+) -> Result<(), String> {
+    let store = CredentialStore::open(home).map_err(|error| error.to_string())?;
+    let configured = store.get(provider).is_some() || provider_env_configured(provider);
+    let supports_oauth = oauth_allowed(provider);
+    let supports_api_key = api_key_login_allowed(provider);
+
+    if configured && !force_replace {
+        let prompt = match (supports_api_key, supports_oauth) {
+            (true, true) => {
+                "Credential already configured: 1) Use existing  2) Replace API key  3) OAuth [1]: "
+            }
+            (true, false) => {
+                "Credential already configured: 1) Use existing  2) Replace API key [1]: "
+            }
+            (false, true) => {
+                "Credential already configured: 1) Use existing  2) Re-login with OAuth [1]: "
+            }
+            (false, false) => return Ok(()),
+        };
+        match read_line(prompt).map_err(|error| error.to_string())?.trim() {
+            "" | "1" => return Ok(()),
+            "2" if supports_api_key => return save_interactive_api_key(home, provider),
+            "2" if supports_oauth => return save_interactive_oauth(home, provider).await,
+            "3" if supports_oauth => return save_interactive_oauth(home, provider).await,
+            _ => return Err("invalid authentication selection".into()),
         }
-        if !api_key_login_allowed(provider) {
-            return Err(format!("API-key login is not supported for {provider}"));
-        }
     }
-    save_interactive_api_key(home, provider)
+
+    match (supports_api_key, supports_oauth) {
+        (true, true) => {
+            let method = read_line("Authentication: 1) OAuth  2) API key [1]: ")
+                .map_err(|error| error.to_string())?;
+            if method.trim().is_empty() || method.trim() == "1" {
+                save_interactive_oauth(home, provider).await
+            } else if method.trim() == "2" {
+                save_interactive_api_key(home, provider)
+            } else {
+                Err("invalid authentication selection".into())
+            }
+        }
+        (true, false) => save_interactive_api_key(home, provider),
+        (false, true) => save_interactive_oauth(home, provider).await,
+        (false, false) => Err(format!(
+            "no interactive authentication method for {provider}"
+        )),
+    }
+}
+
+async fn save_interactive_oauth(home: &std::path::Path, provider: &str) -> Result<(), String> {
+    let tokens = login_oauth(provider, &ConsoleAuthInteraction, &reqwest::Client::new()).await?;
+    let mut store = CredentialStore::open(home).map_err(|error| error.to_string())?;
+    store_oauth(
+        &mut store,
+        provider,
+        &tokens.access,
+        &tokens.refresh,
+        tokens.expires,
+    )
+    .map_err(|error| error.to_string())
 }
 
 async fn discover_provider_models(

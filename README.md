@@ -30,10 +30,10 @@ On first launch Lato asks you to choose a model, then configures OAuth or secure
 Interactive commands:
 
 ```text
-/help     /clear     /model     /approve     /status     /exit
+/help     /clear     /model     /login     /approve     /status     /exit
 ```
 
-The line editor persists history in `~/.lato/history`; Up/Down navigate it and Tab completes slash commands. The workspace starts untrusted. Mutating tool calls display their name and arguments and request approval exactly at the execution boundary. You can instead trust the workspace for the process or use `/approve` to pre-authorize one call.
+The line editor persists history in `~/.lato/history`; Up/Down navigate it and Tab completes slash commands. Selecting a provider with an existing credential offers to reuse it, replace its API key, or re-run OAuth. `/login` always replaces the current provider credential and immediately rebuilds the model client in a fresh conversation. The workspace starts untrusted. Mutating tool calls display their name and arguments and request approval exactly at the execution boundary. You can instead trust the workspace for the process or use `/approve` to pre-authorize one call.
 
 ## Headless CLI smoke test
 
