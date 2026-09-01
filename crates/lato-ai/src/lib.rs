@@ -1,6 +1,7 @@
 pub mod api;
 pub mod auth;
 pub mod catalog;
+pub mod model_port_adapter;
 pub mod models_file;
 pub mod oauth;
 pub mod presets;
