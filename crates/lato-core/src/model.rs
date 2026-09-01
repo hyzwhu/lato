@@ -1,3 +1,7 @@
+// Derived from: Codex@633ab199cfd724aa78013c006b27a2b3d049fc3b:codex-rs/model-provider/src/provider.rs
+// License: Apache-2.0
+// Lato changes: normalized provider requests, capabilities, stream events, and typed failures
+
 use crate::{
     AgentError, ErrorCategory, ModelCallId, Retryability, ToolCallId, ToolDescriptor, ToolName,
 };

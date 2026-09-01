@@ -73,6 +73,14 @@ fn descriptor_rejects_duplicate_capabilities() {
 }
 
 #[test]
+fn custom_capabilities_round_trip_without_erasing_their_name() {
+    let capability = ToolCapability::Other("database_read".into());
+    let encoded = serde_json::to_string(&capability).unwrap();
+    let decoded: ToolCapability = serde_json::from_str(&encoded).unwrap();
+    assert_eq!(decoded, capability);
+}
+
+#[test]
 fn tool_errors_convert_without_string_classification() {
     let error = ToolError::new(
         "tool.invalid_arguments",

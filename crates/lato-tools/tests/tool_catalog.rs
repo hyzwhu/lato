@@ -1,12 +1,13 @@
 use async_trait::async_trait;
 use lato_core::{
-    SideEffect, Tool, ToolCancellation, ToolCapability, ToolConcurrency, ToolContext,
-    ToolDescriptor, ToolError, ToolIdempotency, ToolLayer, ToolName, ToolOutput, ToolReplacement,
-    ToolSource,
+    SessionId, SideEffect, Tool, ToolCallId, ToolCancellation, ToolCapability, ToolConcurrency,
+    ToolContext, ToolDescriptor, ToolError, ToolIdempotency, ToolLayer, ToolName, ToolOutput,
+    ToolReplacement, ToolSource, TurnId,
 };
 use lato_tools::{CatalogError, RegistrationOutcome, ToolCatalog};
 use semver::Version;
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 
 struct FakeTool {
     descriptor: ToolDescriptor,
@@ -58,6 +59,15 @@ fn tool(
             },
         },
     })
+}
+
+fn context() -> ToolContext {
+    ToolContext {
+        session_id: SessionId::from("session-1"),
+        turn_id: TurnId::from("turn-1"),
+        call_id: ToolCallId::from("tool-call-1"),
+        cancellation: CancellationToken::new(),
+    }
 }
 
 #[test]
@@ -163,4 +173,39 @@ fn explicit_compatible_higher_layer_replacement_succeeds() {
         catalog.descriptor(&name).unwrap().source.layer,
         ToolLayer::User
     );
+}
+
+#[test]
+fn rejected_replacement_does_not_mutate_the_existing_descriptor() {
+    let mut catalog = ToolCatalog::new();
+    let name = ToolName::parse("lato:read").unwrap();
+    catalog
+        .register(tool(name.as_str(), 1, ToolLayer::Builtin, None))
+        .unwrap();
+    let before = catalog.descriptor(&name).cloned().unwrap();
+    let incompatible = Some(ToolReplacement {
+        target: name.clone(),
+        compatible_major: 2,
+    });
+    assert!(
+        catalog
+            .register(tool(name.as_str(), 2, ToolLayer::User, incompatible))
+            .is_err()
+    );
+    assert_eq!(catalog.descriptor(&name), Some(&before));
+}
+
+#[tokio::test]
+async fn resolved_tool_invokes_through_the_object_safe_membrane() {
+    let mut catalog = ToolCatalog::new();
+    let name = ToolName::parse("lato:read").unwrap();
+    catalog
+        .register(tool(name.as_str(), 1, ToolLayer::Builtin, None))
+        .unwrap();
+    let resolved = catalog.resolve(&name).unwrap();
+    let output = resolved
+        .invoke(context(), serde_json::json!({}))
+        .await
+        .unwrap();
+    assert_eq!(output.content, name.as_str());
 }

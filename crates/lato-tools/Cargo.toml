@@ -21,3 +21,4 @@ zagens-windows-sandbox = { version = "0.8.9", features = ["windows-impl"] }
 
 [dev-dependencies]
 tempfile = "3"
+tokio-util = { version = "0.7", features = ["rt"] }

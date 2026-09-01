@@ -1,3 +1,7 @@
+// Derived from: Codex@633ab199cfd724aa78013c006b27a2b3d049fc3b:codex-rs/core/src/tools/registry.rs
+// License: Apache-2.0
+// Lato changes: added explicit source layers and semver-compatible replacement rules
+
 use lato_core::{DescriptorError, Tool, ToolDescriptor, ToolLayer, ToolName};
 use std::{collections::BTreeMap, sync::Arc};
 

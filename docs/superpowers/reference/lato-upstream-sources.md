@@ -18,6 +18,9 @@ Every copied production file and its tests must add a row before merge.
 | `crates/lato-runtime/src/session.rs` | Codex `codex-rs/core/src/session/handlers.rs::submission_loop` | Structural derivation | Submission ordering, cancellation, replacement, shutdown tests | Tokio channels expose typed Lato Command/Event values |
 | `crates/lato-runtime/src/driver.rs` | Grok Build `crates/codegen/xai-grok-tools/src/implementations/grok_build/task/coordinator_state.rs` | Structural derivation | Child/event channel completion and cancellation tests | Generalized from child tasks to a foreground turn driver |
 | `crates/lato-agent/src/legacy_driver.rs` | Lato `crates/lato-agent/src/actor.rs` plus Codex `codex-rs/core/src/session/handlers.rs` | Compatibility adapter | Delta forwarding, cancellation, steering, history hydration | Runs the existing Lato turn loop behind the typed `TurnDriver` membrane |
+| `crates/lato-core/src/tool.rs` | Grok Build `crates/common/xai-tool-runtime/src/tool.rs` and `dispatch.rs` | Structural derivation | Object safety, JSON membrane, typed errors | Reduced to Lato core descriptor/invoke contracts; streaming tool output deferred |
+| `crates/lato-tools/src/catalog.rs` | Codex `codex-rs/core/src/tools/registry.rs` | Structural derivation | Duplicate rejection, deterministic registration, runtime/spec separation | Added explicit layer and semver replacement rules |
+| `crates/lato-core/src/model.rs` | Codex `codex-rs/model-provider/src/provider.rs` | Structural derivation | Object-safe provider boundary and capabilities | Added normalized Lato request and stream event types |
 
 ## Required source header
 

@@ -1,3 +1,8 @@
+// Derived from: Grok Build@bb7f39d5858cbf5e00de639367f59debbdcb0138:crates/common/xai-tool-runtime/src/tool.rs
+// Derived from: Grok Build@bb7f39d5858cbf5e00de639367f59debbdcb0138:crates/common/xai-tool-runtime/src/dispatch.rs
+// License: Apache-2.0
+// Lato changes: reduced runtime concepts to descriptors, a JSON invoke membrane, and typed errors
+
 use crate::{AgentError, ErrorCategory, Retryability, SessionId, ToolCallId, TurnId};
 use async_trait::async_trait;
 use semver::Version;
