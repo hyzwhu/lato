@@ -108,6 +108,10 @@ The existing model/tool loop currently runs behind `LegacyTurnDriver`, a compati
 `SessionActor`. This keeps provider, tool, approval, and transcript behavior stable while Phase 2
 moves those capabilities behind dedicated ports.
 
+Phase 2A adds provider-independent `ModelPort` and `Tool` contracts in `lato-core`, plus a layered,
+fail-closed `ToolCatalog` in `lato-tools`. The current provider and built-in tool implementations still
+run through compatibility code; Phase 2B will adapt them one at a time without changing these contracts.
+
 Copied or structurally derived upstream code is pinned in
 [`docs/superpowers/reference/lato-upstream-sources.md`](docs/superpowers/reference/lato-upstream-sources.md).
 
