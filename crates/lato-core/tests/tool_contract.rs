@@ -19,7 +19,7 @@ fn descriptor() -> ToolDescriptor {
             "required": ["path"]
         }),
         capabilities: vec![ToolCapability::FileRead],
-        side_effect: SideEffect::WorkspaceRead,
+        side_effect: SideEffect::ReadOnly,
         concurrency: ToolConcurrency::Parallel,
         idempotency: ToolIdempotency::Idempotent,
         timeout_ms: 30_000,
@@ -40,7 +40,7 @@ fn qualified_names_and_descriptors_have_stable_json() {
     let value = serde_json::to_value(descriptor).unwrap();
     assert_eq!(value["name"], "lato:read_file");
     assert_eq!(value["version"], "1.2.0");
-    assert_eq!(value["side_effect"], "workspace_read");
+    assert_eq!(value["side_effect"], "read_only");
     assert_eq!(value["source"]["layer"], "builtin");
 }
 
@@ -73,8 +73,8 @@ fn descriptor_rejects_duplicate_capabilities() {
 }
 
 #[test]
-fn custom_capabilities_round_trip_without_erasing_their_name() {
-    let capability = ToolCapability::Other("database_read".into());
+fn extension_capability_round_trips() {
+    let capability = ToolCapability::ExtensionInvoke;
     let encoded = serde_json::to_string(&capability).unwrap();
     let decoded: ToolCapability = serde_json::from_str(&encoded).unwrap();
     assert_eq!(decoded, capability);

@@ -10,6 +10,7 @@ fn context(cancellation: CancellationToken) -> ToolContext {
         turn_id: TurnId::from("turn-1"),
         call_id: ToolCallId::from("call-1"),
         cancellation,
+        execution_grant: None,
     }
 }
 
@@ -184,7 +185,7 @@ fn fake_descriptor(
         version: semver::Version::new(1, 0, 0),
         description: format!("fake {name}"),
         input_schema: serde_json::json!({"type": "object"}),
-        capabilities: vec![lato_core::ToolCapability::Other("test".into())],
+        capabilities: vec![lato_core::ToolCapability::ExtensionInvoke],
         side_effect: lato_core::SideEffect::None,
         concurrency: lato_core::ToolConcurrency::Parallel,
         idempotency: lato_core::ToolIdempotency::Idempotent,

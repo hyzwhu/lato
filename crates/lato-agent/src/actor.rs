@@ -215,6 +215,7 @@ impl SessionActor {
                             turn_id: self.turn_id.clone(),
                             call_id,
                             cancellation: self.turn_cancellation.clone(),
+                            execution_grant: None,
                         };
                         let tool_runtime = self.tool_runtime.clone();
                         let invocation = tool_runtime.invoke(context, &name, arguments).await;

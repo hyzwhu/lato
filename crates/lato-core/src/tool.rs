@@ -3,7 +3,9 @@
 // License: Apache-2.0
 // Lato changes: reduced runtime concepts to descriptors, a JSON invoke membrane, and typed errors
 
-use crate::{AgentError, ErrorCategory, Retryability, SessionId, ToolCallId, TurnId};
+use crate::{
+    AgentError, ErrorCategory, ExecutionGrant, Retryability, SessionId, ToolCallId, TurnId,
+};
 use async_trait::async_trait;
 use semver::Version;
 use serde_json::Value;
@@ -80,19 +82,25 @@ pub enum ToolNameError {
 pub enum ToolCapability {
     FileRead,
     FileWrite,
-    Process,
-    Network,
-    Memory,
-    Task,
-    Other(String),
+    #[serde(alias = "process")]
+    ProcessSpawn,
+    #[serde(alias = "network")]
+    NetworkRead,
+    NetworkWrite,
+    #[serde(alias = "task")]
+    TaskControl,
+    #[serde(alias = "memory")]
+    ExtensionInvoke,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SideEffect {
     None,
-    WorkspaceRead,
-    WorkspaceWrite,
+    #[serde(alias = "workspace_read")]
+    ReadOnly,
+    #[serde(alias = "workspace_write")]
+    WorkspaceMutation,
     ExternalMutation,
 }
 
@@ -182,6 +190,22 @@ impl ToolDescriptor {
         {
             return Err(DescriptorError::DuplicateCapability);
         }
+        self.validate_policy_metadata()?;
+        Ok(())
+    }
+
+    pub fn validate_policy_metadata(&self) -> Result<(), DescriptorError> {
+        let mismatch = self.capabilities.iter().any(|capability| match capability {
+            ToolCapability::FileWrite => {
+                matches!(self.side_effect, SideEffect::None | SideEffect::ReadOnly)
+            }
+            ToolCapability::NetworkWrite => self.side_effect != SideEffect::ExternalMutation,
+            ToolCapability::ProcessSpawn => self.side_effect == SideEffect::None,
+            _ => false,
+        });
+        if mismatch {
+            return Err(DescriptorError::CapabilitySideEffectMismatch);
+        }
         Ok(())
     }
 }
@@ -198,6 +222,8 @@ pub enum DescriptorError {
     ZeroOutputLimit,
     #[error("tool capabilities must not contain duplicates")]
     DuplicateCapability,
+    #[error("tool capability and side effect metadata are inconsistent")]
+    CapabilitySideEffectMismatch,
 }
 
 #[derive(Clone, Debug)]
@@ -206,6 +232,14 @@ pub struct ToolContext {
     pub turn_id: TurnId,
     pub call_id: ToolCallId,
     pub cancellation: CancellationToken,
+    pub execution_grant: Option<ExecutionGrant>,
+}
+
+impl ToolContext {
+    pub fn with_execution_grant(mut self, grant: ExecutionGrant) -> Self {
+        self.execution_grant = Some(grant);
+        self
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]

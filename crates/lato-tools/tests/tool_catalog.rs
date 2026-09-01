@@ -45,7 +45,7 @@ fn tool(
             version: Version::new(major, 0, 0),
             description: format!("test tool {name}"),
             input_schema: serde_json::json!({"type": "object"}),
-            capabilities: vec![ToolCapability::Other("test".into())],
+            capabilities: vec![ToolCapability::ExtensionInvoke],
             side_effect: SideEffect::None,
             concurrency: ToolConcurrency::Parallel,
             idempotency: ToolIdempotency::Idempotent,
@@ -67,6 +67,7 @@ fn context() -> ToolContext {
         turn_id: TurnId::from("turn-1"),
         call_id: ToolCallId::from("tool-call-1"),
         cancellation: CancellationToken::new(),
+        execution_grant: None,
     }
 }
 

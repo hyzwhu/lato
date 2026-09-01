@@ -56,7 +56,7 @@ impl lato_core::Tool for RecordingTool {
             version: semver::Version::new(1, 0, 0),
             description: "record typed tool context".into(),
             input_schema: serde_json::json!({"type": "object"}),
-            capabilities: vec![lato_core::ToolCapability::Other("test".into())],
+            capabilities: vec![lato_core::ToolCapability::ExtensionInvoke],
             side_effect: lato_core::SideEffect::None,
             concurrency: lato_core::ToolConcurrency::Serial,
             idempotency: lato_core::ToolIdempotency::Idempotent,
