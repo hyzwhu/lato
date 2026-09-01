@@ -1,3 +1,4 @@
+pub mod builtin_adapter;
 pub mod catalog;
 pub mod dispatch;
 pub mod edit;
@@ -10,6 +11,7 @@ pub mod subagent;
 pub mod todo;
 pub mod web;
 
+pub use builtin_adapter::*;
 pub use catalog::*;
 pub use dispatch::*;
 pub use edit::*;
