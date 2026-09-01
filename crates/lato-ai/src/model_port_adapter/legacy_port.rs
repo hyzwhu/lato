@@ -78,7 +78,6 @@ impl ModelPort for LegacyModelPort {
     fn capabilities(&self) -> ModelCapabilities {
         ModelCapabilities {
             tool_use: true,
-            parallel_tool_calls: true,
             ..ModelCapabilities::default()
         }
     }
@@ -385,6 +384,11 @@ mod tests {
                 reason: ModelStopReason::ToolCalls
             })
         ));
+        let capabilities = port.capabilities();
+        assert!(capabilities.tool_use);
+        assert!(!capabilities.parallel_tool_calls);
+        assert!(!capabilities.reasoning);
+        assert_eq!(capabilities.context_window, None);
     }
 
     #[tokio::test]

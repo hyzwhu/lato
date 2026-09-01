@@ -109,8 +109,15 @@ The existing model/tool loop currently runs behind `LegacyTurnDriver`, a compati
 moves those capabilities behind dedicated ports.
 
 Phase 2A adds provider-independent `ModelPort` and `Tool` contracts in `lato-core`, plus a layered,
-fail-closed `ToolCatalog` in `lato-tools`. The current provider and built-in tool implementations still
-run through compatibility code; Phase 2B will adapt them one at a time without changing these contracts.
+fail-closed `ToolCatalog` in `lato-tools`. Phase 2B-1 now routes every configured CLI and ACP HTTP
+provider through `ModelPort`. A bidirectional adapter keeps `SessionActor` on its legacy JSON/channel
+contract temporarily, while the existing HTTP authentication, request builders, retry policy, and SSE
+parsers remain the protocol authority.
+
+`ModelPort` is the canonical provider extension boundary. New providers should implement it directly;
+`LegacyModelPort` and `ModelPortStreamAdapter` exist only to migrate the current providers and actor
+independently. A later actor-native phase removes the redundant legacy encode/decode round trip without
+changing the core request, event, capability, cancellation, or typed-error contracts.
 
 Copied or structurally derived upstream code is pinned in
 [`docs/superpowers/reference/lato-upstream-sources.md`](docs/superpowers/reference/lato-upstream-sources.md).
