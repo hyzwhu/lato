@@ -179,7 +179,7 @@ The final legacy-facing error string starts with the stable code so existing str
 
 `src/cli.rs` changes only the return expressions inside `configured_stream`. Because this file already contains user modifications, implementation must capture its pre-change diff, apply a narrow patch, and prove every pre-existing hunk remains present. Exact hash preservation applies to every other protected dirty file; for `src/cli.rs`, review is patch-based because the approved adapter wiring intentionally changes it.
 
-No edits are permitted in the existing dirty `actor.rs`, `api.rs`, `models_file.rs`, or `stream.rs` files during this phase.
+No behavior edits are permitted in the existing dirty `actor.rs`, `api.rs`, `models_file.rs`, or `stream.rs` files during this phase. The sole exception is an isolated, mechanical collapse of the currently failing `clippy::collapsible_if` in `stream.rs`; implementation must stage only that formatting hunk and prove all other pre-existing hunks remain present.
 
 ## Testing
 
@@ -245,6 +245,6 @@ AgentField live contract `2026-03-24-v1` and `af doctor --json` were checked dur
 - Cancellation and downstream drop leave no detached provider task.
 - Text and tool-call behavior remains compatible with current actor tests.
 - Stable typed model errors exist at the canonical boundary.
-- No production edits occur in `actor.rs`, `api.rs`, `models_file.rs`, or `stream.rs`.
+- No behavior edits occur in `actor.rs`, `api.rs`, `models_file.rs`, or `stream.rs`; only the explicitly isolated Clippy formatting hunk in `stream.rs` is allowed.
 - All repository gates and installed-command smoke tests pass.
 - All pre-existing user changes remain intact.
