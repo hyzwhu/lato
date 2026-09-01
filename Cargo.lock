@@ -850,6 +850,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "lato-policy"
+version = "0.1.0"
+dependencies = [
+ "lato-core",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "lato-protocol"
 version = "0.1.0"
 dependencies = [
