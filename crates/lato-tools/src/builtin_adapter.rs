@@ -1,13 +1,17 @@
 use crate::{ToolCall, dispatch, v1_tool_definitions};
 use async_trait::async_trait;
 use lato_core::{
-    Retryability, SideEffect, Tool, ToolCancellation, ToolCapability, ToolConcurrency, ToolContext,
-    ToolDescriptor, ToolError, ToolIdempotency, ToolLayer, ToolName, ToolOutput, ToolSource,
+    ExecutionGrant, Retryability, SandboxObligation, SandboxProfile, SideEffect, Tool,
+    ToolCancellation, ToolCapability, ToolConcurrency, ToolContext, ToolDescriptor, ToolError,
+    ToolIdempotency, ToolLayer, ToolName, ToolOutput, ToolSource,
 };
 use lato_workspace::{ApprovalMode, FileLocks, SessionTrust, deny_write};
 use semver::Version;
 use serde_json::Value;
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    path::{Component, Path, PathBuf},
+    sync::Arc,
+};
 
 #[derive(Clone)]
 pub struct BuiltinToolEnvironment {
@@ -45,7 +49,12 @@ impl Tool for LegacyDispatchTool {
             return Err(tool_error("tool.cancelled", "tool call was cancelled"));
         }
         let content = if self.legacy_name == "write_file" {
-            invoke_compat_write_file(&self.environment, &arguments).await
+            invoke_compat_write_file(
+                &self.environment,
+                context.execution_grant.as_ref(),
+                &arguments,
+            )
+            .await
         } else {
             dispatch(
                 &self.environment.locks,
@@ -73,6 +82,7 @@ impl Tool for LegacyDispatchTool {
 
 async fn invoke_compat_write_file(
     environment: &BuiltinToolEnvironment,
+    grant: Option<&ExecutionGrant>,
     arguments: &Value,
 ) -> Result<String, String> {
     let raw_path = arguments
@@ -88,6 +98,10 @@ async fn invoke_compat_write_file(
     if deny_write(&path) {
         return Err("denied by write policy".into());
     }
+    let obligation = grant
+        .map(|grant| &grant.sandbox)
+        .ok_or("denied by policy: execution grant missing")?;
+    validate_write_obligation(obligation, &path)?;
     require_compat_mutating_approval(&environment.trust)?;
     let contents = arguments
         .get("contents")
@@ -95,6 +109,7 @@ async fn invoke_compat_write_file(
         .and_then(Value::as_str)
         .ok_or("missing contents")?;
     let _guard = environment.locks.acquire(&path).await;
+    validate_write_obligation(obligation, &path)?;
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent)
             .await
@@ -104,6 +119,79 @@ async fn invoke_compat_write_file(
         .await
         .map_err(|error| error.to_string())?;
     Ok("ok".into())
+}
+
+fn validate_write_obligation(obligation: &SandboxObligation, path: &Path) -> Result<(), String> {
+    match obligation.profile {
+        SandboxProfile::Off => return Ok(()),
+        SandboxProfile::ReadOnly => {
+            return Err("denied by read-only sandbox policy".into());
+        }
+        SandboxProfile::Workspace => {}
+    }
+
+    let target = lexical_normalize(path)?;
+    let workspace = canonical_existing(&obligation.workspace_root)?;
+    let target_ancestor = canonical_nearest_existing(&target)?;
+    if !target_ancestor.starts_with(&workspace) {
+        return Err("denied by workspace sandbox policy".into());
+    }
+
+    let allowed = obligation.writable_roots.iter().any(|root| {
+        let Ok(lexical_root) = lexical_normalize(root) else {
+            return false;
+        };
+        if !target.starts_with(&lexical_root) {
+            return false;
+        }
+        let Ok(canonical_root) = canonical_nearest_existing(&lexical_root) else {
+            return false;
+        };
+        canonical_root.starts_with(&workspace) && target_ancestor.starts_with(&canonical_root)
+    });
+    if !allowed {
+        return Err("denied by writable-roots sandbox policy".into());
+    }
+    Ok(())
+}
+
+fn lexical_normalize(path: &Path) -> Result<PathBuf, String> {
+    if !path.is_absolute() {
+        return Err("denied by sandbox policy: path is not absolute".into());
+    }
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    return Err("denied by sandbox policy: path escapes its root".into());
+                }
+            }
+            Component::Normal(part) => normalized.push(part),
+        }
+    }
+    Ok(normalized)
+}
+
+fn canonical_existing(path: &Path) -> Result<PathBuf, String> {
+    std::fs::canonicalize(path).map_err(|_| "denied by sandbox policy: root unavailable".into())
+}
+
+fn canonical_nearest_existing(path: &Path) -> Result<PathBuf, String> {
+    let mut current = path;
+    loop {
+        match std::fs::canonicalize(current) {
+            Ok(canonical) => return Ok(canonical),
+            Err(_) => {
+                current = current.parent().ok_or_else(|| {
+                    "denied by sandbox policy: no existing path ancestor".to_owned()
+                })?;
+            }
+        }
+    }
 }
 
 fn require_compat_mutating_approval(trust: &SessionTrust) -> Result<(), String> {

@@ -121,6 +121,30 @@ async fn cancelled_adapter_does_not_dispatch() {
 }
 
 #[tokio::test]
+async fn write_adapter_rejects_missing_execution_grant() {
+    let root = tempfile::tempdir().unwrap();
+    let tools = builtin_tools(BuiltinToolEnvironment {
+        cwd: root.path().to_path_buf(),
+        locks: Arc::new(FileLocks::new()),
+        trust: SessionTrust::for_headless_prompt(root.path()),
+    })
+    .unwrap();
+    let write = tools
+        .into_iter()
+        .find(|tool| tool.descriptor().name.as_str() == "builtin:write_file")
+        .unwrap();
+    let error = write
+        .invoke(
+            context(CancellationToken::new()),
+            serde_json::json!({"path":"missing-grant.txt","contents":"blocked"}),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "tool.policy_denied");
+    assert!(!root.path().join("missing-grant.txt").exists());
+}
+
+#[tokio::test]
 async fn runtime_advertises_and_executes_the_same_tools() {
     let root = tempfile::tempdir().unwrap();
     std::fs::write(root.path().join("a.txt"), "hello").unwrap();
@@ -172,6 +196,101 @@ async fn compat_write_file_creates_missing_parent_directories() {
         std::fs::read_to_string(root.path().join("src/generated/hello.rs")).unwrap(),
         contents
     );
+}
+
+#[tokio::test]
+async fn workspace_write_rejects_parent_traversal() {
+    let container = tempfile::tempdir().unwrap();
+    let workspace = container.path().join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    let runtime = lato_tools::builtin_tool_runtime(BuiltinToolEnvironment {
+        cwd: workspace.clone(),
+        locks: Arc::new(FileLocks::new()),
+        trust: SessionTrust::for_interactive_auto(&workspace),
+    })
+    .unwrap();
+    let error = runtime
+        .invoke(
+            context(CancellationToken::new()),
+            "write_file",
+            serde_json::json!({"path":"../outside.txt","contents":"escape"}),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "tool.policy_denied");
+    assert!(!container.path().join("outside.txt").exists());
+}
+
+#[tokio::test]
+async fn workspace_write_rejects_absolute_outside_path() {
+    let workspace = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let outside_file = outside.path().join("outside.txt");
+    let runtime = lato_tools::builtin_tool_runtime(BuiltinToolEnvironment {
+        cwd: workspace.path().to_path_buf(),
+        locks: Arc::new(FileLocks::new()),
+        trust: SessionTrust::for_interactive_auto(workspace.path()),
+    })
+    .unwrap();
+    let error = runtime
+        .invoke(
+            context(CancellationToken::new()),
+            "write_file",
+            serde_json::json!({"path":outside_file,"contents":"escape"}),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "tool.policy_denied");
+    assert!(!outside_file.exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn workspace_write_rejects_symlink_parent_escape() {
+    let workspace = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink(outside.path(), workspace.path().join("linked")).unwrap();
+    let runtime = lato_tools::builtin_tool_runtime(BuiltinToolEnvironment {
+        cwd: workspace.path().to_path_buf(),
+        locks: Arc::new(FileLocks::new()),
+        trust: SessionTrust::for_interactive_auto(workspace.path()),
+    })
+    .unwrap();
+    let error = runtime
+        .invoke(
+            context(CancellationToken::new()),
+            "write_file",
+            serde_json::json!({"path":"linked/escape.txt","contents":"escape"}),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "tool.policy_denied");
+    assert!(!outside.path().join("escape.txt").exists());
+}
+
+#[tokio::test]
+async fn read_only_write_is_denied_without_modifying_target() {
+    let workspace = tempfile::tempdir().unwrap();
+    let target = workspace.path().join("existing.txt");
+    std::fs::write(&target, "before").unwrap();
+    let mut trust = SessionTrust::for_headless_prompt(workspace.path());
+    trust.sandbox = lato_workspace::SandboxProfile::ReadOnly;
+    let runtime = lato_tools::builtin_tool_runtime(BuiltinToolEnvironment {
+        cwd: workspace.path().to_path_buf(),
+        locks: Arc::new(FileLocks::new()),
+        trust,
+    })
+    .unwrap();
+    let error = runtime
+        .invoke(
+            context(CancellationToken::new()),
+            "write_file",
+            serde_json::json!({"path":"existing.txt","contents":"after"}),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "tool.policy_denied");
+    assert_eq!(std::fs::read_to_string(target).unwrap(), "before");
 }
 
 #[tokio::test]
