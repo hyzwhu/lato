@@ -294,3 +294,103 @@ fn different_namespaces_cannot_advertise_the_same_local_name() {
             if wire_name == "read"
     ));
 }
+
+#[tokio::test]
+async fn write_alias_consumes_allow_once_exactly_once() {
+    let root = tempfile::tempdir().unwrap();
+    let trust = SessionTrust::for_interactive(root.path(), true);
+    trust.allow_once();
+    let runtime = lato_tools::builtin_tool_runtime(BuiltinToolEnvironment {
+        cwd: root.path().to_path_buf(),
+        locks: Arc::new(FileLocks::new()),
+        trust: trust.clone(),
+    })
+    .unwrap();
+
+    runtime
+        .invoke(
+            context(CancellationToken::new()),
+            "write",
+            serde_json::json!({"path": "a.txt", "contents": "one"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("a.txt")).unwrap(),
+        "one"
+    );
+    assert!(!trust.has_allow_once());
+
+    let error = runtime
+        .invoke(
+            context(CancellationToken::new()),
+            "write_file",
+            serde_json::json!({"path": "b.txt", "contents": "two"}),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "tool.policy_denied");
+    assert!(!root.path().join("b.txt").exists());
+}
+
+#[tokio::test]
+async fn malformed_and_denied_calls_are_classified() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join(".env"), "SECRET=1").unwrap();
+    let runtime = lato_tools::builtin_tool_runtime(BuiltinToolEnvironment {
+        cwd: root.path().to_path_buf(),
+        locks: Arc::new(FileLocks::new()),
+        trust: SessionTrust::for_headless_prompt(root.path()),
+    })
+    .unwrap();
+
+    let malformed = runtime
+        .invoke(
+            context(CancellationToken::new()),
+            "read_file",
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(malformed.code, "tool.invalid_arguments");
+
+    let denied = runtime
+        .invoke(
+            context(CancellationToken::new()),
+            "write_file",
+            serde_json::json!({"path": ".env", "contents": "SECRET=2"}),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(denied.code, "tool.policy_denied");
+    assert_eq!(
+        std::fs::read_to_string(root.path().join(".env")).unwrap(),
+        "SECRET=1"
+    );
+}
+
+#[test]
+fn every_advertised_tool_has_one_executable_descriptor() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = lato_tools::builtin_tool_runtime(BuiltinToolEnvironment {
+        cwd: root.path().to_path_buf(),
+        locks: Arc::new(FileLocks::new()),
+        trust: SessionTrust::for_headless_prompt(root.path()),
+    })
+    .unwrap();
+
+    for definition in runtime.model_definitions() {
+        let name = definition
+            .pointer("/function/name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap();
+        assert_eq!(
+            runtime
+                .descriptor_for_wire_name(name)
+                .unwrap()
+                .name
+                .local_name(),
+            name
+        );
+    }
+}

@@ -2,7 +2,7 @@ use crate::{
     BuiltinAdapterError, BuiltinToolEnvironment, CatalogError, RegistrationOutcome, ToolCatalog,
     builtin_tools,
 };
-use lato_core::{Retryability, Tool, ToolContext, ToolError, ToolName, ToolOutput};
+use lato_core::{Retryability, Tool, ToolContext, ToolDescriptor, ToolError, ToolName, ToolOutput};
 use serde_json::{Value, json};
 use std::{collections::BTreeMap, sync::Arc};
 
@@ -100,24 +100,32 @@ impl ToolRuntime {
             ));
         }
 
-        let normalized = wire_name.strip_prefix("Lato:").unwrap_or(wire_name);
-        let normalized = if normalized == "write" {
-            "write_file"
-        } else {
-            normalized
-        };
-        let canonical = if normalized.contains(':') {
-            ToolName::parse(normalized).ok()
-        } else {
-            self.wire_names.get(normalized).cloned()
-        };
-        let Some(canonical) = canonical else {
+        let Some(canonical) = self.resolve_wire_name(wire_name) else {
             return Err(not_found(wire_name));
         };
         let Some(tool) = self.catalog.resolve(&canonical) else {
             return Err(not_found(wire_name));
         };
         tool.invoke(context, arguments).await
+    }
+
+    pub fn descriptor_for_wire_name(&self, wire_name: &str) -> Option<ToolDescriptor> {
+        let canonical = self.resolve_wire_name(wire_name)?;
+        self.catalog.descriptor(&canonical).cloned()
+    }
+
+    fn resolve_wire_name(&self, wire_name: &str) -> Option<ToolName> {
+        let normalized = wire_name.strip_prefix("Lato:").unwrap_or(wire_name);
+        let normalized = if normalized == "write" {
+            "write_file"
+        } else {
+            normalized
+        };
+        if normalized.contains(':') {
+            ToolName::parse(normalized).ok()
+        } else {
+            self.wire_names.get(normalized).cloned()
+        }
     }
 }
 
