@@ -146,6 +146,35 @@ async fn runtime_advertises_and_executes_the_same_tools() {
 }
 
 #[tokio::test]
+async fn compat_write_file_creates_missing_parent_directories() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = lato_tools::builtin_tool_runtime(BuiltinToolEnvironment {
+        cwd: root.path().to_path_buf(),
+        locks: Arc::new(FileLocks::new()),
+        trust: SessionTrust::for_headless_prompt(root.path()),
+    })
+    .unwrap();
+    let contents = "pub fn generated() -> bool { true }\n";
+
+    runtime
+        .invoke(
+            context(CancellationToken::new()),
+            "write_file",
+            serde_json::json!({
+                "path": "src/generated/hello.rs",
+                "contents": contents,
+            }),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("src/generated/hello.rs")).unwrap(),
+        contents
+    );
+}
+
+#[tokio::test]
 async fn unknown_wire_name_is_typed() {
     let root = tempfile::tempdir().unwrap();
     let runtime = lato_tools::builtin_tool_runtime(BuiltinToolEnvironment {

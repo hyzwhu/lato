@@ -95,6 +95,11 @@ async fn invoke_compat_write_file(
         .and_then(Value::as_str)
         .ok_or("missing contents")?;
     let _guard = environment.locks.acquire(&path).await;
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|error| error.to_string())?;
+    }
     tokio::fs::write(path, contents)
         .await
         .map_err(|error| error.to_string())?;
