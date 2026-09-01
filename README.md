@@ -99,11 +99,14 @@ cargo run -q -- login openai-codex --oauth
 
 ## Runtime architecture
 
-Lato is migrating to a typed Command/Event core without replacing the working CLI in one step.
-`lato-core` owns provider-independent IDs, errors, commands, events, and session invariants.
-`lato-runtime` owns the cancellable Tokio session loop and the `TurnDriver` boundary.
-The current ACP host remains the production path until the Phase 1B adapter is complete; this keeps
-headless, interactive, provider, tool, approval, and transcript behavior stable during migration.
+Lato's headless, interactive, and stdio clients share the ACP host. ACP sessions submit typed
+commands to `lato-runtime` and consume versioned events from it. `lato-core` owns provider-independent
+IDs, errors, commands, events, and session invariants; `lato-runtime` owns cancellation, steering,
+replacement, event ordering, and the `TurnDriver` boundary.
+
+The existing model/tool loop currently runs behind `LegacyTurnDriver`, a compatibility adapter around
+`SessionActor`. This keeps provider, tool, approval, and transcript behavior stable while Phase 2
+moves those capabilities behind dedicated ports.
 
 Copied or structurally derived upstream code is pinned in
 [`docs/superpowers/reference/lato-upstream-sources.md`](docs/superpowers/reference/lato-upstream-sources.md).
