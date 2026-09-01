@@ -17,6 +17,7 @@ Every copied production file and its tests must add a row before merge.
 | `crates/lato-core/src/state.rs` | Codex `codex-rs/core/src/session/session.rs` and `codex-rs/core/src/session/handlers.rs` | Structural derivation | Single-active-turn, replace, cancel, shutdown state tests | Reduced to a provider- and transport-independent state machine |
 | `crates/lato-runtime/src/session.rs` | Codex `codex-rs/core/src/session/handlers.rs::submission_loop` | Structural derivation | Submission ordering, cancellation, replacement, shutdown tests | Tokio channels expose typed Lato Command/Event values |
 | `crates/lato-runtime/src/driver.rs` | Grok Build `crates/codegen/xai-grok-tools/src/implementations/grok_build/task/coordinator_state.rs` | Structural derivation | Child/event channel completion and cancellation tests | Generalized from child tasks to a foreground turn driver |
+| `crates/lato-agent/src/legacy_driver.rs` | Lato `crates/lato-agent/src/actor.rs` plus Codex `codex-rs/core/src/session/handlers.rs` | Compatibility adapter | Delta forwarding, cancellation, steering, history hydration | Runs the existing Lato turn loop behind the typed `TurnDriver` membrane |
 
 ## Required source header
 

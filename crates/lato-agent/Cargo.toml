@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+lato-core = { path = "../lato-core" }
+lato-runtime = { path = "../lato-runtime" }
 lato-protocol = { path = "../lato-protocol" }
 lato-workspace = { path = "../lato-workspace" }
 lato-ai = { path = "../lato-ai" }
