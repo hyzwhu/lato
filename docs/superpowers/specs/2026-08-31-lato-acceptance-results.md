@@ -71,8 +71,8 @@ Measured on macOS arm64, rustc 1.98.0, from workspace HEAD plus this Doctor CLI 
 
 | Gate | Result | Evidence |
 |---|---|---|
-| Focused tests | PASS | `cargo test --test doctor_cli --test policy_runtime_wiring --test tool_runtime_wiring`: doctor_cli 6 passed; policy_runtime_wiring 2 passed; tool_runtime_wiring 1 passed, **1 failed** (`actor_uses_the_tool_runtime_for_definitions_and_execution` still asserts `tool_runtime.invoke(` while the actor uses `prepare`/`execute`) |
-| Workspace tests | FAIL (1) | `cargo test --workspace --no-fail-fast`: **303 passed, 1 failed, 0 ignored** (304). Sole failure is the wiring assertion above; it is present on committed `actor.rs` as well as the dirty user copy |
+| Focused tests | PASS | `cargo test --test doctor_cli --test policy_runtime_wiring --test tool_runtime_wiring`: doctor_cli 6 passed; policy_runtime_wiring 2 passed; tool_runtime_wiring 2 passed (wiring now requires `tool_runtime.prepare(` / `tool_runtime.execute(`) |
+| Workspace tests | PASS | `cargo test --workspace --no-fail-fast`: **304 passed, 0 failed, 0 ignored** (304). Stale `invoke(` assertion updated to prepare/execute |
 | Clippy | PASS | `cargo clippy --workspace --all-targets --all-features -- -D warnings` after collapsing nested `if` in `crates/lato-workspace/src/sandbox.rs` and removing a needless struct update in `tests/doctor_cli.rs` |
 | Install | PASS | `cargo install --path .` replaced `/Users/huangyongzhao/.cargo/bin/lato` (8,927,072 bytes, 2026-09-01) |
 | Installed Doctor | PASS | `LATO_HOME=$(mktemp -d) lato doctor` → status `warn`, exit 0; `lato doctor --json` → `schema_version` 1, `tool_catalog` present, exit 0; `lato doctor --strict` → exit 1; seeded `LATO_TEST_SECRET` not present in output; no `--live` so no provider completion |
@@ -80,7 +80,7 @@ Measured on macOS arm64, rustc 1.98.0, from workspace HEAD plus this Doctor CLI 
 | Ask-mode write (installed CLI) | N/A (no tty) | `lato -p --ask "write hello" </dev/null` → `error: --ask requires a tty`, exit 2 |
 | Read / exact write / replay / sandbox | PASS (unit/integration fixtures) | `runtime_advertises_and_executes_the_same_tools` ok; `write_alias_consumes_allow_once_exactly_once` ok; `grant_is_consumed_before_tool_invocation` ok; `consumed_grant_cannot_be_replayed` ok; `missing_wrapper_does_not_execute_workspace_command` ok; `missing_wrapper_is_unavailable_and_does_not_run` ok |
 
-**Public Beta ready: no.** Required workspace test gate failed (`tool_runtime.invoke(` wiring assertion). Doctor CLI, offline default, Clippy, install, and installed-binary Doctor smokes passed.
+**Public Beta ready:** workspace test gate is now green after updating the stale `tool_runtime.invoke(` wiring assertion to `prepare`/`execute`. Doctor CLI, offline default, Clippy, install, and installed-binary Doctor smokes previously passed; re-measure Clippy/install/smokes before a public claim if those artifacts drift.
 
 ## Final commands
 
