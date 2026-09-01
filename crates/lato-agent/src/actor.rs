@@ -1,10 +1,12 @@
 use crate::HistoryItem;
 use async_trait::async_trait;
 use lato_ai::{CONTEXT_HARD_LIMIT_BYTES, ModelStream, StreamPiece};
-use lato_tools::{ToolCall, bound_tool_output, dispatch, v1_tool_definitions};
+use lato_core::{SessionId, ToolCallId, ToolContext, TurnId};
+use lato_tools::{BuiltinToolEnvironment, ToolRuntime, bound_tool_output, builtin_tool_runtime};
 use lato_workspace::{FileLocks, SessionTrust};
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PromptKind {
@@ -28,9 +30,15 @@ pub struct SessionActor {
     cancelled: bool,
     history: Vec<HistoryItem>,
     stream: Arc<dyn ModelStream>,
-    locks: Arc<FileLocks>,
+    _locks: Arc<FileLocks>,
     trust: SessionTrust,
     cwd: PathBuf,
+    tool_runtime: Arc<ToolRuntime>,
+    session_id: SessionId,
+    turn_id: TurnId,
+    turn_cancellation: CancellationToken,
+    next_local_turn: u64,
+    next_local_call: u64,
     events: Option<(mpsc::UnboundedSender<serde_json::Value>, String)>,
     tool_approval: Option<Arc<dyn ToolApproval>>,
     #[cfg(test)]
@@ -44,14 +52,36 @@ impl SessionActor {
         trust: SessionTrust,
         cwd: PathBuf,
     ) -> Self {
+        let tool_runtime = builtin_tool_runtime(BuiltinToolEnvironment {
+            cwd: cwd.clone(),
+            locks: locks.clone(),
+            trust: trust.clone(),
+        })
+        .expect("static built-in tool descriptors must form a valid runtime");
+        Self::new_with_tool_runtime(stream, locks, trust, cwd, tool_runtime)
+    }
+
+    pub fn new_with_tool_runtime(
+        stream: Arc<dyn ModelStream>,
+        locks: Arc<FileLocks>,
+        trust: SessionTrust,
+        cwd: PathBuf,
+        tool_runtime: Arc<ToolRuntime>,
+    ) -> Self {
         Self {
             active: false,
             cancelled: false,
             history: vec![HistoryItem::System(build_world_state(&cwd))],
             stream,
-            locks,
+            _locks: locks,
             trust,
             cwd,
+            tool_runtime,
+            session_id: SessionId::from("local-session"),
+            turn_id: TurnId::from("local-turn-0"),
+            turn_cancellation: CancellationToken::new(),
+            next_local_turn: 0,
+            next_local_call: 0,
             events: None,
             tool_approval: None,
             #[cfg(test)]
@@ -64,18 +94,35 @@ impl SessionActor {
         session_id: String,
         approval: Option<Arc<dyn ToolApproval>>,
     ) -> Self {
+        self.session_id = SessionId::parse(session_id.clone())
+            .unwrap_or_else(|_| SessionId::from("local-session"));
         self.events = Some((events, session_id));
         self.tool_approval = approval;
         self
     }
 
-    pub async fn prompt(&mut self, _kind: PromptKind, text: String) -> Result<TurnOutcome, String> {
+    pub async fn prompt(&mut self, kind: PromptKind, text: String) -> Result<TurnOutcome, String> {
+        self.next_local_turn += 1;
+        let turn_id = TurnId::from(format!("local-turn-{}", self.next_local_turn));
+        self.prompt_with_context(kind, text, turn_id, CancellationToken::new())
+            .await
+    }
+
+    pub async fn prompt_with_context(
+        &mut self,
+        _kind: PromptKind,
+        text: String,
+        turn_id: TurnId,
+        cancellation: CancellationToken,
+    ) -> Result<TurnOutcome, String> {
         if self.active {
             self.cancelled = true;
             self.active = false;
         }
         self.active = true;
         self.cancelled = false;
+        self.turn_id = turn_id;
+        self.turn_cancellation = cancellation;
         self.history.push(HistoryItem::User(text));
         noop_hooks();
         let mut sampling_steps = 0usize;
@@ -91,9 +138,10 @@ impl SessionActor {
                 return Err("context exceeds hard limit; compact not implemented".into());
             }
             let (tx, mut rx) = mpsc::channel(16);
+            let tool_runtime = self.tool_runtime.clone();
             let context = serde_json::json!({
                 "messages": history_to_messages(&self.history),
-                "tools": v1_tool_definitions(),
+                "tools": tool_runtime.model_definitions(),
             });
             let stream = self.stream.clone();
             let prompt_bytes = self.encoded_len();
@@ -101,7 +149,7 @@ impl SessionActor {
                 tokio::spawn(async move { stream.stream(prompt_bytes, context, tx).await });
             let mut saw_tool = false;
             while let Some(piece) = rx.recv().await {
-                if self.cancelled {
+                if self.cancelled || self.turn_cancellation.is_cancelled() {
                     self.active = false;
                     return Ok(TurnOutcome::Cancelled);
                 }
@@ -139,7 +187,7 @@ impl SessionActor {
                         if let Some(cb) = &self.on_after_persist {
                             cb();
                         }
-                        if self.cancelled {
+                        if self.cancelled || self.turn_cancellation.is_cancelled() {
                             self.active = false;
                             return Ok(TurnOutcome::Cancelled);
                         }
@@ -158,14 +206,21 @@ impl SessionActor {
                         if let Some((events, session_id)) = &self.events {
                             let _ = events.send(serde_json::json!({"jsonrpc":"2.0","method":"session/tool_call","params":{"sessionId":session_id,"name":name,"arguments":arguments}}));
                         }
-                        let out = dispatch(
-                            &self.locks,
-                            &self.trust,
-                            &self.cwd,
-                            ToolCall { name, arguments },
-                        )
-                        .await
-                        .unwrap_or_else(|e| format!("ERROR: {e}"));
+                        let call_id = ToolCallId::parse(id.clone()).unwrap_or_else(|_| {
+                            self.next_local_call += 1;
+                            ToolCallId::from(format!("local-tool-call-{}", self.next_local_call))
+                        });
+                        let context = ToolContext {
+                            session_id: self.session_id.clone(),
+                            turn_id: self.turn_id.clone(),
+                            call_id,
+                            cancellation: self.turn_cancellation.clone(),
+                        };
+                        let tool_runtime = self.tool_runtime.clone();
+                        let invocation = tool_runtime.invoke(context, &name, arguments).await;
+                        let out = invocation
+                            .map(|output| output.content)
+                            .unwrap_or_else(|error| format!("ERROR: {}", error.message));
                         let out = bound_tool_output(out, &self.cwd, &id).await?;
                         self.history
                             .push(HistoryItem::ToolResult { id, output: out });
@@ -181,6 +236,7 @@ impl SessionActor {
     }
     pub fn cancel(&mut self) {
         self.cancelled = true;
+        self.turn_cancellation.cancel();
     }
     pub fn history(&self) -> &[HistoryItem] {
         &self.history
