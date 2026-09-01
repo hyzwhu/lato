@@ -1,9 +1,9 @@
 use lato_agent::{ToolApproval, default_fake_stream};
 use lato_ai::{
     AuthInteraction, AuthNotice, CATALOG, CredentialStore, CustomHttpModelStream, CustomModel,
-    HttpModelStream, ModelApi, ModelStream, ProviderModelsStore, api_key_login_allowed,
-    custom_model_auth, get_auth_refreshing, load_models_json, login_oauth, lookup_model,
-    oauth_allowed, phase0_supported, provider_spec, refresh_openai_compatible_models,
+    HttpModelStream, ModelApi, ModelStream, ProviderModelsStore, adapt_model_stream,
+    api_key_login_allowed, custom_model_auth, get_auth_refreshing, load_models_json, login_oauth,
+    lookup_model, oauth_allowed, phase0_supported, provider_spec, refresh_openai_compatible_models,
     refresh_remote_provider_catalog, store_oauth,
 };
 use lato_workspace::{ApprovalMode, SandboxProfile, SessionTrust};
@@ -687,7 +687,8 @@ async fn configured_stream(selection: &str) -> Result<Arc<dyn ModelStream>, Stri
         )
         .await?
         .ok_or_else(|| format!("no credential configured for {provider}"))?;
-        Ok(Arc::new(HttpModelStream::new(model, auth)))
+        let raw: Arc<dyn ModelStream> = Arc::new(HttpModelStream::new(model, auth));
+        adapt_model_stream(provider, model_id, raw).map_err(|error| error.to_string())
     } else {
         let home = lato_home();
         if let Some(custom) = load_models_json(&home.join("models.json"))
@@ -697,7 +698,8 @@ async fn configured_stream(selection: &str) -> Result<Arc<dyn ModelStream>, Stri
         {
             let auth = custom_model_auth(&custom, &|name| std::env::var(name).ok())
                 .ok_or_else(|| format!("environment variable {} is not configured", custom.env))?;
-            return Ok(Arc::new(CustomHttpModelStream::new(custom, auth)));
+            let raw: Arc<dyn ModelStream> = Arc::new(CustomHttpModelStream::new(custom, auth));
+            return adapt_model_stream(provider, model_id, raw).map_err(|error| error.to_string());
         }
         let cached = ProviderModelsStore::open(&home)
             .read(provider)?
@@ -718,7 +720,8 @@ async fn configured_stream(selection: &str) -> Result<Arc<dyn ModelStream>, Stri
         )
         .await?
         .ok_or_else(|| format!("no credential configured for {provider}"))?;
-        Ok(Arc::new(CustomHttpModelStream::new(cached, auth)))
+        let raw: Arc<dyn ModelStream> = Arc::new(CustomHttpModelStream::new(cached, auth));
+        adapt_model_stream(provider, model_id, raw).map_err(|error| error.to_string())
     }
 }
 
