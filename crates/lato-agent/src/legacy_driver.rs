@@ -32,6 +32,31 @@ impl LegacyTurnDriver {
         let (actor_tx, actor_events) = mpsc::unbounded_channel();
         let actor = SessionActor::new(stream, locks, trust, cwd)
             .with_interactive_events(actor_tx, session_id, approval);
+        Self::from_actor(actor, actor_events, passthrough)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_tool_runtime(
+        session_id: String,
+        stream: Arc<dyn ModelStream>,
+        locks: Arc<FileLocks>,
+        trust: SessionTrust,
+        cwd: PathBuf,
+        passthrough: mpsc::UnboundedSender<serde_json::Value>,
+        approval: Option<Arc<dyn ToolApproval>>,
+        tool_runtime: Arc<lato_tools::ToolRuntime>,
+    ) -> Self {
+        let (actor_tx, actor_events) = mpsc::unbounded_channel();
+        let actor = SessionActor::new_with_tool_runtime(stream, locks, trust, cwd, tool_runtime)
+            .with_interactive_events(actor_tx, session_id, approval);
+        Self::from_actor(actor, actor_events, passthrough)
+    }
+
+    fn from_actor(
+        actor: SessionActor,
+        actor_events: mpsc::UnboundedReceiver<serde_json::Value>,
+        passthrough: mpsc::UnboundedSender<serde_json::Value>,
+    ) -> Self {
         Self {
             state: Mutex::new(LegacyState {
                 actor,
@@ -59,6 +84,8 @@ impl TurnDriver for LegacyTurnDriver {
         events: TurnEventEmitter,
     ) -> Result<TurnOutput, AgentError> {
         let mut state = self.state.lock().await;
+        let turn_id = request.turn_id.clone();
+        let cancellation = control.cancellation.clone();
         let mut input = request.input;
         let mut kind = PromptKind::Start;
         let mut steering_open = true;
@@ -75,7 +102,12 @@ impl TurnDriver for LegacyTurnDriver {
                     actor,
                     actor_events,
                 } = &mut *state;
-                let mut prompt = Box::pin(actor.prompt(kind, input.text));
+                let mut prompt = Box::pin(actor.prompt_with_context(
+                    kind,
+                    input.text,
+                    turn_id.clone(),
+                    cancellation.clone(),
+                ));
                 loop {
                     tokio::select! {
                         biased;

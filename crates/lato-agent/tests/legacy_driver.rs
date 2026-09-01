@@ -1,8 +1,11 @@
 use async_trait::async_trait;
 use lato_agent::{HistoryItem, LegacyTurnDriver, default_fake_stream};
 use lato_ai::{FakeModelStream, ModelStream, StreamPiece};
-use lato_core::{Command, EventPayload, SessionId, StartBehavior, StartTurn, UserInput};
+use lato_core::{
+    Command, EventPayload, SessionId, StartBehavior, StartTurn, ToolCallId, TurnId, UserInput,
+};
 use lato_runtime::spawn_session;
+use lato_tools::ToolRuntimeBuilder;
 use lato_workspace::{FileLocks, SessionTrust};
 use std::{
     sync::{
@@ -41,6 +44,78 @@ fn driver() -> (
     driver_with_stream(default_fake_stream())
 }
 
+struct RecordingTool {
+    tx: mpsc::UnboundedSender<(SessionId, TurnId, ToolCallId, bool)>,
+}
+
+#[async_trait]
+impl lato_core::Tool for RecordingTool {
+    fn descriptor(&self) -> lato_core::ToolDescriptor {
+        lato_core::ToolDescriptor {
+            name: lato_core::ToolName::parse("session:record").unwrap(),
+            version: semver::Version::new(1, 0, 0),
+            description: "record typed tool context".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+            capabilities: vec![lato_core::ToolCapability::Other("test".into())],
+            side_effect: lato_core::SideEffect::None,
+            concurrency: lato_core::ToolConcurrency::Serial,
+            idempotency: lato_core::ToolIdempotency::Idempotent,
+            timeout_ms: 1_000,
+            max_output_bytes: 1_024,
+            cancellation: lato_core::ToolCancellation::Cooperative,
+            source: lato_core::ToolSource {
+                layer: lato_core::ToolLayer::SessionOverride,
+                id: "test.recording".into(),
+                replacement: None,
+            },
+        }
+    }
+
+    async fn invoke(
+        &self,
+        context: lato_core::ToolContext,
+        _arguments: serde_json::Value,
+    ) -> Result<lato_core::ToolOutput, lato_core::ToolError> {
+        self.tx
+            .send((
+                context.session_id,
+                context.turn_id,
+                context.call_id,
+                context.cancellation.is_cancelled(),
+            ))
+            .unwrap();
+        Ok(lato_core::ToolOutput {
+            content: "recorded".into(),
+            metadata: serde_json::json!({}),
+            truncated: false,
+            artifact_path: None,
+        })
+    }
+}
+
+fn driver_with_recording_tool(
+    stream: Arc<dyn ModelStream>,
+    recording_tx: mpsc::UnboundedSender<(SessionId, TurnId, ToolCallId, bool)>,
+) -> Arc<LegacyTurnDriver> {
+    let cwd = std::env::current_dir().unwrap();
+    let (updates_tx, _updates_rx) = mpsc::unbounded_channel();
+    let mut builder = ToolRuntimeBuilder::new();
+    builder
+        .register(Arc::new(RecordingTool { tx: recording_tx }))
+        .unwrap();
+    let runtime = Arc::new(builder.build().unwrap());
+    Arc::new(LegacyTurnDriver::new_with_tool_runtime(
+        "legacy-session".into(),
+        stream,
+        Arc::new(FileLocks::new()),
+        SessionTrust::for_headless_prompt(&cwd),
+        cwd,
+        updates_tx,
+        None,
+        runtime,
+    ))
+}
+
 async fn recv_until(
     events: &mut tokio::sync::broadcast::Receiver<lato_core::EventEnvelope>,
     predicate: impl Fn(&EventPayload) -> bool,
@@ -55,6 +130,123 @@ async fn recv_until(
     })
     .await
     .expect("timed out waiting for runtime event")
+}
+
+#[tokio::test]
+async fn tool_context_uses_runtime_session_turn_and_model_call_ids() {
+    let stream = Arc::new(FakeModelStream::new(vec![
+        vec![StreamPiece::ToolCall {
+            id: "record-call-1".into(),
+            name: "record".into(),
+            arguments: serde_json::json!({}),
+        }],
+        vec![StreamPiece::Text("done".into())],
+    ]));
+    let (recording_tx, mut recordings) = mpsc::unbounded_channel();
+    let driver = driver_with_recording_tool(stream, recording_tx);
+    let session = spawn_session(SessionId::from("legacy-session"), driver);
+    let mut events = session.subscribe();
+
+    session
+        .submit(Command::StartTurn(StartTurn {
+            input: UserInput::text("record context"),
+            behavior: StartBehavior::Reject,
+        }))
+        .await
+        .unwrap();
+    let started = recv_until(&mut events, |payload| {
+        matches!(payload, EventPayload::TurnStarted)
+    })
+    .await;
+    let started_turn_id = started
+        .turn_id
+        .expect("turn-started event must carry a turn id");
+    let (session_id, turn_id, call_id, cancelled) =
+        timeout(Duration::from_secs(2), recordings.recv())
+            .await
+            .expect("recording tool timed out")
+            .expect("recording channel closed");
+
+    assert_eq!(session_id, SessionId::from("legacy-session"));
+    assert_eq!(turn_id, started_turn_id);
+    assert_eq!(call_id, ToolCallId::from("record-call-1"));
+    assert!(!cancelled);
+    let completed = recv_until(&mut events, |payload| {
+        matches!(payload, EventPayload::TurnCompleted(_))
+    })
+    .await;
+    assert!(matches!(completed.payload, EventPayload::TurnCompleted(_)));
+}
+
+struct GatedToolCallStream {
+    release: Notify,
+}
+
+#[async_trait]
+impl ModelStream for GatedToolCallStream {
+    async fn stream(
+        &self,
+        _prompt_bytes: usize,
+        _context: serde_json::Value,
+        tx: mpsc::Sender<StreamPiece>,
+    ) -> Result<(), String> {
+        self.release.notified().await;
+        tx.send(StreamPiece::ToolCall {
+            id: "cancelled-record-call".into(),
+            name: "record".into(),
+            arguments: serde_json::json!({}),
+        })
+        .await
+        .map_err(|_| "stream receiver closed".to_string())
+    }
+}
+
+#[tokio::test]
+async fn cancellation_reaches_the_tool_membrane_before_dispatch() {
+    let stream = Arc::new(GatedToolCallStream {
+        release: Notify::new(),
+    });
+    let (recording_tx, mut recordings) = mpsc::unbounded_channel();
+    let driver = driver_with_recording_tool(stream.clone(), recording_tx);
+    let session = spawn_session(SessionId::from("legacy-session"), driver);
+    let mut events = session.subscribe();
+
+    session
+        .submit(Command::StartTurn(StartTurn {
+            input: UserInput::text("record after cancellation"),
+            behavior: StartBehavior::Reject,
+        }))
+        .await
+        .unwrap();
+    let started = recv_until(&mut events, |payload| {
+        matches!(payload, EventPayload::TurnStarted)
+    })
+    .await;
+    session
+        .submit(Command::CancelTurn {
+            turn_id: started.turn_id.unwrap(),
+        })
+        .await
+        .unwrap();
+
+    let terminal = recv_until(&mut events, |payload| {
+        matches!(
+            payload,
+            EventPayload::TurnCancelled { .. }
+                | EventPayload::TurnCompleted(_)
+                | EventPayload::TurnFailed { .. }
+        )
+    })
+    .await;
+    assert!(matches!(
+        terminal.payload,
+        EventPayload::TurnCancelled { .. }
+    ));
+    stream.release.notify_waiters();
+    match timeout(Duration::from_millis(100), recordings.recv()).await {
+        Err(_) | Ok(None) => {}
+        Ok(Some((_, _, _, cancelled))) => assert!(cancelled),
+    }
 }
 
 #[tokio::test]
@@ -153,6 +345,55 @@ struct InterruptibleStream {
     contexts: Mutex<Vec<serde_json::Value>>,
 }
 
+struct SteeringRecordingStream {
+    calls: AtomicUsize,
+    first_started: Notify,
+    first_closed: Notify,
+}
+
+impl SteeringRecordingStream {
+    fn new() -> Self {
+        Self {
+            calls: AtomicUsize::new(0),
+            first_started: Notify::new(),
+            first_closed: Notify::new(),
+        }
+    }
+}
+
+#[async_trait]
+impl ModelStream for SteeringRecordingStream {
+    async fn stream(
+        &self,
+        _prompt_bytes: usize,
+        _context: serde_json::Value,
+        tx: mpsc::Sender<StreamPiece>,
+    ) -> Result<(), String> {
+        match self.calls.fetch_add(1, Ordering::SeqCst) {
+            0 => {
+                self.first_started.notify_one();
+                tx.closed().await;
+                self.first_closed.notify_one();
+            }
+            1 => {
+                tx.send(StreamPiece::ToolCall {
+                    id: "steered-record-call".into(),
+                    name: "record".into(),
+                    arguments: serde_json::json!({}),
+                })
+                .await
+                .map_err(|_| "stream receiver closed".to_string())?;
+            }
+            _ => {
+                tx.send(StreamPiece::Text("steered done".into()))
+                    .await
+                    .map_err(|_| "stream receiver closed".to_string())?;
+            }
+        }
+        Ok(())
+    }
+}
+
 impl InterruptibleStream {
     fn new() -> Self {
         Self {
@@ -218,6 +459,55 @@ async fn cancellation_token_interrupts_a_blocked_legacy_prompt() {
     timeout(Duration::from_secs(2), stream.first_closed.notified())
         .await
         .expect("cancelled stream task retained its receiver");
+}
+
+#[tokio::test]
+async fn steering_keeps_the_runtime_owned_cancellation_token_live() {
+    let stream = Arc::new(SteeringRecordingStream::new());
+    let (recording_tx, mut recordings) = mpsc::unbounded_channel();
+    let driver = driver_with_recording_tool(stream.clone(), recording_tx);
+    let session = spawn_session(SessionId::from("legacy-session"), driver);
+    let mut events = session.subscribe();
+
+    session
+        .submit(Command::StartTurn(StartTurn {
+            input: UserInput::text("old prompt"),
+            behavior: StartBehavior::Reject,
+        }))
+        .await
+        .unwrap();
+    let started = recv_until(&mut events, |payload| {
+        matches!(payload, EventPayload::TurnStarted)
+    })
+    .await;
+    let started_turn_id = started.turn_id.unwrap();
+    stream.first_started.notified().await;
+    session
+        .submit(Command::SteerTurn(UserInput::text("record after steering")))
+        .await
+        .unwrap();
+
+    let (session_id, turn_id, call_id, cancelled) =
+        timeout(Duration::from_secs(2), recordings.recv())
+            .await
+            .expect("steered recording tool timed out")
+            .expect("recording channel closed");
+    assert_eq!(session_id, SessionId::from("legacy-session"));
+    assert_eq!(turn_id, started_turn_id);
+    assert_eq!(call_id, ToolCallId::from("steered-record-call"));
+    assert!(
+        !cancelled,
+        "actor-local steering must not cancel the runtime token"
+    );
+
+    let completed = recv_until(&mut events, |payload| {
+        matches!(payload, EventPayload::TurnCompleted(_))
+    })
+    .await;
+    assert!(matches!(completed.payload, EventPayload::TurnCompleted(_)));
+    timeout(Duration::from_secs(2), stream.first_closed.notified())
+        .await
+        .expect("steered stream task retained its receiver");
 }
 
 #[tokio::test]
