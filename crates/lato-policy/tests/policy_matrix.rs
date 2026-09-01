@@ -171,6 +171,13 @@ fn approve_recomputes_the_fingerprint_and_rejects_tampering() {
         Err(PolicyError::ApprovalFingerprintMismatch)
     );
 
+    let mut changed_summary = approval.clone();
+    changed_summary.summary = "harmless read-only operation".into();
+    assert_eq!(
+        engine.approve(&changed_summary),
+        Err(PolicyError::ApprovalSummaryMismatch)
+    );
+
     let grant = engine.approve(&approval).unwrap();
     let expected = approval_fingerprint(&original_request).unwrap();
     assert_eq!(grant.fingerprint, expected);
@@ -222,6 +229,10 @@ fn policy_errors_have_stable_codes() {
     assert_eq!(
         PolicyError::ApprovalNotRequired.code(),
         "policy.approval_not_required"
+    );
+    assert_eq!(
+        PolicyError::ApprovalSummaryMismatch.code(),
+        "policy.approval_request_mismatch"
     );
     assert_eq!(
         PolicyError::Denied("policy.untrusted_extension".into()).code(),

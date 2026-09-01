@@ -13,6 +13,8 @@ pub enum PolicyError {
     Approval(#[from] ApprovalError),
     #[error("approval request fingerprint does not match its policy request")]
     ApprovalFingerprintMismatch,
+    #[error("approval request summary does not match its policy request")]
+    ApprovalSummaryMismatch,
     #[error("the supplied request does not require approval")]
     ApprovalNotRequired,
     #[error("policy request is invalid")]
@@ -26,6 +28,7 @@ impl PolicyError {
         match self {
             Self::Approval(error) => error.code(),
             Self::ApprovalFingerprintMismatch => "policy.grant_mismatch",
+            Self::ApprovalSummaryMismatch => "policy.approval_request_mismatch",
             Self::ApprovalNotRequired => "policy.approval_not_required",
             Self::InvalidRequest => "policy.invalid_request",
             Self::Denied(code) => code,
@@ -87,6 +90,9 @@ impl PolicyEngine {
         }
         if !requires_human_approval(&approval.request) {
             return Err(PolicyError::ApprovalNotRequired);
+        }
+        if approval.summary != approval_summary(&approval.request) {
+            return Err(PolicyError::ApprovalSummaryMismatch);
         }
 
         self.ledger
