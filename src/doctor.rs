@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use lato_ai::{CATALOG, Credential, CredentialStore, lookup_model};
+use lato_ai::{CredentialStore, lookup_model};
 use lato_core::{
     EnvironmentPolicy, NetworkPolicy, PolicyDecision, PolicyMode, PolicyRequest, SandboxObligation,
     SandboxProfile, SessionId, SideEffect, ToolCallId, ToolCapability, ToolName, TurnId,
@@ -11,7 +11,6 @@ use lato_workspace::{
     FileLocks, HostSandboxBackend, SandboxBackend, SandboxReadiness, SessionTrust,
 };
 use std::{
-    collections::BTreeSet,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -65,7 +64,7 @@ struct DoctorSettings {
 }
 
 pub async fn run(options: DoctorOptions, deps: &DoctorDependencies) -> DoctorReport {
-    let mut secrets = env_secrets();
+    let secrets = env_secrets();
     let mut checks = Vec::new();
 
     checks.push(version_check());
@@ -108,7 +107,6 @@ pub async fn run(options: DoctorOptions, deps: &DoctorDependencies) -> DoctorRep
     checks.push(credentials_check(
         &deps.home,
         configured_provider.map(|(provider, _)| provider),
-        &mut secrets,
     ));
     checks.push(tool_catalog_check(&deps.workspace));
     checks.push(policy_self_test());
@@ -259,11 +257,7 @@ fn model_check(configured: Option<(&str, &str)>) -> DoctorCheck {
     }
 }
 
-fn credentials_check(
-    home: &Path,
-    configured_provider: Option<&str>,
-    secrets: &mut Vec<String>,
-) -> DoctorCheck {
+fn credentials_check(home: &Path, configured_provider: Option<&str>) -> DoctorCheck {
     let store = match CredentialStore::open(home) {
         Ok(store) => store,
         Err(error) => {
@@ -275,11 +269,6 @@ fn credentials_check(
             );
         }
     };
-    for provider in known_providers() {
-        if let Some(credential) = store.get(&provider) {
-            collect_credential_secrets(&credential, secrets);
-        }
-    }
     let Some(provider) = configured_provider else {
         return check(
             "credentials",
@@ -288,7 +277,7 @@ fn credentials_check(
             None,
         );
     };
-    if store.get(provider).is_some() {
+    if store.contains(provider) {
         check(
             "credentials",
             DoctorStatus::Ok,
@@ -472,29 +461,6 @@ fn self_test_request(
             network: NetworkPolicy::Deny,
             environment: EnvironmentPolicy::default(),
         },
-    }
-}
-
-fn known_providers() -> BTreeSet<String> {
-    let mut providers = CATALOG
-        .iter()
-        .map(|model| model.provider.to_string())
-        .collect::<BTreeSet<_>>();
-    for spec in lato_ai::PROVIDERS {
-        providers.insert(spec.id.to_string());
-    }
-    providers
-}
-
-fn collect_credential_secrets(credential: &Credential, secrets: &mut Vec<String>) {
-    match credential {
-        Credential::ApiKey { key } => secrets.push(key.clone()),
-        Credential::Oauth {
-            access, refresh, ..
-        } => {
-            secrets.push(access.clone());
-            secrets.push(refresh.clone());
-        }
     }
 }
 

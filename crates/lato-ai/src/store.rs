@@ -43,6 +43,10 @@ impl CredentialStore {
             .get(provider_id)
             .and_then(|v| serde_json::from_value(v.clone()).ok())
     }
+
+    pub fn contains(&self, provider_id: &str) -> bool {
+        self.data.contains_key(provider_id)
+    }
     pub fn modify<F: FnOnce(&mut serde_json::Map<String, serde_json::Value>)>(
         &mut self,
         f: F,
