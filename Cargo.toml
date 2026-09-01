@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     ".",
     "crates/lato-core",
+    "crates/lato-runtime",
     "crates/lato-protocol",
     "crates/lato-workspace",
     "crates/lato-ai",
