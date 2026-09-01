@@ -665,4 +665,42 @@ mod tests {
         let history = host.sessions["resume-1"].history_snapshot().await;
         assert_eq!(history.len(), 2);
     }
+
+    #[tokio::test]
+    async fn resumed_transcript_appends_without_duplicating_loaded_rows() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = TranscriptStore::open(directory.path()).unwrap();
+        store
+            .append(
+                "resume-append",
+                &[
+                    crate::HistoryItem::User("old".into()),
+                    crate::HistoryItem::AssistantText("answer".into()),
+                ],
+            )
+            .unwrap();
+        let mut host = host();
+        host.transcripts = Some(store.clone());
+        host.handle(req(
+            1,
+            "session/resume",
+            serde_json::json!({"sessionId": "resume-append"}),
+        ))
+        .await
+        .unwrap();
+        host.handle(req(
+            2,
+            "session/prompt",
+            serde_json::json!({"sessionId": "resume-append", "text": "new"}),
+        ))
+        .await
+        .unwrap();
+        let loaded = store.load("resume-append").unwrap();
+        let old_user_rows = loaded
+            .iter()
+            .filter(|item| matches!(item, crate::HistoryItem::User(text) if text == "old"))
+            .count();
+        assert_eq!(old_user_rows, 1);
+        assert!(loaded.len() > 2);
+    }
 }

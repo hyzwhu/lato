@@ -91,3 +91,57 @@ async fn acp_close_stops_and_removes_the_runtime_session() {
         .unwrap();
     assert_eq!(response["error"]["message"], "unknown session");
 }
+
+#[tokio::test]
+async fn idle_cancel_is_idempotent_and_session_remains_usable() {
+    let (mut host, _) = host();
+    let sid = new_session(&mut host).await;
+    let cancelled = host
+        .handle(req(
+            2,
+            "session/cancel",
+            serde_json::json!({"sessionId": sid}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(cancelled["result"]["status"], "cancelled");
+    let prompt = host
+        .handle(req(
+            3,
+            "session/prompt",
+            serde_json::json!({"sessionId": sid, "text": "still alive"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(prompt["result"]["status"], "complete");
+}
+
+#[tokio::test]
+async fn sequential_prompts_reuse_the_runtime_session_and_retain_history() {
+    let (mut host, _) = host();
+    let sid = new_session(&mut host).await;
+    for (id, text) in [(2, "first"), (3, "second")] {
+        let response = host
+            .handle(req(
+                id,
+                "session/prompt",
+                serde_json::json!({"sessionId": sid, "text": text}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response["result"]["status"], "complete");
+    }
+    let listed = host
+        .handle(req(4, "session/list", serde_json::json!({})))
+        .await
+        .unwrap();
+    assert_eq!(
+        listed["result"]["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|value| value.as_str() == Some(sid.as_str()))
+            .count(),
+        1,
+    );
+}
