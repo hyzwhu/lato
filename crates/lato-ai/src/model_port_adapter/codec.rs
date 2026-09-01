@@ -6,10 +6,6 @@ use lato_core::{
 use semver::Version;
 use serde_json::{Map, Value, json};
 
-#[allow(
-    dead_code,
-    reason = "consumed by ModelPortStreamAdapter in the next task"
-)]
 pub(crate) fn decode_legacy_request(
     call_id: ModelCallId,
     selection: ModelSelection,

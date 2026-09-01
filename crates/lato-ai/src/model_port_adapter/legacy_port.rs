@@ -195,7 +195,7 @@ async fn forward_piece(
             let call_id = match ToolCallId::parse(id) {
                 Ok(call_id) => call_id,
                 Err(error) => {
-                    return send_event(
+                    let _ = send_event(
                         event_tx,
                         cancellation,
                         Err(invalid_response(format!(
@@ -203,12 +203,13 @@ async fn forward_piece(
                         ))),
                     )
                     .await;
+                    return false;
                 }
             };
             let name = match ToolName::parse(format!("legacy:{name}")) {
                 Ok(name) => name,
                 Err(error) => {
-                    return send_event(
+                    let _ = send_event(
                         event_tx,
                         cancellation,
                         Err(invalid_response(format!(
@@ -216,6 +217,7 @@ async fn forward_piece(
                         ))),
                     )
                     .await;
+                    return false;
                 }
             };
             let index = *next_tool_index;
@@ -438,6 +440,31 @@ mod tests {
         let error = events[0].as_ref().unwrap_err();
         assert_eq!(error.code, "model.stream_interrupted");
         assert!(error.message.contains("wire broke"));
+    }
+
+    #[tokio::test]
+    async fn invalid_provider_tool_call_stops_without_completion() {
+        let port = port(
+            Behavior::Pieces(vec![StreamPiece::ToolCall {
+                id: "".into(),
+                name: "read_file".into(),
+                arguments: json!({}),
+            }]),
+            Arc::new(AtomicUsize::new(0)),
+        );
+
+        let events = port
+            .stream(request(selection()), CancellationToken::new())
+            .await
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await;
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].as_ref().unwrap_err().code,
+            "model.invalid_response"
+        );
     }
 
     #[tokio::test]
