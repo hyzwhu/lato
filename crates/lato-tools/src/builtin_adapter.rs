@@ -70,12 +70,44 @@ impl Tool for LegacyDispatchTool {
 pub fn builtin_tools(
     environment: BuiltinToolEnvironment,
 ) -> Result<Vec<Arc<dyn Tool>>, BuiltinAdapterError> {
-    v1_tool_definitions()
+    let definitions = v1_tool_definitions();
+    let definitions = definitions
         .as_array()
-        .ok_or_else(|| BuiltinAdapterError::InvalidDefinition("root must be an array".into()))?
+        .ok_or_else(|| BuiltinAdapterError::InvalidDefinition("root must be an array".into()))?;
+    let mut definitions = definitions.clone();
+    if !definitions.iter().any(|definition| {
+        definition.pointer("/function/name").and_then(Value::as_str) == Some("write_file")
+    }) {
+        definitions.push(write_file_definition());
+    }
+    definitions
         .iter()
         .map(|definition| adapter_from_definition(definition, environment.clone()))
         .collect()
+}
+
+fn write_file_definition() -> Value {
+    serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "description": "Create or overwrite a UTF-8 file in the workspace. Use this to write new files such as hello.go. Prefer this over printing file contents in chat.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Path relative to the workspace or absolute"
+                    },
+                    "contents": {
+                        "type": "string",
+                        "description": "Full file contents"
+                    }
+                },
+                "required": ["path", "contents"]
+            }
+        }
+    })
 }
 
 fn adapter_from_definition(

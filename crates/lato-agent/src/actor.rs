@@ -236,7 +236,6 @@ impl SessionActor {
     }
     pub fn cancel(&mut self) {
         self.cancelled = true;
-        self.turn_cancellation.cancel();
     }
     pub fn history(&self) -> &[HistoryItem] {
         &self.history

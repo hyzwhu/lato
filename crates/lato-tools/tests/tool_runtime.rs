@@ -1,5 +1,5 @@
 use lato_core::{SessionId, ToolCallId, ToolContext, TurnId};
-use lato_tools::{BuiltinToolEnvironment, builtin_tools, v1_tool_definitions};
+use lato_tools::{BuiltinToolEnvironment, builtin_tools};
 use lato_workspace::{FileLocks, SessionTrust};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
@@ -26,23 +26,57 @@ fn builtin_adapters_match_the_v1_model_definition_set() {
         .iter()
         .map(|tool| tool.descriptor().name.local_name().to_owned())
         .collect::<Vec<_>>();
-    let mut expected = v1_tool_definitions()
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|definition| {
-            definition
-                .pointer("/function/name")
-                .unwrap()
-                .as_str()
-                .unwrap()
-                .to_owned()
-        })
-        .collect::<Vec<_>>();
+    let mut expected = [
+        "grep",
+        "list_dir",
+        "read_file",
+        "run_terminal_command",
+        "search_replace",
+        "spawn_subagent",
+        "todo_write",
+        "web_fetch",
+        "write_file",
+    ]
+    .map(str::to_owned)
+    .to_vec();
     actual.sort();
     expected.sort();
     assert_eq!(actual, expected);
     assert_eq!(actual.len(), 9);
+    assert_eq!(
+        actual
+            .iter()
+            .filter(|name| name.as_str() == "write_file")
+            .count(),
+        1,
+        "the compatibility definition must not duplicate a registry definition"
+    );
+    let write_file = tools
+        .iter()
+        .map(|tool| tool.descriptor())
+        .find(|descriptor| descriptor.name.as_str() == "builtin:write_file")
+        .unwrap();
+    assert_eq!(
+        write_file.description,
+        "Create or overwrite a UTF-8 file in the workspace. Use this to write new files such as hello.go. Prefer this over printing file contents in chat."
+    );
+    assert_eq!(
+        write_file.input_schema,
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Path relative to the workspace or absolute"
+                },
+                "contents": {
+                    "type": "string",
+                    "description": "Full file contents"
+                }
+            },
+            "required": ["path", "contents"]
+        })
+    );
 }
 
 #[tokio::test]
