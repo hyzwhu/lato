@@ -59,3 +59,5 @@ pub enum IdError {
 string_id!(SessionId);
 string_id!(TurnId);
 string_id!(EventId);
+string_id!(ToolCallId);
+string_id!(ModelCallId);
