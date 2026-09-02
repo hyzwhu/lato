@@ -160,6 +160,8 @@ impl SessionActor {
             let mut context = serde_json::json!({
                 "messages": history_to_messages(&self.history),
                 "tools": tool_runtime.model_definitions(),
+                "session_id": self.session_id.as_str(),
+                "turn_id": self.turn_id.as_str(),
             });
             if force_workspace_tool {
                 context["tool_choice"] = serde_json::json!("required");
