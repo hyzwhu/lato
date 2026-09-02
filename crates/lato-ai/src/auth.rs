@@ -4,6 +4,7 @@ use serde_json::json;
 #[derive(Clone, Debug, Default)]
 pub struct Auth {
     pub api_key: Option<String>,
+    pub account_id: Option<String>,
     pub headers: Vec<(String, String)>,
     pub base_url: Option<String>,
 }
@@ -25,6 +26,7 @@ pub async fn get_auth_refreshing(
         access,
         refresh,
         expires,
+        account_id,
     }) = store.get(provider_id)
     {
         let now = std::time::SystemTime::now()
@@ -44,14 +46,21 @@ pub async fn get_auth_refreshing(
                 &tokens.access,
                 &next_refresh,
                 tokens.expires,
+                tokens.account_id.as_deref(),
             )
             .map_err(|e| e.to_string())?;
             return Ok(Some(Auth {
                 api_key: Some(tokens.access),
+                account_id: tokens.account_id,
                 ..Default::default()
             }));
         }
         return Ok(Some(Auth {
+            account_id: if provider_id == "openai-codex" {
+                account_id.or_else(|| crate::extract_chatgpt_account_id(&access).ok())
+            } else {
+                account_id
+            },
             api_key: Some(access),
             ..Default::default()
         }));
@@ -73,7 +82,14 @@ pub async fn get_auth(
     }
     if let Some(c) = store.get(provider_id) {
         return match c {
-            Credential::Oauth { access, .. } if oauth_allowed(provider_id) => Some(Auth {
+            Credential::Oauth {
+                access, account_id, ..
+            } if oauth_allowed(provider_id) => Some(Auth {
+                account_id: if provider_id == "openai-codex" {
+                    account_id.or_else(|| crate::extract_chatgpt_account_id(&access).ok())
+                } else {
+                    account_id
+                },
                 api_key: Some(access),
                 ..Default::default()
             }),
@@ -143,6 +159,7 @@ pub fn store_oauth(
     access: &str,
     refresh: &str,
     expires: i64,
+    account_id: Option<&str>,
 ) -> std::io::Result<()> {
     if !oauth_allowed(provider_id) {
         return Err(std::io::Error::new(
@@ -153,7 +170,7 @@ pub fn store_oauth(
     store.modify(|m| {
         m.insert(
             provider_id.into(),
-            json!({"type":"oauth","access":access,"refresh":refresh,"expires":expires}),
+            json!({"type":"oauth","access":access,"refresh":refresh,"expires":expires,"account_id":account_id}),
         );
     })
 }
@@ -170,9 +187,21 @@ where
         return Err("stored credential is not oauth".into());
     };
     let (access, new_refresh, expires) = refresh_fn(&refresh)?;
-    store_oauth(store, provider_id, &access, &new_refresh, expires).map_err(|e| e.to_string())?;
+    let account_id = (provider_id == "openai-codex")
+        .then(|| crate::extract_chatgpt_account_id(&access).ok())
+        .flatten();
+    store_oauth(
+        store,
+        provider_id,
+        &access,
+        &new_refresh,
+        expires,
+        account_id.as_deref(),
+    )
+    .map_err(|e| e.to_string())?;
     Ok(Auth {
         api_key: Some(access),
+        account_id,
         headers: vec![],
         base_url: None,
     })
@@ -329,7 +358,7 @@ mod tests {
     async fn c1_1_kimi_oauth_persists_and_resolves_after_reopen() {
         let dir = tempfile::tempdir().unwrap();
         let mut store = CredentialStore::open(dir.path()).unwrap();
-        store_oauth(&mut store, "kimi-coding", "access", "refresh", 123).unwrap();
+        store_oauth(&mut store, "kimi-coding", "access", "refresh", 123, None).unwrap();
         let reopened = CredentialStore::open(dir.path()).unwrap();
         let auth = get_auth(&reopened, "kimi-coding", &|_| None, None)
             .await
@@ -341,7 +370,15 @@ mod tests {
     async fn c1_2_openai_codex_oauth_persists_with_separate_id() {
         let dir = tempfile::tempdir().unwrap();
         let mut store = CredentialStore::open(dir.path()).unwrap();
-        store_oauth(&mut store, "openai-codex", "access", "refresh", 123).unwrap();
+        store_oauth(
+            &mut store,
+            "openai-codex",
+            "access",
+            "refresh",
+            123,
+            Some("acct-test"),
+        )
+        .unwrap();
         assert!(store.get("openai-codex").is_some());
         assert!(store.get("openai").is_none());
         let reopened = CredentialStore::open(dir.path()).unwrap();
@@ -355,14 +392,14 @@ mod tests {
     fn c1_4_oauth_rejected_outside_two_providers() {
         let dir = tempfile::tempdir().unwrap();
         let mut store = CredentialStore::open(dir.path()).unwrap();
-        assert!(store_oauth(&mut store, "xai", "a", "r", 0).is_err());
+        assert!(store_oauth(&mut store, "xai", "a", "r", 0, None).is_err());
     }
 
     #[tokio::test]
     async fn c1_5_oauth_401_refresh_success_once_no_env_fallback() {
         let dir = tempfile::tempdir().unwrap();
         let mut store = CredentialStore::open(dir.path()).unwrap();
-        store_oauth(&mut store, "kimi-coding", "old", "refresh", 0).unwrap();
+        store_oauth(&mut store, "kimi-coding", "old", "refresh", 0, None).unwrap();
         let auth = refresh_oauth_after_401(&mut store, "kimi-coding", |r| {
             assert_eq!(r, "refresh");
             Ok(("new-access".into(), "new-refresh".into(), 999))
@@ -380,7 +417,7 @@ mod tests {
     async fn c1_5_oauth_401_refresh_failure_does_not_use_env() {
         let dir = tempfile::tempdir().unwrap();
         let mut store = CredentialStore::open(dir.path()).unwrap();
-        store_oauth(&mut store, "kimi-coding", "old", "refresh", 0).unwrap();
+        store_oauth(&mut store, "kimi-coding", "old", "refresh", 0, None).unwrap();
         assert!(
             refresh_oauth_after_401(&mut store, "kimi-coding", |_| Err("nope".into()))
                 .await

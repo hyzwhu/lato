@@ -616,6 +616,7 @@ async fn save_interactive_oauth(home: &std::path::Path, provider: &str) -> Resul
         &tokens.access,
         &tokens.refresh,
         tokens.expires,
+        tokens.account_id.as_deref(),
     )
     .map_err(|error| error.to_string())
 }
@@ -864,6 +865,7 @@ async fn login(provider: String, method: LoginMethod) -> i32 {
                 "mock-access",
                 "mock-refresh",
                 4_102_444_800_000,
+                (provider == "openai-codex").then_some("mock-account"),
             )
             .unwrap();
             println!("oauth logged in {provider}");
@@ -884,6 +886,7 @@ async fn login(provider: String, method: LoginMethod) -> i32 {
                     &tokens.access,
                     &tokens.refresh,
                     tokens.expires,
+                    tokens.account_id.as_deref(),
                 ) {
                     eprintln!("error: {e}");
                     return 1;

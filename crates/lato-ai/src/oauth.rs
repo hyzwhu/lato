@@ -33,6 +33,7 @@ pub struct OAuthTokens {
     pub access: String,
     pub refresh: String,
     pub expires: i64,
+    pub account_id: Option<String>,
 }
 
 pub async fn login_oauth(
@@ -93,7 +94,7 @@ async fn login_openai_codex(
         .send()
         .await
         .map_err(|e| e.to_string())?;
-    parse_token_response(response).await
+    with_openai_account_id(parse_token_response(response).await?)
 }
 
 async fn login_kimi_coding(
@@ -188,7 +189,39 @@ pub async fn refresh_oauth_token(
         .send()
         .await
         .map_err(|e| e.to_string())?;
-    parse_token_response(response).await
+    let tokens = refresh_token_provider(provider, parse_token_response(response).await?)?;
+    Ok(tokens)
+}
+
+fn with_openai_account_id(mut tokens: OAuthTokens) -> Result<OAuthTokens, String> {
+    tokens.account_id = Some(extract_chatgpt_account_id(&tokens.access)?);
+    Ok(tokens)
+}
+
+fn refresh_token_provider(provider: &str, tokens: OAuthTokens) -> Result<OAuthTokens, String> {
+    if provider == "openai-codex" {
+        with_openai_account_id(tokens)
+    } else {
+        Ok(tokens)
+    }
+}
+
+pub fn extract_chatgpt_account_id(access_token: &str) -> Result<String, String> {
+    let payload = access_token
+        .split('.')
+        .nth(1)
+        .ok_or_else(|| "OpenAI Codex access token is not a JWT".to_string())?;
+    let decoded = URL_SAFE_NO_PAD
+        .decode(payload)
+        .map_err(|_| "OpenAI Codex access token has an invalid JWT payload".to_string())?;
+    let value: serde_json::Value = serde_json::from_slice(&decoded)
+        .map_err(|_| "OpenAI Codex access token has an invalid JWT payload".to_string())?;
+    value
+        .pointer("/https:~1~1api.openai.com~1auth/chatgpt_account_id")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| "OpenAI Codex access token is missing the ChatGPT account ID".to_string())
 }
 
 async fn parse_token_response(response: reqwest::Response) -> Result<OAuthTokens, String> {
@@ -219,6 +252,7 @@ async fn parse_token_response(response: reqwest::Response) -> Result<OAuthTokens
         access,
         refresh,
         expires: now + expires_in * 1000,
+        account_id: None,
     })
 }
 
@@ -237,6 +271,14 @@ fn random_urlsafe(bytes: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extracts_chatgpt_account_id_from_access_jwt() {
+        let payload = URL_SAFE_NO_PAD
+            .encode(br#"{"https://api.openai.com/auth":{"chatgpt_account_id":"acct-7"}}"#);
+        let token = format!("header.{payload}.signature");
+        assert_eq!(extract_chatgpt_account_id(&token).unwrap(), "acct-7");
+    }
 
     #[test]
     fn c1_pkce_is_s256_and_has_sufficient_entropy() {

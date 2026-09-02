@@ -92,6 +92,7 @@ pub fn custom_model_auth(
 ) -> Option<Auth> {
     env(&model.env).map(|key| Auth {
         api_key: Some(key),
+        account_id: None,
         headers: vec![],
         base_url: Some(model.base_url.clone()),
     })

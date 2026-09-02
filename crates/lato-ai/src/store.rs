@@ -14,6 +14,8 @@ pub enum Credential {
         access: String,
         refresh: String,
         expires: i64,
+        #[serde(default, alias = "accountId", skip_serializing_if = "Option::is_none")]
+        account_id: Option<String>,
     },
 }
 
@@ -77,5 +79,26 @@ impl CredentialStore {
         fs::rename(&tmp, &self.path)?;
         lock.unlock()?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn oauth_credential_accepts_pi_account_id_alias() {
+        let value = serde_json::json!({
+            "type": "oauth",
+            "access": "a",
+            "refresh": "r",
+            "expires": 42,
+            "accountId": "acct-pi"
+        });
+        let credential: Credential = serde_json::from_value(value).unwrap();
+        let Credential::Oauth { account_id, .. } = credential else {
+            panic!()
+        };
+        assert_eq!(account_id.as_deref(), Some("acct-pi"));
     }
 }

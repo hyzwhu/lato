@@ -419,10 +419,16 @@ impl AcpHost {
                         let access = p.get("access").and_then(|v| v.as_str()).unwrap_or("");
                         let refresh = p.get("refresh").and_then(|v| v.as_str()).unwrap_or("");
                         let expires = p.get("expires").and_then(|v| v.as_i64()).unwrap_or(0);
+                        let account_id = p
+                            .get("account_id")
+                            .or_else(|| p.get("accountId"))
+                            .and_then(|v| v.as_str());
                         if access.is_empty() || refresh.is_empty() {
                             return Some(err(id, -32602, "oauth interaction required"));
                         }
-                        if let Err(e) = store_oauth(store, provider, access, refresh, expires) {
+                        if let Err(e) =
+                            store_oauth(store, provider, access, refresh, expires, account_id)
+                        {
                             return Some(err(id, -32000, e.to_string()));
                         }
                     }
