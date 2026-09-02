@@ -11,6 +11,12 @@ use std::{
 pub const REMOTE_CATALOG_REFRESH_INTERVAL_MS: i64 = 4 * 60 * 60 * 1000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RemoteCatalogRefreshPolicy {
+    Cached,
+    Authoritative { attempts: usize },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProviderSpec {
     pub id: &'static str,
     pub name: &'static str,
@@ -150,9 +156,27 @@ pub async fn refresh_remote_provider_catalog(
     catalog_base_url: &str,
     force: bool,
 ) -> Result<Vec<CustomModel>, String> {
+    refresh_remote_provider_catalog_with_policy(
+        spec,
+        store,
+        catalog_base_url,
+        force,
+        RemoteCatalogRefreshPolicy::Cached,
+    )
+    .await
+}
+
+pub async fn refresh_remote_provider_catalog_with_policy(
+    spec: &ProviderSpec,
+    store: &ProviderModelsStore,
+    catalog_base_url: &str,
+    force: bool,
+    policy: RemoteCatalogRefreshPolicy,
+) -> Result<Vec<CustomModel>, String> {
     let stored = store.read(spec.id)?;
     let now = now_ms();
-    if !force
+    if policy == RemoteCatalogRefreshPolicy::Cached
+        && !force
         && stored.as_ref().is_some_and(|entry| {
             entry.checked_at > 0 && now - entry.checked_at < REMOTE_CATALOG_REFRESH_INTERVAL_MS
         })
@@ -165,65 +189,161 @@ pub async fn refresh_remote_provider_catalog(
         spec.id
     );
     let client = crate::http_client_for_url(&url);
-    let mut request = client
-        .get(url)
-        .header("accept", "application/json")
-        .header("user-agent", "lato/0.1.0");
-    if let Some(etag) = stored.as_ref().and_then(|entry| {
-        (!entry.models.is_empty())
-            .then_some(entry.etag.as_ref())
-            .flatten()
-    }) {
-        request = request.header("if-none-match", etag);
-    }
-    let response = request.send().await.map_err(|error| error.to_string())?;
-    let status = response.status();
-    if status.as_u16() == 304 {
-        let mut entry = stored.ok_or("catalog returned 304 without cached models")?;
-        entry.checked_at = now;
-        store.write(spec.id, entry.clone())?;
-        return Ok(entry.models);
-    }
-    if matches!(status.as_u16(), 404 | 501) {
-        let entry = ProviderModelsEntry {
-            checked_at: now,
-            ..stored.unwrap_or_default()
-        };
-        store.write(spec.id, entry.clone())?;
-        return Ok(entry.models);
-    }
-    if !status.is_success() {
-        let mut entry = stored.unwrap_or_default();
-        entry.checked_at = now;
-        store.write(spec.id, entry)?;
-        return Err(format!(
-            "model catalog request failed for {}: {status}",
-            spec.id
-        ));
-    }
-    let etag = response
-        .headers()
-        .get("etag")
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_string);
-    let last_modified = response
-        .headers()
-        .get("last-modified")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| httpdate::parse_http_date(value).ok())
-        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-        .map(|duration| duration.as_millis() as i64)
-        .unwrap_or(0);
-    let value: serde_json::Value = response.json().await.map_err(|error| error.to_string())?;
-    let models = parse_remote_catalog(spec, &value)?;
-    let entry = ProviderModelsEntry {
-        models: models.clone(),
-        checked_at: now,
-        last_modified,
-        etag,
+    let attempts = match policy {
+        RemoteCatalogRefreshPolicy::Cached => 1,
+        RemoteCatalogRefreshPolicy::Authoritative { attempts } => attempts.max(1),
     };
-    store.write(spec.id, entry)?;
-    Ok(models)
+    let mut last_error = String::new();
+
+    for attempt in 1..=attempts {
+        let mut request = client
+            .get(&url)
+            .header("accept", "application/json")
+            .header("user-agent", "lato/0.1.0");
+        if policy == RemoteCatalogRefreshPolicy::Cached
+            && let Some(etag) = stored.as_ref().and_then(|entry| {
+                (!entry.models.is_empty())
+                    .then_some(entry.etag.as_ref())
+                    .flatten()
+            })
+        {
+            request = request.header("if-none-match", etag);
+        }
+
+        let response = match request.send().await {
+            Ok(response) => response,
+            Err(error) => {
+                last_error = format!("transport error: {error}");
+                if attempt < attempts {
+                    tokio::time::sleep(std::time::Duration::from_millis(100 * attempt as u64))
+                        .await;
+                }
+                continue;
+            }
+        };
+        let status = response.status();
+        if status.as_u16() == 304 && policy == RemoteCatalogRefreshPolicy::Cached {
+            let mut entry = stored
+                .clone()
+                .ok_or("catalog returned 304 without cached models")?;
+            entry.checked_at = now;
+            store.write(spec.id, entry.clone())?;
+            return Ok(entry.models);
+        }
+        if matches!(status.as_u16(), 404 | 501) && policy == RemoteCatalogRefreshPolicy::Cached {
+            let entry = ProviderModelsEntry {
+                checked_at: now,
+                ..stored.clone().unwrap_or_default()
+            };
+            store.write(spec.id, entry.clone())?;
+            return Ok(entry.models);
+        }
+        if !status.is_success() {
+            last_error = format!("HTTP status {status}");
+            if policy == RemoteCatalogRefreshPolicy::Cached {
+                let mut entry = stored.clone().unwrap_or_default();
+                entry.checked_at = now;
+                store.write(spec.id, entry)?;
+            }
+            if attempt < attempts {
+                tokio::time::sleep(std::time::Duration::from_millis(100 * attempt as u64)).await;
+            }
+            continue;
+        }
+
+        let etag = response
+            .headers()
+            .get("etag")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let last_modified = response
+            .headers()
+            .get("last-modified")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| httpdate::parse_http_date(value).ok())
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .map(|duration| duration.as_millis() as i64)
+            .unwrap_or(0);
+        let bytes = match response.bytes().await {
+            Ok(bytes) if !bytes.iter().all(u8::is_ascii_whitespace) => bytes,
+            Ok(_) => {
+                last_error = format!("empty response body (status {status})");
+                if attempt < attempts {
+                    tokio::time::sleep(std::time::Duration::from_millis(100 * attempt as u64))
+                        .await;
+                }
+                continue;
+            }
+            Err(error) => {
+                last_error = format!("response body error (status {status}): {error}");
+                if attempt < attempts {
+                    tokio::time::sleep(std::time::Duration::from_millis(100 * attempt as u64))
+                        .await;
+                }
+                continue;
+            }
+        };
+        let value: serde_json::Value = match serde_json::from_slice(&bytes) {
+            Ok(value) => value,
+            Err(error) => {
+                last_error = format!(
+                    "invalid JSON response (status {status}): {error}; body: {}",
+                    sanitized_response_preview(&bytes)
+                );
+                if attempt < attempts {
+                    tokio::time::sleep(std::time::Duration::from_millis(100 * attempt as u64))
+                        .await;
+                }
+                continue;
+            }
+        };
+        let models = match parse_remote_catalog(spec, &value) {
+            Ok(models) if !models.is_empty() => models,
+            Ok(_) => {
+                last_error = "catalog contained no usable models".to_string();
+                if attempt < attempts {
+                    tokio::time::sleep(std::time::Duration::from_millis(100 * attempt as u64))
+                        .await;
+                }
+                continue;
+            }
+            Err(error) => {
+                last_error = error;
+                if attempt < attempts {
+                    tokio::time::sleep(std::time::Duration::from_millis(100 * attempt as u64))
+                        .await;
+                }
+                continue;
+            }
+        };
+        let entry = ProviderModelsEntry {
+            models: models.clone(),
+            checked_at: now,
+            last_modified,
+            etag,
+        };
+        store.write(spec.id, entry)?;
+        return Ok(models);
+    }
+
+    Err(format!(
+        "remote model catalog for {} failed after {attempts} attempts: {last_error}",
+        spec.id
+    ))
+}
+
+fn sanitized_response_preview(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes)
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .take(160)
+        .collect()
 }
 
 fn parse_remote_catalog(
@@ -339,5 +459,85 @@ mod tests {
             store.read("minimax-cn").unwrap().unwrap().etag.as_deref(),
             Some("\"v1\"")
         );
+    }
+
+    #[tokio::test]
+    async fn authoritative_remote_catalog_retries_an_empty_response() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            for attempt in 0..2 {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut request = [0u8; 8192];
+                let count = socket.read(&mut request).unwrap();
+                assert!(
+                    String::from_utf8_lossy(&request[..count])
+                        .starts_with("GET /api/models/providers/minimax-cn")
+                );
+                let body = if attempt == 0 {
+                    ""
+                } else {
+                    r#"{"MiniMax-M3":{"id":"MiniMax-M3","api":"anthropic-messages"}}"#
+                };
+                write!(
+                    socket,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .unwrap();
+            }
+        });
+        let home = tempfile::tempdir().unwrap();
+        let models = refresh_remote_provider_catalog_with_policy(
+            provider_spec("minimax-cn").unwrap(),
+            &ProviderModelsStore::open(home.path()),
+            &format!("http://{address}"),
+            false,
+            RemoteCatalogRefreshPolicy::Authoritative { attempts: 2 },
+        )
+        .await
+        .unwrap();
+        server.join().unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "MiniMax-M3");
+    }
+
+    #[tokio::test]
+    async fn authoritative_remote_catalog_stops_after_repeated_invalid_json() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut request = [0u8; 8192];
+                socket.read(&mut request).unwrap();
+                let body = "<html>temporary edge failure</html>";
+                write!(
+                    socket,
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .unwrap();
+            }
+        });
+        let home = tempfile::tempdir().unwrap();
+        let error = refresh_remote_provider_catalog_with_policy(
+            provider_spec("minimax-cn").unwrap(),
+            &ProviderModelsStore::open(home.path()),
+            &format!("http://{address}"),
+            false,
+            RemoteCatalogRefreshPolicy::Authoritative { attempts: 2 },
+        )
+        .await
+        .unwrap_err();
+        server.join().unwrap();
+        assert!(error.contains("minimax-cn"), "{error}");
+        assert!(error.contains("invalid JSON"), "{error}");
+        assert!(error.contains("after 2 attempts"), "{error}");
+        assert!(!error.contains("sentinel-api-key"), "{error}");
     }
 }
