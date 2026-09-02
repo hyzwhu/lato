@@ -11,6 +11,7 @@ members = [
     "crates/lato-tools",
     "crates/lato-agent",
     "crates/lato-mcp",
+    "crates/lato-store",
 ]
 
 [package]

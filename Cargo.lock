@@ -887,6 +887,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "lato-store"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "lato-core",
+ "libc",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "lato-tools"
 version = "0.1.0"
 dependencies = [

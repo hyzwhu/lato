@@ -21,6 +21,8 @@ Every copied production file and its tests must add a row before merge.
 | `crates/lato-core/src/tool.rs` | Grok Build `crates/common/xai-tool-runtime/src/tool.rs` and `dispatch.rs` | Structural derivation | Object safety, JSON membrane, typed errors | Reduced to Lato core descriptor/invoke contracts; streaming tool output deferred |
 | `crates/lato-tools/src/catalog.rs` | Codex `codex-rs/core/src/tools/registry.rs` | Structural derivation | Duplicate rejection, deterministic registration, runtime/spec separation | Added explicit layer and semver replacement rules |
 | `crates/lato-core/src/model.rs` | Codex `codex-rs/model-provider/src/provider.rs` | Structural derivation | Object-safe provider boundary and capabilities | Added normalized Lato request and stream event types |
+| `crates/lato-store/src/file.rs` | Grok Build `crates/codegen/xai-workflow/src/journal.rs` | Structural derivation | Bounded replay, torn-tail recovery, malformed-record rejection | Generalized to canonical per-session journals with strict projection and atomic legacy import |
+| `crates/lato-store/src/writer.rs` | Codex `codex-rs/rollout/src/recorder.rs` | Structural derivation | Ordered writes, acknowledgement barriers, shutdown draining | Reduced to one bounded writer queue per session with durability levels and reopen/replay retry |
 
 ## Required source header
 
