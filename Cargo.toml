@@ -16,7 +16,7 @@ members = [
 
 [package]
 name = "lato"
-version = "0.1.0"
+version = "0.1.0-beta.1"
 edition = "2024"
 
 [dependencies]
@@ -36,6 +36,7 @@ reqwest = "0.12"
 async-trait = "0.1"
 rpassword = "7"
 rustyline = "17"
+clap = { version = "4", features = ["derive"] }
 
 [dev-dependencies]
 tempfile = "3"

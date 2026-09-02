@@ -1,3 +1,4 @@
+use crate::args::{DoctorArgs, Invocation, LoginMethod, PromptArgs, SandboxArg};
 use lato::doctor::{self, DoctorDependencies, DoctorOptions, LiveProbe};
 use lato_agent::{ApprovalRequest, ToolApproval, default_fake_stream};
 use lato_ai::{
@@ -192,33 +193,22 @@ impl ToolApproval for ConsoleToolApproval {
 }
 
 pub async fn run(args: Vec<String>) -> i32 {
-    if args.is_empty() {
-        if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
-            eprintln!("error: interactive mode requires a tty; use lato -p TEXT for headless mode");
-            return 2;
+    match crate::args::parse(args) {
+        Ok(Invocation::InteractiveNew) => interactive(InteractiveStartup::New).await,
+        Ok(Invocation::Prompt(args)) => prompt(args).await,
+        Ok(Invocation::Sessions { json }) => crate::sessions::list(json).await,
+        Ok(Invocation::Resume { session_id }) => {
+            interactive(InteractiveStartup::Resume(session_id)).await
         }
-        return interactive().await;
+        Ok(Invocation::Login { provider, method }) => login(provider, method).await,
+        Ok(Invocation::Doctor(args)) => doctor_cmd(args).await,
+        Ok(Invocation::Acp) => crate::stdio::run().await,
+        Err(error) => {
+            let code = error.exit_code();
+            let _ = error.print();
+            code
+        }
     }
-    if args.iter().any(|a| a == "--help" || a == "-h") {
-        println!(
-            "usage: lato\n       lato -p [--ask] [--sandbox off|workspace|read-only] [--model provider/model] TEXT\n       lato acp\n       lato login PROVIDER (--api-key KEY|--oauth)\n       lato doctor [--json] [--strict] [--live]\n\nRun without arguments for the interactive coding CLI."
-        );
-        return 0;
-    }
-    if args[0] == "doctor" {
-        return doctor_cmd(&args[1..]).await;
-    }
-    if args[0] == "acp" {
-        return crate::stdio::run().await;
-    }
-    if args[0] == "login" {
-        return login(&args[1..]).await;
-    }
-    if args[0] == "-p" {
-        return prompt(&args[1..]).await;
-    }
-    eprintln!("error: unknown command");
-    2
 }
 
 struct CatalogLiveProbe;
@@ -250,33 +240,15 @@ impl LiveProbe for CatalogLiveProbe {
     }
 }
 
-async fn doctor_cmd(args: &[String]) -> i32 {
-    let mut json = false;
-    let mut strict = false;
-    let mut live = false;
-    for arg in args {
-        match arg.as_str() {
-            "--json" if !json => json = true,
-            "--strict" if !strict => strict = true,
-            "--live" if !live => live = true,
-            "--json" | "--strict" | "--live" => {
-                eprintln!("error: unknown command");
-                return 2;
-            }
-            _ => {
-                eprintln!("error: unknown command");
-                return 2;
-            }
-        }
-    }
+async fn doctor_cmd(args: DoctorArgs) -> i32 {
     let workspace = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let deps = DoctorDependencies {
         home: lato_home(),
         workspace,
         live_probe: Arc::new(CatalogLiveProbe),
     };
-    let report = doctor::run(DoctorOptions { live }, &deps).await;
-    if json {
+    let report = doctor::run(DoctorOptions { live: args.live }, &deps).await;
+    if args.json {
         match serde_json::to_string_pretty(&report) {
             Ok(body) => println!("{body}"),
             Err(error) => {
@@ -287,58 +259,27 @@ async fn doctor_cmd(args: &[String]) -> i32 {
     } else {
         println!("{}", doctor::render_human(&report));
     }
-    doctor::exit_code(&report, strict)
+    doctor::exit_code(&report, args.strict)
 }
 
-async fn prompt(args: &[String]) -> i32 {
-    let ask = args.iter().any(|a| a == "--ask");
-    if ask && !std::io::stdin().is_terminal() {
+async fn prompt(args: PromptArgs) -> i32 {
+    if args.ask && !std::io::stdin().is_terminal() {
         eprintln!("error: --ask requires a tty");
         return 2;
     }
-    let sandbox = match args
-        .iter()
-        .position(|a| a == "--sandbox")
-        .and_then(|i| args.get(i + 1))
-        .map(String::as_str)
-    {
-        None | Some("off") => SandboxProfile::Off,
-        Some("workspace") => SandboxProfile::Workspace,
-        Some("read-only") => SandboxProfile::ReadOnly,
-        Some(other) => {
-            eprintln!("error: unknown sandbox profile {other}");
-            return 2;
-        }
+    let sandbox = match args.sandbox {
+        SandboxArg::Off => SandboxProfile::Off,
+        SandboxArg::Workspace => SandboxProfile::Workspace,
+        SandboxArg::ReadOnly => SandboxProfile::ReadOnly,
     };
-    let model_arg = args
-        .iter()
-        .position(|a| a == "--model")
-        .and_then(|i| args.get(i + 1))
-        .cloned()
-        .or_else(|| std::env::var("LATO_MODEL").ok());
-    let mut text_parts = Vec::new();
-    let mut skip = false;
-    for arg in args {
-        if skip {
-            skip = false;
-            continue;
-        }
-        if arg == "--ask" {
-            continue;
-        }
-        if arg == "--model" || arg == "--sandbox" {
-            skip = true;
-            continue;
-        }
-        text_parts.push(arg.clone());
-    }
-    let text = text_parts.join(" ");
+    let model_arg = args.model.or_else(|| std::env::var("LATO_MODEL").ok());
+    let text = args.text;
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     if let Some(response) = local_fact_response(&text, &cwd, model_arg.as_deref()) {
         println!("{response}");
         return 0;
     }
-    let mut trust = if ask {
+    let mut trust = if args.ask {
         SessionTrust::for_interactive(&cwd, true)
     } else {
         SessionTrust::for_headless_prompt(&cwd)
@@ -367,7 +308,25 @@ async fn prompt(args: &[String]) -> i32 {
     }
 }
 
-async fn interactive() -> i32 {
+enum InteractiveStartup {
+    New,
+    Resume(String),
+}
+
+async fn interactive(startup: InteractiveStartup) -> i32 {
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        let message = match startup {
+            InteractiveStartup::New => {
+                "interactive mode requires a tty; use lato -p TEXT for headless mode"
+            }
+            InteractiveStartup::Resume(_) => "resume requires a tty",
+        };
+        eprintln!("error: {message}");
+        return 2;
+    }
+    if let InteractiveStartup::Resume(session_id) = &startup {
+        let _ = session_id;
+    }
     let home = lato_home();
     if let Err(error) = std::fs::create_dir_all(&home) {
         eprintln!("error: cannot create {}: {error}", home.display());
@@ -982,15 +941,10 @@ fn read_line(prompt: &str) -> std::io::Result<String> {
     Ok(input.trim().to_string())
 }
 
-async fn login(args: &[String]) -> i32 {
-    if args.is_empty() {
-        eprintln!("error: missing provider");
-        return 2;
-    }
-    let provider = &args[0];
+async fn login(provider: String, method: LoginMethod) -> i32 {
     let home = lato_home();
-    if args.iter().any(|a| a == "--oauth") {
-        if !oauth_allowed(provider) {
+    if method == LoginMethod::Oauth {
+        if !oauth_allowed(&provider) {
             eprintln!("error: oauth not supported for {provider}");
             return 1;
         }
@@ -998,7 +952,7 @@ async fn login(args: &[String]) -> i32 {
             let mut store = CredentialStore::open(&home).unwrap();
             store_oauth(
                 &mut store,
-                provider,
+                &provider,
                 "mock-access",
                 "mock-refresh",
                 4_102_444_800_000,
@@ -1013,12 +967,12 @@ async fn login(args: &[String]) -> i32 {
             );
             return 2;
         }
-        match login_oauth(provider, &ConsoleAuthInteraction, &reqwest::Client::new()).await {
+        match login_oauth(&provider, &ConsoleAuthInteraction, &reqwest::Client::new()).await {
             Ok(tokens) => {
                 let mut store = CredentialStore::open(&home).unwrap();
                 if let Err(e) = store_oauth(
                     &mut store,
-                    provider,
+                    &provider,
                     &tokens.access,
                     &tokens.refresh,
                     tokens.expires,
@@ -1035,15 +989,11 @@ async fn login(args: &[String]) -> i32 {
             }
         }
     }
-    if let Some(i) = args.iter().position(|a| a == "--api-key") {
-        if !api_key_login_allowed(provider) {
+    if let LoginMethod::ApiKey(key) = method {
+        if !api_key_login_allowed(&provider) {
             eprintln!("error: api-key login not supported for {provider}");
             return 1;
         }
-        let Some(key) = args.get(i + 1) else {
-            eprintln!("error: missing api key");
-            return 2;
-        };
         let mut store = CredentialStore::open(&home).unwrap();
         store
             .modify(|m| {
@@ -1056,8 +1006,7 @@ async fn login(args: &[String]) -> i32 {
         println!("logged in {provider}");
         return 0;
     }
-    eprintln!("error: expected --api-key or --oauth");
-    2
+    unreachable!("clap requires exactly one login method")
 }
 
 struct ConsoleAuthInteraction;

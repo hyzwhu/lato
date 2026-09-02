@@ -4,6 +4,32 @@ use std::{
 };
 
 #[test]
+fn public_beta_help_lists_session_commands_and_headless_compatibility() {
+    let output = Command::new(env!("CARGO_BIN_EXE_lato"))
+        .arg("--help")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let help = String::from_utf8_lossy(&output.stdout);
+    for required in ["sessions", "resume", "doctor", "login", "acp", "-p"] {
+        assert!(help.contains(required), "missing {required}: {help}");
+    }
+}
+
+#[test]
+fn public_beta_version_matches_cargo_package() {
+    let output = Command::new(env!("CARGO_BIN_EXE_lato"))
+        .arg("--version")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        concat!("lato ", env!("CARGO_PKG_VERSION"))
+    );
+}
+
+#[test]
 fn a1_1_stdio_acp_cli_initializes_and_rejects_session_load() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_lato"))
         .arg("acp")
