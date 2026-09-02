@@ -1,6 +1,39 @@
 pub(crate) mod events;
+pub(crate) mod sse;
 
 use crate::{Auth, HttpRequestSpec, Model, responses_input, responses_tools};
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TransportOutcome {
+    pub events_started: bool,
+    pub terminal: bool,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+pub struct CodexTransportError {
+    pub message: String,
+    pub events_started: bool,
+}
+
+impl CodexTransportError {
+    pub(crate) fn before_stream(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            events_started: false,
+        }
+    }
+
+    pub(crate) fn with_mapper(
+        message: impl Into<String>,
+        mapper: &events::CodexEventMapper,
+    ) -> Self {
+        Self {
+            message: message.into(),
+            events_started: mapper.started(),
+        }
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CodexRequest {
