@@ -3,11 +3,18 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use rand::RngCore;
 use sha2::{Digest, Sha256};
 use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
 
 const OPENAI_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const OPENAI_AUTHORIZE_URL: &str = "https://auth.openai.com/oauth/authorize";
 const OPENAI_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const OPENAI_REDIRECT_URI: &str = "http://localhost:1455/auth/callback";
+const OPENAI_DEVICE_USER_CODE_URL: &str =
+    "https://auth.openai.com/api/accounts/deviceauth/usercode";
+const OPENAI_DEVICE_TOKEN_URL: &str = "https://auth.openai.com/api/accounts/deviceauth/token";
+const OPENAI_DEVICE_VERIFICATION_URL: &str = "https://auth.openai.com/codex/device";
+const OPENAI_DEVICE_REDIRECT_URI: &str = "https://auth.openai.com/deviceauth/callback";
 const KIMI_DEVICE_URL: &str = "https://auth.kimi.com/api/oauth/device_authorization";
 const KIMI_TOKEN_URL: &str = "https://auth.kimi.com/api/oauth/token";
 
@@ -26,6 +33,17 @@ pub enum AuthNotice {
 pub trait AuthInteraction: Send + Sync {
     async fn notify(&self, notice: AuthNotice);
     async fn redirect_url(&self) -> Result<String, String>;
+
+    fn prefers_local_callback(&self) -> bool {
+        false
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum OpenAICodexLoginMode {
+    #[default]
+    Browser,
+    DeviceCode,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -41,8 +59,25 @@ pub async fn login_oauth(
     interaction: &dyn AuthInteraction,
     client: &reqwest::Client,
 ) -> Result<OAuthTokens, String> {
+    login_oauth_with_mode(provider, OpenAICodexLoginMode::Browser, interaction, client).await
+}
+
+pub async fn login_oauth_with_mode(
+    provider: &str,
+    mode: OpenAICodexLoginMode,
+    interaction: &dyn AuthInteraction,
+    client: &reqwest::Client,
+) -> Result<OAuthTokens, String> {
     match provider {
-        "openai-codex" => login_openai_codex(interaction, client).await,
+        "openai-codex" => match mode {
+            OpenAICodexLoginMode::Browser => login_openai_codex(interaction, client).await,
+            OpenAICodexLoginMode::DeviceCode => {
+                login_openai_codex_device(interaction, client).await
+            }
+        },
+        _ if mode == OpenAICodexLoginMode::DeviceCode => {
+            Err("device auth is only supported for openai-codex".into())
+        }
         "kimi-coding" => login_kimi_coding(interaction, client).await,
         _ => Err("oauth not supported for provider".into()),
     }
@@ -54,6 +89,14 @@ async fn login_openai_codex(
 ) -> Result<OAuthTokens, String> {
     let (verifier, challenge) = pkce_pair();
     let state = random_urlsafe(24);
+    let listener =
+        if interaction.prefers_local_callback() {
+            Some(TcpListener::bind("127.0.0.1:1455").await.map_err(|error| {
+                format!("cannot listen for OAuth callback on port 1455: {error}")
+            })?)
+        } else {
+            None
+        };
     let mut url = url::Url::parse(OPENAI_AUTHORIZE_URL).unwrap();
     url.query_pairs_mut()
         .append_pair("response_type", "code")
@@ -63,38 +106,196 @@ async fn login_openai_codex(
         .append_pair("code_challenge", &challenge)
         .append_pair("code_challenge_method", "S256")
         .append_pair("state", &state)
-        .append_pair("codex_cli_simplified_flow", "true");
+        .append_pair("id_token_add_organizations", "true")
+        .append_pair("codex_cli_simplified_flow", "true")
+        .append_pair("originator", "lato");
     interaction
         .notify(AuthNotice::AuthUrl(url.to_string()))
         .await;
-    let redirect = interaction.redirect_url().await?;
-    let redirect = url::Url::parse(&redirect).map_err(|e| e.to_string())?;
+    let redirect = match listener {
+        Some(listener) => receive_openai_callback(listener).await?,
+        None => interaction.redirect_url().await?,
+    };
+    let code = validate_openai_redirect(&redirect, &state)?;
+    exchange_openai_code(client, &code, &verifier, OPENAI_REDIRECT_URI).await
+}
+
+fn validate_openai_redirect(redirect: &str, expected_state: &str) -> Result<String, String> {
+    let redirect = url::Url::parse(redirect).map_err(|e| e.to_string())?;
     if redirect
         .query_pairs()
         .find(|(k, _)| k == "state")
         .map(|(_, v)| v.into_owned())
-        != Some(state)
+        != Some(expected_state.to_string())
     {
         return Err("oauth state mismatch".into());
     }
-    let code = redirect
+    redirect
         .query_pairs()
         .find(|(k, _)| k == "code")
         .map(|(_, v)| v.into_owned())
-        .ok_or("oauth redirect missing code")?;
+        .ok_or_else(|| "oauth redirect missing code".to_string())
+}
+
+async fn exchange_openai_code(
+    client: &reqwest::Client,
+    code: &str,
+    verifier: &str,
+    redirect_uri: &str,
+) -> Result<OAuthTokens, String> {
     let response = client
         .post(OPENAI_TOKEN_URL)
         .form(&[
             ("grant_type", "authorization_code"),
             ("client_id", OPENAI_CLIENT_ID),
-            ("code", code.as_str()),
-            ("code_verifier", verifier.as_str()),
-            ("redirect_uri", OPENAI_REDIRECT_URI),
+            ("code", code),
+            ("code_verifier", verifier),
+            ("redirect_uri", redirect_uri),
         ])
         .send()
         .await
         .map_err(|e| e.to_string())?;
     with_openai_account_id(parse_token_response(response).await?)
+}
+
+async fn receive_openai_callback(listener: TcpListener) -> Result<String, String> {
+    let (mut socket, _) = tokio::time::timeout(Duration::from_secs(15 * 60), listener.accept())
+        .await
+        .map_err(|_| "OAuth callback timed out".to_string())?
+        .map_err(|error| error.to_string())?;
+    let mut request = Vec::with_capacity(2048);
+    let mut chunk = [0_u8; 1024];
+    loop {
+        let read = socket.read(&mut chunk).await.map_err(|e| e.to_string())?;
+        if read == 0 {
+            break;
+        }
+        request.extend_from_slice(&chunk[..read]);
+        if request.windows(4).any(|window| window == b"\r\n\r\n") {
+            break;
+        }
+        if request.len() > 16 * 1024 {
+            return Err("OAuth callback request is too large".into());
+        }
+    }
+    let first_line = std::str::from_utf8(&request)
+        .map_err(|_| "OAuth callback was not valid UTF-8".to_string())?
+        .lines()
+        .next()
+        .ok_or_else(|| "OAuth callback request was empty".to_string())?;
+    let target = first_line
+        .split_ascii_whitespace()
+        .nth(1)
+        .ok_or_else(|| "OAuth callback request was malformed".to_string())?;
+    let redirect = url::Url::parse("http://localhost:1455")
+        .unwrap()
+        .join(target)
+        .map_err(|e| e.to_string())?;
+    if redirect.path() != "/auth/callback" {
+        let _ = socket
+            .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
+            .await;
+        return Err("unexpected OAuth callback path".into());
+    }
+    let body = b"OpenAI Codex login complete. You can close this window.";
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    socket
+        .write_all(response.as_bytes())
+        .await
+        .map_err(|e| e.to_string())?;
+    socket.write_all(body).await.map_err(|e| e.to_string())?;
+    Ok(redirect.to_string())
+}
+
+async fn login_openai_codex_device(
+    interaction: &dyn AuthInteraction,
+    client: &reqwest::Client,
+) -> Result<OAuthTokens, String> {
+    let response = client
+        .post(OPENAI_DEVICE_USER_CODE_URL)
+        .json(&serde_json::json!({"client_id": OPENAI_CLIENT_ID}))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    let status = response.status();
+    let value: serde_json::Value = response.json().await.map_err(|e| e.to_string())?;
+    if !status.is_success() {
+        return Err(format!(
+            "OpenAI device authorization failed ({status}): {value}"
+        ));
+    }
+    let device_auth_id = value
+        .get("device_auth_id")
+        .and_then(|v| v.as_str())
+        .ok_or("missing device_auth_id")?;
+    let user_code = value
+        .get("user_code")
+        .and_then(|v| v.as_str())
+        .ok_or("missing user_code")?;
+    let mut interval = json_u64(&value, "interval").unwrap_or(5).max(1);
+    interaction
+        .notify(AuthNotice::DeviceCode {
+            code: user_code.into(),
+            verification_url: OPENAI_DEVICE_VERIFICATION_URL.into(),
+        })
+        .await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15 * 60);
+    while tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_secs(interval)).await;
+        let response = client
+            .post(OPENAI_DEVICE_TOKEN_URL)
+            .json(&serde_json::json!({
+                "device_auth_id": device_auth_id,
+                "user_code": user_code
+            }))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        let status = response.status();
+        let value: serde_json::Value = response.json().await.unwrap_or_default();
+        if status.is_success() {
+            let code = value
+                .get("authorization_code")
+                .and_then(|v| v.as_str())
+                .ok_or("missing authorization_code")?;
+            let verifier = value
+                .get("code_verifier")
+                .and_then(|v| v.as_str())
+                .ok_or("missing code_verifier")?;
+            return exchange_openai_code(client, code, verifier, OPENAI_DEVICE_REDIRECT_URI).await;
+        }
+        let error = oauth_error_code(&value);
+        if error == "slow_down" {
+            interval += 5;
+        } else if !matches!(
+            error.as_str(),
+            "authorization_pending" | "deviceauth_authorization_pending"
+        ) && !matches!(status.as_u16(), 403 | 404)
+        {
+            return Err(format!("OpenAI device token failed ({status}): {value}"));
+        }
+        interaction.notify(AuthNotice::Progress(error)).await;
+    }
+    Err("OpenAI device code expired".into())
+}
+
+fn json_u64(value: &serde_json::Value, key: &str) -> Option<u64> {
+    value.get(key).and_then(|value| {
+        value
+            .as_u64()
+            .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
+    })
+}
+
+fn oauth_error_code(value: &serde_json::Value) -> String {
+    value
+        .get("error")
+        .and_then(|value| value.as_str().or_else(|| value.get("code")?.as_str()))
+        .unwrap_or("authorization_pending")
+        .to_string()
 }
 
 async fn login_kimi_coding(

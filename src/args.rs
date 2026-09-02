@@ -19,7 +19,7 @@ pub struct PromptArgs {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LoginMethod {
     ApiKey(String),
-    Oauth,
+    Oauth { device_auth: bool },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -109,6 +109,8 @@ enum Command {
         api_key: Option<String>,
         #[arg(long, action = ArgAction::SetTrue)]
         oauth: bool,
+        #[arg(long, action = ArgAction::SetTrue, requires = "oauth")]
+        device_auth: bool,
     },
     /// Diagnose local configuration and runtime readiness
     Doctor {
@@ -153,11 +155,12 @@ impl Cli {
                     provider,
                     api_key,
                     oauth,
+                    device_auth,
                 } => Invocation::Login {
                     provider,
                     method: match (api_key, oauth) {
                         (Some(key), false) => LoginMethod::ApiKey(key),
-                        (None, true) => LoginMethod::Oauth,
+                        (None, true) => LoginMethod::Oauth { device_auth },
                         _ => unreachable!("clap validates the login method group"),
                     },
                 },
@@ -269,10 +272,33 @@ mod tests {
         assert!(matches!(
             oauth,
             Invocation::Login {
-                method: LoginMethod::Oauth,
+                method: LoginMethod::Oauth { device_auth: false },
                 ..
             }
         ));
+
+        let device = parse(vec![
+            "login".into(),
+            "openai-codex".into(),
+            "--oauth".into(),
+            "--device-auth".into(),
+        ])
+        .unwrap();
+        assert!(matches!(
+            device,
+            Invocation::Login {
+                method: LoginMethod::Oauth { device_auth: true },
+                ..
+            }
+        ));
+
+        let missing_oauth = parse(vec![
+            "login".into(),
+            "openai-codex".into(),
+            "--device-auth".into(),
+        ])
+        .unwrap_err();
+        assert_eq!(missing_oauth.kind(), ErrorKind::MissingRequiredArgument);
     }
 
     #[test]

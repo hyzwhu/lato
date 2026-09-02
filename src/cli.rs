@@ -4,10 +4,10 @@ use lato::doctor::{self, DoctorDependencies, DoctorOptions, LiveProbe};
 use lato_agent::default_fake_stream;
 use lato_ai::{
     AuthInteraction, AuthNotice, CATALOG, CredentialStore, CustomHttpModelStream, CustomModel,
-    HttpModelStream, ModelApi, ModelStream, ProviderModelsEntry, ProviderModelsStore,
-    RemoteCatalogRefreshPolicy, adapt_model_stream, api_key_login_allowed, custom_model_auth,
-    get_auth_refreshing, load_models_json, login_oauth, lookup_model, oauth_allowed,
-    phase0_supported, provider_spec, refresh_openai_compatible_models,
+    HttpModelStream, ModelApi, ModelStream, OpenAICodexLoginMode, ProviderModelsEntry,
+    ProviderModelsStore, RemoteCatalogRefreshPolicy, adapt_model_stream, api_key_login_allowed,
+    custom_model_auth, get_auth_refreshing, load_models_json, login_oauth, login_oauth_with_mode,
+    lookup_model, oauth_allowed, phase0_supported, provider_spec, refresh_openai_compatible_models,
     refresh_remote_provider_catalog_with_policy, store_oauth,
 };
 use lato_workspace::{ApprovalMode, SandboxProfile, SessionTrust};
@@ -852,7 +852,7 @@ fn read_line(prompt: &str) -> std::io::Result<String> {
 
 async fn login(provider: String, method: LoginMethod) -> i32 {
     let home = lato_home();
-    if method == LoginMethod::Oauth {
+    if let LoginMethod::Oauth { device_auth } = method {
         if !oauth_allowed(&provider) {
             eprintln!("error: oauth not supported for {provider}");
             return 1;
@@ -871,13 +871,29 @@ async fn login(provider: String, method: LoginMethod) -> i32 {
             println!("oauth logged in {provider}");
             return 0;
         }
-        if !std::io::stdin().is_terminal() {
+        if device_auth && provider != "openai-codex" {
+            eprintln!("error: --device-auth is only supported for openai-codex");
+            return 1;
+        }
+        if !device_auth && !std::io::stdin().is_terminal() {
             eprintln!(
                 "error: oauth CLI login requires a tty; use lato/auth/login from an ACP client"
             );
             return 2;
         }
-        match login_oauth(&provider, &ConsoleAuthInteraction, &reqwest::Client::new()).await {
+        let mode = if device_auth {
+            OpenAICodexLoginMode::DeviceCode
+        } else {
+            OpenAICodexLoginMode::Browser
+        };
+        match login_oauth_with_mode(
+            &provider,
+            mode,
+            &ConsoleAuthInteraction,
+            &reqwest::Client::new(),
+        )
+        .await
+        {
             Ok(tokens) => {
                 let mut store = CredentialStore::open(&home).unwrap();
                 if let Err(e) = store_oauth(
@@ -927,7 +943,7 @@ impl AuthInteraction for ConsoleAuthInteraction {
     async fn notify(&self, notice: AuthNotice) {
         match notice {
             AuthNotice::AuthUrl(url) => eprintln!(
-                "Open this URL in your browser:\n{url}\nThen paste the full redirect URL."
+                "Open this URL in your browser:\n{url}\nWaiting for the local callback on port 1455."
             ),
             AuthNotice::DeviceCode {
                 code,
@@ -947,6 +963,10 @@ impl AuthInteraction for ConsoleAuthInteraction {
         })
         .await
         .map_err(|e| e.to_string())?
+    }
+
+    fn prefers_local_callback(&self) -> bool {
+        true
     }
 }
 

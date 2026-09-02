@@ -415,6 +415,7 @@ mod tests {
     fn auth() -> Auth {
         Auth {
             api_key: Some("sk".into()),
+            account_id: None,
             headers: vec![],
             base_url: None,
         }
@@ -756,6 +757,7 @@ mod tests {
         };
         let bearer = Auth {
             api_key: None,
+            account_id: None,
             headers: vec![("authorization".into(), "Bearer token".into())],
             base_url: None,
         };
