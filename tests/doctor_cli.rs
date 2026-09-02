@@ -3,7 +3,7 @@ use lato::doctor::{
     DoctorCheck, DoctorDependencies, DoctorOptions, DoctorReport, DoctorStatus, LiveProbe,
     exit_code, render_human, run,
 };
-use lato_ai::CredentialStore;
+use lato_ai::{CredentialStore, CustomModel, ModelApi, ProviderModelsEntry, ProviderModelsStore};
 use std::{
     ffi::OsString,
     path::Path,
@@ -97,6 +97,111 @@ fn write_home_fixtures(home: &std::path::Path) {
             );
         })
         .unwrap();
+}
+
+fn write_selected_model(home: &Path, selection: &str) {
+    std::fs::write(
+        home.join("config.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({"default_model": selection})).unwrap(),
+    )
+    .unwrap();
+}
+
+fn custom_model(provider: &str, id: &str) -> CustomModel {
+    CustomModel {
+        provider: provider.into(),
+        id: id.into(),
+        api: ModelApi::OpenaiCompletions,
+        base_url: "http://127.0.0.1:8080/v1".into(),
+        env: "LOCAL_KEY".into(),
+    }
+}
+
+async fn offline_report(home: &Path) -> DoctorReport {
+    let workspace = tempfile::tempdir().unwrap();
+    let deps = DoctorDependencies {
+        home: home.to_path_buf(),
+        workspace: workspace.path().to_path_buf(),
+        live_probe: CountingProbe::panic_if_called(),
+    };
+    run(DoctorOptions { live: false }, &deps).await
+}
+
+fn model_check(report: &DoctorReport) -> &DoctorCheck {
+    report
+        .checks
+        .iter()
+        .find(|check| check.id == "model")
+        .unwrap()
+}
+
+#[tokio::test]
+async fn doctor_recognizes_models_json_selection_offline() {
+    let home = tempfile::tempdir().unwrap();
+    write_selected_model(home.path(), "local/qwen");
+    std::fs::write(
+        home.path().join("models.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "models": [custom_model("local", "qwen")]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let report = offline_report(home.path()).await;
+    assert_eq!(model_check(&report).status, DoctorStatus::Ok);
+    assert!(model_check(&report).message.contains("models.json"));
+}
+
+#[tokio::test]
+async fn doctor_recognizes_provider_store_selection_offline() {
+    let home = tempfile::tempdir().unwrap();
+    write_selected_model(home.path(), "remote/discovered");
+    ProviderModelsStore::open(home.path())
+        .write(
+            "remote",
+            ProviderModelsEntry {
+                models: vec![custom_model("remote", "discovered")],
+                checked_at: 1,
+                last_modified: 0,
+                etag: None,
+            },
+        )
+        .unwrap();
+    let report = offline_report(home.path()).await;
+    assert_eq!(model_check(&report).status, DoctorStatus::Ok);
+    assert!(model_check(&report).message.contains("models-store.json"));
+}
+
+#[tokio::test]
+async fn doctor_recognizes_compatibility_cache_selection_offline() {
+    let home = tempfile::tempdir().unwrap();
+    write_selected_model(home.path(), "compat/cached");
+    std::fs::write(
+        home.path().join("model-cache.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "models": [custom_model("compat", "cached")]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let report = offline_report(home.path()).await;
+    assert_eq!(model_check(&report).status, DoctorStatus::Ok);
+    assert!(model_check(&report).message.contains("model-cache.json"));
+}
+
+#[tokio::test]
+async fn doctor_reports_malformed_models_json_separately() {
+    let home = tempfile::tempdir().unwrap();
+    write_selected_model(home.path(), "local/qwen");
+    std::fs::write(home.path().join("models.json"), b"{broken").unwrap();
+    let report = offline_report(home.path()).await;
+    assert_eq!(model_check(&report).status, DoctorStatus::Error);
+    assert_eq!(
+        model_check(&report).code.as_deref(),
+        Some("doctor.check_failed")
+    );
+    assert!(model_check(&report).message.contains("models.json"));
+    assert!(!model_check(&report).message.contains("unknown model"));
 }
 
 #[tokio::test]

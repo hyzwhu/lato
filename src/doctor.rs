@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use lato_ai::{CredentialStore, lookup_model};
+use lato_ai::{CredentialStore, ProviderModelsStore, load_models_json, lookup_model};
 use lato_core::{
     EnvironmentPolicy, NetworkPolicy, PolicyDecision, PolicyMode, PolicyRequest, SandboxObligation,
     SandboxProfile, SessionId, SideEffect, ToolCallId, ToolCapability, ToolName, TurnId,
@@ -103,7 +103,7 @@ pub async fn run(options: DoctorOptions, deps: &DoctorDependencies) -> DoctorRep
     checks.push(settings_check);
 
     let configured_provider = default_model.as_deref().and_then(split_model);
-    checks.push(model_check(configured_provider));
+    checks.push(model_check(&deps.home, configured_provider));
     checks.push(credentials_check(
         &deps.home,
         configured_provider.map(|(provider, _)| provider),
@@ -232,7 +232,26 @@ fn load_settings(home: &Path) -> Result<Option<DoctorSettings>, String> {
     serde_json::from_slice(&bytes).map_err(|error| format!("parse {}: {error}", path.display()))
 }
 
-fn model_check(configured: Option<(&str, &str)>) -> DoctorCheck {
+#[derive(Clone, Copy)]
+enum ModelSource {
+    BuiltIn,
+    ModelsJson,
+    ProviderStore,
+    CompatibilityCache,
+}
+
+impl ModelSource {
+    fn label(self) -> &'static str {
+        match self {
+            Self::BuiltIn => "built-in catalog",
+            Self::ModelsJson => "models.json",
+            Self::ProviderStore => "models-store.json",
+            Self::CompatibilityCache => "model-cache.json",
+        }
+    }
+}
+
+fn model_check(home: &Path, configured: Option<(&str, &str)>) -> DoctorCheck {
     let Some((provider, model_id)) = configured else {
         return check(
             "model",
@@ -241,20 +260,82 @@ fn model_check(configured: Option<(&str, &str)>) -> DoctorCheck {
             None,
         );
     };
-    match lookup_model(provider, model_id) {
-        Some(model) => check(
-            "model",
-            DoctorStatus::Ok,
-            format!("catalog contains {}/{}", model.provider, model.id),
-            None,
-        ),
-        None => check(
-            "model",
-            DoctorStatus::Warn,
-            format!("{provider}/{model_id} is not in the built-in catalog"),
-            None,
-        ),
+    if lookup_model(provider, model_id).is_some() {
+        return model_found(provider, model_id, ModelSource::BuiltIn);
     }
+
+    let models_path = home.join("models.json");
+    if models_path.exists() {
+        match load_models_json(&models_path) {
+            Ok(models)
+                if models
+                    .iter()
+                    .any(|model| model.provider == provider && model.id == model_id) =>
+            {
+                return model_found(provider, model_id, ModelSource::ModelsJson);
+            }
+            Ok(_) => {}
+            Err(error) => return model_source_error(&models_path, error),
+        }
+    }
+
+    let provider_store_path = home.join("models-store.json");
+    if provider_store_path.exists() {
+        match ProviderModelsStore::open(home).read(provider) {
+            Ok(Some(entry))
+                if entry
+                    .models
+                    .iter()
+                    .any(|model| model.provider == provider && model.id == model_id) =>
+            {
+                return model_found(provider, model_id, ModelSource::ProviderStore);
+            }
+            Ok(_) => {}
+            Err(error) => return model_source_error(&provider_store_path, error),
+        }
+    }
+
+    let compatibility_path = home.join("model-cache.json");
+    if compatibility_path.exists() {
+        match load_models_json(&compatibility_path) {
+            Ok(models)
+                if models
+                    .iter()
+                    .any(|model| model.provider == provider && model.id == model_id) =>
+            {
+                return model_found(provider, model_id, ModelSource::CompatibilityCache);
+            }
+            Ok(_) => {}
+            Err(error) => return model_source_error(&compatibility_path, error),
+        }
+    }
+
+    check(
+        "model",
+        DoctorStatus::Warn,
+        format!(
+            "unknown model {provider}/{model_id}; run lato and select the model again, or repair the local model configuration"
+        ),
+        None,
+    )
+}
+
+fn model_found(provider: &str, model_id: &str, source: ModelSource) -> DoctorCheck {
+    check(
+        "model",
+        DoctorStatus::Ok,
+        format!("{provider}/{model_id} found in {}", source.label()),
+        None,
+    )
+}
+
+fn model_source_error(path: &Path, error: String) -> DoctorCheck {
+    check(
+        "model",
+        DoctorStatus::Error,
+        format!("cannot parse {}: {error}", path.display()),
+        Some("doctor.check_failed"),
+    )
 }
 
 fn credentials_check(home: &Path, configured_provider: Option<&str>) -> DoctorCheck {
