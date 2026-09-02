@@ -1,0 +1,172 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build-${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            executable: lato
+            archive: tar.gz
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            executable: lato
+            archive: tar.gz
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            executable: lato
+            archive: tar.gz
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            executable: lato
+            archive: tar.gz
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            executable: lato.exe
+            archive: zip
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Read and validate version
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(cargo pkgid -p lato | sed 's/.*#//')"
+          test -n "$version"
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            test "$GITHUB_REF_NAME" = "v$version"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Smoke binary on Unix
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          VERSION: ${{ steps.package.outputs.version }}
+          BINARY: target/${{ matrix.target }}/release/${{ matrix.executable }}
+        run: |
+          set -euo pipefail
+          test "$("$BINARY" --version)" = "lato $VERSION"
+          smoke_home="$(mktemp -d)"
+          LATO_HOME="$smoke_home" "$BINARY" doctor --json > doctor.json
+          python3 -c 'import json; assert json.load(open("doctor.json"))["schema_version"] == 1'
+          test "$(LATO_HOME="$smoke_home" "$BINARY" -p 'reply with hi only')" = hi
+
+      - name: Smoke binary on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.package.outputs.version }}
+          BINARY: target/${{ matrix.target }}/release/${{ matrix.executable }}
+        run: |
+          if ((& $env:BINARY --version) -ne "lato $env:VERSION") { throw "version mismatch" }
+          $smokeHome = New-Item -ItemType Directory -Path (Join-Path $env:RUNNER_TEMP "lato-smoke") -Force
+          $env:LATO_HOME = $smokeHome.FullName
+          $doctor = (& $env:BINARY doctor --json | ConvertFrom-Json)
+          if ($doctor.schema_version -ne 1) { throw "doctor schema mismatch" }
+          if ((& $env:BINARY -p "reply with hi only") -ne "hi") { throw "headless smoke failed" }
+
+      - name: Package Unix archive
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          VERSION: ${{ steps.package.outputs.version }}
+          TARGET: ${{ matrix.target }}
+          EXECUTABLE: ${{ matrix.executable }}
+        run: |
+          set -euo pipefail
+          root="lato-$VERSION-$TARGET"
+          mkdir -p "stage/$root" dist
+          cp "target/$TARGET/release/$EXECUTABLE" "stage/$root/lato"
+          cp README.md LICENSE NOTICE "stage/$root/"
+          tar -C stage -czf "dist/$root.tar.gz" "$root"
+
+      - name: Package Windows archive
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.package.outputs.version }}
+          TARGET: ${{ matrix.target }}
+          EXECUTABLE: ${{ matrix.executable }}
+        run: |
+          $root = "lato-$env:VERSION-$env:TARGET"
+          $stage = Join-Path "stage" $root
+          New-Item -ItemType Directory -Path $stage -Force | Out-Null
+          New-Item -ItemType Directory -Path "dist" -Force | Out-Null
+          Copy-Item "target/$env:TARGET/release/$env:EXECUTABLE" (Join-Path $stage "lato.exe")
+          Copy-Item README.md, LICENSE, NOTICE $stage
+          Compress-Archive -Path $stage -DestinationPath "dist/$root.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: publish-release
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t archives < <(find dist -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.zip' \) | sort)
+          test "${#archives[@]}" -eq 5
+          (cd dist && sha256sum ./*.tar.gz ./*.zip | sort -k2 > SHA256SUMS)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-assets
+          path: dist/*
+          if-no-files-found: error
+
+      - name: Publish GitHub prerelease
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          cat > release-notes.md <<'EOF'
+          Lato Public Beta release.
+
+          LIVE provider validation unavailable unless a successful manual live-provider-smoke run is linked separately.
+          EOF
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --verify-tag \
+            --prerelease \
+            --title "Lato $GITHUB_REF_NAME" \
+            --notes-file release-notes.md
