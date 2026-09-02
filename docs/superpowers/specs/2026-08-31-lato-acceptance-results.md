@@ -125,6 +125,8 @@ Measured on macOS arm64 with Homebrew `rustc 1.98.0` from branch
 | Crash-boundary repetition | PASS | `lato-store/tests/file_recovery.rs` ran 3 times with 12/12 passing each time; `lato-agent/tests/journal_runtime.rs` ran 3 times with 5/5 passing each time. Covered write/flush/sync boundaries, import publication, no duplicate acknowledgement, prepared-before-invoke, and unknown completion outcome. |
 | Legacy migration | PASS | Atomic/idempotent import, retained legacy source, journal precedence, malformed-source no-publication, list deduplication, and unresolved prepared-call refusal all pass. |
 | Source headless journal smoke | PASS | Fresh temporary `LATO_HOME`; `cargo run -q -- -p "reply with hi only"` printed `hi` and created `sessions/s<timestamp>-1/events.jsonl`; offline Doctor JSON parsed with `schema_version == 1`. |
+| Local install | PASS | `cargo install --path .` completed in release mode and replaced `/Users/huangyongzhao/.cargo/bin/lato`. |
+| Installed binary smoke | PASS | Fresh temporary `LATO_HOME`; installed `lato doctor --json` exited 0 with `schema_version == 1`; installed `lato -p "reply with hi only"` printed `hi`, exited 0, and created `sessions/s<timestamp>-1/events.jsonl`. |
 | Windows cross-check | UNAVAILABLE optional gate | `rustup target list --installed` listed `x86_64-pc-windows-gnu`, but the active Homebrew Rust toolchain could not find that target's `core` crate (`E0463`). No Windows compile claim is made for this checkpoint. Unix-only code remains platform-gated and non-Unix fallbacks compile structurally in the host build. |
 | LIVE vendors | SKIPPED | No live provider credentials or subscription accounts were used; no live-provider claim is made. |
 
