@@ -1,6 +1,8 @@
 use crate::HistoryItem;
 use async_trait::async_trait;
-use lato_ai::{CONTEXT_HARD_LIMIT_BYTES, ModelStream, StreamPiece};
+use lato_ai::{
+    CONTEXT_HARD_LIMIT_BYTES, ModelStream, StreamPiece, extract_text_embedded_tool_calls,
+};
 pub use lato_core::ApprovalRequest;
 use lato_core::{
     PolicyDecision, Retryability, SessionId, ToolCallId, ToolContext, ToolError, TurnId,
@@ -126,9 +128,13 @@ impl SessionActor {
         self.cancelled = false;
         self.turn_id = turn_id;
         self.turn_cancellation = cancellation;
+        let task_requires_workspace_change = task_requires_workspace_change(&text);
         self.history.push(HistoryItem::User(text));
         noop_hooks();
         let mut sampling_steps = 0usize;
+        let mut no_tool_retry_used = false;
+        let mut executed_any_tool = false;
+        let mut force_workspace_tool = false;
         let mut repeated_calls: HashMap<String, usize> = HashMap::new();
         loop {
             sampling_steps += 1;
@@ -142,15 +148,20 @@ impl SessionActor {
             }
             let (tx, mut rx) = mpsc::channel(16);
             let tool_runtime = self.tool_runtime.clone();
-            let context = serde_json::json!({
+            let mut context = serde_json::json!({
                 "messages": history_to_messages(&self.history),
                 "tools": tool_runtime.model_definitions(),
             });
+            if force_workspace_tool {
+                context["tool_choice"] = serde_json::json!("required");
+                context["stream"] = serde_json::json!(false);
+            }
             let stream = self.stream.clone();
             let prompt_bytes = self.encoded_len();
             let stream_task =
                 tokio::spawn(async move { stream.stream(prompt_bytes, context, tx).await });
             let mut saw_tool = false;
+            let mut round_text = String::new();
             while let Some(piece) = rx.recv().await {
                 if self.cancelled || self.turn_cancellation.is_cancelled() {
                     self.active = false;
@@ -161,6 +172,7 @@ impl SessionActor {
                         if let Some((events, session_id)) = &self.events {
                             let _ = events.send(serde_json::json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":session_id,"delta":t}}));
                         }
+                        round_text.push_str(&t);
                         self.history.push(HistoryItem::AssistantText(t));
                     }
                     StreamPiece::ToolCall {
@@ -169,92 +181,53 @@ impl SessionActor {
                         arguments,
                     } => {
                         saw_tool = true;
-                        let fingerprint = format!(
-                            "{name}:{}",
-                            serde_json::to_string(&arguments).unwrap_or_default()
-                        );
-                        let repeats = repeated_calls.entry(fingerprint).or_default();
-                        *repeats += 1;
-                        if *repeats > 3 {
-                            self.active = false;
-                            return Err(
-                                "stalled: identical tool call repeated more than 3 times".into()
-                            );
+                        match self
+                            .process_tool_call(id, name, arguments, &mut repeated_calls)
+                            .await?
+                        {
+                            ProcessTool::Executed => executed_any_tool = true,
+                            ProcessTool::Cancelled => {
+                                self.active = false;
+                                return Ok(TurnOutcome::Cancelled);
+                            }
                         }
-                        self.history.push(HistoryItem::ToolCall {
-                            id: id.clone(),
-                            name: name.clone(),
-                            arguments: arguments.clone(),
-                        });
-                        #[cfg(test)]
-                        if let Some(cb) = &self.on_after_persist {
-                            cb();
-                        }
-                        if self.cancelled || self.turn_cancellation.is_cancelled() {
-                            self.active = false;
-                            return Ok(TurnOutcome::Cancelled);
-                        }
-                        let call_id = ToolCallId::parse(id.clone()).unwrap_or_else(|_| {
-                            self.next_local_call += 1;
-                            ToolCallId::from(format!("local-tool-call-{}", self.next_local_call))
-                        });
-                        let context = ToolContext {
-                            session_id: self.session_id.clone(),
-                            turn_id: self.turn_id.clone(),
-                            call_id,
-                            cancellation: self.turn_cancellation.clone(),
-                            execution_grant: None,
-                        };
-                        let tool_runtime = self.tool_runtime.clone();
-                        let authorization =
-                            match tool_runtime.prepare(context, &name, arguments.clone()) {
-                                Ok(prepared) => match tool_runtime.decision(&prepared).clone() {
-                                    PolicyDecision::Allow(grant) => Ok((prepared, grant)),
-                                    PolicyDecision::RequireApproval(request) => {
-                                        let approved = match &self.tool_approval {
-                                            Some(approval) => approval.approve(&request).await,
-                                            None => false,
-                                        };
-                                        if approved {
-                                            tool_runtime
-                                                .approve(&request)
-                                                .map(|grant| (prepared, grant))
-                                        } else {
-                                            Err(ToolError::new(
-                                                "policy.approval_denied",
-                                                "tool approval denied by user",
-                                                Retryability::Never,
-                                            ))
-                                        }
-                                    }
-                                    PolicyDecision::Deny(denial) => Err(ToolError::new(
-                                        denial.code,
-                                        denial.message,
-                                        Retryability::Never,
-                                    )),
-                                },
-                                Err(error) => Err(error),
-                            };
-                        if let Some((events, session_id)) = &self.events {
-                            let _ = events.send(serde_json::json!({"jsonrpc":"2.0","method":"session/tool_call","params":{"sessionId":session_id,"name":name,"arguments":arguments}}));
-                        }
-                        let invocation = match authorization {
-                            Ok((prepared, grant)) => tool_runtime.execute(prepared, grant).await,
-                            Err(error) => Err(error),
-                        };
-                        let out = invocation
-                            .map(|output| output.content)
-                            .unwrap_or_else(|error| {
-                                format!("ERROR [{}]: {}", error.code, error.message)
-                            });
-                        let out = bound_tool_output(out, &self.cwd, &id).await?;
-                        self.history
-                            .push(HistoryItem::ToolResult { id, output: out });
                     }
                 }
             }
             stream_task.await.map_err(|error| error.to_string())??;
             if !saw_tool {
+                for piece in extract_text_embedded_tool_calls(&round_text) {
+                    let StreamPiece::ToolCall {
+                        id,
+                        name,
+                        arguments,
+                    } = piece
+                    else {
+                        continue;
+                    };
+                    saw_tool = true;
+                    match self
+                        .process_tool_call(id, name, arguments, &mut repeated_calls)
+                        .await?
+                    {
+                        ProcessTool::Executed => executed_any_tool = true,
+                        ProcessTool::Cancelled => {
+                            self.active = false;
+                            return Ok(TurnOutcome::Cancelled);
+                        }
+                    }
+                }
+            }
+            if !saw_tool {
+                if !no_tool_retry_used && task_requires_workspace_change && !executed_any_tool {
+                    no_tool_retry_used = true;
+                    force_workspace_tool = true;
+                    self.history.push(HistoryItem::User(
+                        "You have not used any tool yet. The user asked you to create or modify files in the workspace. Call write_file (or another workspace tool) now. Do not only reply with text."
+                            .into(),
+                    ));
+                    continue;
+                }
                 self.active = false;
                 return Ok(TurnOutcome::Complete);
             }
@@ -289,6 +262,91 @@ impl SessionActor {
             .unwrap_or(usize::MAX)
     }
 
+    async fn process_tool_call(
+        &mut self,
+        id: String,
+        name: String,
+        arguments: serde_json::Value,
+        repeated_calls: &mut HashMap<String, usize>,
+    ) -> Result<ProcessTool, String> {
+        let fingerprint = format!(
+            "{name}:{}",
+            serde_json::to_string(&arguments).unwrap_or_default()
+        );
+        let repeats = repeated_calls.entry(fingerprint).or_default();
+        *repeats += 1;
+        if *repeats > 3 {
+            self.active = false;
+            return Err("stalled: identical tool call repeated more than 3 times".into());
+        }
+        self.history.push(HistoryItem::ToolCall {
+            id: id.clone(),
+            name: name.clone(),
+            arguments: arguments.clone(),
+        });
+        #[cfg(test)]
+        if let Some(cb) = &self.on_after_persist {
+            cb();
+        }
+        if self.cancelled || self.turn_cancellation.is_cancelled() {
+            return Ok(ProcessTool::Cancelled);
+        }
+        let call_id = ToolCallId::parse(id.clone()).unwrap_or_else(|_| {
+            self.next_local_call += 1;
+            ToolCallId::from(format!("local-tool-call-{}", self.next_local_call))
+        });
+        let context = ToolContext {
+            session_id: self.session_id.clone(),
+            turn_id: self.turn_id.clone(),
+            call_id,
+            cancellation: self.turn_cancellation.clone(),
+            execution_grant: None,
+        };
+        let tool_runtime = self.tool_runtime.clone();
+        let authorization = match tool_runtime.prepare(context, &name, arguments.clone()) {
+            Ok(prepared) => match tool_runtime.decision(&prepared).clone() {
+                PolicyDecision::Allow(grant) => Ok((prepared, grant)),
+                PolicyDecision::RequireApproval(request) => {
+                    let approved = match &self.tool_approval {
+                        Some(approval) => approval.approve(&request).await,
+                        None => false,
+                    };
+                    if approved {
+                        tool_runtime
+                            .approve(&request)
+                            .map(|grant| (prepared, grant))
+                    } else {
+                        Err(ToolError::new(
+                            "policy.approval_denied",
+                            "tool approval denied by user",
+                            Retryability::Never,
+                        ))
+                    }
+                }
+                PolicyDecision::Deny(denial) => Err(ToolError::new(
+                    denial.code,
+                    denial.message,
+                    Retryability::Never,
+                )),
+            },
+            Err(error) => Err(error),
+        };
+        if let Some((events, session_id)) = &self.events {
+            let _ = events.send(serde_json::json!({"jsonrpc":"2.0","method":"session/tool_call","params":{"sessionId":session_id,"name":name,"arguments":arguments}}));
+        }
+        let invocation = match authorization {
+            Ok((prepared, grant)) => tool_runtime.execute(prepared, grant).await,
+            Err(error) => Err(error),
+        };
+        let out = invocation
+            .map(|output| output.content)
+            .unwrap_or_else(|error| format!("ERROR [{}]: {}", error.code, error.message));
+        let out = bound_tool_output(out, &self.cwd, &id).await?;
+        self.history
+            .push(HistoryItem::ToolResult { id, output: out });
+        Ok(ProcessTool::Executed)
+    }
+
     pub fn compact_explicit(
         &mut self,
         summary: String,
@@ -305,24 +363,106 @@ impl SessionActor {
         Ok(())
     }
 }
+enum ProcessTool {
+    Executed,
+    Cancelled,
+}
+
 fn noop_hooks() {}
 
+fn task_requires_workspace_change(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    [
+        "写入",
+        "写个",
+        "写一个",
+        "创建",
+        "新建",
+        "修改",
+        "编辑",
+        "保存到",
+        "生成文件",
+        "write ",
+        "create ",
+        "modify ",
+        "edit ",
+        "save ",
+        "add a file",
+        "update ",
+    ]
+    .iter()
+    .any(|term| lower.contains(term))
+}
+
 fn history_to_messages(history: &[HistoryItem]) -> serde_json::Value {
-    serde_json::Value::Array(history.iter().map(|item| match item {
-        HistoryItem::System(content) => serde_json::json!({"role":"system","content":content}),
-        HistoryItem::User(content) => serde_json::json!({"role":"user","content":content}),
-        HistoryItem::AssistantText(content) => serde_json::json!({"role":"assistant","content":content}),
-        HistoryItem::ToolCall { id, name, arguments } => serde_json::json!({
-            "role":"assistant","tool_calls":[{"id":id,"type":"function","function":{"name":name,"arguments":serde_json::to_string(arguments).unwrap_or_default()}}]
-        }),
-        HistoryItem::ToolResult { id, output } => serde_json::json!({"role":"tool","tool_call_id":id,"content":output}),
-        HistoryItem::CompactionSummary(content) => serde_json::json!({"role":"system","content":format!("Compaction summary:\n{content}")}),
-    }).collect())
+    let mut out = Vec::new();
+    let mut index = 0;
+    while index < history.len() {
+        match &history[index] {
+            HistoryItem::System(content) => {
+                out.push(serde_json::json!({"role":"system","content":content}));
+                index += 1;
+            }
+            HistoryItem::User(content) => {
+                out.push(serde_json::json!({"role":"user","content":content}));
+                index += 1;
+            }
+            HistoryItem::CompactionSummary(content) => {
+                out.push(serde_json::json!({"role":"system","content":format!("Compaction summary:\n{content}")}));
+                index += 1;
+            }
+            HistoryItem::ToolResult { id, output } => {
+                out.push(serde_json::json!({"role":"tool","tool_call_id":id,"content":output}));
+                index += 1;
+            }
+            HistoryItem::AssistantText(_) | HistoryItem::ToolCall { .. } => {
+                let mut text = String::new();
+                let mut tool_calls = Vec::new();
+                while index < history.len() {
+                    match &history[index] {
+                        HistoryItem::AssistantText(chunk) => {
+                            text.push_str(chunk);
+                            index += 1;
+                        }
+                        HistoryItem::ToolCall {
+                            id,
+                            name,
+                            arguments,
+                        } => {
+                            tool_calls.push(serde_json::json!({
+                                "id": id,
+                                "type": "function",
+                                "function": {
+                                    "name": name,
+                                    "arguments": serde_json::to_string(arguments).unwrap_or_default()
+                                }
+                            }));
+                            index += 1;
+                        }
+                        _ => break,
+                    }
+                }
+                let mut message = serde_json::json!({"role":"assistant"});
+                if tool_calls.is_empty() {
+                    message["content"] = serde_json::json!(text);
+                } else {
+                    message["content"] = if text.is_empty() {
+                        serde_json::Value::Null
+                    } else {
+                        serde_json::json!(text)
+                    };
+                    message["tool_calls"] = serde_json::Value::Array(tool_calls);
+                }
+                out.push(message);
+            }
+        }
+    }
+    serde_json::Value::Array(out)
 }
 
 fn build_world_state(cwd: &std::path::Path) -> String {
     let mut text = format!(
-        "You are Lato, a coding agent. Work in the host workspace.\nCWD: {}\nShell: {}\nUnix time: {}",
+        "You are Lato, a coding agent. Work in the host workspace.\n\nYou must keep going until the user's request is completely resolved before ending your turn. If the user asks you to create, write, edit, or modify files, you must actually change the workspace using tools before the final answer. Use write_file to create or overwrite files (for example hello.go). Use search_replace to edit an existing file. Use run_terminal_command for shell actions such as go run. Do not only say you will create a file.\n\nCWD: {}\nShell: {}\nUnix time: {}",
         cwd.display(),
         lato_workspace::default_shell().to_string_lossy(),
         std::time::SystemTime::now()
@@ -479,13 +619,14 @@ mod tests {
             },
         );
         builder.register(Arc::new(RenamedWriteTool(calls))).unwrap();
+        let runtime = Arc::new(builder.build().unwrap());
         let (events, _rx) = mpsc::unbounded_channel();
         SessionActor::new_with_tool_runtime(
             Arc::new(FakeModelStream::new(script)),
             Arc::new(FileLocks::new()),
             SessionTrust::for_interactive(&cwd, true),
             cwd,
-            Arc::new(builder.build().unwrap()),
+            runtime,
         )
         .with_interactive_events(events, "session-renamed".into(), Some(approval))
     }
@@ -508,7 +649,9 @@ mod tests {
             calls.clone(),
             approval.clone(),
         );
+
         actor.prompt(PromptKind::Start, "go".into()).await.unwrap();
+
         assert_eq!(calls.load(Ordering::Acquire), 1);
         let requests = approval.requests.lock().unwrap();
         assert_eq!(requests.len(), 1);
@@ -526,6 +669,7 @@ mod tests {
     async fn denied_generic_approval_does_not_invoke_tool() {
         let d = tempfile::tempdir().unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
+        let approval = Arc::new(RecordingApproval::new(vec![false]));
         let mut actor = actor_with_renamed_write_tool(
             vec![
                 vec![StreamPiece::ToolCall {
@@ -537,9 +681,11 @@ mod tests {
             ],
             d.path().to_path_buf(),
             calls.clone(),
-            Arc::new(RecordingApproval::new(vec![false])),
+            approval,
         );
+
         actor.prompt(PromptKind::Start, "go".into()).await.unwrap();
+
         assert_eq!(calls.load(Ordering::Acquire), 0);
         assert!(actor.history().iter().any(|item| matches!(
             item,
@@ -570,7 +716,9 @@ mod tests {
             calls.clone(),
             approval.clone(),
         );
+
         actor.prompt(PromptKind::Start, "go".into()).await.unwrap();
+
         assert_eq!(calls.load(Ordering::Acquire), 1);
         let requests = approval.requests.lock().unwrap();
         assert_eq!(requests.len(), 2);
@@ -752,11 +900,126 @@ mod tests {
                 .unwrap()
                 .contains("Use cargo test")
         );
-        assert!(messages[0]["content"].as_str().unwrap().contains("CWD:"));
+        let content = messages[0]["content"].as_str().unwrap();
+        assert!(content.contains("CWD:"));
+        assert!(
+            content.contains("must keep going until the user's request is completely resolved")
+        );
+        assert!(content.contains("Use write_file to create or overwrite files"));
+    }
+
+    #[test]
+    fn history_merges_streamed_assistant_chunks_with_tool_calls() {
+        let messages = history_to_messages(&[
+            HistoryItem::System("sys".into()),
+            HistoryItem::User("hi".into()),
+            HistoryItem::AssistantText("好".into()),
+            HistoryItem::AssistantText("的".into()),
+            HistoryItem::User("写文件".into()),
+            HistoryItem::AssistantText("我来写。".into()),
+            HistoryItem::ToolCall {
+                id: "c1".into(),
+                name: "write_file".into(),
+                arguments: json!({"path":"hello.go"}),
+            },
+            HistoryItem::ToolResult {
+                id: "c1".into(),
+                output: "ok".into(),
+            },
+        ]);
+        let items = messages.as_array().unwrap();
+        assert_eq!(items.len(), 6);
+        assert_eq!(items[2]["role"], "assistant");
+        assert_eq!(items[2]["content"], "好的");
+        assert_eq!(items[4]["content"], "我来写。");
+        assert_eq!(items[4]["tool_calls"][0]["function"]["name"], "write_file");
+        assert_eq!(items[5]["role"], "tool");
     }
 
     #[tokio::test]
-    async fn repeated_identical_tool_calls_trigger_stall_detection() {
+    async fn file_creation_request_continues_until_a_tool_is_used() {
+        let d = tempfile::tempdir().unwrap();
+        let mut a = actor(
+            vec![
+                vec![StreamPiece::Text("我来为你创建。".into())],
+                vec![StreamPiece::ToolCall {
+                    id: "create".into(),
+                    name: "run_terminal_command".into(),
+                    arguments: json!({"command":"cat > hello.go <<'EOF'\npackage main\n\nimport \"fmt\"\n\nfunc main() {\n    fmt.Println(\"Hello, World!\")\n}\nEOF"}),
+                }],
+                vec![StreamPiece::Text("已创建 hello.go".into())],
+            ],
+            d.path().to_path_buf(),
+        );
+        a.prompt(PromptKind::Start, "写一个go的helloword程序给我".into())
+            .await
+            .unwrap();
+        let written = std::fs::read_to_string(d.path().join("hello.go")).unwrap();
+        assert!(written.contains("package main"));
+        assert!(written.contains("Hello, World!"));
+        assert!(a.latest_assistant_text().contains("已创建"));
+        assert!(
+            a.history().iter().any(|item| matches!(
+                item,
+                HistoryItem::User(text) if text.contains("have not used any tool")
+            )),
+            "SenseNova requires the last retry message to be user, not system"
+        );
+    }
+
+    #[tokio::test]
+    async fn file_creation_request_uses_write_file_tool() {
+        let d = tempfile::tempdir().unwrap();
+        let mut a = actor(
+            vec![
+                vec![StreamPiece::ToolCall {
+                    id: "create".into(),
+                    name: "write_file".into(),
+                    arguments: json!({
+                        "path":"hello.go",
+                        "contents":"package main\n\nimport \"fmt\"\n\nfunc main() {\n    fmt.Println(\"Hello, World!\")\n}\n"
+                    }),
+                }],
+                vec![StreamPiece::Text("已创建 hello.go".into())],
+            ],
+            d.path().to_path_buf(),
+        );
+        a.prompt(
+            PromptKind::Start,
+            "在当前路径写一个go的helloworld程序".into(),
+        )
+        .await
+        .unwrap();
+        let written = std::fs::read_to_string(d.path().join("hello.go")).unwrap();
+        assert!(written.contains("package main"));
+        assert!(written.contains("Hello, World!"));
+    }
+
+    #[tokio::test]
+    async fn glm_xml_write_file_in_assistant_text_is_executed() {
+        let d = tempfile::tempdir().unwrap();
+        let mut a = actor(
+            vec![
+                vec![StreamPiece::Text(
+                    "<tool_call>write_file<arg_key>path</arg_key><arg_value>hello.go</arg_value><arg_key>contents</arg_key><arg_value>package main</arg_value></tool_call>"
+                        .into(),
+                )],
+                vec![StreamPiece::Text("已写入".into())],
+            ],
+            d.path().to_path_buf(),
+        );
+        a.prompt(PromptKind::Start, "写一个go的helloworld程序".into())
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(d.path().join("hello.go")).unwrap(),
+            "package main"
+        );
+        assert!(a.latest_assistant_text().contains("已写入"));
+    }
+
+    #[tokio::test]
+    async fn repeated_identical_tool_calls_fail_instead_of_fabricating_completion() {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("a.txt"), "x").unwrap();
         let call = StreamPiece::ToolCall {
@@ -773,11 +1036,25 @@ mod tests {
             ],
             d.path().to_path_buf(),
         );
-        let err = a
+        let error = a
             .prompt(PromptKind::Start, "loop".into())
             .await
             .unwrap_err();
-        assert!(err.contains("stalled"));
+        assert_eq!(
+            error,
+            "stalled: identical tool call repeated more than 3 times"
+        );
+        assert!(!a.latest_assistant_text().contains("上次工具结果"));
+    }
+
+    #[test]
+    fn workspace_change_detection_requires_an_action() {
+        assert!(task_requires_workspace_change(
+            "create a file named hello.txt"
+        ));
+        assert!(task_requires_workspace_change("修改 src/main.rs"));
+        assert!(!task_requires_workspace_change("explain this file format"));
+        assert!(!task_requires_workspace_change("what is a program?"));
     }
 
     #[test]
