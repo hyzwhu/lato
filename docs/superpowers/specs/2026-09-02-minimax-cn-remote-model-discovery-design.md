@@ -19,11 +19,15 @@ Introduce an explicit strict remote-discovery policy for `minimax-cn` at the CLI
 
 Interactive configuration will recognize `minimax-cn` as strict. On successful discovery, it will present only the models returned by the remote catalog. It will not merge the built-in catalog entry into the choices. On terminal failure, it will return the discovery error immediately and will not print the model-selection prompt. The existing remote model store may still be updated after a successful response for normal runtime lookup, but it will not satisfy a failed interactive refresh.
 
+Strict discovery must not read or parse the existing model store before making the remote request. A malformed derived cache is not an authoritative input and therefore cannot block remote discovery. After a successful remote response, the store update will acquire the normal store lock and attempt to load the existing document. If that document is malformed, it will be moved to a timestamped sibling with a `.corrupt-<timestamp>` suffix before a fresh document containing the remote result is written atomically. This preserves evidence for recovery while restoring a usable cache. Credential files are separate and must never be moved or rewritten by this recovery path.
+
 The retry policy will use a small fixed attempt budget with short bounded backoff so setup remains responsive. HTTP authentication is not involved in the `pi.dev` catalog request, and retries must reuse only a freshly constructed catalog request without logging credential state.
 
 ## Error Handling
 
 Errors will identify the provider and failure category: transport failure, unsuccessful HTTP status, empty body, malformed JSON, or invalid catalog shape. Malformed-response diagnostics will include only a short sanitized prefix of the response body. After the attempt budget is exhausted, the error will state that remote model discovery failed and setup was stopped. No built-in or cached fallback message will be emitted for `minimax-cn`.
+
+A malformed local model cache is handled only after a successful authoritative response. If preserving the corrupt cache or writing the replacement fails, setup stops with a local cache recovery error rather than presenting models that cannot be resolved later. The corrupt backup remains recoverable and contains only derived model metadata, never provider credentials.
 
 ## Testing
 
@@ -34,6 +38,8 @@ Unit and integration coverage will verify:
 - repeated malformed responses return an error after the bounded attempt count;
 - strict `minimax-cn` configuration never merges or falls back to `MiniMax-M2.1`;
 - terminal discovery failure prevents the model-selection stage;
+- a NUL-filled or otherwise malformed model store does not prevent the remote request;
+- a successful remote response preserves the malformed store as a timestamped corrupt backup and installs a valid replacement;
 - diagnostics do not contain the configured API key.
 
 ## Scope
