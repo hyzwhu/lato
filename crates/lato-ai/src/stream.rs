@@ -1,4 +1,4 @@
-use crate::{Auth, Model, build_request, http_client_for_url, send_request_response};
+use crate::{Auth, Model, ModelApi, build_request, http_client_for_url, send_request_response};
 use async_trait::async_trait;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock, mpsc};
@@ -129,8 +129,13 @@ impl ModelStream for HttpModelStream {
         if prompt_bytes > CONTEXT_HARD_LIMIT_BYTES {
             return Err("context exceeds hard limit; compact required".into());
         }
-        let request = build_request(&self.model, &self.auth, context)?;
-        stream_http_request_with_tool_choice_fallback(&self.client, request, tx).await
+        if self.model.api == ModelApi::OpenaiCodexResponses {
+            let request = crate::codex::build_codex_request(&self.model, &self.auth, &context)?;
+            crate::codex::stream_codex(&self.client, &request, tx).await
+        } else {
+            let request = build_request(&self.model, &self.auth, context)?;
+            stream_http_request_with_tool_choice_fallback(&self.client, request, tx).await
+        }
     }
 }
 

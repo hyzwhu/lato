@@ -1,7 +1,12 @@
 pub(crate) mod events;
 pub(crate) mod sse;
+pub(crate) mod websocket;
 
-use crate::{Auth, HttpRequestSpec, Model, responses_input, responses_tools};
+use crate::StreamPiece;
+use crate::{Auth, Model, responses_input, responses_tools};
+use std::collections::HashSet;
+use std::sync::{Mutex, OnceLock};
+use tokio::sync::mpsc;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct TransportOutcome {
@@ -35,6 +40,64 @@ impl CodexTransportError {
     }
 }
 
+fn websocket_fallback_sessions() -> &'static Mutex<HashSet<String>> {
+    static SESSIONS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    SESSIONS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+pub(crate) async fn stream_codex(
+    client: &reqwest::Client,
+    request: &CodexRequest,
+    tx: mpsc::Sender<StreamPiece>,
+) -> Result<(), String> {
+    let fallback_active = request.session_key.as_ref().is_some_and(|session| {
+        websocket_fallback_sessions()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(session)
+    });
+    if fallback_active {
+        return sse::stream_sse(client, request, tx)
+            .await
+            .map(|_| ())
+            .map_err(|error| error.message);
+    }
+    let mut websocket_result = websocket::stream_websocket(request, tx.clone()).await;
+    if websocket_result
+        .as_ref()
+        .is_err_and(|error| !error.events_started && websocket_retryable(&error.message))
+    {
+        websocket_result = websocket::stream_websocket(request, tx.clone()).await;
+    }
+    match websocket_result {
+        Ok(_) => Ok(()),
+        Err(error) if !error.events_started => {
+            if let Some(session) = &request.session_key {
+                websocket_fallback_sessions()
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .insert(session.clone());
+            }
+            sse::stream_sse(client, request, tx)
+                .await
+                .map(|_| ())
+                .map_err(|sse_error| {
+                    format!(
+                        "Codex WebSocket failed before streaming ({}); SSE fallback failed: {}",
+                        error.message, sse_error.message
+                    )
+                })
+        }
+        Err(error) => Err(error.message),
+    }
+}
+
+fn websocket_retryable(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("websocket_connection_limit_reached")
+        || message.contains("previous_response_not_found")
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CodexRequest {
     pub url: String,
@@ -49,15 +112,6 @@ impl CodexRequest {
             .iter()
             .find(|(key, _)| key.eq_ignore_ascii_case(name))
             .map(|(_, value)| value.as_str())
-    }
-
-    pub(crate) fn as_http_request(&self) -> HttpRequestSpec {
-        HttpRequestSpec {
-            method: "POST",
-            url: self.url.clone(),
-            headers: self.headers.clone(),
-            body: self.body.clone(),
-        }
     }
 }
 
@@ -104,7 +158,7 @@ pub fn build_codex_request(
         .filter(|value| !value.is_empty())
         .or(session_key.as_deref());
     let mut headers = auth.headers.clone();
-    headers.extend([
+    for (key, value) in [
         ("authorization".into(), format!("Bearer {token}")),
         ("chatgpt-account-id".into(), account_id.into()),
         ("originator".into(), "lato".into()),
@@ -115,7 +169,9 @@ pub fn build_codex_request(
         ("openai-beta".into(), "responses=experimental".into()),
         ("accept".into(), "text/event-stream".into()),
         ("content-type".into(), "application/json".into()),
-    ]);
+    ] {
+        set_header(&mut headers, key, value);
+    }
     if let Some(session_key) = &session_key {
         headers.push(("session-id".into(), session_key.clone()));
     }
@@ -157,6 +213,11 @@ pub fn build_codex_request(
         body,
         session_key,
     })
+}
+
+fn set_header(headers: &mut Vec<(String, String)>, key: String, value: String) {
+    headers.retain(|(existing, _)| !existing.eq_ignore_ascii_case(&key));
+    headers.push((key, value));
 }
 
 fn split_system_messages(messages: serde_json::Value) -> (String, serde_json::Value) {
