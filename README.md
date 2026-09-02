@@ -55,15 +55,22 @@ Run `lato` without arguments:
 lato
 ```
 
-On first launch Lato asks you to choose a model, then configures OAuth or securely reads an API key without echoing it. The selected model is saved in `~/.lato/config.json`; credentials are kept separately in the locked credential store. After setup, the same process maintains a multi-turn conversation and renders HTTP/SSE model deltas as they arrive.
+On first launch Lato asks you to choose a model, then configures OAuth or securely reads an API key without echoing it. The selected model is saved in `~/.lato/config.json`; credentials are kept separately in the locked credential store. After setup, Lato opens a full-screen Ratatui interface with session navigation, streaming reasoning and responses, live tool-call cards, and approval dialogs.
+
+The interface follows `LC_ALL`, `LC_MESSAGES`, or `LANG` on first launch and supports Chinese and English. Override and persist the language with either form below; `/lang` switches it from inside the TUI.
+
+```bash
+lato --lang zh-CN
+lato --lang en
+```
 
 Interactive commands:
 
 ```text
-/help     /clear     /model     /login     /approve     /status     /exit
+/help     /clear     /model     /login     /lang     /approve     /status     /exit
 ```
 
-The line editor persists history in `~/.lato/history`; Up/Down navigate it and Tab completes slash commands. Enter `exit`, `quit`, `/exit`, or `/quit` to leave; Ctrl-C exits both at the input prompt and while a model is streaming. Selecting a provider with an existing credential offers to reuse it, replace its API key, or re-run OAuth. `/login` always replaces the current provider credential and immediately rebuilds the model client in a fresh conversation. The workspace starts untrusted. Mutating tool calls display their name and arguments and request approval exactly at the execution boundary. You can instead trust the workspace for the process or use `/approve` to pre-authorize one call.
+Use Tab/Shift-Tab to move between panels, Up/Down to scroll the focused panel, Cmd/Ctrl-K to open the command palette, `/` on an empty composer to search, and Ctrl-C to cancel a streaming turn or exit while idle. `/model` and `/login` temporarily leave the full-screen view for secure terminal prompts, then return in a fresh conversation. The workspace starts untrusted. Mutating tool calls display their name and arguments and request approval exactly at the execution boundary. You can instead trust the workspace for the process or use `/approve` to pre-authorize one call. On smaller terminals, side panels collapse automatically so the conversation remains usable.
 
 For a one-shot, script-friendly prompt:
 
@@ -173,7 +180,7 @@ lato login openai-codex --oauth
 
 ## Public Beta limitations
 
-- The interactive client is line-oriented; a full-screen TUI is not included in this release.
+- Session entries currently use durable IDs instead of generated titles, and selecting a historical session from the side panel is not yet supported; use `lato resume SESSION_ID`.
 - Homebrew, Scoop, and other package-manager channels are not maintained yet.
 - Session listing exposes durable IDs, not generated titles, rename, or delete operations.
 - LIVE provider validation is reported separately and may be unavailable when repository credentials are not configured. Offline protocol and localhost end-to-end tests still run in ordinary CI.

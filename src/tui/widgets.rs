@@ -361,6 +361,8 @@ pub fn command_palette(frame: &mut Frame<'_>, app: &AppState) {
     frame.render_widget(Clear, area);
     let commands = [
         tr(app.language, TextKey::NewSession),
+        tr(app.language, TextKey::SwitchModel),
+        tr(app.language, TextKey::Login),
         tr(app.language, TextKey::SwitchLanguage),
         tr(app.language, TextKey::Search),
         tr(app.language, TextKey::ApproveOnce),

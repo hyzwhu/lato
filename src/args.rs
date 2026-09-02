@@ -137,6 +137,12 @@ impl Cli {
                     "headless prompt options cannot be combined with a subcommand",
                 ));
             }
+            if self.language.is_some() && !matches!(&command, Command::Resume { .. }) {
+                return Err(semantic_error(
+                    ErrorKind::ArgumentConflict,
+                    "--lang is only available in interactive mode",
+                ));
+            }
             return Ok(match command {
                 Command::Sessions { json } => Invocation::Sessions { json },
                 Command::Resume { session_id } => Invocation::Resume {
@@ -312,6 +318,12 @@ mod tests {
             "hello".into(),
         ])
         .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn rejects_language_for_non_interactive_subcommands() {
+        let error = parse(vec!["--lang".into(), "en".into(), "sessions".into()]).unwrap_err();
         assert_eq!(error.kind(), ErrorKind::ArgumentConflict);
     }
 }

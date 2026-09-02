@@ -10,16 +10,16 @@ fn actor_has_no_legacy_name_or_counter_approval_bypass() {
 }
 
 #[test]
-fn console_approval_does_not_render_raw_arguments() {
-    let cli = include_str!("../src/cli.rs");
-    let implementation = cli
-        .split("impl ToolApproval for ConsoleToolApproval")
+fn tui_approval_does_not_render_raw_arguments() {
+    let backend = include_str!("../src/tui/backend.rs");
+    let implementation = backend
+        .split("impl ToolApproval for TuiToolApproval")
         .nth(1)
-        .expect("console approval implementation");
+        .expect("TUI approval implementation");
     let implementation = implementation
-        .split("pub async fn run")
+        .split("pub struct BackendHandle")
         .next()
-        .expect("console approval implementation boundary");
+        .expect("TUI approval implementation boundary");
     assert!(implementation.contains("ApprovalRequest"));
     assert!(!implementation.contains("arguments"));
 }

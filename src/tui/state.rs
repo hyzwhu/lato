@@ -1,4 +1,5 @@
 use super::{
+    TuiExit,
     backend::{BackendCommand, BackendEvent},
     i18n::Language,
     input::InputBuffer,
@@ -135,6 +136,7 @@ pub struct AppState {
     pub error: Option<String>,
     pub scroll: u16,
     pub should_exit: bool,
+    pub exit_action: TuiExit,
 }
 
 #[derive(Debug)]
@@ -151,7 +153,7 @@ pub enum AppEvent {
     Scroll(i16),
     SwitchLanguage(Language),
     ClearConversation,
-    Exit,
+    Exit(TuiExit),
 }
 
 #[derive(Debug)]
@@ -198,6 +200,7 @@ impl AppState {
             error: None,
             scroll: 0,
             should_exit: false,
+            exit_action: TuiExit::Quit,
         }
     }
 
@@ -267,8 +270,9 @@ impl AppState {
                 self.overlay = None;
                 vec![Effect::Backend(BackendCommand::Clear)]
             }
-            AppEvent::Exit => {
+            AppEvent::Exit(action) => {
                 self.should_exit = true;
+                self.exit_action = action;
                 vec![Effect::Backend(BackendCommand::Shutdown)]
             }
         }

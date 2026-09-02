@@ -390,13 +390,33 @@ async fn interactive(startup: InteractiveStartup, language_override: Option<Lang
         trust: session_trust,
         language,
         workspace: cwd,
-        model: selection,
-        home,
+        model: selection.clone(),
+        home: home.clone(),
         sessions,
     })
     .await
     {
-        Ok(()) => 0,
+        Ok(crate::tui::TuiExit::Quit) => 0,
+        Ok(crate::tui::TuiExit::SwitchModel) => match configure_interactively(&home).await {
+            Ok(_) => Box::pin(interactive(InteractiveStartup::New, Some(language))).await,
+            Err(error) => {
+                eprintln!("error: {error}");
+                1
+            }
+        },
+        Ok(crate::tui::TuiExit::Login) => {
+            let Some((provider, _)) = selection.split_once('/') else {
+                eprintln!("error: model must be provider/model");
+                return 1;
+            };
+            match configure_provider_auth(&home, provider, true).await {
+                Ok(()) => Box::pin(interactive(InteractiveStartup::New, Some(language))).await,
+                Err(error) => {
+                    eprintln!("error: {error}");
+                    1
+                }
+            }
+        }
         Err(error) => {
             eprintln!("error: {error}");
             1

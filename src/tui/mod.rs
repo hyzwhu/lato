@@ -31,7 +31,15 @@ pub struct InteractiveBootstrap {
     pub sessions: Vec<String>,
 }
 
-pub async fn run(bootstrap: InteractiveBootstrap) -> Result<(), String> {
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TuiExit {
+    #[default]
+    Quit,
+    SwitchModel,
+    Login,
+}
+
+pub async fn run(bootstrap: InteractiveBootstrap) -> Result<TuiExit, String> {
     let (_guard, terminal) = TerminalGuard::enter()?;
     tokio::task::LocalSet::new()
         .run_until(run_loop(terminal, bootstrap))
@@ -41,7 +49,7 @@ pub async fn run(bootstrap: InteractiveBootstrap) -> Result<(), String> {
 async fn run_loop(
     mut terminal: terminal::TuiTerminal,
     mut bootstrap: InteractiveBootstrap,
-) -> Result<(), String> {
+) -> Result<TuiExit, String> {
     let session_id = bootstrap.client.session_id().to_string();
     let (backend, mut backend_events) = backend::spawn(bootstrap.client);
     let mut app = AppState::new(
@@ -71,13 +79,13 @@ async fn run_loop(
                     app.error = Some(error.to_string());
                     (Vec::new(), true)
                 }
-                None => (app.reduce(AppEvent::Exit), true),
+                None => (app.reduce(AppEvent::Exit(TuiExit::Quit)), true),
             },
             event = backend_events.recv() => match event {
                 Some(event) => (app.reduce(AppEvent::Backend(event)), true),
                 None => {
                     app.error = Some("backend event channel closed".into());
-                    (app.reduce(AppEvent::Exit), true)
+                    (app.reduce(AppEvent::Exit(TuiExit::Quit)), true)
                 }
             },
             approval = bootstrap.approvals.recv(), if approvals_open => {
@@ -107,7 +115,7 @@ async fn run_loop(
         }
     }
     let _ = backend.send(BackendCommand::Shutdown);
-    Ok(())
+    Ok(app.exit_action)
 }
 
 fn execute_effects(
@@ -164,7 +172,7 @@ fn handle_key(
             }
             return Vec::new();
         }
-        return app.reduce(AppEvent::Exit);
+        return app.reduce(AppEvent::Exit(TuiExit::Quit));
     }
     if app.approval.is_some() {
         return handle_approval_key(app, key);
@@ -239,8 +247,10 @@ fn submit_or_command(app: &mut AppState, trust: &SessionTrust) -> Vec<Effect> {
     match command.as_str() {
         "/exit" | "/quit" => {
             app.composer.clear();
-            app.reduce(AppEvent::Exit)
+            app.reduce(AppEvent::Exit(TuiExit::Quit))
         }
+        "/model" => app.reduce(AppEvent::Exit(TuiExit::SwitchModel)),
+        "/login" => app.reduce(AppEvent::Exit(TuiExit::Login)),
         "/clear" => {
             app.composer.clear();
             app.reduce(AppEvent::ClearConversation)
@@ -273,7 +283,7 @@ fn submit_or_command(app: &mut AppState, trust: &SessionTrust) -> Vec<Effect> {
             app.screen = state::Screen::Main;
             app.messages.push(Message {
                 role: MessageRole::System,
-                content: "/help  /clear  /lang  /approve  /status  /exit".into(),
+                content: "/help  /clear  /model  /login  /lang  /approve  /status  /exit".into(),
                 expanded: true,
             });
             Vec::new()
@@ -313,20 +323,22 @@ fn handle_palette_key(app: &mut AppState, key: KeyEvent, trust: &SessionTrust) -
         }
         KeyCode::Enter => match app.palette_index {
             0 => app.reduce(AppEvent::ClearConversation),
-            1 => {
+            1 => app.reduce(AppEvent::Exit(TuiExit::SwitchModel)),
+            2 => app.reduce(AppEvent::Exit(TuiExit::Login)),
+            3 => {
                 let language = match app.language {
                     Language::ZhCn => Language::En,
                     Language::En => Language::ZhCn,
                 };
                 app.reduce(AppEvent::SwitchLanguage(language))
             }
-            2 => app.reduce(AppEvent::OpenSearch),
-            3 => {
+            4 => app.reduce(AppEvent::OpenSearch),
+            5 => {
                 trust.allow_once();
                 app.overlay = None;
                 Vec::new()
             }
-            4 => {
+            6 => {
                 app.overlay = None;
                 app.screen = state::Screen::Main;
                 app.messages.push(Message {
@@ -336,7 +348,7 @@ fn handle_palette_key(app: &mut AppState, key: KeyEvent, trust: &SessionTrust) -
                 });
                 Vec::new()
             }
-            _ => app.reduce(AppEvent::Exit),
+            _ => app.reduce(AppEvent::Exit(TuiExit::Quit)),
         },
         _ => Vec::new(),
     }

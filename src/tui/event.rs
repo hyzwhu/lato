@@ -1,1 +1,1 @@
-pub const COMMAND_COUNT: usize = 6;
+pub const COMMAND_COUNT: usize = 8;
