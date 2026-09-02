@@ -135,3 +135,28 @@ complete corruption. Mutating/non-idempotent tools are synchronously prepared be
 synchronously completed afterward. A prepared call without completion is surfaced as
 `journal.incomplete_side_effect` and is never automatically replayed. Phase 4B snapshotting and
 compaction were intentionally not included in this gate.
+
+## Public Beta local release gate (2026-09-02)
+
+Measured on macOS arm64 with Homebrew `rustc 1.98.0` from branch
+`codex/public-beta-release`. The binary package version is `0.1.0-beta.1`.
+
+| Gate | Result | Evidence |
+|---|---|---|
+| Formatting | PASS | `cargo fmt --all -- --check` exited 0. |
+| Workspace tests | PASS | `cargo test --workspace --no-fail-fast`: **364 passed, 0 failed, 0 ignored** across 52 unit, integration, and doc-test result groups. |
+| Clippy | PASS | `cargo clippy --workspace --all-targets --all-features -- -D warnings` exited 0 with no warnings. |
+| Typed CLI | PASS | Generated help contains `sessions`, `resume`, `login`, `doctor`, `acp`, and `-p`; `lato --version` prints `lato 0.1.0-beta.1`; invalid combinations retain exit 2. |
+| Session listing | PASS | Fresh-home human output reports `No saved sessions.`; JSON parses with `schema_version == 1`; two persisted sessions list newest-first. |
+| Session resume | PASS | Unknown sessions are rejected without creation; existing legacy and canonical sessions hydrate history; unresolved prepared side effects retain fail-closed journal handling; non-TTY resume returns 2. |
+| Doctor model resolution | PASS | Built-in, `models.json`, `models-store.json`, and `model-cache.json` sources are covered offline. The installed local configuration reports `sensenova/glm-5.2 found in models-store.json` and Doctor status `ok`. |
+| Source smokes | PASS | Fresh temporary `LATO_HOME`: version matched, Doctor JSON parsed with schema 1, fake-model prompt returned `hi`, and session JSON parsed with one persisted session. |
+| Local install | PASS | `cargo install --path .` replaced `/Users/huangyongzhao/.cargo/bin/lato` with `lato 0.1.0-beta.1` (10,546,512 bytes). |
+| Installed smokes | PASS | Fresh temporary `LATO_HOME`: installed version matched, Doctor JSON parsed with schema 1, fake-model prompt returned `hi`, and session JSON parsed with one persisted session. |
+| Workflow static validation | PASS | Ruby YAML parsing succeeded for `release.yml` and `live-smoke.yml`; release workflow contains five native target entries, an exact archive-count gate, SHA-256 generation, offline smokes, and publish-only `contents: write`; provider secrets occur only in the manual LIVE workflow. |
+| Five-platform remote build | SKIPPED | The GitHub `workflow_dispatch`/tag workflow was not run from this local repository. No remote runner or archive claim is made. |
+| LIVE providers | SKIPPED | The manual `live-provider-smoke` workflow was not dispatched and no provider credentials were used. Release notes must state that LIVE validation is unavailable until a successful run is linked. |
+| GitHub prerelease | NOT PUBLISHED | No remote is configured and no tag was created or pushed. Publishing requires separate authorization after the five-platform workflow passes. |
+
+The local Beta gate is green. A public tag remains gated on the five native GitHub runner builds;
+missing LIVE credentials do not block the Beta but must remain visible as skipped.
