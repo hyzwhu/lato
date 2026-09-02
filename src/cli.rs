@@ -2,10 +2,10 @@ use lato::doctor::{self, DoctorDependencies, DoctorOptions, LiveProbe};
 use lato_agent::{ApprovalRequest, ToolApproval, default_fake_stream};
 use lato_ai::{
     AuthInteraction, AuthNotice, CATALOG, CredentialStore, CustomHttpModelStream, CustomModel,
-    HttpModelStream, ModelApi, ModelStream, ProviderModelsStore, adapt_model_stream,
-    api_key_login_allowed, custom_model_auth, get_auth_refreshing, load_models_json, login_oauth,
-    lookup_model, oauth_allowed, phase0_supported, provider_spec, refresh_openai_compatible_models,
-    refresh_remote_provider_catalog, store_oauth,
+    HttpModelStream, ModelApi, ModelStream, ProviderModelsEntry, ProviderModelsStore,
+    adapt_model_stream, api_key_login_allowed, custom_model_auth, get_auth_refreshing,
+    load_models_json, login_oauth, lookup_model, oauth_allowed, phase0_supported, provider_spec,
+    refresh_openai_compatible_models, refresh_remote_provider_catalog, store_oauth,
 };
 use lato_workspace::{ApprovalMode, SandboxProfile, SessionTrust};
 use rustyline::{
@@ -21,7 +21,7 @@ use std::{
     io::{IsTerminal, Write},
     path::PathBuf,
     sync::Arc,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -32,6 +32,110 @@ struct CliSettings {
 const INTERACTIVE_COMMANDS: &[&str] = &[
     "/help", "/clear", "/model", "/login", "/approve", "/status", "/exit", "/quit",
 ];
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LocalFact {
+    Model,
+    CurrentDirectory,
+    AncestorDirectory(usize),
+}
+
+fn local_fact_response(input: &str, cwd: &std::path::Path, model: Option<&str>) -> Option<String> {
+    let facts = requested_local_facts(input);
+    if facts.is_empty() {
+        return None;
+    }
+
+    let mut lines = Vec::new();
+    for fact in facts {
+        match fact {
+            LocalFact::Model => {
+                lines.push(format!("当前模型: {}", model.unwrap_or("built-in/fake")))
+            }
+            LocalFact::CurrentDirectory => lines.push(format!("当前工作目录: {}", cwd.display())),
+            LocalFact::AncestorDirectory(levels) => {
+                let mut ancestor = cwd;
+                for _ in 0..levels {
+                    ancestor = ancestor.parent().unwrap_or(ancestor);
+                }
+                let label = match levels {
+                    1 => "上一层目录".to_string(),
+                    2 => "上上层目录".to_string(),
+                    _ => format!("上{levels}层目录"),
+                };
+                lines.push(format!("{label}: {}", ancestor.display()));
+            }
+        }
+    }
+    Some(lines.join("\n"))
+}
+
+fn requested_local_facts(input: &str) -> Vec<LocalFact> {
+    let trimmed = input.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if lower == "pwd" {
+        return vec![LocalFact::CurrentDirectory];
+    }
+
+    let asks_current_model = [
+        "当前模型",
+        "现在的模型",
+        "你是什么模型",
+        "你当前是什么模型",
+        "你现在是什么模型",
+        "current model",
+        "which model are you",
+        "what model are you",
+    ]
+    .iter()
+    .any(|term| lower.contains(term));
+    let asks_current_directory = [
+        "当前目录",
+        "当前文件夹",
+        "当前工作目录",
+        "当前工作区路径",
+        "current directory",
+        "current folder",
+        "working directory",
+    ]
+    .iter()
+    .any(|term| lower.contains(term));
+    let asks_grandparent = [
+        "上上层目录",
+        "上两层目录",
+        "祖父目录",
+        "grandparent directory",
+        "two levels up",
+    ]
+    .iter()
+    .any(|term| lower.contains(term));
+    let asks_parent = asks_grandparent
+        || [
+            "上一层目录",
+            "上一级目录",
+            "父目录",
+            "parent directory",
+            "one level up",
+        ]
+        .iter()
+        .any(|term| lower.contains(term));
+
+    let mut facts = Vec::new();
+    if asks_current_model {
+        facts.push(LocalFact::Model);
+    }
+    if asks_current_directory {
+        facts.push(LocalFact::CurrentDirectory);
+    }
+    if asks_parent {
+        facts.push(LocalFact::AncestorDirectory(if asks_grandparent {
+            2
+        } else {
+            1
+        }));
+    }
+    facts
+}
 
 struct LatoLineHelper;
 impl Helper for LatoLineHelper {}
@@ -230,6 +334,10 @@ async fn prompt(args: &[String]) -> i32 {
     }
     let text = text_parts.join(" ");
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    if let Some(response) = local_fact_response(&text, &cwd, model_arg.as_deref()) {
+        println!("{response}");
+        return 0;
+    }
     let mut trust = if ask {
         SessionTrust::for_interactive(&cwd, true)
     } else {
@@ -456,6 +564,10 @@ async fn interactive() -> i32 {
                 continue;
             }
             _ => {}
+        }
+        if let Some(response) = local_fact_response(&input, &cwd, Some(&selection)) {
+            println!("Lato: {response}\n");
+            continue;
         }
         print!("Lato: ");
         let _ = std::io::stdout().flush();
@@ -723,14 +835,31 @@ async fn discover_provider_models(
         .first()
         .copied()
         .unwrap_or("LATO_API_KEY");
-    refresh_openai_compatible_models(
+    let models = refresh_openai_compatible_models(
         provider,
         seed.api,
         base_url,
         env_name,
         auth.api_key.as_deref(),
     )
-    .await
+    .await?;
+    ProviderModelsStore::open(home).write(
+        provider,
+        ProviderModelsEntry {
+            models: models.clone(),
+            checked_at: now_ms(),
+            last_modified: 0,
+            etag: None,
+        },
+    )?;
+    Ok(models)
+}
+
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
 }
 
 fn save_interactive_api_key(home: &std::path::Path, provider: &str) -> Result<(), String> {
@@ -973,7 +1102,10 @@ fn lato_home() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_exit_command, resolve_item, should_discover_provider_models};
+    use super::{
+        LocalFact, is_exit_command, requested_local_facts, resolve_item,
+        should_discover_provider_models,
+    };
 
     #[test]
     fn interactive_exit_commands_accept_plain_slash_and_case_variants() {
@@ -997,5 +1129,20 @@ mod tests {
             resolve_item("sensenova-6.8-flash-lite", &models, "model").unwrap(),
             models[0]
         );
+    }
+
+    #[test]
+    fn local_fact_matcher_only_intercepts_explicit_current_facts() {
+        assert_eq!(
+            requested_local_facts("pwd"),
+            vec![LocalFact::CurrentDirectory]
+        );
+        assert_eq!(
+            requested_local_facts("你是什么模型"),
+            vec![LocalFact::Model]
+        );
+        assert!(requested_local_facts("which model architecture should I use?").is_empty());
+        assert!(requested_local_facts("show me how path handling works").is_empty());
+        assert!(requested_local_facts("解释这个 workspace 文件").is_empty());
     }
 }

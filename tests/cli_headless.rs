@@ -177,6 +177,141 @@ fn b1_6_headless_http_model_tool_loop_edits_workspace_offline_fixture() {
 }
 
 #[test]
+fn headless_answers_current_workspace_without_model_or_tool_call() {
+    let d = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_lato"))
+        .current_dir(d.path())
+        .env("LATO_HOME", home.path())
+        .args(["-p", "给我一下当前文件夹路径"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("当前工作目录:"), "stdout={stdout}");
+    assert!(
+        stdout.contains(&d.path().display().to_string()),
+        "stdout={stdout}"
+    );
+}
+
+#[test]
+fn headless_answers_parent_workspace_directory_without_model_or_tool_call() {
+    let d = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_lato"))
+        .current_dir(d.path())
+        .env("LATO_HOME", home.path())
+        .args(["-p", "上一层目录是什么"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("上一层目录:"), "stdout={stdout}");
+    assert!(
+        stdout.contains(&d.path().parent().unwrap().display().to_string()),
+        "stdout={stdout}"
+    );
+}
+
+#[test]
+fn headless_answers_grandparent_workspace_directory_without_model_or_tool_call() {
+    let d = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_lato"))
+        .current_dir(d.path())
+        .env("LATO_HOME", home.path())
+        .args(["-p", "上上层目录是什么"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("上上层目录:"), "stdout={stdout}");
+    assert!(
+        stdout.contains(
+            &d.path()
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .display()
+                .to_string()
+        ),
+        "stdout={stdout}"
+    );
+}
+
+#[test]
+fn headless_answers_pwd_without_model_or_tool_call() {
+    let d = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_lato"))
+        .current_dir(d.path())
+        .env("LATO_HOME", home.path())
+        .args(["-p", "pwd"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("当前工作目录:"), "stdout={stdout}");
+    assert!(
+        stdout.contains(&d.path().display().to_string()),
+        "stdout={stdout}"
+    );
+}
+
+#[test]
+fn headless_answers_current_model_without_validating_provider() {
+    let d = tempfile::tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_lato"))
+        .env("LATO_HOME", d.path())
+        .args(["-p", "--model", "fixture/coder", "你是什么模型"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "当前模型: fixture/coder"
+    );
+}
+
+#[test]
+fn general_model_question_is_not_stolen_by_local_fact_shortcut() {
+    let home = tempfile::tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_lato"))
+        .env("LATO_HOME", home.path())
+        .args(["-p", "which model architecture should I use?"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "hi");
+}
+
+#[test]
 fn a5_1_headless_prompt_fake_model() {
     let d = tempfile::tempdir().unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_lato"))
