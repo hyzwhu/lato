@@ -1,4 +1,4 @@
-use lato_agent::{AcpHost, ToolApproval};
+use lato_agent::{AcpHost, ToolApproval, default_fake_stream};
 use lato_ai::ModelStream;
 use lato_protocol::JsonRpcReq;
 use lato_workspace::SessionTrust;
@@ -58,16 +58,60 @@ impl InteractiveAcpClient {
         stream: Arc<dyn ModelStream>,
         approval: Option<Arc<dyn ToolApproval>>,
     ) -> Result<Self, String> {
+        Self::new_session_with_approval(cwd, trust, stream, approval).await
+    }
+
+    pub async fn new_session_with_approval(
+        cwd: std::path::PathBuf,
+        trust: SessionTrust,
+        stream: Arc<dyn ModelStream>,
+        approval: Option<Arc<dyn ToolApproval>>,
+    ) -> Result<Self, String> {
+        Self::initialize_with_approval(cwd, trust, stream, approval, SessionStart::New).await
+    }
+
+    pub async fn resume_session_with_approval(
+        cwd: std::path::PathBuf,
+        trust: SessionTrust,
+        stream: Arc<dyn ModelStream>,
+        approval: Option<Arc<dyn ToolApproval>>,
+        session_id: String,
+    ) -> Result<Self, String> {
+        Self::initialize_with_approval(
+            cwd,
+            trust,
+            stream,
+            approval,
+            SessionStart::Resume(session_id),
+        )
+        .await
+    }
+
+    async fn initialize_with_approval(
+        cwd: std::path::PathBuf,
+        trust: SessionTrust,
+        stream: Arc<dyn ModelStream>,
+        approval: Option<Arc<dyn ToolApproval>>,
+        start: SessionStart,
+    ) -> Result<Self, String> {
         let (tx, updates) = tokio::sync::mpsc::unbounded_channel();
         let mut host = AcpHost::new_with_approval(cwd, trust, tx, stream, approval);
         let _ = host
             .handle(req(1, "initialize", serde_json::json!({})))
             .await;
+        let (method, params) = match start {
+            SessionStart::New => ("session/new", serde_json::json!({})),
+            SessionStart::Resume(session_id) => (
+                "session/resume",
+                serde_json::json!({"sessionId": session_id}),
+            ),
+        };
         let response = host
-            .handle(req(2, "session/new", serde_json::json!({})))
+            .handle(req(2, method, params))
             .await
             .ok_or("no response")?;
-        let session_id = response["result"]["sessionId"]
+        let result = response_result(&response)?;
+        let session_id = result["sessionId"]
             .as_str()
             .ok_or("no session")?
             .to_string();
@@ -126,14 +170,49 @@ impl InteractiveAcpClient {
     }
 }
 
-fn response_result_text(response: serde_json::Value) -> Result<String, String> {
+enum SessionStart {
+    New,
+    Resume(String),
+}
+
+pub async fn list_sessions_over_acp(cwd: std::path::PathBuf) -> Result<Vec<String>, String> {
+    let (tx, _updates) = tokio::sync::mpsc::unbounded_channel();
+    let trust = SessionTrust::for_headless_prompt(&cwd);
+    let mut host = AcpHost::new(cwd, trust, tx, default_fake_stream());
+    let _ = host
+        .handle(req(1, "initialize", serde_json::json!({})))
+        .await;
+    let response = host
+        .handle(req(2, "session/list", serde_json::json!({})))
+        .await
+        .ok_or("no response")?;
+    response_result(&response)?["sessions"]
+        .as_array()
+        .ok_or_else(|| "invalid session list response".to_string())?
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::to_string)
+                .ok_or_else(|| "invalid session id in response".to_string())
+        })
+        .collect()
+}
+
+fn response_result(response: &serde_json::Value) -> Result<&serde_json::Value, String> {
     if response.get("error").is_some() {
         return Err(response["error"]["message"]
             .as_str()
             .unwrap_or("error")
             .to_string());
     }
-    Ok(response["result"]["text"]
+    response
+        .get("result")
+        .ok_or_else(|| "no result".to_string())
+}
+
+fn response_result_text(response: serde_json::Value) -> Result<String, String> {
+    Ok(response_result(&response)?["text"]
         .as_str()
         .unwrap_or_default()
         .to_string())

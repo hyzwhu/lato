@@ -125,6 +125,32 @@ impl AcpHost {
         )))
     }
 
+    async fn session_exists(&self, sid: &str) -> Result<bool, String> {
+        if self.sessions.contains_key(sid) {
+            return Ok(true);
+        }
+        if let Some(store) = &self.transcripts
+            && store
+                .list()
+                .map_err(|error| error.to_string())?
+                .iter()
+                .any(|id| id == sid)
+        {
+            return Ok(true);
+        }
+        if let Some(store) = &self.events
+            && store
+                .list_sessions()
+                .await
+                .map_err(|error| error.to_string())?
+                .iter()
+                .any(|id| id.as_str() == sid)
+        {
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
     pub async fn handle(&mut self, req: JsonRpcReq) -> Option<serde_json::Value> {
         let id = req.id.clone();
         if !is_implemented(&req.method) {
@@ -222,6 +248,11 @@ impl AcpHost {
                     .and_then(|p| p.get("sessionId"))
                     .and_then(|v| v.as_str())
                     .unwrap_or("s1");
+                match self.session_exists(sid).await {
+                    Ok(true) => {}
+                    Ok(false) => return Some(err(id, -32000, "unknown session")),
+                    Err(error) => return Some(err(id, -32000, error)),
+                }
                 if !self.sessions.contains_key(sid) {
                     let replay = if let Some(events) = &self.events {
                         match import_legacy_if_needed(
@@ -596,7 +627,9 @@ mod tests {
     }
     #[tokio::test]
     async fn a1_5_list_close_resume() {
+        let directory = tempfile::tempdir().unwrap();
         let mut h = host();
+        h.events = Some(Arc::new(FileEventStore::open(directory.path()).unwrap()));
         let r = h
             .handle(req(1, "session/new", serde_json::json!({})))
             .await
@@ -621,11 +654,40 @@ mod tests {
             .handle(req(
                 4,
                 "session/resume",
-                serde_json::json!({"sessionId":"same"}),
+                serde_json::json!({"sessionId":sid}),
             ))
             .await
             .unwrap();
         assert_eq!(rr["result"]["replayed"], false);
+    }
+
+    #[tokio::test]
+    async fn resume_rejects_unknown_session_without_creating_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut h = host();
+        h.events = Some(Arc::new(FileEventStore::open(directory.path()).unwrap()));
+        let response = h
+            .handle(req(
+                1,
+                "session/resume",
+                serde_json::json!({"sessionId": "s1700000000000-404"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response["error"]["code"], -32000);
+        assert_eq!(response["error"]["message"], "unknown session");
+
+        let listed = h
+            .handle(req(2, "session/list", serde_json::json!({})))
+            .await
+            .unwrap();
+        assert!(
+            !listed["result"]["sessions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|id| id == "s1700000000000-404")
+        );
     }
     #[tokio::test]
     async fn a1_6_set_model_rejects_unsupported_catalog_model() {

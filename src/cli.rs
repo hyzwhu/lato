@@ -324,9 +324,6 @@ async fn interactive(startup: InteractiveStartup) -> i32 {
         eprintln!("error: {message}");
         return 2;
     }
-    if let InteractiveStartup::Resume(session_id) = &startup {
-        let _ = session_id;
-    }
     let home = lato_home();
     if let Err(error) = std::fs::create_dir_all(&home) {
         eprintln!("error: cannot create {}: {error}", home.display());
@@ -387,14 +384,28 @@ async fn interactive(startup: InteractiveStartup) -> i32 {
     let approval = trust.clone();
     let inline_approval: Option<Arc<dyn ToolApproval>> = (approval.mode == ApprovalMode::Ask)
         .then(|| Arc::new(ConsoleToolApproval) as Arc<dyn ToolApproval>);
-    let mut client = match crate::client::InteractiveAcpClient::new_with_approval(
-        cwd.clone(),
-        trust,
-        stream,
-        inline_approval.clone(),
-    )
-    .await
-    {
+    let client_result = match &startup {
+        InteractiveStartup::New => {
+            crate::client::InteractiveAcpClient::new_session_with_approval(
+                cwd.clone(),
+                trust,
+                stream,
+                inline_approval.clone(),
+            )
+            .await
+        }
+        InteractiveStartup::Resume(session_id) => {
+            crate::client::InteractiveAcpClient::resume_session_with_approval(
+                cwd.clone(),
+                trust,
+                stream,
+                inline_approval.clone(),
+                session_id.clone(),
+            )
+            .await
+        }
+    };
+    let mut client = match client_result {
         Ok(client) => client,
         Err(error) => {
             eprintln!("error: {error}");
@@ -414,6 +425,9 @@ async fn interactive(startup: InteractiveStartup) -> i32 {
     };
     editor.set_helper(Some(LatoLineHelper));
     let _ = editor.load_history(&history_path);
+    if let InteractiveStartup::Resume(session_id) = &startup {
+        println!("Resumed session: {session_id}");
+    }
     println!("Model: {selection}\nWorkspace: {}\n", cwd.display());
     loop {
         let input = match editor.readline("lato> ") {

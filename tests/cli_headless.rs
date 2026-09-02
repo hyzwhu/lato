@@ -30,6 +30,69 @@ fn public_beta_version_matches_cargo_package() {
 }
 
 #[test]
+fn sessions_render_empty_human_and_versioned_json() {
+    let home = tempfile::tempdir().unwrap();
+    let human = Command::new(env!("CARGO_BIN_EXE_lato"))
+        .env("LATO_HOME", home.path())
+        .arg("sessions")
+        .output()
+        .unwrap();
+    assert!(human.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&human.stdout).trim(),
+        "No saved sessions."
+    );
+
+    let json = Command::new(env!("CARGO_BIN_EXE_lato"))
+        .env("LATO_HOME", home.path())
+        .args(["sessions", "--json"])
+        .output()
+        .unwrap();
+    assert!(json.status.success());
+    assert!(json.stderr.is_empty());
+    let body: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(body["schema_version"], 1);
+    assert_eq!(body["sessions"], serde_json::json!([]));
+}
+
+#[test]
+fn sessions_are_listed_newest_first() {
+    let home = tempfile::tempdir().unwrap();
+    for _ in 0..2 {
+        let prompt = Command::new(env!("CARGO_BIN_EXE_lato"))
+            .env("LATO_HOME", home.path())
+            .args(["-p", "reply with hi only"])
+            .output()
+            .unwrap();
+        assert!(prompt.status.success());
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    let output = Command::new(env!("CARGO_BIN_EXE_lato"))
+        .env("LATO_HOME", home.path())
+        .args(["sessions", "--json"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let body: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let sessions = body["sessions"].as_array().unwrap();
+    assert_eq!(sessions.len(), 2);
+    assert!(sessions[0].as_str().unwrap() > sessions[1].as_str().unwrap());
+}
+
+#[test]
+fn resume_requires_a_tty() {
+    let home = tempfile::tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_lato"))
+        .env("LATO_HOME", home.path())
+        .args(["resume", "s1700000000000-1"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("resume requires a tty"));
+    assert!(!home.path().join("sessions").exists());
+}
+
+#[test]
 fn a1_1_stdio_acp_cli_initializes_and_rejects_session_load() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_lato"))
         .arg("acp")
