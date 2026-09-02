@@ -13,6 +13,8 @@
 - The model choices for `minimax-cn` must come exclusively from the current remote catalog response.
 - All retry attempts failing must stop interactive model selection.
 - Neither built-in models nor previously cached remote models may satisfy a failed `minimax-cn` refresh.
+- A malformed derived model cache must not prevent the authoritative remote request.
+- After a successful authoritative response, preserve a malformed cache as a timestamped `.corrupt-<timestamp>` sibling before atomically replacing it.
 - Diagnostics must not expose API keys or authorization headers.
 - Other providers retain their current discovery behavior.
 
@@ -154,3 +156,72 @@ Expected: the command exits successfully and prints the installed Lato version.
 Run: `git status --short`
 
 Expected: only pre-existing user-owned files such as untracked `AGENTS.md` remain; no implementation files are uncommitted.
+
+### Task 4: Recover a malformed derived model store after authoritative refresh
+
+**Files:**
+- Modify: `crates/lato-ai/src/provider.rs:94-326`
+- Test: `crates/lato-ai/src/provider.rs:429-539`
+
+**Interfaces:**
+- Consumes: `RemoteCatalogRefreshPolicy::Authoritative`, `ProviderModelsStore`, and the successfully parsed remote `ProviderModelsEntry` from Task 1.
+- Produces: `ProviderModelsStore::write_authoritative(provider: &str, entry: ProviderModelsEntry) -> Result<(), String>`, which preserves malformed derived cache data and atomically installs a valid replacement.
+
+- [ ] **Step 1: Write a failing regression test using a NUL-filled store**
+
+Create a temporary `models-store.json` containing `vec![0_u8; 4707]`, matching the observed local corruption. Start a local catalog server that returns valid object-shaped MiniMax JSON, then call `refresh_remote_provider_catalog_with_policy` in authoritative mode. Assert that the server receives the request, the call returns `MiniMax-M3`, the replacement `models-store.json` parses successfully, and exactly one sibling filename begins with `models-store.json.corrupt-` whose bytes equal the original NUL-filled content.
+
+- [ ] **Step 2: Run the focused test and verify the cache blocks discovery**
+
+Run: `cargo test -p lato-ai provider::tests::authoritative_remote_catalog_recovers_malformed_store -- --nocapture`
+
+Expected: FAIL with a JSON parse error before the local server can satisfy the request.
+
+- [ ] **Step 3: Skip cache reads in authoritative mode**
+
+Change initialization in `refresh_remote_provider_catalog_with_policy` so only cached policy calls `store.read(spec.id)`:
+
+```rust
+let stored = match policy {
+    RemoteCatalogRefreshPolicy::Cached => store.read(spec.id)?,
+    RemoteCatalogRefreshPolicy::Authoritative { .. } => None,
+};
+```
+
+This guarantees malformed local derived state cannot prevent the network attempt and guarantees no stale entry can produce an authoritative result.
+
+- [ ] **Step 4: Add locked corrupt-file preservation and atomic replacement**
+
+Implement `write_authoritative` with these exact phases: open and exclusively lock `models-store.json`; call `read_document`; if parsing succeeds, update the provider entry normally; if parsing fails, copy the locked file bytes to `models-store.json.corrupt-<now_ms>` using `create_new(true)` and `sync_all`, then begin from `ModelsStoreDocument::default()`; serialize the new document; write it to a sibling temporary file with mode `0600` on Unix; `sync_all`; rename the temporary over `models-store.json`; unlock. Use copying rather than renaming while the original descriptor is locked so concurrent store users never observe a missing canonical path. If backup or replacement fails, return a provider-scoped cache recovery error.
+
+In the successful remote response path, select the writer by policy:
+
+```rust
+match policy {
+    RemoteCatalogRefreshPolicy::Cached => store.write(spec.id, entry)?,
+    RemoteCatalogRefreshPolicy::Authoritative { .. } => {
+        store.write_authoritative(spec.id, entry)?
+    }
+}
+```
+
+- [ ] **Step 5: Run focused and full verification**
+
+Run: `cargo test -p lato-ai provider::tests -- --nocapture`
+
+Expected: all provider tests pass, including malformed-store recovery, retry behavior, and cached freshness behavior.
+
+Run: `cargo test --workspace`
+
+Expected: all workspace tests pass.
+
+- [ ] **Step 6: Commit, install, and smoke-test**
+
+```bash
+git add crates/lato-ai/src/provider.rs
+git commit -m "fix: recover corrupt authoritative model cache"
+cargo install --path .
+lato --version
+```
+
+Expected: installation replaces the local `lato` executable and `lato --version` prints `lato 0.1.0-beta.1`.
