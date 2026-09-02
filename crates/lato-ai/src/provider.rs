@@ -615,7 +615,7 @@ mod tests {
             for _ in 0..2 {
                 let (mut socket, _) = listener.accept().unwrap();
                 let mut request = [0u8; 8192];
-                socket.read(&mut request).unwrap();
+                let _read = socket.read(&mut request).unwrap();
                 let body = "<html>temporary edge failure</html>";
                 write!(
                     socket,

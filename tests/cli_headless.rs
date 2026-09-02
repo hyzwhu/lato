@@ -578,7 +578,29 @@ fn c1_2_cli_mock_openai_codex_oauth_writes_separate_id() {
     );
     let text = std::fs::read_to_string(d.path().join("auth.json")).unwrap();
     assert!(text.contains("openai-codex"));
+    assert!(text.contains("\"account_id\": \"mock-account\""));
     assert!(!text.contains("\"openai\""));
+}
+
+#[test]
+fn cli_mock_openai_codex_device_auth_writes_account_identity() {
+    let d = tempfile::tempdir().unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_lato"))
+        .env("LATO_HOME", d.path())
+        .env("LATO_MOCK_OAUTH", "1")
+        .args(["login", "openai-codex", "--oauth", "--device-auth"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(d.path().join("auth.json")).unwrap()).unwrap();
+    assert_eq!(value["openai-codex"]["account_id"], "mock-account");
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("mock-access"));
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("mock-refresh"));
 }
 
 #[test]

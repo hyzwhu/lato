@@ -176,7 +176,15 @@ Only `kimi-coding` and `openai-codex` advertise OAuth. Other providers reject OA
 ```bash
 lato login kimi-coding --oauth
 lato login openai-codex --oauth
+lato login openai-codex --oauth --device-auth
+lato -p --model openai-codex/codex-mini-latest "reply with hi only"
 ```
+
+`openai-codex` uses ChatGPT subscription authentication, not an OpenAI Platform API key. Browser login is the default: Lato listens once on loopback port `1455` for the OAuth callback. Use `--device-auth` on a headless machine and enter the displayed code at the verification URL. A ChatGPT plan with Codex access is required.
+
+Lato owns this login independently. It stores the access token, refresh token, expiry, and ChatGPT account identity in `$LATO_HOME/auth.json` (normally `~/.lato/auth.json`) and refreshes them itself. It does not read or modify Pi's or the Codex CLI's credential files.
+
+Model calls use `https://chatgpt.com/backend-api/codex/responses`, prefer a session-affine WebSocket, and reuse healthy connections. If WebSocket setup fails before any response event, Lato falls back to an incrementally parsed SSE request with a zstd-compressed body. It never replays a request after model output has begun, preventing duplicated text or tool calls.
 
 ## Public Beta limitations
 
