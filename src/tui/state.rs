@@ -135,6 +135,7 @@ pub struct AppState {
     pub elapsed_seconds: u64,
     pub error: Option<String>,
     pub scroll: u16,
+    pub session_index: usize,
     pub should_exit: bool,
     pub exit_action: TuiExit,
 }
@@ -199,6 +200,7 @@ impl AppState {
             elapsed_seconds: 0,
             error: None,
             scroll: 0,
+            session_index: 0,
             should_exit: false,
             exit_action: TuiExit::Quit,
         }
@@ -252,6 +254,16 @@ impl AppState {
                 Vec::new()
             }
             AppEvent::Scroll(delta) => {
+                if self.focus == Focus::Sessions {
+                    let last = self.sessions.len().saturating_sub(1);
+                    self.session_index = if delta.is_negative() {
+                        self.session_index
+                            .saturating_sub(delta.unsigned_abs() as usize)
+                    } else {
+                        self.session_index.saturating_add(delta as usize).min(last)
+                    };
+                    return Vec::new();
+                }
                 self.scroll = if delta.is_negative() {
                     self.scroll.saturating_sub(delta.unsigned_abs())
                 } else {

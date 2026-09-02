@@ -104,7 +104,7 @@ pub fn sessions(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
         .style(style);
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let items = app.sessions.iter().map(|session| {
+    let items = app.sessions.iter().enumerate().map(|(index, session)| {
         let marker = if session.id == app.session_id {
             "●"
         } else {
@@ -118,6 +118,11 @@ pub fn sessions(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
                 Style::default().fg(MUTED),
             ),
         ]))
+        .style(if active && index == app.session_index {
+            Style::default().bg(Color::Rgb(45, 48, 52))
+        } else {
+            Style::default()
+        })
     });
     frame.render_widget(List::new(items).style(style), inner);
     if app.sessions.is_empty() {
@@ -361,6 +366,8 @@ pub fn command_palette(frame: &mut Frame<'_>, app: &AppState) {
     frame.render_widget(Clear, area);
     let commands = [
         tr(app.language, TextKey::NewSession),
+        tr(app.language, TextKey::SwitchSession),
+        tr(app.language, TextKey::ClearConversation),
         tr(app.language, TextKey::SwitchModel),
         tr(app.language, TextKey::Login),
         tr(app.language, TextKey::SwitchLanguage),

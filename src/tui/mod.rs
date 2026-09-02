@@ -29,14 +29,16 @@ pub struct InteractiveBootstrap {
     pub model: String,
     pub home: PathBuf,
     pub sessions: Vec<String>,
+    pub resumed: bool,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub enum TuiExit {
     #[default]
     Quit,
     SwitchModel,
     Login,
+    Resume(String),
 }
 
 pub async fn run(bootstrap: InteractiveBootstrap) -> Result<TuiExit, String> {
@@ -59,6 +61,9 @@ async fn run_loop(
         session_id,
         bootstrap.sessions,
     );
+    if bootstrap.resumed {
+        app.screen = state::Screen::Main;
+    }
     let size = terminal
         .size()
         .map_err(|error| format!("read terminal size: {error}"))?;
@@ -195,6 +200,7 @@ fn handle_key(
         KeyCode::Tab => app.reduce(AppEvent::FocusNext),
         KeyCode::BackTab => app.reduce(AppEvent::FocusPrevious),
         KeyCode::Esc => app.reduce(AppEvent::Escape),
+        KeyCode::Enter if app.focus == state::Focus::Sessions => resume_selected_session(app),
         KeyCode::Enter => submit_or_command(app, trust),
         KeyCode::Backspace => {
             app.composer.backspace();
@@ -296,6 +302,17 @@ fn submit_or_command(app: &mut AppState, trust: &SessionTrust) -> Vec<Effect> {
     }
 }
 
+fn resume_selected_session(app: &mut AppState) -> Vec<Effect> {
+    let Some(session) = app.sessions.get(app.session_index) else {
+        return Vec::new();
+    };
+    if session.id == app.session_id {
+        app.focus = state::Focus::Chat;
+        return Vec::new();
+    }
+    app.reduce(AppEvent::Exit(TuiExit::Resume(session.id.clone())))
+}
+
 fn handle_approval_key(app: &mut AppState, key: KeyEvent) -> Vec<Effect> {
     let decision = match key.code {
         KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => Some(true),
@@ -323,22 +340,28 @@ fn handle_palette_key(app: &mut AppState, key: KeyEvent, trust: &SessionTrust) -
         }
         KeyCode::Enter => match app.palette_index {
             0 => app.reduce(AppEvent::ClearConversation),
-            1 => app.reduce(AppEvent::Exit(TuiExit::SwitchModel)),
-            2 => app.reduce(AppEvent::Exit(TuiExit::Login)),
-            3 => {
+            1 => {
+                app.overlay = None;
+                app.focus = state::Focus::Sessions;
+                Vec::new()
+            }
+            2 => app.reduce(AppEvent::ClearConversation),
+            3 => app.reduce(AppEvent::Exit(TuiExit::SwitchModel)),
+            4 => app.reduce(AppEvent::Exit(TuiExit::Login)),
+            5 => {
                 let language = match app.language {
                     Language::ZhCn => Language::En,
                     Language::En => Language::ZhCn,
                 };
                 app.reduce(AppEvent::SwitchLanguage(language))
             }
-            4 => app.reduce(AppEvent::OpenSearch),
-            5 => {
+            6 => app.reduce(AppEvent::OpenSearch),
+            7 => {
                 trust.allow_once();
                 app.overlay = None;
                 Vec::new()
             }
-            6 => {
+            8 => {
                 app.overlay = None;
                 app.screen = state::Screen::Main;
                 app.messages.push(Message {
@@ -390,5 +413,29 @@ fn active_input(app: &mut AppState) -> &mut input::InputBuffer {
         &mut app.search
     } else {
         &mut app.composer
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TuiExit, resume_selected_session};
+    use crate::tui::{i18n::Language, state::AppState};
+    use std::path::PathBuf;
+
+    #[test]
+    fn selected_historical_session_requests_resume() {
+        let mut app = AppState::new(
+            Language::En,
+            PathBuf::from("/workspace"),
+            "provider/model".into(),
+            "current".into(),
+            vec!["current".into(), "historical".into()],
+        );
+        app.session_index = 1;
+
+        resume_selected_session(&mut app);
+
+        assert!(app.should_exit);
+        assert_eq!(app.exit_action, TuiExit::Resume("historical".into()));
     }
 }

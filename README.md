@@ -70,7 +70,7 @@ Interactive commands:
 /help     /clear     /model     /login     /lang     /approve     /status     /exit
 ```
 
-Use Tab/Shift-Tab to move between panels, Up/Down to scroll the focused panel, Cmd/Ctrl-K to open the command palette, `/` on an empty composer to search, and Ctrl-C to cancel a streaming turn or exit while idle. `/model` and `/login` temporarily leave the full-screen view for secure terminal prompts, then return in a fresh conversation. The workspace starts untrusted. Mutating tool calls display their name and arguments and request approval exactly at the execution boundary. You can instead trust the workspace for the process or use `/approve` to pre-authorize one call. On smaller terminals, side panels collapse automatically so the conversation remains usable.
+Use Tab/Shift-Tab to move between panels, Up/Down to scroll the focused panel, Enter on a selected session to resume it, Cmd/Ctrl-K to open the command palette, `/` on an empty composer to search, and Ctrl-C to cancel a streaming turn or exit while idle. `/model` and `/login` temporarily leave the full-screen view for secure terminal prompts, then return in a fresh conversation. The workspace starts untrusted. Mutating tool calls display their name and arguments and request approval exactly at the execution boundary. You can instead trust the workspace for the process or use `/approve` to pre-authorize one call. On smaller terminals, side panels collapse automatically so the conversation remains usable.
 
 For a one-shot, script-friendly prompt:
 
@@ -180,7 +180,7 @@ lato login openai-codex --oauth
 
 ## Public Beta limitations
 
-- Session entries currently use durable IDs instead of generated titles, and selecting a historical session from the side panel is not yet supported; use `lato resume SESSION_ID`.
+- Session entries currently use durable IDs instead of generated titles, rename, and delete controls.
 - Homebrew, Scoop, and other package-manager channels are not maintained yet.
 - Session listing exposes durable IDs, not generated titles, rename, or delete operations.
 - LIVE provider validation is reported separately and may be unavailable when repository credentials are not configured. Offline protocol and localhost end-to-end tests still run in ordinary CI.

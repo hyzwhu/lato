@@ -393,6 +393,7 @@ async fn interactive(startup: InteractiveStartup, language_override: Option<Lang
         model: selection.clone(),
         home: home.clone(),
         sessions,
+        resumed: matches!(startup, InteractiveStartup::Resume(_)),
     })
     .await
     {
@@ -416,6 +417,13 @@ async fn interactive(startup: InteractiveStartup, language_override: Option<Lang
                     1
                 }
             }
+        }
+        Ok(crate::tui::TuiExit::Resume(session_id)) => {
+            Box::pin(interactive(
+                InteractiveStartup::Resume(session_id),
+                Some(language),
+            ))
+            .await
         }
         Err(error) => {
             eprintln!("error: {error}");
