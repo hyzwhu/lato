@@ -1,0 +1,119 @@
+name: live-provider-smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      timeout_seconds:
+        description: Per-provider timeout
+        required: true
+        default: "60"
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    name: live-${{ matrix.provider }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - provider: openai
+            model: openai/gpt-4.1
+            credential_env: OPENAI_API_KEY
+            secret_name: OPENAI_API_KEY
+          - provider: minimax
+            model: minimax/MiniMax-M2.1
+            credential_env: MINIMAX_API_KEY
+            secret_name: MINIMAX_API_KEY
+    env:
+      PROVIDER_SECRET: ${{ secrets[matrix.secret_name] }}
+      MODEL: ${{ matrix.model }}
+      CREDENTIAL_ENV: ${{ matrix.credential_env }}
+      TIMEOUT_SECONDS: ${{ inputs.timeout_seconds }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check credential availability
+        id: credential
+        shell: bash
+        env:
+          PROVIDER: ${{ matrix.provider }}
+        run: |
+          set -euo pipefail
+          mkdir -p live-result
+          if [[ -z "$PROVIDER_SECRET" ]]; then
+            echo skipped > "live-result/$PROVIDER.txt"
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          else
+            echo failed > "live-result/$PROVIDER.txt"
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build Lato
+        if: steps.credential.outputs.enabled == 'true'
+        run: cargo build --locked
+
+      - name: Run bounded provider smoke
+        if: steps.credential.outputs.enabled == 'true'
+        shell: bash
+        env:
+          PROVIDER: ${{ matrix.provider }}
+        run: |
+          set -euo pipefail
+          smoke_home="$(mktemp -d)"
+          set +e
+          output="$(env \
+            LATO_HOME="$smoke_home" \
+            "$CREDENTIAL_ENV=$PROVIDER_SECRET" \
+            timeout "${TIMEOUT_SECONDS}s" \
+            target/debug/lato -p --model "$MODEL" "Reply with exactly LATO_LIVE_OK")"
+          status=$?
+          set -e
+          if [[ $status -eq 0 && "$(printf '%s' "$output" | tr -d '\r\n')" == LATO_LIVE_OK ]]; then
+            echo passed > "live-result/$PROVIDER.txt"
+          else
+            echo "Provider smoke failed with exit $status" >&2
+            exit 1
+          fi
+
+      - name: Upload provider status
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-${{ matrix.provider }}
+          path: live-result/${{ matrix.provider }}.txt
+          if-no-files-found: error
+
+  summary:
+    name: live-summary
+    if: always()
+    needs: smoke
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          pattern: live-*
+          path: live-results
+          merge-multiple: true
+
+      - name: Write summary
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo '## Lato LIVE provider smoke'
+            echo
+            echo '| Provider | Result |'
+            echo '|---|---|'
+            for provider in openai minimax; do
+              result=failed
+              if [[ -f "live-results/$provider.txt" ]]; then
+                result="$(tr -d '\r\n' < "live-results/$provider.txt")"
+              fi
+              echo "| $provider | $result |"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
