@@ -5,9 +5,10 @@ use lato_agent::default_fake_stream;
 use lato_ai::{
     AuthInteraction, AuthNotice, CATALOG, CredentialStore, CustomHttpModelStream, CustomModel,
     HttpModelStream, ModelApi, ModelStream, ProviderModelsEntry, ProviderModelsStore,
-    adapt_model_stream, api_key_login_allowed, custom_model_auth, get_auth_refreshing,
-    load_models_json, login_oauth, lookup_model, oauth_allowed, phase0_supported, provider_spec,
-    refresh_openai_compatible_models, refresh_remote_provider_catalog, store_oauth,
+    RemoteCatalogRefreshPolicy, adapt_model_stream, api_key_login_allowed, custom_model_auth,
+    get_auth_refreshing, load_models_json, login_oauth, lookup_model, oauth_allowed,
+    phase0_supported, provider_spec, refresh_openai_compatible_models,
+    refresh_remote_provider_catalog_with_policy, store_oauth,
 };
 use lato_workspace::{ApprovalMode, SandboxProfile, SessionTrust};
 use std::{
@@ -476,36 +477,41 @@ async fn configure_interactively(home: &std::path::Path) -> Result<String, Strin
     let models = if !should_discover_provider_models(&provider) {
         fallback
     } else if is_catalog_provider {
-        match discover_provider_models(home, &provider).await {
-            Ok(models) if !models.is_empty() => {
-                println!("Fetched {} catalog models for {provider}.", models.len());
-                let mut merged = fallback.clone();
-                for model in models {
-                    if let Some(index) = merged.iter().position(|entry| entry.id == model.id) {
-                        merged[index] = model;
-                    } else {
-                        merged.push(model);
+        let discovered = discover_provider_models(home, &provider).await;
+        if requires_authoritative_remote_models(&provider) {
+            resolve_authoritative_models(&provider, discovered)?
+        } else {
+            match discovered {
+                Ok(models) if !models.is_empty() => {
+                    println!("Fetched {} catalog models for {provider}.", models.len());
+                    let mut merged = fallback.clone();
+                    for model in models {
+                        if let Some(index) = merged.iter().position(|entry| entry.id == model.id) {
+                            merged[index] = model;
+                        } else {
+                            merged.push(model);
+                        }
                     }
+                    merged
                 }
-                merged
-            }
-            Ok(_) => {
-                eprintln!("Provider returned an empty model list; using built-in fallback.");
-                fallback
-            }
-            Err(error)
-                if !provider_spec(&provider).is_some_and(|spec| spec.remote_catalog)
-                    && (error.contains("401") || error.contains("403")) =>
-            {
-                return Err(format!(
-                    "{provider} rejected the credential while listing models: {error}"
-                ));
-            }
-            Err(error) => {
-                eprintln!(
-                    "Could not fetch models from {provider}: {error}\nUsing built-in fallback models."
-                );
-                fallback
+                Ok(_) => {
+                    eprintln!("Provider returned an empty model list; using built-in fallback.");
+                    fallback
+                }
+                Err(error)
+                    if !provider_spec(&provider).is_some_and(|spec| spec.remote_catalog)
+                        && (error.contains("401") || error.contains("403")) =>
+                {
+                    return Err(format!(
+                        "{provider} rejected the credential while listing models: {error}"
+                    ));
+                }
+                Err(error) => {
+                    eprintln!(
+                        "Could not fetch models from {provider}: {error}\nUsing built-in fallback models."
+                    );
+                    fallback
+                }
             }
         }
     } else {
@@ -618,6 +624,28 @@ fn should_discover_provider_models(provider: &str) -> bool {
     provider == "sensenova" || provider_spec(provider).is_none_or(|spec| spec.remote_catalog)
 }
 
+fn requires_authoritative_remote_models(provider: &str) -> bool {
+    provider == "minimax-cn"
+}
+
+fn resolve_authoritative_models(
+    provider: &str,
+    discovered: Result<Vec<CustomModel>, String>,
+) -> Result<Vec<CustomModel>, String> {
+    match discovered {
+        Ok(models) if !models.is_empty() => {
+            println!("Fetched {} catalog models for {provider}.", models.len());
+            Ok(models)
+        }
+        Ok(_) => Err(format!(
+            "authoritative model catalog for {provider} returned no models; model selection stopped"
+        )),
+        Err(error) => Err(format!(
+            "could not refresh authoritative model catalog for {provider}: {error}; model selection stopped"
+        )),
+    }
+}
+
 async fn discover_provider_models(
     home: &std::path::Path,
     provider: &str,
@@ -625,11 +653,17 @@ async fn discover_provider_models(
     if let Some(spec) = provider_spec(provider).filter(|spec| spec.remote_catalog) {
         let catalog_base =
             std::env::var("LATO_CATALOG_BASE_URL").unwrap_or_else(|_| "https://pi.dev".into());
-        return refresh_remote_provider_catalog(
+        let policy = if requires_authoritative_remote_models(provider) {
+            RemoteCatalogRefreshPolicy::Authoritative { attempts: 3 }
+        } else {
+            RemoteCatalogRefreshPolicy::Cached
+        };
+        return refresh_remote_provider_catalog_with_policy(
             spec,
             &ProviderModelsStore::open(home),
             &catalog_base,
             false,
+            policy,
         )
         .await;
     }
@@ -926,9 +960,10 @@ fn lato_home() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        LocalFact, is_exit_command, requested_local_facts, resolve_item,
-        should_discover_provider_models,
+        LocalFact, is_exit_command, requested_local_facts, requires_authoritative_remote_models,
+        resolve_authoritative_models, resolve_item, should_discover_provider_models,
     };
+    use lato_ai::{CustomModel, ModelApi};
 
     #[test]
     fn interactive_exit_commands_accept_plain_slash_and_case_variants() {
@@ -942,6 +977,37 @@ mod tests {
     fn sensenova_uses_its_vendor_model_discovery_endpoint() {
         assert!(should_discover_provider_models("sensenova"));
         assert!(should_discover_provider_models("minimax-cn"));
+    }
+
+    #[test]
+    fn minimax_cn_requires_authoritative_remote_models() {
+        assert!(requires_authoritative_remote_models("minimax-cn"));
+        assert!(!requires_authoritative_remote_models("minimax"));
+        assert!(!requires_authoritative_remote_models("sensenova"));
+    }
+
+    #[test]
+    fn minimax_cn_uses_only_successful_remote_models() {
+        let remote = CustomModel {
+            provider: "minimax-cn".to_string(),
+            id: "MiniMax-M3".to_string(),
+            api: ModelApi::AnthropicMessages,
+            base_url: "https://api.minimaxi.com/anthropic".to_string(),
+            env: "MINIMAX_CN_API_KEY".to_string(),
+        };
+        let models = resolve_authoritative_models("minimax-cn", Ok(vec![remote])).unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "MiniMax-M3");
+        assert!(
+            resolve_authoritative_models("minimax-cn", Ok(Vec::new()))
+                .unwrap_err()
+                .contains("model selection stopped")
+        );
+        assert!(
+            resolve_authoritative_models("minimax-cn", Err("invalid JSON".to_string()))
+                .unwrap_err()
+                .contains("invalid JSON")
+        );
     }
 
     #[test]
