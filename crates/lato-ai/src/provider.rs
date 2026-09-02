@@ -136,6 +136,100 @@ impl ProviderModelsStore {
         let _ = file.unlock();
         Ok(())
     }
+
+    pub fn write_authoritative(
+        &self,
+        provider: &str,
+        entry: ProviderModelsEntry,
+    ) -> Result<(), String> {
+        use std::io::{Read, Seek};
+
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&self.path)
+            .map_err(|error| format!("open model cache for {provider}: {error}"))?;
+        file.lock_exclusive()
+            .map_err(|error| format!("lock model cache for {provider}: {error}"))?;
+        let mut document = match read_document(&file) {
+            Ok(document) => document,
+            Err(_) => {
+                file.rewind()
+                    .map_err(|error| format!("rewind corrupt model cache: {error}"))?;
+                let mut corrupt_bytes = Vec::new();
+                file.read_to_end(&mut corrupt_bytes)
+                    .map_err(|error| format!("read corrupt model cache: {error}"))?;
+                write_unique_store_file(&self.path, "corrupt", &corrupt_bytes)?;
+                ModelsStoreDocument::default()
+            }
+        };
+        document.providers.insert(provider.to_string(), entry);
+        let bytes = serde_json::to_vec_pretty(&document)
+            .map_err(|error| format!("serialize model cache for {provider}: {error}"))?;
+        let temporary_path = write_unique_store_file(&self.path, "tmp", &bytes)?;
+        std::fs::rename(&temporary_path, &self.path).map_err(|error| {
+            let _ = std::fs::remove_file(&temporary_path);
+            format!("replace model cache for {provider}: {error}")
+        })?;
+        let _ = file.unlock();
+        Ok(())
+    }
+}
+
+fn write_unique_store_file(path: &Path, kind: &str, bytes: &[u8]) -> Result<PathBuf, String> {
+    use std::io::Write;
+
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("models-store.json");
+    for sequence in 0..100 {
+        let suffix = if sequence == 0 {
+            String::new()
+        } else {
+            format!("-{sequence}")
+        };
+        let candidate = path.with_file_name(format!(
+            "{file_name}.{kind}-{}-{pid}{suffix}",
+            now_ms(),
+            pid = std::process::id()
+        ));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(mut file) => {
+                let result = (|| {
+                    set_private_file_permissions(&file)?;
+                    file.write_all(bytes)
+                        .map_err(|error| format!("write {kind} model cache file: {error}"))?;
+                    file.sync_all()
+                        .map_err(|error| format!("sync {kind} model cache file: {error}"))
+                })();
+                if let Err(error) = result {
+                    let _ = std::fs::remove_file(&candidate);
+                    return Err(error);
+                }
+                return Ok(candidate);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(format!("create {kind} model cache file: {error}")),
+        }
+    }
+    Err(format!("could not allocate unique {kind} model cache file"))
+}
+
+fn set_private_file_permissions(file: &std::fs::File) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|error| format!("set private model cache permissions: {error}"))?;
+    }
+    Ok(())
 }
 
 fn read_document(mut file: &std::fs::File) -> Result<ModelsStoreDocument, String> {
@@ -173,7 +267,10 @@ pub async fn refresh_remote_provider_catalog_with_policy(
     force: bool,
     policy: RemoteCatalogRefreshPolicy,
 ) -> Result<Vec<CustomModel>, String> {
-    let stored = store.read(spec.id)?;
+    let stored = match policy {
+        RemoteCatalogRefreshPolicy::Cached => store.read(spec.id)?,
+        RemoteCatalogRefreshPolicy::Authoritative { .. } => None,
+    };
     let now = now_ms();
     if policy == RemoteCatalogRefreshPolicy::Cached
         && !force
@@ -322,7 +419,12 @@ pub async fn refresh_remote_provider_catalog_with_policy(
             last_modified,
             etag,
         };
-        store.write(spec.id, entry)?;
+        match policy {
+            RemoteCatalogRefreshPolicy::Cached => store.write(spec.id, entry)?,
+            RemoteCatalogRefreshPolicy::Authoritative { .. } => {
+                store.write_authoritative(spec.id, entry)?
+            }
+        }
         return Ok(models);
     }
 
@@ -539,5 +641,61 @@ mod tests {
         assert!(error.contains("invalid JSON"), "{error}");
         assert!(error.contains("after 2 attempts"), "{error}");
         assert!(!error.contains("sentinel-api-key"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn authoritative_remote_catalog_recovers_malformed_store() {
+        use std::io::{Read, Write};
+        let home = tempfile::tempdir().unwrap();
+        let corrupt_bytes = vec![0_u8; 4707];
+        std::fs::write(home.path().join("models-store.json"), &corrupt_bytes).unwrap();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = [0u8; 8192];
+            let count = socket.read(&mut request).unwrap();
+            assert!(
+                String::from_utf8_lossy(&request[..count])
+                    .starts_with("GET /api/models/providers/minimax-cn")
+            );
+            let body = r#"{"MiniMax-M3":{"id":"MiniMax-M3","api":"anthropic-messages"}}"#;
+            write!(
+                socket,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+
+        let models = refresh_remote_provider_catalog_with_policy(
+            provider_spec("minimax-cn").unwrap(),
+            &ProviderModelsStore::open(home.path()),
+            &format!("http://{address}"),
+            false,
+            RemoteCatalogRefreshPolicy::Authoritative { attempts: 1 },
+        )
+        .await
+        .unwrap();
+        server.join().unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "MiniMax-M3");
+
+        let replacement = std::fs::read(home.path().join("models-store.json")).unwrap();
+        serde_json::from_slice::<serde_json::Value>(&replacement).unwrap();
+        let backups = std::fs::read_dir(home.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("models-store.json.corrupt-")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(std::fs::read(backups[0].path()).unwrap(), corrupt_bytes);
     }
 }
