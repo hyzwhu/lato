@@ -1,6 +1,7 @@
 use crate::{
     Auth, CONTEXT_HARD_LIMIT_BYTES, HttpRequestSpec, ModelApi, ModelStream, StreamPiece,
-    http_client_for_url, stream_http_request,
+    api::{anthropic_request_body, openai_chat_body, responses_request_body},
+    http_client_for_url, stream_http_request_with_tool_choice_fallback,
 };
 use async_trait::async_trait;
 use std::path::Path;
@@ -112,18 +113,23 @@ pub fn build_custom_request(
         .get("tools")
         .cloned()
         .unwrap_or_else(|| serde_json::json!([]));
+    let tool_choice = context.get("tool_choice").cloned();
+    let stream = context
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
     match model.api {
         ModelApi::OpenaiCompletions => Ok(HttpRequestSpec {
             method: "POST",
             url: format!("{}/chat/completions", model.base_url.trim_end_matches('/')),
             headers: bearer(auth),
-            body: serde_json::json!({"model":model.id,"messages":messages,"tools":tools,"stream":true}),
+            body: openai_chat_body(&model.id, messages, tools, tool_choice, stream),
         }),
         ModelApi::OpenaiResponses => Ok(HttpRequestSpec {
             method: "POST",
             url: format!("{}/responses", model.base_url.trim_end_matches('/')),
             headers: bearer(auth),
-            body: serde_json::json!({"model":model.id,"input":messages,"tools":tools,"stream":true}),
+            body: responses_request_body(Some(&model.id), messages, tools, tool_choice, stream),
         }),
         ModelApi::AnthropicMessages => {
             let mut headers = auth.headers.clone();
@@ -136,7 +142,7 @@ pub fn build_custom_request(
                 method: "POST",
                 url: format!("{}/v1/messages", model.base_url.trim_end_matches('/')),
                 headers,
-                body: serde_json::json!({"model":model.id,"messages":messages,"tools":anthropic_tools(tools),"max_tokens":4096,"stream":true}),
+                body: anthropic_request_body(&model.id, messages, tools, tool_choice, stream),
             })
         }
         _ => {
@@ -146,24 +152,6 @@ pub fn build_custom_request(
             Err("custom model dialect unsupported".into())
         }
     }
-}
-
-fn anthropic_tools(tools: serde_json::Value) -> serde_json::Value {
-    serde_json::Value::Array(
-        tools
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|tool| {
-                let function = tool.get("function")?;
-                Some(serde_json::json!({
-                    "name": function.get("name")?,
-                    "description": function.get("description").cloned().unwrap_or_default(),
-                    "input_schema": function.get("parameters").cloned().unwrap_or_else(|| serde_json::json!({"type":"object"}))
-                }))
-            })
-            .collect(),
-    )
 }
 
 pub struct CustomHttpModelStream {
@@ -195,7 +183,7 @@ impl ModelStream for CustomHttpModelStream {
             return Err("context exceeds hard limit; compact required".into());
         }
         let request = build_custom_request(&self.model, &self.auth, context)?;
-        stream_http_request(&self.client, &request, tx).await
+        stream_http_request_with_tool_choice_fallback(&self.client, request, tx).await
     }
 }
 

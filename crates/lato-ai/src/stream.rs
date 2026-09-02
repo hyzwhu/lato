@@ -150,8 +150,10 @@ pub(crate) async fn stream_http_request_with_tool_choice_fallback(
 }
 
 fn tool_choice_required_rejected(error: &str, request: &crate::HttpRequestSpec) -> bool {
+    let lower = error.to_ascii_lowercase();
     request.body.get("tool_choice").and_then(|v| v.as_str()) == Some("required")
-        && (error.contains("http 400") || error.to_ascii_lowercase().contains("tool_choice"))
+        && lower.contains("http 400")
+        && (lower.contains("tool_choice") || lower.contains("tool choice"))
 }
 
 pub async fn stream_http_request(
@@ -766,6 +768,24 @@ mod tests {
         ));
         assert!(!tool_choice_required_rejected(
             "http 401: unauthorized",
+            &request
+        ));
+    }
+
+    #[test]
+    fn unrelated_http_400_does_not_trigger_tool_choice_fallback() {
+        let request = HttpRequestSpec {
+            method: "POST",
+            url: "http://example.invalid".into(),
+            headers: vec![],
+            body: serde_json::json!({"tool_choice":"required"}),
+        };
+        assert!(!tool_choice_required_rejected(
+            "http 400: invalid model",
+            &request
+        ));
+        assert!(tool_choice_required_rejected(
+            "http 400: unsupported tool_choice required",
             &request
         ));
     }

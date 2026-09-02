@@ -40,6 +40,11 @@ pub fn build_request(
         .get("tools")
         .cloned()
         .unwrap_or_else(|| serde_json::Value::Array(vec![]));
+    let tool_choice = context.get("tool_choice").cloned();
+    let stream = context
+        .get("stream")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(true);
     let base = auth
         .base_url
         .as_deref()
@@ -51,19 +56,25 @@ pub fn build_request(
             method: "POST",
             url: format!("{base}/chat/completions"),
             headers: bearer_headers(auth),
-            body: serde_json::json!({"model": model.id, "messages": messages, "tools":openai_tools, "stream": true}),
+            body: openai_chat_body(model.id, messages, openai_tools, tool_choice, stream),
         }),
         ModelApi::OpenaiResponses | ModelApi::OpenaiCodexResponses => Ok(HttpRequestSpec {
             method: "POST",
             url: format!("{base}/responses"),
             headers: bearer_headers(auth),
-            body: serde_json::json!({"model": model.id, "input": messages, "tools":responses_tools(openai_tools), "stream": true}),
+            body: responses_request_body(
+                Some(model.id),
+                messages,
+                openai_tools,
+                tool_choice,
+                stream,
+            ),
         }),
         ModelApi::AzureOpenaiResponses => Ok(HttpRequestSpec {
             method: "POST",
             url: format!("{base}/responses?api-version=2025-04-01-preview"),
             headers: api_key_headers(auth),
-            body: serde_json::json!({"input": messages, "tools":responses_tools(openai_tools), "stream": true}),
+            body: responses_request_body(None, messages, openai_tools, tool_choice, stream),
         }),
         ModelApi::AnthropicMessages => {
             let mut headers = auth.headers.clone();
@@ -76,7 +87,7 @@ pub fn build_request(
                 method: "POST",
                 url: format!("{base}/v1/messages"),
                 headers,
-                body: serde_json::json!({"model": model.id, "messages": messages, "tools":anthropic_tools(openai_tools), "max_tokens": 4096, "stream": true}),
+                body: anthropic_request_body(model.id, messages, openai_tools, tool_choice, stream),
             })
         }
         ModelApi::GoogleGenerativeAi => Ok(HttpRequestSpec {
@@ -110,7 +121,144 @@ pub fn build_request(
     }
 }
 
-fn responses_tools(openai_tools: serde_json::Value) -> serde_json::Value {
+pub(crate) fn responses_input(messages: serde_json::Value) -> serde_json::Value {
+    let Some(items) = messages.as_array() else {
+        return messages;
+    };
+    serde_json::Value::Array(
+        items
+            .iter()
+            .flat_map(|message| {
+                if message.get("role").and_then(|v| v.as_str()) == Some("tool") {
+                    return vec![serde_json::json!({
+                        "type":"function_call_output",
+                        "call_id":message.get("tool_call_id").cloned().unwrap_or_default(),
+                        "output":message.get("content").cloned().unwrap_or_default()
+                    })];
+                }
+                if let Some(calls) = message.get("tool_calls").and_then(|v| v.as_array()) {
+                    return calls
+                        .iter()
+                        .filter_map(|call| {
+                            let function = call.get("function")?;
+                            Some(serde_json::json!({
+                                "type":"function_call",
+                                "call_id":call.get("id").cloned().unwrap_or_default(),
+                                "name":function.get("name").cloned().unwrap_or_default(),
+                                "arguments":function.get("arguments").cloned().unwrap_or_default()
+                            }))
+                        })
+                        .collect();
+                }
+                vec![message.clone()]
+            })
+            .collect(),
+    )
+}
+
+pub(crate) fn anthropic_messages(messages: serde_json::Value) -> (String, serde_json::Value) {
+    let Some(items) = messages.as_array() else {
+        return (String::new(), messages);
+    };
+    let mut system = Vec::new();
+    let mut out = Vec::new();
+    for message in items {
+        match message.get("role").and_then(|v| v.as_str()) {
+            Some("system") => {
+                if let Some(content) = message.get("content").and_then(|v| v.as_str()) {
+                    system.push(content.to_string());
+                }
+            }
+            Some("tool") => out.push(serde_json::json!({
+                "role":"user",
+                "content":[{"type":"tool_result","tool_use_id":message.get("tool_call_id").cloned().unwrap_or_default(),"content":message.get("content").cloned().unwrap_or_default()}]
+            })),
+            Some("assistant") if message.get("tool_calls").is_some() => {
+                let content = message
+                    .get("tool_calls")
+                    .and_then(|v| v.as_array())
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|call| {
+                        let function = call.get("function")?;
+                        let input = function
+                            .get("arguments")
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+                            .unwrap_or_else(|| serde_json::json!({}));
+                        Some(serde_json::json!({
+                            "type":"tool_use",
+                            "id":call.get("id").cloned().unwrap_or_default(),
+                            "name":function.get("name").cloned().unwrap_or_default(),
+                            "input":input
+                        }))
+                    })
+                    .collect::<Vec<_>>();
+                out.push(serde_json::json!({"role":"assistant","content":content}));
+            }
+            _ => out.push(message.clone()),
+        }
+    }
+    (system.join("\n\n"), serde_json::Value::Array(out))
+}
+
+pub(crate) fn responses_request_body(
+    model_id: Option<&str>,
+    messages: serde_json::Value,
+    openai_tools: serde_json::Value,
+    tool_choice: Option<serde_json::Value>,
+    stream: bool,
+) -> serde_json::Value {
+    let tools = responses_tools(openai_tools);
+    let has_tools = tools.as_array().is_some_and(|items| !items.is_empty());
+    let mut body = serde_json::json!({
+        "input": responses_input(messages),
+        "tools": tools,
+        "stream": stream,
+    });
+    if let Some(model_id) = model_id {
+        body["model"] = serde_json::json!(model_id);
+    }
+    if has_tools && let Some(tool_choice) = tool_choice {
+        body["tool_choice"] = tool_choice;
+    }
+    body
+}
+
+pub(crate) fn anthropic_request_body(
+    model_id: &str,
+    messages: serde_json::Value,
+    openai_tools: serde_json::Value,
+    tool_choice: Option<serde_json::Value>,
+    stream: bool,
+) -> serde_json::Value {
+    let (system, messages) = anthropic_messages(messages);
+    let tools = anthropic_tools(openai_tools);
+    let has_tools = tools.as_array().is_some_and(|items| !items.is_empty());
+    let mut body = serde_json::json!({
+        "model": model_id,
+        "system": system,
+        "messages": messages,
+        "tools": tools,
+        "max_tokens": 4096,
+        "stream": stream,
+    });
+    if has_tools && let Some(tool_choice) = anthropic_tool_choice(tool_choice.as_ref()) {
+        body["tool_choice"] = tool_choice;
+    }
+    body
+}
+
+fn anthropic_tool_choice(choice: Option<&serde_json::Value>) -> Option<serde_json::Value> {
+    match choice.and_then(|value| value.as_str()) {
+        Some("required") => Some(serde_json::json!({"type":"any"})),
+        Some("auto") => Some(serde_json::json!({"type":"auto"})),
+        Some("none") => Some(serde_json::json!({"type":"none"})),
+        _ => None,
+    }
+}
+
+pub(crate) fn responses_tools(openai_tools: serde_json::Value) -> serde_json::Value {
     serde_json::Value::Array(openai_tools.as_array().into_iter().flatten().filter_map(|tool| {
         let function = tool.get("function")?;
         Some(serde_json::json!({
@@ -149,6 +297,29 @@ fn api_key_headers(auth: &Auth) -> Vec<(String, String)> {
     }
     headers.push(("content-type".into(), "application/json".into()));
     headers
+}
+
+pub(crate) fn openai_chat_body(
+    model_id: &str,
+    messages: serde_json::Value,
+    tools: serde_json::Value,
+    tool_choice: Option<serde_json::Value>,
+    stream: bool,
+) -> serde_json::Value {
+    let has_tools = tools.as_array().is_some_and(|items| !items.is_empty());
+    let mut body = serde_json::json!({
+        "model": model_id,
+        "messages": messages,
+        "stream": stream,
+    });
+    if has_tools {
+        body["tools"] = tools;
+        // SenseNova/GLM-family gateways often skip function calling unless tool_choice is set.
+        // Callers can raise this to "required" when a workspace mutation was requested but
+        // the model only produced assistant text.
+        body["tool_choice"] = tool_choice.unwrap_or_else(|| serde_json::json!("auto"));
+    }
+    body
 }
 
 fn bearer_headers(auth: &Auth) -> Vec<(String, String)> {
@@ -396,11 +567,89 @@ mod tests {
         .unwrap();
         assert_eq!(r.url, "https://h/chat/completions");
         assert_eq!(r.body["stream"], true);
+        assert!(r.body.get("tool_choice").is_none());
         assert!(
             r.headers
                 .iter()
                 .any(|(k, v)| k == "authorization" && v == "Bearer sk")
         );
+    }
+
+    #[test]
+    fn openai_completions_enables_tools_explicitly() {
+        let m = Model {
+            provider: "sensenova",
+            id: "glm-5.2",
+            api: ModelApi::OpenaiCompletions,
+            base_url: Some("https://token.sensenova.cn/v1"),
+        };
+        let r = build_request(
+            &m,
+            &auth(),
+            serde_json::json!({
+                "messages":[{"role":"user","content":"写 hello.go"}],
+                "tools":[{"type":"function","function":{"name":"run_terminal_command","parameters":{"type":"object"}}}]
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            r.body["tools"][0]["function"]["name"],
+            "run_terminal_command"
+        );
+        assert_eq!(r.body["tool_choice"], "auto");
+    }
+
+    #[test]
+    fn openai_completions_honors_required_tool_choice_and_non_stream_retry() {
+        let m = Model {
+            provider: "sensenova",
+            id: "glm-5.2",
+            api: ModelApi::OpenaiCompletions,
+            base_url: Some("https://token.sensenova.cn/v1"),
+        };
+        let r = build_request(
+            &m,
+            &auth(),
+            serde_json::json!({
+                "messages":[{"role":"user","content":"写 hello.go"}],
+                "tools":[{"type":"function","function":{"name":"write_file","parameters":{"type":"object"}}}],
+                "tool_choice":"required",
+                "stream": false
+            }),
+        )
+        .unwrap();
+        assert_eq!(r.body["tool_choice"], "required");
+        assert_eq!(r.body["stream"], false);
+    }
+
+    #[test]
+    fn responses_and_anthropic_honor_required_tool_choice_and_non_stream_mode() {
+        let context = serde_json::json!({
+            "messages":[{"role":"user","content":"write a file"}],
+            "tools":[{"type":"function","function":{"name":"write_file","parameters":{"type":"object"}}}],
+            "tool_choice":"required",
+            "stream":false
+        });
+        let responses = build_request(
+            &lookup_model("openai", "gpt-4.1").unwrap(),
+            &auth(),
+            context.clone(),
+        )
+        .unwrap();
+        assert_eq!(responses.body["tool_choice"], "required");
+        assert_eq!(responses.body["stream"], false);
+
+        let anthropic = build_request(
+            &lookup_model("kimi-coding", "kimi-k2").unwrap(),
+            &auth(),
+            context,
+        )
+        .unwrap();
+        assert_eq!(
+            anthropic.body["tool_choice"],
+            serde_json::json!({"type":"any"})
+        );
+        assert_eq!(anthropic.body["stream"], false);
     }
 
     #[test]
@@ -423,6 +672,42 @@ mod tests {
         assert_eq!(r.url, "https://api.kimi.com/coding/v1/messages");
         assert!(r.headers.iter().any(|(k, v)| k == "x-api-key" && v == "sk"));
         assert_eq!(r.body["max_tokens"], 4096);
+    }
+
+    #[test]
+    fn tool_history_is_converted_for_responses_and_anthropic_apis() {
+        let history = serde_json::json!([
+            {"role":"system","content":"sys"},
+            {"role":"user","content":"pwd"},
+            {"role":"assistant","content":null,"tool_calls":[{"id":"c1","type":"function","function":{"name":"run_terminal_command","arguments":"{\"command\":\"pwd\"}"}}]},
+            {"role":"tool","tool_call_id":"c1","content":"/tmp/project\n"}
+        ]);
+
+        let openai = build_request(
+            &lookup_model("openai", "gpt-4.1").unwrap(),
+            &auth(),
+            history.clone(),
+        )
+        .unwrap();
+        assert_eq!(openai.body["input"][2]["type"], "function_call");
+        assert_eq!(openai.body["input"][3]["type"], "function_call_output");
+        assert_eq!(openai.body["input"][3]["call_id"], "c1");
+
+        let anthropic = build_request(
+            &lookup_model("kimi-coding", "kimi-k2").unwrap(),
+            &auth(),
+            history,
+        )
+        .unwrap();
+        assert_eq!(anthropic.body["system"], "sys");
+        assert_eq!(
+            anthropic.body["messages"][1]["content"][0]["type"],
+            "tool_use"
+        );
+        assert_eq!(
+            anthropic.body["messages"][2]["content"][0]["type"],
+            "tool_result"
+        );
     }
 
     #[test]
