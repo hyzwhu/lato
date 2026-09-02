@@ -4,6 +4,86 @@ use lato_protocol::JsonRpcReq;
 use lato_workspace::SessionTrust;
 use std::sync::Arc;
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ClientUpdate {
+    TextDelta(String),
+    ReasoningDelta(String),
+    ToolStarted {
+        id: String,
+        name: String,
+        arguments: String,
+    },
+    ToolFinished {
+        id: String,
+        result: String,
+    },
+    ToolFailed {
+        id: String,
+        error: String,
+    },
+    PermissionRequested,
+    Unknown,
+}
+
+impl ClientUpdate {
+    pub fn from_json(value: &serde_json::Value) -> Self {
+        let method = value.get("method").and_then(serde_json::Value::as_str);
+        let params = value.get("params").unwrap_or(&serde_json::Value::Null);
+        match method {
+            Some("session/update") => params
+                .get("delta")
+                .and_then(serde_json::Value::as_str)
+                .map(|text| Self::TextDelta(text.to_string()))
+                .unwrap_or(Self::Unknown),
+            Some("session/reasoning") => params
+                .get("delta")
+                .and_then(serde_json::Value::as_str)
+                .map(|text| Self::ReasoningDelta(text.to_string()))
+                .unwrap_or(Self::Unknown),
+            Some("session/tool_call") => {
+                let name = params
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("tool")
+                    .to_string();
+                let id = params
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(&name)
+                    .to_string();
+                let arguments = params
+                    .get("arguments")
+                    .map(serde_json::Value::to_string)
+                    .unwrap_or_else(|| "{}".to_string());
+                Self::ToolStarted {
+                    id,
+                    name,
+                    arguments,
+                }
+            }
+            Some("session/tool_result") => {
+                let id = params
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("tool")
+                    .to_string();
+                let output = params
+                    .get("result")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                if params.get("status").and_then(serde_json::Value::as_str) == Some("error") {
+                    Self::ToolFailed { id, error: output }
+                } else {
+                    Self::ToolFinished { id, result: output }
+                }
+            }
+            Some("session/request_permission") => Self::PermissionRequested,
+            _ => Self::Unknown,
+        }
+    }
+}
+
 pub async fn run_prompt_over_acp_with_stream(
     cwd: std::path::PathBuf,
     trust: SessionTrust,
@@ -163,6 +243,24 @@ impl InteractiveAcpClient {
         Ok(())
     }
 
+    pub async fn cancel(&mut self) -> Result<(), String> {
+        let id = self.take_id();
+        let response = self
+            .host
+            .handle(req(
+                id,
+                "session/cancel",
+                serde_json::json!({"sessionId": self.session_id}),
+            ))
+            .await
+            .ok_or("no response")?;
+        response_result(&response).map(|_| ())
+    }
+
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
     fn take_id(&mut self) -> i32 {
         let id = self.next_id;
         self.next_id += 1;
@@ -224,5 +322,53 @@ fn req(id: i32, method: &str, params: serde_json::Value) -> JsonRpcReq {
         id: Some(serde_json::json!(id)),
         method: method.into(),
         params: Some(params),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ClientUpdate;
+
+    #[test]
+    fn converts_tool_call_update() {
+        let raw = serde_json::json!({
+            "method": "session/tool_call",
+            "params": {
+                "id": "call-1",
+                "name": "read_file",
+                "arguments": {"path": "src/main.rs"}
+            }
+        });
+        assert!(matches!(
+            ClientUpdate::from_json(&raw),
+            ClientUpdate::ToolStarted { id, name, .. }
+                if id == "call-1" && name == "read_file"
+        ));
+    }
+
+    #[test]
+    fn converts_tool_result_status() {
+        let done = serde_json::json!({
+            "method": "session/tool_result",
+            "params": {"id": "call-1", "status": "done", "result": "ok"}
+        });
+        let failed = serde_json::json!({
+            "method": "session/tool_result",
+            "params": {"id": "call-2", "status": "error", "result": "denied"}
+        });
+        assert_eq!(
+            ClientUpdate::from_json(&done),
+            ClientUpdate::ToolFinished {
+                id: "call-1".into(),
+                result: "ok".into()
+            }
+        );
+        assert_eq!(
+            ClientUpdate::from_json(&failed),
+            ClientUpdate::ToolFailed {
+                id: "call-2".into(),
+                error: "denied".into()
+            }
+        );
     }
 }

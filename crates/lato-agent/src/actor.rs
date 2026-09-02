@@ -459,7 +459,7 @@ impl SessionActor {
             Err(error) => Err(error),
         };
         if let Some((events, session_id)) = &self.events {
-            let _ = events.send(serde_json::json!({"jsonrpc":"2.0","method":"session/tool_call","params":{"sessionId":session_id,"name":name,"arguments":arguments}}));
+            let _ = events.send(serde_json::json!({"jsonrpc":"2.0","method":"session/tool_call","params":{"sessionId":session_id,"id":id,"name":name,"arguments":arguments}}));
         }
         let invocation = match authorization {
             Ok((prepared, grant)) => {
@@ -496,10 +496,15 @@ impl SessionActor {
                 Err(error)
             }
         };
+        let failed = invocation.is_err();
         let out = invocation
             .map(|output| output.content)
             .unwrap_or_else(|error| format!("ERROR [{}]: {}", error.code, error.message));
         let out = bound_tool_output(out, &self.cwd, &id).await?;
+        if let Some((events, session_id)) = &self.events {
+            let status = if failed { "error" } else { "done" };
+            let _ = events.send(serde_json::json!({"jsonrpc":"2.0","method":"session/tool_result","params":{"sessionId":session_id,"id":id,"status":status,"result":out}}));
+        }
         self.history
             .push(HistoryItem::ToolResult { id, output: out });
         Ok(ProcessTool::Executed)
