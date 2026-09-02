@@ -7,9 +7,11 @@ use crate::driver::{
 };
 use lato_core::{
     AgentError, CancelReason, Command, ErrorCategory, EventEnvelope, EventId, EventPayload,
-    Retryability, SessionId, SessionMachine, SessionPhase, StartDecision, StartTurn,
-    TransitionError, TurnId, UserInput,
+    EventStore, JOURNAL_SCHEMA_VERSION, JournalDurability, JournalEnvelope, JournalError,
+    JournalRecord, JournalRecordId, JournalReplay, Retryability, SessionId, SessionMachine,
+    SessionPhase, StartDecision, StartTurn, TransitionError, TurnId, UserInput,
 };
+use lato_store::MemoryEventStore;
 use std::{
     sync::{
         Arc,
@@ -51,9 +53,39 @@ impl SessionHandle {
 }
 
 pub fn spawn_session(session_id: SessionId, driver: Arc<dyn TurnDriver>) -> SessionHandle {
+    let store: Arc<dyn EventStore> = Arc::new(MemoryEventStore::new());
+    spawn_session_with_store(
+        session_id.clone(),
+        driver,
+        store,
+        SessionBootstrap {
+            replay: JournalReplay::empty(session_id),
+        },
+    )
+}
+
+#[derive(Clone)]
+pub struct SessionBootstrap {
+    pub replay: JournalReplay,
+}
+
+pub fn spawn_session_with_store(
+    session_id: SessionId,
+    driver: Arc<dyn TurnDriver>,
+    store: Arc<dyn EventStore>,
+    bootstrap: SessionBootstrap,
+) -> SessionHandle {
+    debug_assert_eq!(bootstrap.replay.projection.session_id, session_id);
     let (command_tx, command_rx) = mpsc::channel(COMMAND_CAPACITY);
     let (event_tx, _) = broadcast::channel(EVENT_CAPACITY);
-    let session = SessionLoop::new(session_id, driver, command_rx, event_tx.clone());
+    let session = SessionLoop::new(
+        session_id,
+        driver,
+        store,
+        bootstrap,
+        command_rx,
+        event_tx.clone(),
+    );
     tokio::spawn(session.run());
     SessionHandle {
         command_tx,
@@ -82,6 +114,7 @@ struct PendingStart {
 struct SessionLoop {
     session_id: SessionId,
     driver: Arc<dyn TurnDriver>,
+    store: Arc<dyn EventStore>,
     machine: SessionMachine,
     command_rx: mpsc::Receiver<SubmittedCommand>,
     event_tx: broadcast::Sender<EventEnvelope>,
@@ -90,6 +123,8 @@ struct SessionLoop {
     active: Option<ActiveRuntimeTurn>,
     pending_start: Option<PendingStart>,
     sequence: u64,
+    journal_sequence: u64,
+    journal_exists: bool,
     started_emitted: bool,
 }
 
@@ -97,6 +132,8 @@ impl SessionLoop {
     fn new(
         session_id: SessionId,
         driver: Arc<dyn TurnDriver>,
+        store: Arc<dyn EventStore>,
+        bootstrap: SessionBootstrap,
         command_rx: mpsc::Receiver<SubmittedCommand>,
         event_tx: broadcast::Sender<EventEnvelope>,
     ) -> Self {
@@ -104,6 +141,7 @@ impl SessionLoop {
         Self {
             session_id,
             driver,
+            store,
             machine: SessionMachine::new(),
             command_rx,
             event_tx,
@@ -112,6 +150,8 @@ impl SessionLoop {
             active: None,
             pending_start: None,
             sequence: 0,
+            journal_sequence: bootstrap.replay.projection.next_journal_sequence,
+            journal_exists: bootstrap.replay.exists,
             started_emitted: false,
         }
     }
@@ -121,11 +161,13 @@ impl SessionLoop {
             tokio::select! {
                 command = self.command_rx.recv() => {
                     let Some(command) = command else {
-                        self.shutdown();
+                        let _ = self.shutdown().await;
                         break;
                     };
-                    self.emit_session_started_once();
-                    let result = self.handle_command(command.command);
+                    let result = match self.emit_session_started_once().await {
+                        Ok(()) => self.handle_command(command.command).await,
+                        Err(error) => Err(error),
+                    };
                     let _ = command.reply_tx.send(result);
                     if matches!(self.machine.phase(), SessionPhase::Stopped) {
                         break;
@@ -133,10 +175,10 @@ impl SessionLoop {
                 }
                 message = self.driver_rx.recv() => {
                     let Some(message) = message else {
-                        self.shutdown();
+                        let _ = self.shutdown().await;
                         break;
                     };
-                    self.handle_driver_message(message);
+                    self.handle_driver_message(message).await;
                     if matches!(self.machine.phase(), SessionPhase::Stopped) {
                         break;
                     }
@@ -145,9 +187,9 @@ impl SessionLoop {
         }
     }
 
-    fn handle_command(&mut self, command: Command) -> Result<(), AgentError> {
+    async fn handle_command(&mut self, command: Command) -> Result<(), AgentError> {
         match command {
-            Command::StartTurn(start) => self.request_start(start),
+            Command::StartTurn(start) => self.request_start(start).await,
             Command::SteerTurn(input) => {
                 let active = self.active.as_ref().ok_or_else(|| {
                     invalid_state("runtime.no_active_turn", "cannot steer an idle session")
@@ -174,21 +216,25 @@ impl SessionLoop {
                 active.cancellation.cancel();
                 Ok(())
             }
-            Command::Shutdown => {
-                self.shutdown();
-                Ok(())
-            }
+            Command::Shutdown => self.shutdown().await,
         }
     }
 
-    fn request_start(&mut self, start: StartTurn) -> Result<(), AgentError> {
+    async fn request_start(&mut self, start: StartTurn) -> Result<(), AgentError> {
         let requested_id = next_turn_id();
+        let previous_machine = self.machine.clone();
         match self
             .machine
             .request_start(requested_id.clone(), start.behavior)
             .map_err(transition_error)?
         {
-            StartDecision::StartNow => self.launch(requested_id, start),
+            StartDecision::StartNow => {
+                if let Err(error) = self.launch(requested_id, start).await {
+                    self.machine = previous_machine;
+                    return Err(error);
+                }
+                Ok(())
+            }
             StartDecision::CancelThenStart { active, pending } => {
                 let current = self.active.as_mut().ok_or_else(|| {
                     invalid_state(
@@ -210,13 +256,21 @@ impl SessionLoop {
         }
     }
 
-    fn launch(&mut self, turn_id: TurnId, start: StartTurn) -> Result<(), AgentError> {
+    async fn launch(&mut self, turn_id: TurnId, start: StartTurn) -> Result<(), AgentError> {
         if self.active.is_some() {
             return Err(invalid_state(
                 "runtime.active_turn_exists",
                 "cannot launch a second foreground turn",
             ));
         }
+        self.commit(
+            Some(turn_id.clone()),
+            JournalRecord::TurnInputAccepted {
+                input: start.input.clone(),
+            },
+            JournalDurability::Flush,
+        )
+        .await?;
         let cancellation = CancellationToken::new();
         let (steering, steering_rx) = mpsc::unbounded_channel();
         let driver = self.driver.clone();
@@ -252,9 +306,9 @@ impl SessionLoop {
         Ok(())
     }
 
-    fn handle_driver_message(&mut self, message: DriverMessage) {
+    async fn handle_driver_message(&mut self, message: DriverMessage) {
         match message {
-            DriverMessage::Event { turn_id, event } => {
+            DriverMessage::LiveEvent { turn_id, event } => {
                 if self.active.as_ref().map(|active| &active.id) != Some(&turn_id) {
                     return;
                 }
@@ -263,6 +317,22 @@ impl SessionLoop {
                     DriverEvent::ReasoningDelta(text) => EventPayload::ReasoningDelta { text },
                 };
                 self.emit(Some(turn_id), payload);
+            }
+            DriverMessage::Commit {
+                turn_id,
+                record,
+                durability,
+                ack,
+            } => {
+                let result = if self.active.as_ref().map(|active| &active.id) == Some(&turn_id) {
+                    self.commit(Some(turn_id), record, durability).await
+                } else {
+                    Err(invalid_state(
+                        "runtime.stale_turn_commit",
+                        "cannot commit canonical state for an inactive turn",
+                    ))
+                };
+                let _ = ack.send(result);
             }
             DriverMessage::Finished { turn_id, result } => {
                 let Some(active) = self.active.take() else {
@@ -274,24 +344,61 @@ impl SessionLoop {
                 }
                 if self.machine.finish(&turn_id).is_err() {
                     self.machine.stop();
-                    self.emit(
-                        Some(turn_id),
-                        EventPayload::TurnFailed {
-                            error: invalid_state(
-                                "runtime.invalid_transition",
-                                "finished turn does not match the state machine",
-                            ),
-                        },
-                    );
-                    self.emit(None, EventPayload::SessionStopped);
                     return;
                 }
                 if let Some(reason) = active.cancel_reason {
+                    if self
+                        .commit(
+                            Some(turn_id.clone()),
+                            JournalRecord::TurnCancelled { reason },
+                            JournalDurability::SyncData,
+                        )
+                        .await
+                        .is_err()
+                    {
+                        self.pending_start = None;
+                        self.machine.stop();
+                        return;
+                    }
                     self.emit(Some(turn_id), EventPayload::TurnCancelled { reason });
                 } else {
                     match result {
-                        Ok(output) => self.emit(Some(turn_id), EventPayload::TurnCompleted(output)),
-                        Err(error) => self.emit(Some(turn_id), EventPayload::TurnFailed { error }),
+                        Ok(output) => {
+                            if self
+                                .commit(
+                                    Some(turn_id.clone()),
+                                    JournalRecord::TurnCompleted {
+                                        output: output.clone(),
+                                    },
+                                    JournalDurability::SyncData,
+                                )
+                                .await
+                                .is_err()
+                            {
+                                self.pending_start = None;
+                                self.machine.stop();
+                                return;
+                            }
+                            self.emit(Some(turn_id), EventPayload::TurnCompleted(output));
+                        }
+                        Err(error) => {
+                            if self
+                                .commit(
+                                    Some(turn_id.clone()),
+                                    JournalRecord::TurnFailed {
+                                        error: error.clone(),
+                                    },
+                                    JournalDurability::SyncData,
+                                )
+                                .await
+                                .is_err()
+                            {
+                                self.pending_start = None;
+                                self.machine.stop();
+                                return;
+                            }
+                            self.emit(Some(turn_id), EventPayload::TurnFailed { error });
+                        }
                     }
                 }
                 if let Some(pending) = self.pending_start.take() {
@@ -300,7 +407,7 @@ impl SessionLoop {
                         .request_start(pending.id.clone(), pending.start.behavior)
                     {
                         Ok(StartDecision::StartNow) => {
-                            if let Err(error) = self.launch(pending.id, pending.start) {
+                            if let Err(error) = self.launch(pending.id, pending.start).await {
                                 self.emit(None, EventPayload::TurnFailed { error });
                             }
                         }
@@ -327,18 +434,36 @@ impl SessionLoop {
         }
     }
 
-    fn emit_session_started_once(&mut self) {
+    async fn emit_session_started_once(&mut self) -> Result<(), AgentError> {
         if !self.started_emitted {
+            if !self.journal_exists {
+                self.commit(
+                    None,
+                    JournalRecord::SessionStarted,
+                    JournalDurability::SyncData,
+                )
+                .await?;
+                self.journal_exists = true;
+            }
             self.started_emitted = true;
             self.emit(None, EventPayload::SessionStarted);
         }
+        Ok(())
     }
 
-    fn shutdown(&mut self) {
+    async fn shutdown(&mut self) -> Result<(), AgentError> {
         self.pending_start = None;
         if let Some(active) = self.active.take() {
             active.cancellation.cancel();
             active.task.abort();
+            self.commit(
+                Some(active.id.clone()),
+                JournalRecord::TurnCancelled {
+                    reason: CancelReason::Shutdown,
+                },
+                JournalDurability::SyncData,
+            )
+            .await?;
             self.emit(
                 Some(active.id),
                 EventPayload::TurnCancelled {
@@ -347,7 +472,42 @@ impl SessionLoop {
             );
         }
         self.machine.stop();
+        self.commit(
+            None,
+            JournalRecord::SessionStopped,
+            JournalDurability::SyncData,
+        )
+        .await?;
         self.emit(None, EventPayload::SessionStopped);
+        self.store
+            .shutdown(&self.session_id)
+            .await
+            .map_err(journal_error)?;
+        Ok(())
+    }
+
+    async fn commit(
+        &mut self,
+        turn_id: Option<TurnId>,
+        record: JournalRecord,
+        durability: JournalDurability,
+    ) -> Result<(), AgentError> {
+        let sequence = self.journal_sequence;
+        let envelope = JournalEnvelope {
+            schema_version: JOURNAL_SCHEMA_VERSION,
+            record_id: JournalRecordId::from(format!("{}-journal-{sequence}", self.session_id)),
+            session_id: self.session_id.clone(),
+            turn_id,
+            journal_sequence: sequence,
+            timestamp_ms: now_ms(),
+            record,
+        };
+        self.store
+            .append(envelope, durability)
+            .await
+            .map_err(journal_error)?;
+        self.journal_sequence += 1;
+        Ok(())
     }
 
     fn emit(&mut self, turn_id: Option<TurnId>, payload: EventPayload) {
@@ -402,5 +562,14 @@ fn bus_closed(code: &str, message: &str) -> AgentError {
         ErrorCategory::InternalInvariant,
         message,
         Retryability::Never,
+    )
+}
+
+fn journal_error(error: JournalError) -> AgentError {
+    AgentError::new(
+        error.code(),
+        ErrorCategory::Storage,
+        error.to_string(),
+        error.retryability(),
     )
 }

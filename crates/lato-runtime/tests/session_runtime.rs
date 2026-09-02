@@ -1,8 +1,14 @@
 use async_trait::async_trait;
 use lato_core::{
-    CancelReason, Command, EventPayload, StartBehavior, StartTurn, TurnOutput, UserInput,
+    CancelReason, Command, EventPayload, EventStore, JOURNAL_SCHEMA_VERSION, JournalDurability,
+    JournalEnvelope, JournalError, JournalRecord, JournalRecordId, JournalReplay, ModelContent,
+    ModelMessage, ModelRole, SessionId, StartBehavior, StartTurn, TurnOutput, UserInput,
 };
-use lato_runtime::{TurnControl, TurnDriver, TurnEventEmitter, TurnRequest, spawn_session};
+use lato_runtime::{
+    SessionBootstrap, TurnControl, TurnDriver, TurnEventEmitter, TurnRequest, spawn_session,
+    spawn_session_with_store,
+};
+use lato_store::MemoryEventStore;
 use std::{
     future::pending,
     sync::{
@@ -10,10 +16,91 @@ use std::{
         atomic::{AtomicUsize, Ordering},
     },
 };
-use tokio::sync::oneshot;
+use tokio::sync::{Notify, oneshot};
 use tokio::time::{Duration, timeout};
 
 struct EchoDriver;
+
+struct ControlledStore {
+    inner: MemoryEventStore,
+    block_kind: Option<&'static str>,
+    fail_kind: Option<&'static str>,
+    append_started: Notify,
+    release: Notify,
+    records: tokio::sync::Mutex<Vec<JournalEnvelope>>,
+}
+
+impl ControlledStore {
+    fn new(block_kind: Option<&'static str>, fail_kind: Option<&'static str>) -> Self {
+        Self {
+            inner: MemoryEventStore::new(),
+            block_kind,
+            fail_kind,
+            append_started: Notify::new(),
+            release: Notify::new(),
+            records: tokio::sync::Mutex::new(Vec::new()),
+        }
+    }
+}
+
+#[async_trait]
+impl EventStore for ControlledStore {
+    async fn append(
+        &self,
+        envelope: JournalEnvelope,
+        durability: JournalDurability,
+    ) -> Result<(), JournalError> {
+        let kind = record_kind(&envelope.record);
+        if self.block_kind == Some(kind) {
+            self.append_started.notify_one();
+            self.release.notified().await;
+        }
+        if self.fail_kind == Some(kind) {
+            return Err(JournalError::Io {
+                message: "injected append failure".into(),
+            });
+        }
+        self.inner.append(envelope.clone(), durability).await?;
+        self.records.lock().await.push(envelope);
+        Ok(())
+    }
+
+    async fn replay(&self, session_id: &SessionId) -> Result<JournalReplay, JournalError> {
+        self.inner.replay(session_id).await
+    }
+
+    async fn import_if_absent(
+        &self,
+        session_id: &SessionId,
+        envelopes: Vec<JournalEnvelope>,
+    ) -> Result<JournalReplay, JournalError> {
+        self.inner.import_if_absent(session_id, envelopes).await
+    }
+
+    async fn list_sessions(&self) -> Result<Vec<SessionId>, JournalError> {
+        self.inner.list_sessions().await
+    }
+
+    async fn shutdown(&self, session_id: &SessionId) -> Result<(), JournalError> {
+        self.inner.shutdown(session_id).await
+    }
+}
+
+fn record_kind(record: &JournalRecord) -> &'static str {
+    match record {
+        JournalRecord::SessionStarted => "session_started",
+        JournalRecord::TurnInputAccepted { .. } => "turn_input_accepted",
+        JournalRecord::ConversationItemCommitted { .. } => "conversation_item_committed",
+        JournalRecord::TurnCompleted { .. } => "turn_completed",
+        _ => "other",
+    }
+}
+
+fn bootstrap(session_id: &SessionId) -> SessionBootstrap {
+    SessionBootstrap {
+        replay: JournalReplay::empty(session_id.clone()),
+    }
+}
 
 #[async_trait]
 impl TurnDriver for EchoDriver {
@@ -31,6 +118,35 @@ impl TurnDriver for EchoDriver {
 }
 
 struct BlockingDriver;
+
+struct CommitDriver;
+
+#[async_trait]
+impl TurnDriver for CommitDriver {
+    async fn run(
+        &self,
+        _request: TurnRequest,
+        _control: TurnControl,
+        events: TurnEventEmitter,
+    ) -> Result<TurnOutput, lato_core::AgentError> {
+        events
+            .commit(
+                JournalRecord::ConversationItemCommitted {
+                    message: ModelMessage {
+                        role: ModelRole::Assistant,
+                        content: vec![ModelContent::Text {
+                            text: "committed".into(),
+                        }],
+                    },
+                },
+                JournalDurability::SyncData,
+            )
+            .await?;
+        Ok(TurnOutput {
+            final_text: "done".into(),
+        })
+    }
+}
 
 #[async_trait]
 impl TurnDriver for BlockingDriver {
@@ -502,4 +618,200 @@ async fn slow_subscribers_observe_bounded_event_lag() {
         lagged,
         tokio::sync::broadcast::error::RecvError::Lagged(skipped) if skipped > 0
     ));
+}
+
+#[tokio::test]
+async fn canonical_state_is_persisted_before_broadcast() {
+    let sid = SessionId::from("session-barrier");
+    let store = Arc::new(ControlledStore::new(Some("turn_input_accepted"), None));
+    let session = spawn_session_with_store(
+        sid.clone(),
+        Arc::new(EchoDriver),
+        store.clone(),
+        bootstrap(&sid),
+    );
+    let mut events = session.subscribe();
+    let submitted = {
+        let session = session.clone();
+        tokio::spawn(async move {
+            session
+                .submit(Command::StartTurn(StartTurn {
+                    input: UserInput::text("hello"),
+                    behavior: StartBehavior::Reject,
+                }))
+                .await
+        })
+    };
+
+    assert!(matches!(
+        next_event(&mut events).await.payload,
+        EventPayload::SessionStarted
+    ));
+    store.append_started.notified().await;
+    assert!(
+        timeout(Duration::from_millis(30), events.recv())
+            .await
+            .is_err()
+    );
+    store.release.notify_one();
+    submitted.await.unwrap().unwrap();
+    assert!(matches!(
+        next_event(&mut events).await.payload,
+        EventPayload::TurnStarted
+    ));
+}
+
+#[tokio::test]
+async fn journal_failure_stops_the_turn_without_broadcasting_committed_state() {
+    let sid = SessionId::from("session-journal-failure");
+    let store = Arc::new(ControlledStore::new(None, Some("turn_input_accepted")));
+    let session =
+        spawn_session_with_store(sid.clone(), Arc::new(EchoDriver), store, bootstrap(&sid));
+    let mut events = session.subscribe();
+    let error = session
+        .submit(Command::StartTurn(StartTurn {
+            input: UserInput::text("hello"),
+            behavior: StartBehavior::Reject,
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "journal.io");
+    assert!(matches!(
+        next_event(&mut events).await.payload,
+        EventPayload::SessionStarted
+    ));
+    assert!(
+        timeout(Duration::from_millis(30), events.recv())
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn driver_commit_waits_for_store_ack() {
+    let sid = SessionId::from("session-driver-commit");
+    let store = Arc::new(ControlledStore::new(
+        Some("conversation_item_committed"),
+        None,
+    ));
+    let session = spawn_session_with_store(
+        sid.clone(),
+        Arc::new(CommitDriver),
+        store.clone(),
+        bootstrap(&sid),
+    );
+    let mut events = session.subscribe();
+    session
+        .submit(Command::StartTurn(StartTurn {
+            input: UserInput::text("commit"),
+            behavior: StartBehavior::Reject,
+        }))
+        .await
+        .unwrap();
+    assert!(matches!(
+        next_event(&mut events).await.payload,
+        EventPayload::SessionStarted
+    ));
+    assert!(matches!(
+        next_event(&mut events).await.payload,
+        EventPayload::TurnStarted
+    ));
+    store.append_started.notified().await;
+    assert!(
+        timeout(Duration::from_millis(30), events.recv())
+            .await
+            .is_err()
+    );
+    store.release.notify_one();
+    assert!(matches!(
+        next_event(&mut events).await.payload,
+        EventPayload::TurnCompleted(_)
+    ));
+}
+
+#[tokio::test]
+async fn model_deltas_are_live_and_never_appended() {
+    let sid = SessionId::from("session-live-delta");
+    let store = Arc::new(ControlledStore::new(None, None));
+    let session = spawn_session_with_store(
+        sid.clone(),
+        Arc::new(EchoDriver),
+        store.clone(),
+        bootstrap(&sid),
+    );
+    let mut events = session.subscribe();
+    session
+        .submit(Command::StartTurn(StartTurn {
+            input: UserInput::text("hello"),
+            behavior: StartBehavior::Reject,
+        }))
+        .await
+        .unwrap();
+    let mut saw_delta = false;
+    loop {
+        match next_event(&mut events).await.payload {
+            EventPayload::ModelDelta { .. } => saw_delta = true,
+            EventPayload::TurnCompleted(_) => break,
+            _ => {}
+        }
+    }
+    assert!(saw_delta);
+    let kinds: Vec<_> = store
+        .records
+        .lock()
+        .await
+        .iter()
+        .map(|envelope| record_kind(&envelope.record))
+        .collect();
+    assert_eq!(
+        kinds,
+        vec!["session_started", "turn_input_accepted", "turn_completed"]
+    );
+}
+
+#[tokio::test]
+async fn bootstrap_resumes_the_next_journal_sequence_without_duplicate_start() {
+    let sid = SessionId::from("session-resume");
+    let store = Arc::new(MemoryEventStore::new());
+    store
+        .append(
+            JournalEnvelope {
+                schema_version: JOURNAL_SCHEMA_VERSION,
+                record_id: JournalRecordId::from("session-resume-journal-0"),
+                session_id: sid.clone(),
+                turn_id: None,
+                journal_sequence: 0,
+                timestamp_ms: 0,
+                record: JournalRecord::SessionStarted,
+            },
+            JournalDurability::SyncData,
+        )
+        .await
+        .unwrap();
+    let replay = store.replay(&sid).await.unwrap();
+    let session = spawn_session_with_store(
+        sid.clone(),
+        Arc::new(EchoDriver),
+        store.clone(),
+        SessionBootstrap { replay },
+    );
+    session
+        .submit(Command::StartTurn(StartTurn {
+            input: UserInput::text("resume"),
+            behavior: StartBehavior::Reject,
+        }))
+        .await
+        .unwrap();
+    tokio::task::yield_now().await;
+    let replay = store.replay(&sid).await.unwrap();
+    assert_eq!(replay.envelopes[0].record, JournalRecord::SessionStarted);
+    assert_eq!(
+        replay
+            .envelopes
+            .iter()
+            .filter(|item| matches!(item.record, JournalRecord::SessionStarted))
+            .count(),
+        1
+    );
+    assert_eq!(replay.envelopes[1].journal_sequence, 1);
 }

@@ -3,8 +3,11 @@
 // Lato changes: generalized the child reporter channel into a foreground turn event emitter
 
 use async_trait::async_trait;
-use lato_core::{AgentError, ErrorCategory, Retryability, TurnId, TurnOutput, UserInput};
-use tokio::sync::mpsc;
+use lato_core::{
+    AgentError, ErrorCategory, JournalDurability, JournalRecord, Retryability, TurnId, TurnOutput,
+    UserInput,
+};
+use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Debug)]
@@ -33,20 +36,30 @@ impl TurnEventEmitter {
         self.send(DriverEvent::ReasoningDelta(text.into()))
     }
 
+    pub async fn commit(
+        &self,
+        record: JournalRecord,
+        durability: JournalDurability,
+    ) -> Result<(), AgentError> {
+        let (ack, result) = oneshot::channel();
+        self.tx
+            .send(DriverMessage::Commit {
+                turn_id: self.turn_id.clone(),
+                record,
+                durability,
+                ack,
+            })
+            .map_err(|_| event_bus_closed())?;
+        result.await.map_err(|_| event_bus_closed())?
+    }
+
     fn send(&self, event: DriverEvent) -> Result<(), AgentError> {
         self.tx
-            .send(DriverMessage::Event {
+            .send(DriverMessage::LiveEvent {
                 turn_id: self.turn_id.clone(),
                 event,
             })
-            .map_err(|_| {
-                AgentError::new(
-                    "runtime.event_bus_closed",
-                    ErrorCategory::InternalInvariant,
-                    "runtime event bus closed",
-                    Retryability::Never,
-                )
-            })
+            .map_err(|_| event_bus_closed())
     }
 }
 
@@ -68,12 +81,27 @@ pub(crate) enum DriverEvent {
 
 #[derive(Debug)]
 pub(crate) enum DriverMessage {
-    Event {
+    LiveEvent {
         turn_id: TurnId,
         event: DriverEvent,
+    },
+    Commit {
+        turn_id: TurnId,
+        record: JournalRecord,
+        durability: JournalDurability,
+        ack: oneshot::Sender<Result<(), AgentError>>,
     },
     Finished {
         turn_id: TurnId,
         result: Result<TurnOutput, AgentError>,
     },
+}
+
+fn event_bus_closed() -> AgentError {
+    AgentError::new(
+        "runtime.event_bus_closed",
+        ErrorCategory::InternalInvariant,
+        "runtime event bus closed",
+        Retryability::Never,
+    )
 }
