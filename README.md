@@ -1,27 +1,57 @@
 # Lato
 
-Lato is a Rust coding-agent harness with a shared ACP host for headless, stdio, and future interactive clients.
+Lato is a Public Beta coding agent for terminal-based development workflows. It provides an interactive coding CLI, a headless prompt mode, and an ACP host backed by the same runtime, tool policy, and durable session journal.
 
-## Build and test
+> **Beta software:** interfaces and stored formats are versioned and tested, but may still change before a stable release. Back up important work and review tool approvals carefully.
+
+Prebuilt binaries are available for macOS Intel, macOS Apple Silicon, Linux x86-64, Linux ARM64, and Windows x86-64.
+
+## Install a prebuilt binary
+
+Download the archive for your platform and `SHA256SUMS` from the [v0.1.0-beta.1 release](../../releases/tag/v0.1.0-beta.1). Verify the archive before extracting it.
+
+macOS example for Apple Silicon:
 
 ```bash
-cargo build --workspace
-cargo test --workspace
-cargo clippy --workspace --all-targets -- -D warnings
+shasum -a 256 -c SHA256SUMS --ignore-missing
+tar -xzf lato-0.1.0-beta.1-aarch64-apple-darwin.tar.gz
+mkdir -p "$HOME/.local/bin"
+install -m 0755 lato-0.1.0-beta.1-aarch64-apple-darwin/lato "$HOME/.local/bin/lato"
 ```
 
-Windows compile gate from macOS/Linux with the Rust target installed:
+Linux x86-64 example:
 
 ```bash
-cargo check --workspace --target x86_64-pc-windows-gnu
+sha256sum --check SHA256SUMS --ignore-missing
+tar -xzf lato-0.1.0-beta.1-x86_64-unknown-linux-gnu.tar.gz
+mkdir -p "$HOME/.local/bin"
+install -m 0755 lato-0.1.0-beta.1-x86_64-unknown-linux-gnu/lato "$HOME/.local/bin/lato"
 ```
 
-## Interactive CLI
+Ensure `$HOME/.local/bin` is on `PATH` before running Lato.
 
-Install once, then run `lato` without arguments:
+Windows PowerShell example:
+
+```powershell
+$archive = "lato-0.1.0-beta.1-x86_64-pc-windows-msvc.zip"
+Get-FileHash $archive -Algorithm SHA256
+# Compare the printed hash with this archive's entry in SHA256SUMS.
+Expand-Archive $archive -DestinationPath .
+New-Item -ItemType Directory -Force "$HOME\bin" | Out-Null
+Copy-Item ".\lato-0.1.0-beta.1-x86_64-pc-windows-msvc\lato.exe" "$HOME\bin\lato.exe"
+```
+
+Add `%USERPROFILE%\bin` to the user `PATH`, then verify the installation:
+
+```text
+lato --version
+```
+
+## Quick Start
+
+Run `lato` without arguments:
 
 ```bash
-cargo install --path .
 lato
 ```
 
@@ -34,6 +64,24 @@ Interactive commands:
 ```
 
 The line editor persists history in `~/.lato/history`; Up/Down navigate it and Tab completes slash commands. Enter `exit`, `quit`, `/exit`, or `/quit` to leave; Ctrl-C exits both at the input prompt and while a model is streaming. Selecting a provider with an existing credential offers to reuse it, replace its API key, or re-run OAuth. `/login` always replaces the current provider credential and immediately rebuilds the model client in a fresh conversation. The workspace starts untrusted. Mutating tool calls display their name and arguments and request approval exactly at the execution boundary. You can instead trust the workspace for the process or use `/approve` to pre-authorize one call.
+
+For a one-shot, script-friendly prompt:
+
+```bash
+lato -p --model openai/gpt-4.1 --sandbox workspace "inspect this repository and report failing tests"
+```
+
+## Sessions and resume
+
+Lato persists accepted turns and complete conversation state under `~/.lato/sessions`. List saved sessions in human or stable JSON form, then resume one interactively:
+
+```bash
+lato sessions
+lato sessions --json
+lato resume s1788336000000-1
+```
+
+Resume uses the currently configured default model and current working directory. It repeats the folder-trust prompt and fails closed instead of creating a replacement when a journal is missing, corrupt, or contains an unresolved side-effect outcome.
 
 ## Doctor
 
@@ -51,7 +99,7 @@ Default `lato doctor` is offline: it does not contact providers or submit a prom
 The default phase fixture is offline and does not require a credential:
 
 ```bash
-LATO_HOME=$(mktemp -d) cargo run -q -- -p "reply with hi only"
+LATO_HOME=$(mktemp -d) lato -p "reply with hi only"
 # hi
 ```
 
@@ -91,10 +139,25 @@ Custom OpenAI-compatible endpoints are read from `$LATO_HOME/models.json`:
 }
 ```
 
+## Build and test from source
+
+```bash
+cargo build --workspace
+cargo test --workspace
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo install --path .
+```
+
+Windows compile gate from macOS/Linux with the Rust target installed:
+
+```bash
+cargo check --workspace --target x86_64-pc-windows-gnu
+```
+
 ## ACP stdio
 
 ```bash
-cargo run -q -- acp
+lato acp
 ```
 
 Each input and output is one JSON-RPC object per line. `session/load` is intentionally unsupported; use `session/resume`.
@@ -104,9 +167,17 @@ Each input and output is one JSON-RPC object per line. `session/load` is intenti
 Only `kimi-coding` and `openai-codex` advertise OAuth. Other providers reject OAuth rather than silently changing credential channels.
 
 ```bash
-cargo run -q -- login kimi-coding --oauth
-cargo run -q -- login openai-codex --oauth
+lato login kimi-coding --oauth
+lato login openai-codex --oauth
 ```
+
+## Public Beta limitations
+
+- The interactive client is line-oriented; a full-screen TUI is not included in this release.
+- Homebrew, Scoop, and other package-manager channels are not maintained yet.
+- Session listing exposes durable IDs, not generated titles, rename, or delete operations.
+- LIVE provider validation is reported separately and may be unavailable when repository credentials are not configured. Offline protocol and localhost end-to-end tests still run in ordinary CI.
+- `~/.lato` may contain prompts, paths, tool arguments, tool results, credentials, and policy metadata. Treat the entire directory as sensitive local data.
 
 ## Runtime architecture
 
