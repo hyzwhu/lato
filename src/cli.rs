@@ -1,4 +1,5 @@
 use crate::args::{DoctorArgs, Invocation, LoginMethod, PromptArgs, SandboxArg};
+use crate::tui::i18n::Language;
 use lato::doctor::{self, DoctorDependencies, DoctorOptions, LiveProbe};
 use lato_agent::{ApprovalRequest, ToolApproval, default_fake_stream};
 use lato_ai::{
@@ -28,6 +29,8 @@ use std::{
 #[derive(serde::Serialize, serde::Deserialize)]
 struct CliSettings {
     default_model: String,
+    #[serde(default)]
+    language: Option<Language>,
 }
 
 const INTERACTIVE_COMMANDS: &[&str] = &[
@@ -194,12 +197,15 @@ impl ToolApproval for ConsoleToolApproval {
 
 pub async fn run(args: Vec<String>) -> i32 {
     match crate::args::parse(args) {
-        Ok(Invocation::InteractiveNew) => interactive(InteractiveStartup::New).await,
+        Ok(Invocation::InteractiveNew { language }) => {
+            interactive(InteractiveStartup::New, language).await
+        }
         Ok(Invocation::Prompt(args)) => prompt(args).await,
         Ok(Invocation::Sessions { json }) => crate::sessions::list(json).await,
-        Ok(Invocation::Resume { session_id }) => {
-            interactive(InteractiveStartup::Resume(session_id)).await
-        }
+        Ok(Invocation::Resume {
+            session_id,
+            language,
+        }) => interactive(InteractiveStartup::Resume(session_id), language).await,
         Ok(Invocation::Login { provider, method }) => login(provider, method).await,
         Ok(Invocation::Doctor(args)) => doctor_cmd(args).await,
         Ok(Invocation::Acp) => crate::stdio::run().await,
@@ -313,7 +319,7 @@ enum InteractiveStartup {
     Resume(String),
 }
 
-async fn interactive(startup: InteractiveStartup) -> i32 {
+async fn interactive(startup: InteractiveStartup, _language: Option<Language>) -> i32 {
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         let message = match startup {
             InteractiveStartup::New => {
@@ -674,6 +680,7 @@ async fn configure_interactively(home: &std::path::Path) -> Result<String, Strin
         home,
         &CliSettings {
             default_model: selection.clone(),
+            language: None,
         },
     )?;
     Ok(selection)

@@ -1,3 +1,4 @@
+use crate::tui::i18n::Language;
 use clap::{ArgAction, ArgGroup, CommandFactory, Parser, Subcommand, ValueEnum, error::ErrorKind};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -30,13 +31,16 @@ pub struct DoctorArgs {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Invocation {
-    InteractiveNew,
+    InteractiveNew {
+        language: Option<Language>,
+    },
     Prompt(PromptArgs),
     Sessions {
         json: bool,
     },
     Resume {
         session_id: String,
+        language: Option<Language>,
     },
     Login {
         provider: String,
@@ -54,6 +58,10 @@ pub enum Invocation {
     after_help = "Run without arguments for the interactive coding CLI.\n\nHeadless: lato -p [--ask] [--sandbox off|workspace|read-only] [--model provider/model] TEXT\nDoctor: lato doctor [--json] [--strict] [--live]"
 )]
 struct Cli {
+    /// Interface language for interactive mode
+    #[arg(long = "lang", global = true, value_enum)]
+    language: Option<Language>,
+
     /// Run one headless prompt
     #[arg(short = 'p', action = ArgAction::SetTrue)]
     prompt: bool,
@@ -131,7 +139,10 @@ impl Cli {
             }
             return Ok(match command {
                 Command::Sessions { json } => Invocation::Sessions { json },
-                Command::Resume { session_id } => Invocation::Resume { session_id },
+                Command::Resume { session_id } => Invocation::Resume {
+                    session_id,
+                    language: self.language,
+                },
                 Command::Login {
                     provider,
                     api_key,
@@ -152,6 +163,12 @@ impl Cli {
         }
 
         if self.prompt {
+            if self.language.is_some() {
+                return Err(semantic_error(
+                    ErrorKind::ArgumentConflict,
+                    "--lang is only available in interactive mode",
+                ));
+            }
             if self.text.is_empty() {
                 return Err(semantic_error(
                     ErrorKind::MissingRequiredArgument,
@@ -172,7 +189,9 @@ impl Cli {
                 "headless prompt options and text require -p",
             ));
         }
-        Ok(Invocation::InteractiveNew)
+        Ok(Invocation::InteractiveNew {
+            language: self.language,
+        })
     }
 }
 
@@ -187,6 +206,7 @@ pub fn parse(args: Vec<String>) -> Result<Invocation, clap::Error> {
 #[cfg(test)]
 mod tests {
     use super::{Invocation, LoginMethod, SandboxArg, parse};
+    use crate::tui::i18n::Language;
     use clap::error::ErrorKind;
 
     #[test]
@@ -258,6 +278,40 @@ mod tests {
     #[test]
     fn duplicate_doctor_flags_are_rejected() {
         let error = parse(vec!["doctor".into(), "--json".into(), "--json".into()]).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn parses_interactive_language_override() {
+        assert!(matches!(
+            parse(vec!["--lang".into(), "zh-CN".into()]),
+            Ok(Invocation::InteractiveNew {
+                language: Some(Language::ZhCn)
+            })
+        ));
+        assert!(matches!(
+            parse(vec![
+                "resume".into(),
+                "session-1".into(),
+                "--lang".into(),
+                "en".into()
+            ]),
+            Ok(Invocation::Resume {
+                language: Some(Language::En),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn rejects_language_for_headless_prompt() {
+        let error = parse(vec![
+            "--lang".into(),
+            "en".into(),
+            "-p".into(),
+            "hello".into(),
+        ])
+        .unwrap_err();
         assert_eq!(error.kind(), ErrorKind::ArgumentConflict);
     }
 }

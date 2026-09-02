@@ -3,6 +3,7 @@ mod cli;
 mod client;
 mod sessions;
 mod stdio;
+mod tui;
 
 #[tokio::main]
 async fn main() {
