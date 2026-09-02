@@ -1,10 +1,12 @@
-use crate::{HistoryItem, LegacyTurnDriver, ToolApproval};
+use crate::{HistoryItem, LegacyTurnDriver, ToolApproval, model_messages_to_history};
 use lato_ai::ModelStream;
 use lato_core::{
-    AgentError, CancelReason, Command, ErrorCategory, EventPayload, Retryability, SessionId,
-    StartBehavior, StartTurn, TurnId, UserInput,
+    AgentError, CancelReason, Command, ErrorCategory, EventPayload, EventStore, JournalError,
+    JournalReplay, Retryability, SessionId, StartBehavior, StartTurn, TurnId, UserInput,
 };
-use lato_runtime::{SessionHandle, TurnDriver, spawn_session};
+use lato_runtime::{
+    SessionBootstrap, SessionHandle, TurnDriver, spawn_session, spawn_session_with_store,
+};
 use lato_workspace::{FileLocks, SessionTrust};
 use std::{path::PathBuf, sync::Arc};
 use tokio::sync::{Mutex, broadcast, mpsc};
@@ -60,6 +62,61 @@ impl RuntimeSession {
             active_turn: Mutex::new(None),
             submission_gate: Mutex::new(()),
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn new_with_store(
+        session_id: String,
+        stream: Arc<dyn ModelStream>,
+        locks: Arc<FileLocks>,
+        trust: SessionTrust,
+        cwd: PathBuf,
+        updates: mpsc::UnboundedSender<serde_json::Value>,
+        approval: Option<Arc<dyn ToolApproval>>,
+        store: Arc<dyn EventStore>,
+        replay: JournalReplay,
+    ) -> Result<Self, AgentError> {
+        if let Some(unresolved) = replay.projection.unresolved_tools.first() {
+            return Err(journal_error(JournalError::IncompleteSideEffect {
+                call_id: unresolved.call_id.clone(),
+            }));
+        }
+        let session_id = SessionId::from(session_id);
+        let driver = Arc::new(LegacyTurnDriver::new(
+            session_id.to_string(),
+            stream,
+            locks,
+            trust,
+            cwd,
+            updates.clone(),
+            approval,
+        ));
+        let mut history =
+            model_messages_to_history(&replay.projection.messages).map_err(journal_error)?;
+        if !history.is_empty() && !matches!(history.first(), Some(HistoryItem::System(_))) {
+            let initial = driver.history_snapshot().await;
+            if let Some(system) = initial.into_iter().next() {
+                history.insert(0, system);
+            }
+        }
+        if !history.is_empty() {
+            driver.replace_history(history).await;
+        }
+        let runtime_driver: Arc<dyn TurnDriver> = driver.clone();
+        let handle = spawn_session_with_store(
+            session_id.clone(),
+            runtime_driver,
+            store,
+            SessionBootstrap { replay },
+        );
+        Ok(Self {
+            session_id,
+            handle,
+            driver,
+            updates,
+            active_turn: Mutex::new(None),
+            submission_gate: Mutex::new(()),
+        })
     }
 
     pub async fn prompt(&self, input: String) -> Result<RuntimePromptOutcome, AgentError> {
@@ -236,9 +293,20 @@ fn missing_turn_id() -> AgentError {
     )
 }
 
+fn journal_error(error: JournalError) -> AgentError {
+    AgentError::new(
+        error.code(),
+        ErrorCategory::Storage,
+        error.to_string(),
+        error.retryability(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lato_core::{ToolCallId, UnresolvedToolCall};
+    use lato_store::MemoryEventStore;
 
     #[test]
     fn lagged_event_error_is_structured_and_reports_the_count() {
@@ -253,5 +321,35 @@ mod tests {
         let error = event_bus_closed();
         assert_eq!(error.code, "runtime.event_bus_closed");
         assert_eq!(error.category, ErrorCategory::InternalInvariant);
+    }
+
+    #[tokio::test]
+    async fn unresolved_prepared_tool_prevents_driver_start() {
+        let directory = tempfile::tempdir().unwrap();
+        let sid = SessionId::from("unknown-outcome");
+        let mut replay = JournalReplay::empty(sid.clone());
+        replay.exists = true;
+        replay.projection.unresolved_tools.push(UnresolvedToolCall {
+            call_id: ToolCallId::from("call-1"),
+            request_hash: "sha256:v1:test".into(),
+        });
+        let (updates, _updates_rx) = mpsc::unbounded_channel();
+        let result = RuntimeSession::new_with_store(
+            sid.to_string(),
+            crate::default_fake_stream(),
+            Arc::new(FileLocks::new()),
+            SessionTrust::for_headless_prompt(directory.path()),
+            directory.path().to_path_buf(),
+            updates,
+            None,
+            Arc::new(MemoryEventStore::new()),
+            replay,
+        )
+        .await;
+        let error = match result {
+            Ok(_) => panic!("unknown side-effect outcome must block resume"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, "journal.incomplete_side_effect");
     }
 }

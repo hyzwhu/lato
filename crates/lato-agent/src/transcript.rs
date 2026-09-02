@@ -50,10 +50,19 @@ impl TranscriptStore {
     }
 
     pub fn load(&self, session_id: &str) -> Result<Vec<HistoryItem>, String> {
+        self.load_optional(session_id)?
+            .ok_or_else(|| "legacy transcript not found".into())
+    }
+
+    pub fn load_optional(&self, session_id: &str) -> Result<Option<Vec<HistoryItem>>, String> {
         validate_session_id(session_id)?;
         let path = self.path(session_id);
-        let file = fs::File::open(path).map_err(|e| e.to_string())?;
-        std::io::BufReader::new(file)
+        let file = match fs::File::open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.to_string()),
+        };
+        let history = std::io::BufReader::new(file)
             .lines()
             .filter(|line| {
                 line.as_ref()
@@ -64,7 +73,8 @@ impl TranscriptStore {
                 let line = line.map_err(|e| e.to_string())?;
                 serde_json::from_str(&line).map_err(|e| e.to_string())
             })
-            .collect()
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Some(history))
     }
 
     pub fn list(&self) -> Result<Vec<String>, String> {

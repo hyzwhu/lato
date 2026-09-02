@@ -1,4 +1,4 @@
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum HistoryItem {
     System(String),
     User(String),

@@ -1,12 +1,16 @@
-use crate::{RuntimePromptOutcome, RuntimeSession, ToolApproval, TranscriptStore};
+use crate::{
+    RuntimePromptOutcome, RuntimeSession, ToolApproval, TranscriptStore, import_legacy_if_needed,
+};
 use lato_ai::{
     CATALOG, CredentialStore, CustomHttpModelStream, CustomModel, FakeModelStream, HttpModelStream,
     ModelStream, StreamPiece, SwitchableModelStream, adapt_model_stream, api_key_login_allowed,
     custom_model_auth, dialect_implemented, get_auth_refreshing, load_models_json, lookup_model,
     oauth_allowed, phase0_supported, store_oauth,
 };
+use lato_core::{EventStore, JournalReplay, SessionId};
 use lato_mcp::{PluginOrigin, PluginPackage, discover_plugin};
 use lato_protocol::{JsonRpcReq, METHODS_IMPLEMENTED, PROTOCOL_VERSION, err, is_implemented, ok};
+use lato_store::FileEventStore;
 use lato_workspace::{ApprovalMode, FileLocks, SessionTrust};
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
@@ -21,7 +25,7 @@ pub struct AcpHost {
     pub prompts_via_acp: usize,
     model: (String, String),
     transcripts: Option<TranscriptStore>,
-    persisted: HashMap<String, usize>,
+    events: Option<Arc<FileEventStore>>,
     credentials: Option<CredentialStore>,
     custom_models: Vec<CustomModel>,
     plugins: Vec<PluginPackage>,
@@ -50,6 +54,10 @@ impl AcpHost {
         let transcripts = lato_home
             .as_deref()
             .and_then(|home| TranscriptStore::open(home).ok());
+        let events = lato_home
+            .as_deref()
+            .and_then(|home| FileEventStore::open(home).ok())
+            .map(Arc::new);
         let credentials = lato_home
             .as_deref()
             .and_then(|home| CredentialStore::open(home).ok());
@@ -69,7 +77,7 @@ impl AcpHost {
             prompts_via_acp: 0,
             model: ("openai".into(), "gpt-4.1".into()),
             transcripts,
-            persisted: HashMap::new(),
+            events,
             credentials,
             custom_models,
             plugins,
@@ -77,8 +85,36 @@ impl AcpHost {
         }
     }
 
-    fn make_runtime_session(&self, sid: &str) -> Arc<RuntimeSession> {
-        Arc::new(RuntimeSession::new(
+    async fn make_runtime_session(
+        &self,
+        sid: &str,
+        replay: Option<JournalReplay>,
+    ) -> Result<Arc<RuntimeSession>, String> {
+        if let Some(events) = &self.events {
+            let replay = match replay {
+                Some(replay) => replay,
+                None => events
+                    .replay(&SessionId::from(sid))
+                    .await
+                    .map_err(|error| error.to_string())?,
+            };
+            let store: Arc<dyn EventStore> = events.clone();
+            return RuntimeSession::new_with_store(
+                sid.to_string(),
+                self.stream.clone(),
+                self.locks.clone(),
+                self.trust.clone(),
+                self.cwd.clone(),
+                self.updates.clone(),
+                self.tool_approval.clone(),
+                store,
+                replay,
+            )
+            .await
+            .map(Arc::new)
+            .map_err(|error| error.to_string());
+        }
+        Ok(Arc::new(RuntimeSession::new(
             sid.to_string(),
             self.stream.clone(),
             self.locks.clone(),
@@ -86,7 +122,7 @@ impl AcpHost {
             self.cwd.clone(),
             self.updates.clone(),
             self.tool_approval.clone(),
-        ))
+        )))
     }
 
     pub async fn handle(&mut self, req: JsonRpcReq) -> Option<serde_json::Value> {
@@ -106,7 +142,10 @@ impl AcpHost {
                     .as_millis();
                 let sid = format!("s{now}-{}", self.next_id);
                 self.next_id += 1;
-                let session = self.make_runtime_session(&sid);
+                let session = match self.make_runtime_session(&sid, None).await {
+                    Ok(session) => session,
+                    Err(error) => return Some(err(id, -32000, error)),
+                };
                 self.sessions.insert(sid.clone(), session);
                 Some(ok(id, serde_json::json!({"sessionId": sid})))
             }
@@ -127,18 +166,6 @@ impl AcpHost {
                 }
                 match session.prompt(text).await {
                     Ok(RuntimePromptOutcome::Complete { text }) => {
-                        let history = session.history_snapshot().await;
-                        if let Some(store) = &self.transcripts {
-                            let start = *self.persisted.get(sid).unwrap_or(&0);
-                            if let Err(error) = store.append(sid, &history[start..]) {
-                                return Some(err(
-                                    id,
-                                    -32000,
-                                    format!("persist transcript: {error}"),
-                                ));
-                            }
-                            self.persisted.insert(sid.to_string(), history.len());
-                        }
                         let _ = self.updates.send(serde_json::json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":sid,"text":text}}));
                         Some(ok(id, serde_json::json!({"status":"complete","text":text})))
                     }
@@ -167,6 +194,11 @@ impl AcpHost {
                 {
                     sessions.extend(on_disk);
                 }
+                if let Some(store) = &self.events
+                    && let Ok(on_disk) = store.list_sessions().await
+                {
+                    sessions.extend(on_disk.into_iter().map(|session| session.to_string()));
+                }
                 sessions.sort();
                 sessions.dedup();
                 Some(ok(id, serde_json::json!({"sessions": sessions})))
@@ -191,18 +223,31 @@ impl AcpHost {
                     .and_then(|v| v.as_str())
                     .unwrap_or("s1");
                 if !self.sessions.contains_key(sid) {
-                    let session = self.make_runtime_session(sid);
-                    if let Some(store) = &self.transcripts {
-                        match store.load(sid) {
-                            Ok(history) => {
-                                self.persisted.insert(sid.into(), history.len());
-                                session.replace_history(history).await;
+                    let replay = if let Some(events) = &self.events {
+                        match import_legacy_if_needed(
+                            &SessionId::from(sid),
+                            self.transcripts.as_ref(),
+                            events.as_ref(),
+                        )
+                        .await
+                        {
+                            Ok(replay) => Some(replay),
+                            Err(error) => {
+                                return Some(err(id, -32000, error.to_string()));
                             }
-                            Err(e) if !e.contains("No such file") => {
-                                return Some(err(id, -32000, format!("resume transcript: {e}")));
-                            }
-                            Err(_) => {}
                         }
+                    } else {
+                        None
+                    };
+                    let session = match self.make_runtime_session(sid, replay).await {
+                        Ok(session) => session,
+                        Err(error) => return Some(err(id, -32000, error)),
+                    };
+                    if self.events.is_none()
+                        && let Some(store) = &self.transcripts
+                        && let Ok(Some(history)) = store.load_optional(sid)
+                    {
+                        session.replace_history(history).await;
                     }
                     self.sessions.insert(sid.into(), session);
                 }
@@ -695,7 +740,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resumed_transcript_appends_without_duplicating_loaded_rows() {
+    async fn resumed_transcript_is_preserved_while_new_rows_go_to_the_journal() {
         let directory = tempfile::tempdir().unwrap();
         let store = TranscriptStore::open(directory.path()).unwrap();
         store
@@ -709,6 +754,7 @@ mod tests {
             .unwrap();
         let mut host = host();
         host.transcripts = Some(store.clone());
+        host.events = Some(Arc::new(FileEventStore::open(directory.path()).unwrap()));
         host.handle(req(
             1,
             "session/resume",
@@ -729,6 +775,55 @@ mod tests {
             .filter(|item| matches!(item, crate::HistoryItem::User(text) if text == "old"))
             .count();
         assert_eq!(old_user_rows, 1);
-        assert!(loaded.len() > 2);
+        assert_eq!(loaded.len(), 2);
+        let replay = host
+            .events
+            .as_ref()
+            .unwrap()
+            .replay(&SessionId::from("resume-append"))
+            .await
+            .unwrap();
+        assert!(replay.projection.messages.len() > 2);
+    }
+
+    #[tokio::test]
+    async fn session_list_unions_legacy_and_journal_ids_without_duplicates() {
+        let directory = tempfile::tempdir().unwrap();
+        let transcripts = TranscriptStore::open(directory.path()).unwrap();
+        transcripts
+            .append("shared", &[crate::HistoryItem::User("legacy".into())])
+            .unwrap();
+        transcripts
+            .append("legacy-only", &[crate::HistoryItem::User("legacy".into())])
+            .unwrap();
+        let events = Arc::new(FileEventStore::open(directory.path()).unwrap());
+        for sid in ["shared", "journal-only"] {
+            events
+                .append(
+                    lato_core::JournalEnvelope {
+                        schema_version: lato_core::JOURNAL_SCHEMA_VERSION,
+                        record_id: lato_core::JournalRecordId::from(format!("{sid}-0")),
+                        session_id: SessionId::from(sid),
+                        turn_id: None,
+                        journal_sequence: 0,
+                        timestamp_ms: 0,
+                        record: lato_core::JournalRecord::SessionStarted,
+                    },
+                    lato_core::JournalDurability::SyncData,
+                )
+                .await
+                .unwrap();
+        }
+        let mut host = host();
+        host.transcripts = Some(transcripts);
+        host.events = Some(events);
+        let response = host
+            .handle(req(1, "session/list", serde_json::json!({})))
+            .await
+            .unwrap();
+        assert_eq!(
+            response["result"]["sessions"],
+            serde_json::json!(["journal-only", "legacy-only", "shared"])
+        );
     }
 }
