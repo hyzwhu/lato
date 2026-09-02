@@ -102,6 +102,7 @@ impl TurnDriver for LegacyTurnDriver {
                     actor,
                     actor_events,
                 } = &mut *state;
+                actor.set_journal_events(Some(events.clone()));
                 let mut prompt = Box::pin(actor.prompt_with_context(
                     kind,
                     input.text,

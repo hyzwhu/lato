@@ -788,6 +788,7 @@ dependencies = [
  "lato-policy",
  "lato-protocol",
  "lato-runtime",
+ "lato-store",
  "lato-tools",
  "lato-workspace",
  "reqwest",

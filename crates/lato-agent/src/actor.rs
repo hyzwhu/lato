@@ -5,8 +5,11 @@ use lato_ai::{
 };
 pub use lato_core::ApprovalRequest;
 use lato_core::{
-    PolicyDecision, Retryability, SessionId, ToolCallId, ToolContext, ToolError, TurnId,
+    JournalDurability, JournalRecord, ModelContent, ModelMessage, ModelRole, PolicyAuditDecision,
+    PolicyAuditStage, PolicyDecision, Retryability, SessionId, ToolCallId, ToolContext, ToolError,
+    ToolName, TurnId, journal_request_hash,
 };
+use lato_runtime::TurnEventEmitter;
 use lato_tools::{BuiltinToolEnvironment, ToolRuntime, bound_tool_output, builtin_tool_runtime};
 use lato_workspace::{FileLocks, SessionTrust};
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
@@ -46,6 +49,7 @@ pub struct SessionActor {
     next_local_call: u64,
     events: Option<(mpsc::UnboundedSender<serde_json::Value>, String)>,
     tool_approval: Option<Arc<dyn ToolApproval>>,
+    journal_events: Option<TurnEventEmitter>,
     #[cfg(test)]
     pub(crate) on_after_persist: Option<Box<dyn Fn() + Send + Sync>>,
 }
@@ -89,6 +93,7 @@ impl SessionActor {
             next_local_call: 0,
             events: None,
             tool_approval: None,
+            journal_events: None,
             #[cfg(test)]
             on_after_persist: None,
         }
@@ -111,6 +116,10 @@ impl SessionActor {
         let turn_id = TurnId::from(format!("local-turn-{}", self.next_local_turn));
         self.prompt_with_context(kind, text, turn_id, CancellationToken::new())
             .await
+    }
+
+    pub fn set_journal_events(&mut self, events: Option<TurnEventEmitter>) {
+        self.journal_events = events;
     }
 
     pub async fn prompt_with_context(
@@ -162,6 +171,7 @@ impl SessionActor {
                 tokio::spawn(async move { stream.stream(prompt_bytes, context, tx).await });
             let mut saw_tool = false;
             let mut round_text = String::new();
+            let mut uncommitted_text = String::new();
             while let Some(piece) = rx.recv().await {
                 if self.cancelled || self.turn_cancellation.is_cancelled() {
                     self.active = false;
@@ -173,6 +183,7 @@ impl SessionActor {
                             let _ = events.send(serde_json::json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":session_id,"delta":t}}));
                         }
                         round_text.push_str(&t);
+                        uncommitted_text.push_str(&t);
                         self.history.push(HistoryItem::AssistantText(t));
                     }
                     StreamPiece::ToolCall {
@@ -180,6 +191,8 @@ impl SessionActor {
                         name,
                         arguments,
                     } => {
+                        self.commit_assistant_text(&uncommitted_text).await?;
+                        uncommitted_text.clear();
                         saw_tool = true;
                         match self
                             .process_tool_call(id, name, arguments, &mut repeated_calls)
@@ -195,6 +208,7 @@ impl SessionActor {
                 }
             }
             stream_task.await.map_err(|error| error.to_string())??;
+            self.commit_assistant_text(&uncommitted_text).await?;
             if !saw_tool {
                 for piece in extract_text_embedded_tool_calls(&round_text) {
                     let StreamPiece::ToolCall {
@@ -262,6 +276,38 @@ impl SessionActor {
             .unwrap_or(usize::MAX)
     }
 
+    async fn commit_assistant_text(&self, text: &str) -> Result<(), String> {
+        if text.is_empty() {
+            return Ok(());
+        }
+        self.commit(
+            JournalRecord::ConversationItemCommitted {
+                message: ModelMessage {
+                    role: ModelRole::Assistant,
+                    content: vec![ModelContent::Text {
+                        text: text.to_owned(),
+                    }],
+                },
+            },
+            JournalDurability::Flush,
+        )
+        .await
+    }
+
+    async fn commit(
+        &self,
+        record: JournalRecord,
+        durability: JournalDurability,
+    ) -> Result<(), String> {
+        match &self.journal_events {
+            Some(events) => events
+                .commit(record, durability)
+                .await
+                .map_err(|error| error.to_string()),
+            None => Ok(()),
+        }
+    }
+
     async fn process_tool_call(
         &mut self,
         id: String,
@@ -279,6 +325,26 @@ impl SessionActor {
             self.active = false;
             return Err("stalled: identical tool call repeated more than 3 times".into());
         }
+        let call_id = ToolCallId::parse(id.clone()).unwrap_or_else(|_| {
+            self.next_local_call += 1;
+            ToolCallId::from(format!("local-tool-call-{}", self.next_local_call))
+        });
+        let tool_runtime = self.tool_runtime.clone();
+        let journal_name = tool_runtime
+            .descriptor_for_wire_name(&name)
+            .map(|descriptor| descriptor.name)
+            .unwrap_or_else(|| fallback_tool_name(&name));
+        let request_hash = journal_request_hash(journal_name.as_str(), &arguments);
+        self.commit(
+            JournalRecord::ToolCallRequested {
+                call_id: call_id.clone(),
+                name: journal_name,
+                arguments: arguments.clone(),
+                request_hash: request_hash.clone(),
+            },
+            JournalDurability::Flush,
+        )
+        .await?;
         self.history.push(HistoryItem::ToolCall {
             id: id.clone(),
             name: name.clone(),
@@ -289,45 +355,106 @@ impl SessionActor {
             cb();
         }
         if self.cancelled || self.turn_cancellation.is_cancelled() {
+            let error = ToolError::new(
+                "tool.cancelled",
+                "tool call was cancelled",
+                Retryability::Never,
+            );
+            self.commit(
+                JournalRecord::ToolCallRejected {
+                    call_id,
+                    request_hash,
+                    error,
+                },
+                JournalDurability::SyncData,
+            )
+            .await?;
             return Ok(ProcessTool::Cancelled);
         }
-        let call_id = ToolCallId::parse(id.clone()).unwrap_or_else(|_| {
-            self.next_local_call += 1;
-            ToolCallId::from(format!("local-tool-call-{}", self.next_local_call))
-        });
         let context = ToolContext {
             session_id: self.session_id.clone(),
             turn_id: self.turn_id.clone(),
-            call_id,
+            call_id: call_id.clone(),
             cancellation: self.turn_cancellation.clone(),
             execution_grant: None,
         };
-        let tool_runtime = self.tool_runtime.clone();
-        let authorization = match tool_runtime.prepare(context, &name, arguments.clone()) {
+        let authorization = match tool_runtime.authorize(context, &name, arguments.clone()) {
             Ok(prepared) => match tool_runtime.decision(&prepared).clone() {
-                PolicyDecision::Allow(grant) => Ok((prepared, grant)),
+                PolicyDecision::Allow(grant) => {
+                    self.commit(
+                        JournalRecord::PolicyDecisionCommitted {
+                            audit: prepared.policy_audit(
+                                PolicyAuditStage::Evaluated,
+                                PolicyAuditDecision::Allowed,
+                            ),
+                        },
+                        JournalDurability::Flush,
+                    )
+                    .await?;
+                    Ok((prepared, grant))
+                }
                 PolicyDecision::RequireApproval(request) => {
                     let approved = match &self.tool_approval {
                         Some(approval) => approval.approve(&request).await,
                         None => false,
                     };
                     if approved {
-                        tool_runtime
-                            .approve(&request)
-                            .map(|grant| (prepared, grant))
+                        match tool_runtime.approve(&request) {
+                            Ok(grant) => {
+                                self.commit(
+                                    JournalRecord::PolicyDecisionCommitted {
+                                        audit: prepared.policy_audit(
+                                            PolicyAuditStage::ApprovalResolved,
+                                            PolicyAuditDecision::Approved,
+                                        ),
+                                    },
+                                    JournalDurability::Flush,
+                                )
+                                .await?;
+                                Ok((prepared, grant))
+                            }
+                            Err(error) => Err(error),
+                        }
                     } else {
-                        Err(ToolError::new(
+                        let error = ToolError::new(
                             "policy.approval_denied",
                             "tool approval denied by user",
                             Retryability::Never,
-                        ))
+                        );
+                        self.commit(
+                            JournalRecord::PolicyDecisionCommitted {
+                                audit: prepared.policy_audit(
+                                    PolicyAuditStage::ApprovalResolved,
+                                    PolicyAuditDecision::Denied {
+                                        code: error.code.clone(),
+                                    },
+                                ),
+                            },
+                            JournalDurability::Flush,
+                        )
+                        .await?;
+                        Err(error)
                     }
                 }
-                PolicyDecision::Deny(denial) => Err(ToolError::new(
-                    denial.code,
-                    denial.message,
-                    Retryability::Never,
-                )),
+                PolicyDecision::Deny(denial) => {
+                    self.commit(
+                        JournalRecord::PolicyDecisionCommitted {
+                            audit: prepared.policy_audit(
+                                PolicyAuditStage::Evaluated,
+                                PolicyAuditDecision::Denied {
+                                    code: denial.code.clone(),
+                                },
+                            ),
+                        },
+                        JournalDurability::Flush,
+                    )
+                    .await?;
+                    Err(ToolError::new(
+                        denial.code,
+                        denial.message,
+                        Retryability::Never,
+                    ))
+                }
             },
             Err(error) => Err(error),
         };
@@ -335,8 +462,39 @@ impl SessionActor {
             let _ = events.send(serde_json::json!({"jsonrpc":"2.0","method":"session/tool_call","params":{"sessionId":session_id,"name":name,"arguments":arguments}}));
         }
         let invocation = match authorization {
-            Ok((prepared, grant)) => tool_runtime.execute(prepared, grant).await,
-            Err(error) => Err(error),
+            Ok((prepared, grant)) => {
+                let audit = prepared.audit();
+                self.commit(
+                    JournalRecord::ToolCallPrepared {
+                        audit: audit.clone(),
+                    },
+                    JournalDurability::SyncData,
+                )
+                .await?;
+                let result = tool_runtime.execute_authorized(prepared, grant).await;
+                self.commit(
+                    JournalRecord::ToolCallCompleted {
+                        call_id: audit.call_id,
+                        request_hash: audit.request_hash,
+                        result: result.clone(),
+                    },
+                    JournalDurability::SyncData,
+                )
+                .await?;
+                result
+            }
+            Err(error) => {
+                self.commit(
+                    JournalRecord::ToolCallRejected {
+                        call_id,
+                        request_hash,
+                        error: error.clone(),
+                    },
+                    JournalDurability::SyncData,
+                )
+                .await?;
+                Err(error)
+            }
         };
         let out = invocation
             .map(|output| output.content)
@@ -369,6 +527,24 @@ enum ProcessTool {
 }
 
 fn noop_hooks() {}
+
+fn fallback_tool_name(wire_name: &str) -> ToolName {
+    let local: String = wire_name
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    ToolName::parse(format!(
+        "model:{}",
+        if local.is_empty() { "unknown" } else { &local }
+    ))
+    .expect("sanitized fallback tool name must be valid")
+}
 
 fn task_requires_workspace_change(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();

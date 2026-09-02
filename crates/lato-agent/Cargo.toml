@@ -22,5 +22,6 @@ async-trait = "0.1"
 
 [dev-dependencies]
 lato-policy = { path = "../lato-policy" }
+lato-store = { path = "../lato-store" }
 semver = "1"
 tempfile = "3"

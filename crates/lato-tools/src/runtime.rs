@@ -4,8 +4,9 @@ use crate::{
 };
 use lato_core::{
     ApprovalFingerprint, ApprovalRequest, EnvironmentPolicy, ExecutionGrant, NetworkPolicy,
-    PolicyDecision, PolicyMode, PolicyRequest, Retryability, SandboxObligation, SandboxProfile,
-    Tool, ToolContext, ToolDescriptor, ToolError, ToolName, ToolOutput,
+    PolicyAuditDecision, PolicyAuditRecord, PolicyAuditStage, PolicyDecision, PolicyMode,
+    PolicyRequest, PreparedToolAudit, Retryability, SandboxObligation, SandboxProfile, Tool,
+    ToolContext, ToolDescriptor, ToolError, ToolName, ToolOutput, journal_request_hash,
 };
 use lato_policy::{
     ApprovalLedger, NoopPolicyEventSink, PolicyEngine, PolicyEvent, PolicyEventKind,
@@ -50,6 +51,30 @@ pub struct PreparedToolCall {
     request: PolicyRequest,
     fingerprint: ApprovalFingerprint,
     decision: PolicyDecision,
+    audit: PreparedToolAudit,
+}
+
+impl PreparedToolCall {
+    pub fn audit(&self) -> PreparedToolAudit {
+        self.audit.clone()
+    }
+
+    pub fn policy_audit(
+        &self,
+        stage: PolicyAuditStage,
+        decision: PolicyAuditDecision,
+    ) -> PolicyAuditRecord {
+        PolicyAuditRecord {
+            stage,
+            decision,
+            call_id: self.audit.call_id.clone(),
+            tool_name: self.audit.tool_name.clone(),
+            request_hash: self.audit.request_hash.clone(),
+            approval_fingerprint: self.audit.approval_fingerprint.clone(),
+            capabilities: self.audit.capabilities.clone(),
+            sandbox: self.audit.sandbox.clone(),
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -230,6 +255,16 @@ impl ToolRuntime {
             )
         })?;
         let decision = self.policy.evaluate(&request);
+        let audit = PreparedToolAudit {
+            call_id: context.call_id.clone(),
+            tool_name: descriptor.name,
+            request_hash: journal_request_hash(request.tool_name.as_str(), &arguments),
+            approval_fingerprint: fingerprint.clone(),
+            idempotency: descriptor.idempotency,
+            side_effect: descriptor.side_effect,
+            sandbox: request.sandbox.clone(),
+            capabilities: request.capabilities.clone(),
+        };
         Ok(PreparedToolCall {
             context,
             tool,
@@ -237,7 +272,17 @@ impl ToolRuntime {
             request,
             fingerprint,
             decision,
+            audit,
         })
+    }
+
+    pub fn authorize(
+        &self,
+        context: ToolContext,
+        wire_name: &str,
+        arguments: Value,
+    ) -> Result<PreparedToolCall, ToolError> {
+        self.prepare(context, wire_name, arguments)
     }
 
     pub fn decision<'a>(&self, prepared: &'a PreparedToolCall) -> &'a PolicyDecision {
@@ -325,6 +370,14 @@ impl ToolRuntime {
                 Err(error)
             }
         }
+    }
+
+    pub async fn execute_authorized(
+        &self,
+        prepared: PreparedToolCall,
+        grant: ExecutionGrant,
+    ) -> Result<ToolOutput, ToolError> {
+        self.execute(prepared, grant).await
     }
 
     #[doc(hidden)]
