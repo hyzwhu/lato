@@ -154,9 +154,11 @@ Measured on macOS arm64 with Homebrew `rustc 1.98.0` from branch
 | Local install | PASS | `cargo install --path .` replaced `/Users/huangyongzhao/.cargo/bin/lato` with `lato 0.1.0-beta.1` (10,546,512 bytes). |
 | Installed smokes | PASS | Fresh temporary `LATO_HOME`: installed version matched, Doctor JSON parsed with schema 1, fake-model prompt returned `hi`, and session JSON parsed with one persisted session. |
 | Workflow static validation | PASS | Ruby YAML parsing succeeded for `release.yml` and `live-smoke.yml`; release workflow contains five native target entries, an exact archive-count gate, SHA-256 generation, offline smokes, and publish-only `contents: write`; provider secrets occur only in the manual LIVE workflow. |
-| Five-platform remote build | SKIPPED | The GitHub `workflow_dispatch`/tag workflow was not run from this local repository. No remote runner or archive claim is made. |
+| Five-platform remote build | PASS | GitHub Actions run `33596316688` completed successfully for macOS x86_64/arm64, Linux x86_64/arm64, and Windows x86_64; every build, offline Doctor/headless smoke, archive upload, checksum, and publish step passed. |
 | LIVE providers | SKIPPED | The manual `live-provider-smoke` workflow was not dispatched and no provider credentials were used. Release notes must state that LIVE validation is unavailable until a successful run is linked. |
-| GitHub prerelease | NOT PUBLISHED | No remote is configured and no tag was created or pushed. Publishing requires separate authorization after the five-platform workflow passes. |
+| GitHub prerelease | PUBLISHED | `v0.1.0-beta.1` was published as a non-draft prerelease at `https://github.com/hyzwhu/lato/releases/tag/v0.1.0-beta.1` with five platform archives plus `SHA256SUMS`. All five downloaded archives passed local `shasum -a 256 -c SHA256SUMS` verification. |
+| General branch CI | FOLLOW-UP | Initial `master` CI run `33595874555` passed macOS and the no-LIVE-network guard, but the full Linux and Windows test jobs exited 101. The release workflow's native builds and binary smokes passed on both platforms; the failing full-suite cases still require authenticated log inspection and repair. |
 
-The local Beta gate is green. A public tag remains gated on the five native GitHub runner builds;
-missing LIVE credentials do not block the Beta but must remain visible as skipped.
+The downloadable Public Beta gate is green and the five archives are checksum-verified. LIVE provider
+coverage remains explicitly skipped. General Linux/Windows full-suite CI is a visible follow-up and
+must be green before promoting the Beta toward a stable release.
