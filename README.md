@@ -130,6 +130,30 @@ parsers remain the protocol authority.
 independently. A later actor-native phase removes the redundant legacy encode/decode round trip without
 changing the core request, event, capability, cancellation, or typed-error contracts.
 
+### Canonical session journal
+
+Sessions backed by `LATO_HOME` persist canonical records at
+`$LATO_HOME/sessions/<session-id>/events.jsonl`. The journal contains accepted turn input, complete
+conversation items, policy decisions, tool lifecycle boundaries, and turn/session terminals. Model
+and reasoning deltas remain live-only events: they are never replayed as authoritative state.
+
+Journal appends are acknowledged before related visible state is broadcast. A mutating or
+non-idempotent tool is synchronously recorded as prepared before invocation and synchronously
+recorded as completed afterward. If recovery finds a prepared call without a completion, Lato
+reports `journal.incomplete_side_effect` (an unknown outcome) and does not automatically invoke the
+tool again.
+
+Replay is bounded to 64 MiB and 100,000 records per session. It validates schema, session identity,
+dense sequence numbers, unique record IDs, and tool request hashes. Only an interrupted final JSONL
+record is repaired; a complete malformed or structurally divergent record fails closed. On Unix,
+journal files use mode `0600`, session directories use `0700`, and symlink journal targets are
+rejected. Journals may contain prompts, tool arguments/results, paths, and policy metadata, so the
+entire Lato home should be treated as sensitive local data.
+
+Legacy `$LATO_HOME/sessions/<session-id>.jsonl` transcripts are imported lazily and atomically on
+first resume. The original transcript remains unchanged for compatibility; once both formats exist,
+the canonical journal wins. Snapshotting and journal compaction are deferred to Phase 4B.
+
 Copied or structurally derived upstream code is pinned in
 [`docs/superpowers/reference/lato-upstream-sources.md`](docs/superpowers/reference/lato-upstream-sources.md).
 

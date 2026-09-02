@@ -110,3 +110,26 @@ LATO_HOME=$(mktemp -d) lato doctor --json
 LATO_HOME=$(mktemp -d) lato -p "reply with hi only"
 PATH="$HOME/.cargo/bin:$PATH" cargo check --workspace --target x86_64-pc-windows-gnu
 ```
+
+## Phase 4A canonical event journal gate (2026-09-02)
+
+Measured on macOS arm64 with Homebrew `rustc 1.98.0` from branch
+`codex/phase-4a-event-journal`.
+
+| Gate | Result | Evidence |
+|---|---|---|
+| Formatting | PASS | `cargo fmt --all -- --check` exited 0. |
+| Focused journal suites | PASS | `lato-core` journal contract: 4 passed; `lato-store`: 14 passed; `lato-runtime`: 15 passed; `lato-agent`: 64 passed. |
+| Workspace tests | PASS | `cargo test --workspace --no-fail-fast`: **348 passed, 0 failed, 0 ignored** including doc-tests. The runtime wiring assertion was updated to the new `authorize` / `execute_authorized` membrane before the final green run. |
+| Clippy | PASS | `cargo clippy --workspace --all-targets --all-features -- -D warnings` exited 0 with no warnings. |
+| Crash-boundary repetition | PASS | `lato-store/tests/file_recovery.rs` ran 3 times with 12/12 passing each time; `lato-agent/tests/journal_runtime.rs` ran 3 times with 5/5 passing each time. Covered write/flush/sync boundaries, import publication, no duplicate acknowledgement, prepared-before-invoke, and unknown completion outcome. |
+| Legacy migration | PASS | Atomic/idempotent import, retained legacy source, journal precedence, malformed-source no-publication, list deduplication, and unresolved prepared-call refusal all pass. |
+| Source headless journal smoke | PASS | Fresh temporary `LATO_HOME`; `cargo run -q -- -p "reply with hi only"` printed `hi` and created `sessions/s<timestamp>-1/events.jsonl`; offline Doctor JSON parsed with `schema_version == 1`. |
+| Windows cross-check | UNAVAILABLE optional gate | `rustup target list --installed` listed `x86_64-pc-windows-gnu`, but the active Homebrew Rust toolchain could not find that target's `core` crate (`E0463`). No Windows compile claim is made for this checkpoint. Unix-only code remains platform-gated and non-Unix fallbacks compile structurally in the host build. |
+| LIVE vendors | SKIPPED | No live provider credentials or subscription accounts were used; no live-provider claim is made. |
+
+The canonical journal stores no model/reasoning deltas, repairs only a torn final record, and rejects
+complete corruption. Mutating/non-idempotent tools are synchronously prepared before invocation and
+synchronously completed afterward. A prepared call without completion is surfaced as
+`journal.incomplete_side_effect` and is never automatically replayed. Phase 4B snapshotting and
+compaction were intentionally not included in this gate.
