@@ -61,3 +61,4 @@ string_id!(TurnId);
 string_id!(EventId);
 string_id!(ToolCallId);
 string_id!(ModelCallId);
+string_id!(JournalRecordId);

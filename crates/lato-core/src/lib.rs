@@ -2,6 +2,7 @@ mod command;
 mod error;
 mod event;
 mod id;
+mod journal;
 mod model;
 mod policy;
 mod state;
@@ -10,7 +11,13 @@ mod tool;
 pub use command::{Command, StartBehavior, StartTurn, UserInput};
 pub use error::{AgentError, ErrorCategory, Retryability};
 pub use event::{CancelReason, EVENT_SCHEMA_VERSION, EventEnvelope, EventPayload, TurnOutput};
-pub use id::{EventId, IdError, ModelCallId, SessionId, ToolCallId, TurnId};
+pub use id::{EventId, IdError, JournalRecordId, ModelCallId, SessionId, ToolCallId, TurnId};
+pub use journal::{
+    EventStore, JOURNAL_SCHEMA_VERSION, JournalDurability, JournalEnvelope, JournalError,
+    JournalRecord, JournalReplay, JournalTerminal, PolicyAuditDecision, PolicyAuditRecord,
+    PolicyAuditStage, PreparedToolAudit, SessionProjection, UnresolvedToolCall, canonical_json,
+    journal_request_hash, project_journal,
+};
 pub use model::{
     ModelCapabilities, ModelContent, ModelError, ModelEventStream, ModelMessage, ModelPort,
     ModelRequest, ModelRole, ModelSelection, ModelSelectionError, ModelStopReason,
