@@ -132,15 +132,6 @@ pub struct InteractiveAcpClient {
 }
 
 impl InteractiveAcpClient {
-    pub async fn new_with_approval(
-        cwd: std::path::PathBuf,
-        trust: SessionTrust,
-        stream: Arc<dyn ModelStream>,
-        approval: Option<Arc<dyn ToolApproval>>,
-    ) -> Result<Self, String> {
-        Self::new_session_with_approval(cwd, trust, stream, approval).await
-    }
-
     pub async fn new_session_with_approval(
         cwd: std::path::PathBuf,
         trust: SessionTrust,

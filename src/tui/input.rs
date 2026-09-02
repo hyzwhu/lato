@@ -12,6 +12,7 @@ impl InputBuffer {
         Self::default()
     }
 
+    #[cfg(test)]
     pub fn from(text: impl Into<String>) -> Self {
         let text = text.into();
         let cursor = text.len();
@@ -26,14 +27,11 @@ impl InputBuffer {
         self.text.is_empty()
     }
 
-    pub fn cursor_byte(&self) -> usize {
-        self.cursor
-    }
-
     pub fn cursor_width(&self) -> usize {
         UnicodeWidthStr::width(&self.text[..self.cursor])
     }
 
+    #[cfg(test)]
     pub fn display_width(&self) -> usize {
         UnicodeWidthStr::width(self.text.as_str())
     }

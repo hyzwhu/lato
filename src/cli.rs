@@ -1,7 +1,7 @@
 use crate::args::{DoctorArgs, Invocation, LoginMethod, PromptArgs, SandboxArg};
 use crate::tui::i18n::Language;
 use lato::doctor::{self, DoctorDependencies, DoctorOptions, LiveProbe};
-use lato_agent::{ApprovalRequest, ToolApproval, default_fake_stream};
+use lato_agent::default_fake_stream;
 use lato_ai::{
     AuthInteraction, AuthNotice, CATALOG, CredentialStore, CustomHttpModelStream, CustomModel,
     HttpModelStream, ModelApi, ModelStream, ProviderModelsEntry, ProviderModelsStore,
@@ -10,15 +10,6 @@ use lato_ai::{
     refresh_openai_compatible_models, refresh_remote_provider_catalog, store_oauth,
 };
 use lato_workspace::{ApprovalMode, SandboxProfile, SessionTrust};
-use rustyline::{
-    CompletionType, Config, Context, Editor, Helper,
-    completion::{Completer, Pair},
-    error::ReadlineError,
-    highlight::Highlighter,
-    hint::Hinter,
-    history::DefaultHistory,
-    validate::Validator,
-};
 use std::{
     io::{IsTerminal, Write},
     path::PathBuf,
@@ -32,10 +23,6 @@ struct CliSettings {
     #[serde(default)]
     language: Option<Language>,
 }
-
-const INTERACTIVE_COMMANDS: &[&str] = &[
-    "/help", "/clear", "/model", "/login", "/approve", "/status", "/exit", "/quit",
-];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LocalFact {
@@ -139,60 +126,6 @@ fn requested_local_facts(input: &str) -> Vec<LocalFact> {
         }));
     }
     facts
-}
-
-struct LatoLineHelper;
-impl Helper for LatoLineHelper {}
-impl Validator for LatoLineHelper {}
-impl Highlighter for LatoLineHelper {}
-impl Hinter for LatoLineHelper {
-    type Hint = String;
-}
-impl Completer for LatoLineHelper {
-    type Candidate = Pair;
-    fn complete(
-        &self,
-        line: &str,
-        _position: usize,
-        _context: &Context<'_>,
-    ) -> rustyline::Result<(usize, Vec<Pair>)> {
-        if !line.starts_with('/') {
-            return Ok((0, Vec::new()));
-        }
-        Ok((
-            0,
-            INTERACTIVE_COMMANDS
-                .iter()
-                .filter(|command| command.starts_with(line))
-                .map(|command| Pair {
-                    display: (*command).to_string(),
-                    replacement: (*command).to_string(),
-                })
-                .collect(),
-        ))
-    }
-}
-
-struct ConsoleToolApproval;
-
-#[async_trait::async_trait]
-impl ToolApproval for ConsoleToolApproval {
-    async fn approve(&self, request: &ApprovalRequest) -> bool {
-        let tool = request.request.tool_name.to_string();
-        let capabilities = format!("{:?}", request.request.capabilities);
-        let side_effect = format!("{:?}", request.request.side_effect);
-        let summary = request.summary.clone();
-        tokio::task::spawn_blocking(move || {
-            println!(
-                "\nTool request: {tool}\n  capabilities: {capabilities}\n  side effect: {side_effect}\n  {summary}"
-            );
-            read_line("Allow this tool call? [y/N] ")
-                .map(|answer| matches!(answer.to_ascii_lowercase().as_str(), "y" | "yes"))
-                .unwrap_or(false)
-        })
-        .await
-        .unwrap_or(false)
-    }
 }
 
 pub async fn run(args: Vec<String>) -> i32 {
@@ -319,7 +252,7 @@ enum InteractiveStartup {
     Resume(String),
 }
 
-async fn interactive(startup: InteractiveStartup, _language: Option<Language>) -> i32 {
+async fn interactive(startup: InteractiveStartup, language_override: Option<Language>) -> i32 {
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         let message = match startup {
             InteractiveStartup::New => {
@@ -335,50 +268,77 @@ async fn interactive(startup: InteractiveStartup, _language: Option<Language>) -
         eprintln!("error: cannot create {}: {error}", home.display());
         return 1;
     }
-    println!("Lato coding agent\nType /help for commands.\n");
-    let mut selection = match load_settings(&home) {
-        Ok(Some(settings)) => settings.default_model,
-        Ok(None) => match configure_interactively(&home).await {
-            Ok(selection) => selection,
-            Err(error) => {
-                eprintln!("error: {error}");
-                return 1;
-            }
-        },
+    let settings = match load_settings(&home) {
+        Ok(settings) => settings,
         Err(error) => {
             eprintln!("error: {error}");
             return 1;
         }
     };
-    let stream = match configured_stream(&selection).await {
-        Ok(stream) => stream,
-        Err(error) => {
-            eprintln!("The saved model cannot start: {error}");
-            match configure_interactively(&home).await {
-                Ok(new_selection) => {
-                    selection = new_selection;
-                    match configured_stream(&selection).await {
-                        Ok(stream) => stream,
-                        Err(error) => {
-                            eprintln!("error: {error}");
-                            return 1;
-                        }
-                    }
-                }
+    let tui_test_mode = std::env::var_os("LATO_TUI_TEST").is_some();
+    let language = Language::resolve(
+        language_override,
+        settings.as_ref().and_then(|settings| settings.language),
+        Language::system().as_deref(),
+    );
+    let mut selection = if tui_test_mode {
+        "built-in/fake".to_string()
+    } else {
+        match settings {
+            Some(settings) => settings.default_model,
+            None => match configure_interactively(&home).await {
+                Ok(selection) => selection,
                 Err(error) => {
                     eprintln!("error: {error}");
                     return 1;
+                }
+            },
+        }
+    };
+    if !tui_test_mode && let Err(error) = persist_language(&home, language) {
+        eprintln!("error: {error}");
+        return 1;
+    }
+    let stream = if tui_test_mode {
+        default_fake_stream()
+    } else {
+        match configured_stream(&selection).await {
+            Ok(stream) => stream,
+            Err(error) => {
+                eprintln!("The saved model cannot start: {error}");
+                match configure_interactively(&home).await {
+                    Ok(new_selection) => {
+                        selection = new_selection;
+                        match configured_stream(&selection).await {
+                            Ok(stream) => stream,
+                            Err(error) => {
+                                eprintln!("error: {error}");
+                                return 1;
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!("error: {error}");
+                        return 1;
+                    }
                 }
             }
         }
     };
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let trusted = match read_line("Trust this folder and allow edits/commands this session? [y/N] ")
-    {
-        Ok(answer) => matches!(answer.to_ascii_lowercase().as_str(), "y" | "yes"),
-        Err(error) => {
-            eprintln!("error: {error}");
-            return 1;
+    let trust_prompt = match language {
+        Language::ZhCn => "是否信任此文件夹并允许本次会话编辑文件/执行命令？[y/N] ",
+        Language::En => "Trust this folder and allow edits/commands this session? [y/N] ",
+    };
+    let trusted = if tui_test_mode {
+        true
+    } else {
+        match read_line(trust_prompt) {
+            Ok(answer) => matches!(answer.to_ascii_lowercase().as_str(), "y" | "yes"),
+            Err(error) => {
+                eprintln!("error: {error}");
+                return 1;
+            }
         }
     };
     let trust = if trusted {
@@ -387,14 +347,13 @@ async fn interactive(startup: InteractiveStartup, _language: Option<Language>) -
         SessionTrust::for_interactive(&cwd, false)
     };
     let session_trust = trust.clone();
-    let approval = trust.clone();
-    let inline_approval: Option<Arc<dyn ToolApproval>> = (approval.mode == ApprovalMode::Ask)
-        .then(|| Arc::new(ConsoleToolApproval) as Arc<dyn ToolApproval>);
+    let (tui_approval, approvals) = crate::tui::backend::TuiToolApproval::channel();
+    let inline_approval = (trust.mode == ApprovalMode::Ask).then_some(tui_approval);
     let client_result = match &startup {
         InteractiveStartup::New => {
             crate::client::InteractiveAcpClient::new_session_with_approval(
                 cwd.clone(),
-                trust,
+                trust.clone(),
                 stream,
                 inline_approval.clone(),
             )
@@ -403,7 +362,7 @@ async fn interactive(startup: InteractiveStartup, _language: Option<Language>) -
         InteractiveStartup::Resume(session_id) => {
             crate::client::InteractiveAcpClient::resume_session_with_approval(
                 cwd.clone(),
-                trust,
+                trust.clone(),
                 stream,
                 inline_approval.clone(),
                 session_id.clone(),
@@ -411,178 +370,36 @@ async fn interactive(startup: InteractiveStartup, _language: Option<Language>) -
             .await
         }
     };
-    let mut client = match client_result {
+    let client = match client_result {
         Ok(client) => client,
         Err(error) => {
             eprintln!("error: {error}");
             return 1;
         }
     };
-    let history_path = home.join("history");
-    let config = Config::builder()
-        .completion_type(CompletionType::List)
-        .build();
-    let mut editor = match Editor::<LatoLineHelper, DefaultHistory>::with_config(config) {
-        Ok(editor) => editor,
-        Err(error) => {
-            eprintln!("error: initialize line editor: {error}");
-            return 1;
-        }
-    };
-    editor.set_helper(Some(LatoLineHelper));
-    let _ = editor.load_history(&history_path);
-    if let InteractiveStartup::Resume(session_id) = &startup {
-        println!("Resumed session: {session_id}");
+    let mut sessions = crate::client::list_sessions_over_acp(cwd.clone())
+        .await
+        .unwrap_or_default();
+    if !sessions.iter().any(|id| id == client.session_id()) {
+        sessions.push(client.session_id().to_string());
     }
-    println!("Model: {selection}\nWorkspace: {}\n", cwd.display());
-    loop {
-        let input = match editor.readline("lato> ") {
-            Ok(input) => input.trim().to_string(),
-            Err(ReadlineError::Interrupted) => {
-                let _ = editor.save_history(&history_path);
-                println!("^C\nGoodbye.");
-                return 0;
-            }
-            Err(ReadlineError::Eof) => {
-                let _ = editor.save_history(&history_path);
-                println!("Goodbye.");
-                return 0;
-            }
-            Err(error) => {
-                eprintln!("error: {error}");
-                return 1;
-            }
-        };
-        if input.is_empty() {
-            continue;
-        }
-        let _ = editor.add_history_entry(input.as_str());
-        let _ = editor.save_history(&history_path);
-        match input.as_str() {
-            command if is_exit_command(command) => {
-                println!("Goodbye.");
-                return 0;
-            }
-            "/help" => {
-                println!(
-                    "/help       show commands\n/clear      start a fresh conversation\n/model      choose and switch model\n/login      replace credential for the current provider\n/approve    pre-approve one mutating tool call\n/status     show model and workspace\n/exit       quit\n\nUse Up/Down for history and Tab to complete slash commands."
-                );
-                continue;
-            }
-            "/clear" => {
-                match client.clear().await {
-                    Ok(()) => println!("Conversation cleared."),
-                    Err(error) => eprintln!("error: {error}"),
-                }
-                continue;
-            }
-            "/model" => {
-                match configure_interactively(&home).await {
-                    Ok(new_selection) => match configured_stream(&new_selection).await {
-                        Ok(stream) => match crate::client::InteractiveAcpClient::new_with_approval(
-                            cwd.clone(),
-                            session_trust.clone(),
-                            stream,
-                            inline_approval.clone(),
-                        )
-                        .await
-                        {
-                            Ok(new_client) => {
-                                client = new_client;
-                                selection = new_selection;
-                                println!("Switched to {selection}; started a fresh conversation.");
-                            }
-                            Err(error) => eprintln!("error: {error}"),
-                        },
-                        Err(error) => eprintln!("error: {error}"),
-                    },
-                    Err(error) => eprintln!("error: {error}"),
-                }
-                continue;
-            }
-            "/login" => {
-                let Some((provider, _)) = selection.split_once('/') else {
-                    eprintln!("error: invalid current model");
-                    continue;
-                };
-                match configure_provider_auth(&home, provider, true).await {
-                    Ok(()) => match configured_stream(&selection).await {
-                        Ok(stream) => match crate::client::InteractiveAcpClient::new_with_approval(
-                            cwd.clone(),
-                            session_trust.clone(),
-                            stream,
-                            inline_approval.clone(),
-                        )
-                        .await
-                        {
-                            Ok(new_client) => {
-                                client = new_client;
-                                println!(
-                                    "Credential replaced for {provider}; started a fresh conversation."
-                                );
-                            }
-                            Err(error) => eprintln!("error: {error}"),
-                        },
-                        Err(error) => eprintln!("error: {error}"),
-                    },
-                    Err(error) => eprintln!("error: {error}"),
-                }
-                continue;
-            }
-            "/approve" => {
-                approval.allow_once();
-                println!("Approved one mutating tool call.");
-                continue;
-            }
-            "/status" => {
-                println!("Model: {selection}\nWorkspace: {}", cwd.display());
-                continue;
-            }
-            command if command.starts_with('/') => {
-                eprintln!("Unknown command. Type /help.");
-                continue;
-            }
-            _ => {}
-        }
-        if let Some(response) = local_fact_response(&input, &cwd, Some(&selection)) {
-            println!("Lato: {response}\n");
-            continue;
-        }
-        print!("Lato: ");
-        let _ = std::io::stdout().flush();
-        let streamed = std::cell::Cell::new(false);
-        let response = client.send_streaming(input, |event| {
-            if let Some(delta) = event
-                .pointer("/params/delta")
-                .and_then(|value| value.as_str())
-            {
-                streamed.set(true);
-                print!("{delta}");
-                let _ = std::io::stdout().flush();
-            } else if event["method"] == "session/tool_call"
-                && let Some(name) = event
-                    .pointer("/params/name")
-                    .and_then(|value| value.as_str())
-            {
-                println!("\n[tool] {name}");
-            }
-        });
-        tokio::pin!(response);
-        let result = tokio::select! {
-            result = &mut response => result,
-            signal = tokio::signal::ctrl_c() => {
-                let _ = editor.save_history(&history_path);
-                match signal {
-                    Ok(()) => println!("\n^C\nGoodbye."),
-                    Err(error) => eprintln!("\nerror: Ctrl-C handler failed: {error}"),
-                }
-                return 0;
-            }
-        };
-        match result {
-            Ok(_text) if streamed.get() => println!("\n"),
-            Ok(text) => println!("{text}\n"),
-            Err(error) => eprintln!("\nerror: {error}\n"),
+    sessions.sort_by(|left, right| right.cmp(left));
+    match crate::tui::run(crate::tui::InteractiveBootstrap {
+        client,
+        approvals,
+        trust: session_trust,
+        language,
+        workspace: cwd,
+        model: selection,
+        home,
+        sessions,
+    })
+    .await
+    {
+        Ok(()) => 0,
+        Err(error) => {
+            eprintln!("error: {error}");
+            1
         }
     }
 }
@@ -947,6 +764,14 @@ fn save_settings(home: &std::path::Path, settings: &CliSettings) -> Result<(), S
     std::fs::rename(temporary, path).map_err(|e| e.to_string())
 }
 
+pub(crate) fn persist_language(home: &std::path::Path, language: Language) -> Result<(), String> {
+    let mut settings = load_settings(home)?
+        .ok_or_else(|| "cannot persist language before model configuration".to_string())?;
+    settings.language = Some(language);
+    save_settings(home, &settings)
+}
+
+#[cfg(test)]
 fn is_exit_command(command: &str) -> bool {
     matches!(
         command.to_ascii_lowercase().as_str(),
