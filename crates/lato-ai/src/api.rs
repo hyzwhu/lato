@@ -58,7 +58,7 @@ pub fn build_request(
             headers: bearer_headers(auth),
             body: openai_chat_body(model.id, messages, openai_tools, tool_choice, stream),
         }),
-        ModelApi::OpenaiResponses | ModelApi::OpenaiCodexResponses => Ok(HttpRequestSpec {
+        ModelApi::OpenaiResponses => Ok(HttpRequestSpec {
             method: "POST",
             url: format!("{base}/responses"),
             headers: bearer_headers(auth),
@@ -117,6 +117,9 @@ pub fn build_request(
             headers: bearer_headers(auth),
             body: serde_json::json!({"model": model.id, "inputs": messages, "tools":openai_tools, "stream": true}),
         }),
+        ModelApi::OpenaiCodexResponses => {
+            Err("openai-codex requires the dedicated Codex transport".into())
+        }
         ModelApi::PiMessages => Err("dialect_unimplemented".into()),
     }
 }
