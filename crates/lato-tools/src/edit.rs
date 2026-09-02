@@ -19,6 +19,18 @@ pub async fn search_replace(
         .map_err(|e| e.to_string())
 }
 
+pub async fn write_file(locks: &FileLocks, path: &Path, contents: &str) -> Result<(), String> {
+    let _guard = locks.acquire(path).await;
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    tokio::fs::write(path, contents)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -57,5 +69,14 @@ mod tests {
         a.await.unwrap().unwrap();
         b.await.unwrap().unwrap();
         assert_eq!(std::fs::read_to_string(p).unwrap(), "AB");
+    }
+
+    #[tokio::test]
+    async fn write_file_creates_new_utf8_file_and_parents() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("src").join("hello.go");
+        let locks = FileLocks::new();
+        write_file(&locks, &p, "package main\n").await.unwrap();
+        assert_eq!(std::fs::read_to_string(p).unwrap(), "package main\n");
     }
 }

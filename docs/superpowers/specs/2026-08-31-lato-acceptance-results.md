@@ -82,6 +82,21 @@ Measured on macOS arm64, rustc 1.98.0, from workspace HEAD plus this Doctor CLI 
 
 **Public Beta ready:** workspace test gate is now green after updating the stale `tool_runtime.invoke(` wiring assertion to `prepare`/`execute`. Doctor CLI, offline default, Clippy, install, and installed-binary Doctor smokes previously passed; re-measure Clippy/install/smokes before a public claim if those artifacts drift.
 
+## HTTP model tool-loop hardening gate (2026-09-02)
+
+Measured on macOS arm64, rustc 1.98.0, from branch `codex/http-tool-loop-hardening`.
+
+| Gate | Result | Evidence |
+|---|---|---|
+| Focused regressions | PASS | Lossless split-UTF-8 streaming, malformed tool arguments, OpenAI Responses/Anthropic request options, unrelated HTTP 400 classification, repeated-call termination, local-fact false positives, compatibility aliases, model cache, and offline HTTP edit-loop fixtures all pass. |
+| Workspace tests | PASS | `cargo test --workspace --no-fail-fast`: **314 passed, 0 failed, 0 ignored**; all doc-tests pass. |
+| Formatting | PASS | `cargo fmt --all -- --check` exits 0 with no output. |
+| Clippy | PASS | `cargo clippy --workspace --all-targets --all-features -- -D warnings` exits 0 with no warnings. |
+| Install | PASS | `cargo install --path .` replaced `/Users/huangyongzhao/.cargo/bin/lato`. |
+| Installed Doctor | PASS | Empty temporary `LATO_HOME`: human Doctor reports `warn` and exits 0; JSON reports `schema_version: 1`, nine registered tools, and exits 0. |
+| Installed headless smoke | PASS | Fake-model prompt prints `hi`; `lato -p "pwd"` prints the repository working directory. |
+| LIVE vendors | SKIPPED | No live provider credentials were used; no live-provider claim is made by this gate. |
+
 ## Final commands
 
 ```text

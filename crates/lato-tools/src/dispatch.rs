@@ -1,6 +1,6 @@
 use crate::{
     create_subagent_worktree, grep, list_dir, read_file, run_terminal_command_sandboxed,
-    search_replace, todo_write, web_fetch,
+    search_replace, todo_write, web_fetch, write_file,
 };
 use lato_workspace::{ApprovalMode, FileLocks, SessionTrust, deny_write};
 use serde_json::Value;
@@ -29,7 +29,7 @@ pub async fn dispatch(
             .await
         }
         "list_dir" => {
-            let p = arg_path(cwd, &call.arguments, "path")?;
+            let p = arg_path(cwd, &call.arguments, "path").unwrap_or_else(|_| cwd.to_path_buf());
             Ok(serde_json::to_string(&list_dir(&p).await?).unwrap())
         }
         "grep" => {
@@ -41,6 +41,20 @@ pub async fn dispatch(
                 .and_then(|v| v.as_str())
                 .ok_or("missing pattern")?;
             Ok(serde_json::to_string(&grep(&root, pat)?).unwrap())
+        }
+        "write_file" | "write" => {
+            let p = arg_path(cwd, &call.arguments, "path")?;
+            if deny_write(&p) {
+                return Err("denied by write policy".into());
+            }
+            require_mutating_approval(trust)?;
+            let contents = call
+                .arguments
+                .get("contents")
+                .or_else(|| call.arguments.get("content"))
+                .and_then(|v| v.as_str())
+                .ok_or("missing contents")?;
+            write_file(locks, &p, contents).await.map(|_| "ok".into())
         }
         "search_replace" => {
             let p = arg_path(cwd, &call.arguments, "path")?;
@@ -114,7 +128,7 @@ pub async fn dispatch(
 pub fn requires_approval(name: &str) -> bool {
     matches!(
         name.strip_prefix("Lato:").unwrap_or(name),
-        "search_replace" | "run_terminal_command" | "spawn_subagent"
+        "search_replace" | "write_file" | "write" | "run_terminal_command" | "spawn_subagent"
     )
 }
 
@@ -187,6 +201,65 @@ mod tests {
             std::fs::read_to_string(d.path().join("file.txt")).unwrap(),
             "after"
         );
+    }
+
+    #[tokio::test]
+    async fn list_dir_defaults_to_workspace_when_path_is_missing() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("file.txt"), "x").unwrap();
+        let locks = FileLocks::new();
+        let trust = SessionTrust::for_headless_prompt(d.path());
+        let output = dispatch(
+            &locks,
+            &trust,
+            d.path(),
+            ToolCall {
+                name: "list_dir".into(),
+                arguments: serde_json::json!({}),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(output.contains("file.txt"), "{output}");
+    }
+
+    #[tokio::test]
+    async fn write_file_creates_hello_world_and_denies_env() {
+        let d = tempfile::tempdir().unwrap();
+        let locks = FileLocks::new();
+        let trust = SessionTrust::for_headless_prompt(d.path());
+        dispatch(
+            &locks,
+            &trust,
+            d.path(),
+            ToolCall {
+                name: "write_file".into(),
+                arguments: serde_json::json!({
+                    "path":"hello.go",
+                    "contents":"package main\n\nimport \"fmt\"\n\nfunc main() {\n\tfmt.Println(\"Hello, World!\")\n}\n"
+                }),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            std::fs::read_to_string(d.path().join("hello.go"))
+                .unwrap()
+                .contains("Hello, World!")
+        );
+        let err = dispatch(
+            &locks,
+            &trust,
+            d.path(),
+            ToolCall {
+                name: "write_file".into(),
+                arguments: serde_json::json!({"path":".env","contents":"A=1"}),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("denied"));
+        assert!(!d.path().join(".env").exists());
     }
 
     #[tokio::test]
