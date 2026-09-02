@@ -2,8 +2,53 @@ use lato_core::{
     EventStore, JOURNAL_SCHEMA_VERSION, JournalDurability, JournalEnvelope, JournalRecord,
     JournalRecordId, SessionId,
 };
-use lato_store::{FileEventStore, MAX_JOURNAL_BYTES};
-use std::io::Write;
+use lato_store::{FaultPoint, FileEventStore, FileFaultInjector, MAX_JOURNAL_BYTES};
+use std::{
+    io::Write,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
+
+struct CountingFault {
+    point: FaultPoint,
+    remaining: AtomicUsize,
+}
+
+impl CountingFault {
+    fn once(point: FaultPoint) -> Arc<Self> {
+        Arc::new(Self {
+            point,
+            remaining: AtomicUsize::new(1),
+        })
+    }
+
+    fn times(point: FaultPoint, times: usize) -> Arc<Self> {
+        Arc::new(Self {
+            point,
+            remaining: AtomicUsize::new(times),
+        })
+    }
+}
+
+impl FileFaultInjector for CountingFault {
+    fn check(&self, point: FaultPoint) -> Result<(), lato_core::JournalError> {
+        if point == self.point
+            && self
+                .remaining
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+        {
+            return Err(lato_core::JournalError::Io {
+                message: format!("injected {point:?}"),
+            });
+        }
+        Ok(())
+    }
+}
 
 #[tokio::test]
 async fn invalid_unterminated_tail_is_truncated() {
@@ -139,6 +184,152 @@ async fn journal_and_session_directory_have_private_permissions() {
             & 0o777,
         0o700
     );
+}
+
+#[tokio::test]
+async fn every_append_fault_boundary_recovers_to_one_acknowledged_record() {
+    for point in [
+        FaultPoint::BeforeWrite,
+        FaultPoint::AfterWrite,
+        FaultPoint::BeforeFlush,
+        FaultPoint::AfterFlush,
+        FaultPoint::BeforeSyncData,
+        FaultPoint::AfterSyncData,
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let store =
+            FileEventStore::open_with_fault_injector(directory.path(), CountingFault::once(point))
+                .unwrap();
+        let sid = SessionId::from("fault-session");
+        store
+            .append(envelope(&sid, 0), JournalDurability::SyncData)
+            .await
+            .unwrap_or_else(|error| panic!("{point:?} did not recover: {error}"));
+        let replay = store.replay(&sid).await.unwrap();
+        assert_eq!(replay.envelopes.len(), 1, "fault point {point:?}");
+        assert_eq!(replay.envelopes[0].journal_sequence, 0);
+    }
+}
+
+#[tokio::test]
+async fn failed_retry_does_not_advance_the_persisted_prefix() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = FileEventStore::open_with_fault_injector(
+        directory.path(),
+        CountingFault::times(FaultPoint::BeforeWrite, 2),
+    )
+    .unwrap();
+    let sid = SessionId::from("failed-retry-session");
+    assert!(
+        store
+            .append(envelope(&sid, 0), JournalDurability::SyncData)
+            .await
+            .is_err()
+    );
+    assert!(store.replay(&sid).await.unwrap().envelopes.is_empty());
+    store
+        .append(envelope(&sid, 0), JournalDurability::SyncData)
+        .await
+        .unwrap();
+    assert_eq!(store.replay(&sid).await.unwrap().envelopes.len(), 1);
+}
+
+#[tokio::test]
+async fn import_faults_never_replace_an_existing_authoritative_journal() {
+    let sid = SessionId::from("import-fault-session");
+
+    let before_directory = tempfile::tempdir().unwrap();
+    let before = FileEventStore::open_with_fault_injector(
+        before_directory.path(),
+        CountingFault::once(FaultPoint::BeforeRename),
+    )
+    .unwrap();
+    assert!(
+        before
+            .import_if_absent(&sid, vec![envelope(&sid, 0)])
+            .await
+            .is_err()
+    );
+    assert!(!before.replay(&sid).await.unwrap().exists);
+    assert_eq!(
+        before
+            .import_if_absent(&sid, vec![envelope(&sid, 0)])
+            .await
+            .unwrap()
+            .envelopes
+            .len(),
+        1
+    );
+
+    let after_directory = tempfile::tempdir().unwrap();
+    let after = FileEventStore::open_with_fault_injector(
+        after_directory.path(),
+        CountingFault::once(FaultPoint::AfterRename),
+    )
+    .unwrap();
+    assert!(
+        after
+            .import_if_absent(&sid, vec![envelope(&sid, 0)])
+            .await
+            .is_err()
+    );
+    let reopened = FileEventStore::open(after_directory.path()).unwrap();
+    assert_eq!(reopened.replay(&sid).await.unwrap().envelopes.len(), 1);
+    let different = vec![envelope(&sid, 0), envelope(&sid, 1)];
+    assert_eq!(
+        reopened
+            .import_if_absent(&sid, different)
+            .await
+            .unwrap()
+            .envelopes
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn concurrent_imports_converge_without_overwriting() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(FileEventStore::open(directory.path()).unwrap());
+    let sid = SessionId::from("concurrent-import-session");
+    let first = {
+        let store = store.clone();
+        let sid = sid.clone();
+        tokio::spawn(async move {
+            store
+                .import_if_absent(&sid, vec![envelope(&sid, 0)])
+                .await
+                .unwrap()
+        })
+    };
+    let second = {
+        let store = store.clone();
+        let sid = sid.clone();
+        tokio::spawn(async move {
+            store
+                .import_if_absent(&sid, vec![envelope(&sid, 0), envelope(&sid, 1)])
+                .await
+                .unwrap()
+        })
+    };
+    let first = first.await.unwrap();
+    let second = second.await.unwrap();
+    assert_eq!(first.envelopes, second.envelopes);
+    assert_eq!(store.replay(&sid).await.unwrap().envelopes, first.envelopes);
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinked_sessions_directory_is_rejected() {
+    use std::os::unix::fs::symlink;
+    let directory = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    symlink(outside.path(), directory.path().join("sessions")).unwrap();
+    let error = match FileEventStore::open(directory.path()) {
+        Ok(_) => panic!("symlinked sessions directory must be rejected"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code(), "journal.unsafe_restore");
 }
 
 fn envelope(session_id: &SessionId, sequence: u64) -> JournalEnvelope {

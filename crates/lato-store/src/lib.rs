@@ -2,7 +2,7 @@ mod file;
 mod memory;
 mod writer;
 
-pub use file::FileEventStore;
+pub use file::{FaultPoint, FileEventStore, FileFaultInjector};
 pub use memory::MemoryEventStore;
 
 pub const MAX_JOURNAL_BYTES: u64 = 64 * 1024 * 1024;

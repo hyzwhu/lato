@@ -13,22 +13,57 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     path::{Path, PathBuf},
+    sync::Arc,
 };
 use tokio::sync::Mutex;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FaultPoint {
+    BeforeWrite,
+    AfterWrite,
+    BeforeFlush,
+    AfterFlush,
+    BeforeSyncData,
+    AfterSyncData,
+    BeforeRename,
+    AfterRename,
+}
+
+#[doc(hidden)]
+pub trait FileFaultInjector: Send + Sync {
+    fn check(&self, point: FaultPoint) -> Result<(), JournalError>;
+}
+
+struct NoFaults;
+
+impl FileFaultInjector for NoFaults {
+    fn check(&self, _point: FaultPoint) -> Result<(), JournalError> {
+        Ok(())
+    }
+}
 
 pub struct FileEventStore {
     sessions_dir: PathBuf,
     writers: Mutex<BTreeMap<SessionId, WriterHandle>>,
+    faults: Arc<dyn FileFaultInjector>,
 }
 
 impl FileEventStore {
     pub fn open(lato_home: &Path) -> Result<Self, JournalError> {
+        Self::open_with_fault_injector(lato_home, Arc::new(NoFaults))
+    }
+
+    #[doc(hidden)]
+    pub fn open_with_fault_injector(
+        lato_home: &Path,
+        faults: Arc<dyn FileFaultInjector>,
+    ) -> Result<Self, JournalError> {
         let sessions_dir = lato_home.join("sessions");
-        fs::create_dir_all(&sessions_dir).map_err(io_error)?;
-        set_dir_permissions(&sessions_dir)?;
+        ensure_secure_directory(&sessions_dir)?;
         Ok(Self {
             sessions_dir,
             writers: Mutex::new(BTreeMap::new()),
+            faults,
         })
     }
 
@@ -45,7 +80,11 @@ impl FileEventStore {
         if let Some(writer) = writers.get(session_id) {
             return Ok(writer.clone());
         }
-        let writer = WriterHandle::spawn(session_id.clone(), self.journal_path(session_id)?);
+        let writer = WriterHandle::spawn(
+            session_id.clone(),
+            self.journal_path(session_id)?,
+            self.faults.clone(),
+        );
         writers.insert(session_id.clone(), writer.clone());
         Ok(writer)
     }
@@ -84,6 +123,7 @@ impl EventStore for FileEventStore {
         ensure_capacity(envelopes.len(), bytes, envelopes.len() as u64)?;
         let session_id = session_id.clone();
         let path = self.journal_path(&session_id)?;
+        let faults = self.faults.clone();
         tokio::task::spawn_blocking(move || {
             if path.exists() {
                 return replay_path_blocking(&session_id, &path);
@@ -91,8 +131,7 @@ impl EventStore for FileEventStore {
             let parent = path.parent().ok_or_else(|| JournalError::MigrationFailed {
                 message: "journal path has no parent".into(),
             })?;
-            fs::create_dir_all(parent).map_err(io_error)?;
-            set_dir_permissions(parent)?;
+            ensure_secure_directory(parent)?;
             let temp = parent.join(format!(
                 "events.jsonl.{}.{}.tmp",
                 std::process::id(),
@@ -103,9 +142,21 @@ impl EventStore for FileEventStore {
                 let _ = fs::remove_file(&temp);
                 return replay_path_blocking(&session_id, &path);
             }
-            fs::rename(&temp, &path).map_err(|error| JournalError::MigrationFailed {
-                message: error.to_string(),
-            })?;
+            faults.check(FaultPoint::BeforeRename)?;
+            match fs::hard_link(&temp, &path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let _ = fs::remove_file(&temp);
+                    return replay_path_blocking(&session_id, &path);
+                }
+                Err(error) => {
+                    return Err(JournalError::MigrationFailed {
+                        message: error.to_string(),
+                    });
+                }
+            }
+            faults.check(FaultPoint::AfterRename)?;
+            fs::remove_file(&temp).map_err(io_error)?;
             sync_directory(parent)?;
             let replay = replay_path_blocking(&session_id, &path)?;
             if replay.projection != projection {
@@ -134,7 +185,9 @@ impl EventStore for FileEventStore {
                 let Ok(session_id) = SessionId::parse(name) else {
                     continue;
                 };
-                if entry.path().join("events.jsonl").is_file() {
+                if fs::symlink_metadata(entry.path().join("events.jsonl"))
+                    .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+                {
                     sessions.push(session_id);
                 }
             }
@@ -161,6 +214,7 @@ pub(crate) fn append_envelope_blocking(
     path: &Path,
     envelope: &JournalEnvelope,
     durability: JournalDurability,
+    faults: &dyn FileFaultInjector,
 ) -> Result<(), JournalError> {
     let replay = replay_path_blocking(session_id, path)?;
     let mut candidate = replay.envelopes;
@@ -179,17 +233,34 @@ pub(crate) fn append_envelope_blocking(
     let parent = path.parent().ok_or_else(|| JournalError::Io {
         message: "journal path has no parent".into(),
     })?;
-    fs::create_dir_all(parent).map_err(io_error)?;
-    set_dir_permissions(parent)?;
+    ensure_secure_directory(parent)?;
     let new_file = !path.exists();
     let mut file = secure_append(path)?;
+    faults.check(FaultPoint::BeforeWrite)?;
     file.write_all(&line).map_err(io_error)?;
+    faults.check(FaultPoint::AfterWrite)?;
+    faults.check(FaultPoint::BeforeFlush)?;
     file.flush().map_err(io_error)?;
+    faults.check(FaultPoint::AfterFlush)?;
     if durability == JournalDurability::SyncData {
+        faults.check(FaultPoint::BeforeSyncData)?;
         file.sync_data().map_err(io_error)?;
+        faults.check(FaultPoint::AfterSyncData)?;
         if new_file {
             sync_directory(parent)?;
         }
+    }
+    Ok(())
+}
+
+pub(crate) fn satisfy_existing_durability(
+    path: &Path,
+    durability: JournalDurability,
+) -> Result<(), JournalError> {
+    let mut file = secure_append(path)?;
+    file.flush().map_err(io_error)?;
+    if durability == JournalDurability::SyncData {
+        file.sync_data().map_err(io_error)?;
     }
     Ok(())
 }
@@ -218,7 +289,7 @@ pub(crate) fn replay_path_blocking(
     }
     let mut file = secure_read(path)?;
     let opened = file.metadata().map_err(io_error)?;
-    if !opened.is_file() || opened.len() > MAX_JOURNAL_BYTES {
+    if !opened.is_file() || opened.len() > MAX_JOURNAL_BYTES || !same_file(&metadata, &opened) {
         return Err(JournalError::UnsafeRestore {
             message: "journal changed during open".into(),
         });
@@ -406,6 +477,42 @@ fn set_dir_permissions(path: &Path) -> Result<(), JournalError> {
 #[cfg(not(unix))]
 fn set_dir_permissions(_path: &Path) -> Result<(), JournalError> {
     Ok(())
+}
+
+fn ensure_secure_directory(path: &Path) -> Result<(), JournalError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err(JournalError::UnsafeRestore {
+                message: format!("journal directory is unsafe: {}", path.display()),
+            });
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir_all(path).map_err(io_error)?;
+        }
+        Err(error) => return Err(io_error(error)),
+    }
+    let metadata = fs::symlink_metadata(path).map_err(io_error)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(JournalError::UnsafeRestore {
+            message: format!(
+                "journal directory changed during creation: {}",
+                path.display()
+            ),
+        });
+    }
+    set_dir_permissions(path)
+}
+
+#[cfg(unix)]
+fn same_file(before: &fs::Metadata, after: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    before.dev() == after.dev() && before.ino() == after.ino()
+}
+
+#[cfg(not(unix))]
+fn same_file(before: &fs::Metadata, after: &fs::Metadata) -> bool {
+    before.len() == after.len()
 }
 
 #[cfg(unix)]

@@ -2,9 +2,11 @@
 // License: Apache-2.0
 // Lato changes: reduced the rollout writer to a bounded per-session journal command queue
 
-use crate::file::{append_envelope_blocking, replay_path_blocking};
+use crate::file::{
+    FileFaultInjector, append_envelope_blocking, replay_path_blocking, satisfy_existing_durability,
+};
 use lato_core::{JournalDurability, JournalEnvelope, JournalError, SessionId};
-use std::path::PathBuf;
+use std::{path::PathBuf, sync::Arc};
 use tokio::sync::{mpsc, oneshot};
 
 const WRITER_CAPACITY: usize = 128;
@@ -26,7 +28,11 @@ enum WriterCommand {
 }
 
 impl WriterHandle {
-    pub(crate) fn spawn(session_id: SessionId, path: PathBuf) -> Self {
+    pub(crate) fn spawn(
+        session_id: SessionId,
+        path: PathBuf,
+        faults: Arc<dyn FileFaultInjector>,
+    ) -> Self {
         let (tx, mut rx) = mpsc::channel(WRITER_CAPACITY);
         tokio::spawn(async move {
             while let Some(command) = rx.recv().await {
@@ -38,8 +44,15 @@ impl WriterHandle {
                     } => {
                         let session_id = session_id.clone();
                         let path = path.clone();
+                        let faults = faults.clone();
                         let result = tokio::task::spawn_blocking(move || {
-                            append_with_recovery(&session_id, &path, *envelope, durability)
+                            append_with_recovery(
+                                &session_id,
+                                &path,
+                                *envelope,
+                                durability,
+                                faults.as_ref(),
+                            )
                         })
                         .await
                         .map_err(|error| JournalError::Io {
@@ -98,8 +111,9 @@ fn append_with_recovery(
     path: &std::path::Path,
     envelope: JournalEnvelope,
     durability: JournalDurability,
+    faults: &dyn FileFaultInjector,
 ) -> Result<(), JournalError> {
-    match append_envelope_blocking(session_id, path, &envelope, durability) {
+    match append_envelope_blocking(session_id, path, &envelope, durability, faults) {
         Ok(()) => Ok(()),
         Err(first @ JournalError::Io { .. }) => {
             let replay = replay_path_blocking(session_id, path)?;
@@ -108,13 +122,13 @@ fn append_with_recovery(
                 .last()
                 .is_some_and(|saved| saved.record_id == envelope.record_id)
             {
-                return Ok(());
+                return satisfy_existing_durability(path, durability);
             }
-            append_envelope_blocking(session_id, path, &envelope, durability).map_err(|second| {
-                JournalError::Io {
+            append_envelope_blocking(session_id, path, &envelope, durability, faults).map_err(
+                |second| JournalError::Io {
                     message: format!("{first}; retry failed: {second}"),
-                }
-            })
+                },
+            )
         }
         Err(error) => Err(error),
     }
