@@ -100,7 +100,29 @@ impl CodexEventMapper {
                     arguments,
                 }])
             }
-            "response.completed" | "response.incomplete" => {
+            "response.output_item.done"
+                if value.pointer("/item/type").and_then(|value| value.as_str())
+                    == Some("function_call") =>
+            {
+                self.started = true;
+                let item = &value["item"];
+                let item_id = required_string(item, "id")?;
+                let Some(call) = self.pending.remove(&item_id) else {
+                    return Ok(Vec::new());
+                };
+                let raw = item
+                    .get("arguments")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or(&call.arguments);
+                let arguments = serde_json::from_str(raw)
+                    .map_err(|_| format!("invalid tool arguments for {}", call.call_id))?;
+                Ok(vec![StreamPiece::ToolCall {
+                    id: call.call_id,
+                    name: call.name,
+                    arguments,
+                }])
+            }
+            "response.completed" | "response.done" | "response.incomplete" => {
                 self.started = true;
                 self.terminal = true;
                 Ok(Vec::new())

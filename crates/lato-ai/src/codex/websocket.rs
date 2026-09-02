@@ -11,8 +11,8 @@ use tokio_tungstenite::{
     tungstenite::{Message, client::IntoClientRequest, http::HeaderValue},
 };
 
-const MAX_CONNECTIONS: usize = 8;
-const IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const MAX_CONNECTIONS: usize = 32;
+const IDLE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;

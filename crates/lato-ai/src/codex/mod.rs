@@ -3,7 +3,7 @@ pub(crate) mod sse;
 pub(crate) mod websocket;
 
 use crate::StreamPiece;
-use crate::{Auth, Model, responses_input, responses_tools};
+use crate::{Auth, Model, responses_tools};
 use std::collections::HashSet;
 use std::sync::{Mutex, OnceLock};
 use tokio::sync::mpsc;
@@ -24,7 +24,7 @@ pub struct CodexTransportError {
 impl CodexTransportError {
     pub(crate) fn before_stream(message: impl Into<String>) -> Self {
         Self {
-            message: message.into(),
+            message: safe_error_excerpt(&message.into()),
             events_started: false,
         }
     }
@@ -34,10 +34,18 @@ impl CodexTransportError {
         mapper: &events::CodexEventMapper,
     ) -> Self {
         Self {
-            message: message.into(),
+            message: safe_error_excerpt(&message.into()),
             events_started: mapper.started(),
         }
     }
+}
+
+fn safe_error_excerpt(message: &str) -> String {
+    message
+        .chars()
+        .filter(|character| !character.is_control() || matches!(character, '\n' | '\t'))
+        .take(4096)
+        .collect()
 }
 
 fn websocket_fallback_sessions() -> &'static Mutex<HashSet<String>> {
@@ -183,14 +191,25 @@ pub fn build_codex_request(
         "store": false,
         "stream": true,
         "instructions": if instructions.is_empty() { "You are a helpful assistant." } else { &instructions },
-        "input": responses_input(input_messages),
+        "input": codex_input(input_messages),
         "text": { "verbosity": context.get("text_verbosity").and_then(|value| value.as_str()).unwrap_or("low") },
         "include": ["reasoning.encrypted_content"],
         "tool_choice": context.get("tool_choice").cloned().unwrap_or_else(|| serde_json::json!("auto")),
         "parallel_tool_calls": true,
     });
     if !tools.as_array().is_none_or(Vec::is_empty) {
-        body["tools"] = tools;
+        body["tools"] = serde_json::Value::Array(
+            tools
+                .as_array()
+                .unwrap()
+                .iter()
+                .cloned()
+                .map(|mut tool| {
+                    tool["strict"] = serde_json::Value::Null;
+                    tool
+                })
+                .collect(),
+        );
     }
     if let Some(session_key) = &session_key {
         body["prompt_cache_key"] = serde_json::json!(session_key);
@@ -213,6 +232,62 @@ pub fn build_codex_request(
         body,
         session_key,
     })
+}
+
+fn codex_input(messages: serde_json::Value) -> serde_json::Value {
+    let Some(messages) = messages.as_array() else {
+        return messages;
+    };
+    let mut input = Vec::new();
+    for (index, message) in messages.iter().enumerate() {
+        match message.get("role").and_then(|value| value.as_str()) {
+            Some("user") => input.push(serde_json::json!({
+                "role": "user",
+                "content": [{
+                    "type": "input_text",
+                    "text": message.get("content").and_then(|value| value.as_str()).unwrap_or("")
+                }]
+            })),
+            Some("assistant") => {
+                if let Some(text) = message
+                    .get("content")
+                    .and_then(|value| value.as_str())
+                    .filter(|text| !text.is_empty())
+                {
+                    input.push(serde_json::json!({
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type":"output_text","text":text,"annotations":[]}],
+                        "status": "completed",
+                        "id": format!("msg_lato_{index}")
+                    }));
+                }
+                for call in message
+                    .get("tool_calls")
+                    .and_then(|value| value.as_array())
+                    .into_iter()
+                    .flatten()
+                {
+                    let Some(function) = call.get("function") else {
+                        continue;
+                    };
+                    input.push(serde_json::json!({
+                        "type": "function_call",
+                        "call_id": call.get("id").cloned().unwrap_or_default(),
+                        "name": function.get("name").cloned().unwrap_or_default(),
+                        "arguments": function.get("arguments").cloned().unwrap_or_else(|| serde_json::json!("{}"))
+                    }));
+                }
+            }
+            Some("tool") => input.push(serde_json::json!({
+                "type": "function_call_output",
+                "call_id": message.get("tool_call_id").cloned().unwrap_or_default(),
+                "output": message.get("content").cloned().unwrap_or_default()
+            })),
+            _ => input.push(message.clone()),
+        }
+    }
+    serde_json::Value::Array(input)
 }
 
 fn set_header(headers: &mut Vec<(String, String)>, key: String, value: String) {
@@ -247,6 +322,10 @@ fn clamp_prompt_cache_key(value: &str) -> String {
 mod tests {
     use super::*;
     use crate::ModelApi;
+    use futures_util::{SinkExt, StreamExt};
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio_tungstenite::{accept_async, tungstenite::Message};
 
     #[test]
     fn builds_pi_compatible_codex_request_contract() {
@@ -303,5 +382,91 @@ mod tests {
             base_url: Some("https://chatgpt.com/backend-api"),
         };
         assert!(build_codex_request(&model, &Auth::default(), &serde_json::json!([])).is_err());
+    }
+
+    fn local_request(base_url: &'static str, session: &str) -> CodexRequest {
+        build_codex_request(
+            &Model {
+                provider: "openai-codex",
+                id: "gpt-5-codex",
+                api: ModelApi::OpenaiCodexResponses,
+                base_url: Some(base_url),
+            },
+            &Auth {
+                api_key: Some("token".into()),
+                account_id: Some("acct".into()),
+                ..Default::default()
+            },
+            &serde_json::json!({"messages":[],"session_id":session,"turn_id":"turn"}),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn codex_falls_back_to_sse_only_before_stream_start() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut websocket = accept_async(socket).await.unwrap();
+            let _ = websocket.next().await;
+            websocket.close(None).await.unwrap();
+
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 16 * 1024];
+            let _ = socket.read(&mut request).await.unwrap();
+            let body = concat!(
+                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"fallback-ok\"}\n\n",
+                "data: {\"type\":\"response.completed\",\"response\":{}}\n\n"
+            );
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        });
+        let base_url: &'static str = Box::leak(format!("http://{address}").into_boxed_str());
+        let request = local_request(base_url, "fallback-before-stream-test");
+        let (tx, mut rx) = mpsc::channel(2);
+        stream_codex(&crate::http_client_for_url(&request.url), &request, tx)
+            .await
+            .unwrap();
+        assert!(matches!(rx.recv().await, Some(StreamPiece::Text(text)) if text == "fallback-ok"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn codex_does_not_replay_after_a_websocket_event() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut websocket = accept_async(socket).await.unwrap();
+            let _ = websocket.next().await;
+            websocket
+                .send(Message::Text(
+                    r#"{"type":"response.output_text.delta","delta":"started"}"#.into(),
+                ))
+                .await
+                .unwrap();
+            websocket.close(None).await.unwrap();
+            tokio::time::timeout(Duration::from_millis(200), listener.accept())
+                .await
+                .is_ok()
+        });
+        let base_url: &'static str = Box::leak(format!("http://{address}").into_boxed_str());
+        let request = local_request(base_url, "fallback-after-stream-test");
+        let (tx, mut rx) = mpsc::channel(2);
+        let error = stream_codex(&crate::http_client_for_url(&request.url), &request, tx)
+            .await
+            .unwrap_err();
+        assert!(error.contains("closed"));
+        assert!(matches!(rx.recv().await, Some(StreamPiece::Text(text)) if text == "started"));
+        assert!(!server.await.unwrap(), "SSE replay must not be attempted");
     }
 }
