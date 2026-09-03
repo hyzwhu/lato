@@ -167,37 +167,55 @@ pub async fn stream_http_request(
     tx: mpsc::Sender<StreamPiece>,
 ) -> Result<(), String> {
     let mut response = send_request_response(client, request).await?;
-    let mut body = Vec::<u8>::new();
-    let mut line_start = 0usize;
-    while let Some(chunk) = response.chunk().await.map_err(|error| error.to_string())? {
-        body.extend_from_slice(&chunk);
-        while let Some(relative_end) = body[line_start..].iter().position(|byte| *byte == b'\n') {
-            let line_end = line_start + relative_end;
-            let line = std::str::from_utf8(&body[line_start..line_end])
+    let mut buffered = Vec::<u8>::new();
+    let mut decoder = WireDecoder::default();
+    let mut parser = ModelEventParser::default();
+    'read: loop {
+        let chunk = tokio::select! {
+            _ = tx.closed() => return Err("stream receiver closed".into()),
+            chunk = response.chunk() => chunk.map_err(|error| error.to_string())?,
+        };
+        let Some(chunk) = chunk else {
+            break;
+        };
+        buffered.extend_from_slice(&chunk);
+        let mut start = 0;
+        while let Some(end) = buffered[start..].iter().position(|byte| *byte == b'\n') {
+            let end = start + end;
+            let line = std::str::from_utf8(&buffered[start..end])
                 .map_err(|_| "model response was not valid UTF-8".to_string())?;
-            for piece in parse_stream_text_line(line) {
-                tx.send(piece)
-                    .await
-                    .map_err(|_| "stream receiver closed".to_string())?;
+            if let Some(value) = decoder.line(line)? {
+                send_pieces(&tx, parser.accept(value)?).await?;
             }
-            line_start = line_end + 1;
+            start = end + 1;
+            if decoder.terminal || parser.terminal {
+                buffered.clear();
+                break 'read;
+            }
+        }
+        buffered.drain(..start);
+    }
+    if !buffered.is_empty() {
+        let line = std::str::from_utf8(&buffered)
+            .map_err(|_| "model response was not valid UTF-8".to_string())?;
+        if let Some(value) = decoder.line(line)? {
+            send_pieces(&tx, parser.accept(value)?).await?;
         }
     }
-    let body =
-        std::str::from_utf8(&body).map_err(|_| "model response was not valid UTF-8".to_string())?;
-    if line_start < body.len() {
-        for piece in parse_stream_text_line(&body[line_start..]) {
-            tx.send(piece)
-                .await
-                .map_err(|_| "stream receiver closed".to_string())?;
-        }
+    if let Some(value) = decoder.finish()? {
+        send_pieces(&tx, parser.accept(value)?).await?;
     }
-    for piece in parse_stream_body(body)? {
-        if matches!(piece, StreamPiece::ToolCall { .. }) {
-            tx.send(piece)
-                .await
-                .map_err(|_| "stream receiver closed".to_string())?;
-        }
+    send_pieces(&tx, parser.finish()?).await
+}
+
+async fn send_pieces(
+    tx: &mpsc::Sender<StreamPiece>,
+    pieces: Vec<StreamPiece>,
+) -> Result<(), String> {
+    for piece in pieces {
+        tx.send(piece)
+            .await
+            .map_err(|_| "stream receiver closed".to_string())?;
     }
     Ok(())
 }
@@ -214,32 +232,6 @@ fn json_str_non_empty<'a>(value: &'a serde_json::Value, pointer: &str) -> Option
         .pointer(pointer)
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
-}
-
-fn parse_stream_text_line(line: &str) -> Vec<StreamPiece> {
-    let raw = line.trim();
-    let data = raw.strip_prefix("data:").map(str::trim).unwrap_or(raw);
-    if data.is_empty() || data == "[DONE]" {
-        return Vec::new();
-    }
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(data) else {
-        return Vec::new();
-    };
-    let event_type = value
-        .get("type")
-        .and_then(|item| item.as_str())
-        .unwrap_or("");
-    let text = json_str_non_empty(&value, "/choices/0/delta/content")
-        .or_else(|| json_str_non_empty(&value, "/choices/0/message/content"))
-        .or_else(|| json_str_non_empty(&value, "/delta/text"))
-        .or_else(|| {
-            (event_type == "response.output_text.delta")
-                .then(|| value.get("delta").and_then(|item| item.as_str()))
-                .flatten()
-        })
-        .or_else(|| value.get("text").and_then(|item| item.as_str()));
-    text.map(|text| vec![StreamPiece::Text(text.into())])
-        .unwrap_or_default()
 }
 
 fn append_tool_arguments(pending: &mut PendingToolCall, arguments: Option<&serde_json::Value>) {
@@ -267,7 +259,7 @@ fn drain_complete_tool_calls(
         .iter()
         .filter_map(|(key, call)| (!call.name.is_empty()).then_some(key.clone()))
         .collect::<Vec<_>>();
-    keys.sort();
+    keys.sort_by_key(|key| (key.parse::<u64>().unwrap_or(u64::MAX), key.clone()));
     for key in keys {
         if let Some(call) = pending_tools.remove(&key) {
             let call_id = if call.id.is_empty() { key } else { call.id };
@@ -282,20 +274,159 @@ fn drain_complete_tool_calls(
     Ok(())
 }
 
-pub fn parse_stream_body(body: &str) -> Result<Vec<StreamPiece>, String> {
-    let mut pieces = Vec::new();
-    let mut pending_tools: std::collections::HashMap<String, PendingToolCall> =
-        std::collections::HashMap::new();
-    for raw in body.lines() {
-        let raw = raw.trim();
-        let data = raw.strip_prefix("data:").map(str::trim).unwrap_or(raw);
-        if data.is_empty() || data == "[DONE]" {
-            continue;
+// Decode SSE data fields incrementally, while retaining complete JSON documents.
+#[derive(Default)]
+struct WireDecoder {
+    data: String,
+    document: Option<String>,
+    terminal: bool,
+}
+
+impl WireDecoder {
+    fn line(&mut self, line: &str) -> Result<Option<serde_json::Value>, String> {
+        let line = line.trim_end_matches('\r');
+        if self.document.is_some() || line.trim_start().starts_with(['{', '[']) {
+            let document = self.document.get_or_insert_default();
+            document.push_str(line);
+            document.push('\n');
+            return Ok(None);
         }
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(data) else {
-            continue;
-        };
+        if let Some(raw) = line.strip_prefix("data:") {
+            if raw.trim() == "[DONE]" {
+                self.finish_data()?;
+                self.terminal = true;
+                return Ok(None);
+            }
+            if !self.data.is_empty() {
+                self.data.push('\n');
+            }
+            self.data.push_str(raw.trim_start());
+            // Some compatible endpoints omit blank separators between events.
+            if let Ok(value) = serde_json::from_str(&self.data) {
+                self.data.clear();
+                return Ok(Some(value));
+            }
+        } else if line.is_empty() {
+            self.finish_data()?;
+        }
+        Ok(None)
+    }
+
+    fn finish_data(&self) -> Result<(), String> {
+        if self.data.is_empty() {
+            Ok(())
+        } else {
+            Err("invalid model SSE event".into())
+        }
+    }
+
+    fn finish(&mut self) -> Result<Option<serde_json::Value>, String> {
+        self.finish_data()?;
+        self.document
+            .take()
+            .map(|document| {
+                serde_json::from_str(&document)
+                    .map_err(|error| format!("invalid model JSON response: {error}"))
+            })
+            .transpose()
+    }
+}
+
+#[derive(Default)]
+struct ModelEventParser {
+    pending_tools: std::collections::HashMap<String, PendingToolCall>,
+    responses: crate::codex::events::CodexEventMapper,
+    terminal: bool,
+    text: String,
+    saw_tool: bool,
+}
+
+impl ModelEventParser {
+    fn accept(&mut self, value: serde_json::Value) -> Result<Vec<StreamPiece>, String> {
+        let pieces = self.accept_event(value)?;
+        for piece in &pieces {
+            match piece {
+                StreamPiece::Text(text) => self.text.push_str(text),
+                StreamPiece::ToolCall { .. } => self.saw_tool = true,
+            }
+        }
+        Ok(pieces)
+    }
+
+    fn accept_event(&mut self, value: serde_json::Value) -> Result<Vec<StreamPiece>, String> {
+        let mut pieces = Vec::new();
+        self.terminal = matches!(
+            value.get("type").and_then(|v| v.as_str()),
+            Some(
+                "response.completed"
+                    | "response.done"
+                    | "response.failed"
+                    | "response.incomplete"
+                    | "message_stop"
+                    | "error"
+            )
+        );
         let event_type = value.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        if value.get("error").is_some_and(|error| !error.is_null()) || event_type == "error" {
+            return Err(value
+                .pointer("/error/message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("model provider returned an error")
+                .into());
+        }
+        if event_type.starts_with("response.") {
+            pieces.extend(self.responses.accept(value)?);
+            return Ok(pieces);
+        }
+        if value.get("output").is_some() {
+            let event_type = match value.get("status").and_then(|v| v.as_str()) {
+                Some("failed") => "response.failed",
+                Some("incomplete") => "response.incomplete",
+                _ => "response.completed",
+            };
+            pieces.extend(
+                self.responses
+                    .accept(serde_json::json!({"type":event_type,"response":value}))?,
+            );
+            return Ok(pieces);
+        }
+        if event_type == "message" {
+            for block in value
+                .get("content")
+                .and_then(|v| v.as_array())
+                .into_iter()
+                .flatten()
+            {
+                match block.get("type").and_then(|v| v.as_str()) {
+                    Some("text") => {
+                        if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
+                            pieces.push(StreamPiece::Text(text.into()));
+                        }
+                    }
+                    Some("tool_use") => {
+                        let id = block
+                            .get("id")
+                            .and_then(|v| v.as_str())
+                            .ok_or("tool_use missing id")?;
+                        let name = block
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .ok_or("tool_use missing name")?;
+                        let arguments = block
+                            .get("input")
+                            .cloned()
+                            .ok_or("tool_use missing input")?;
+                        pieces.push(StreamPiece::ToolCall {
+                            id: id.into(),
+                            name: name.into(),
+                            arguments,
+                        });
+                    }
+                    _ => {}
+                }
+            }
+            return Ok(pieces);
+        }
         if let Some(text) = json_str_non_empty(&value, "/choices/0/delta/content")
             .or_else(|| json_str_non_empty(&value, "/choices/0/message/content"))
             .or_else(|| json_str_non_empty(&value, "/delta/text"))
@@ -336,7 +467,7 @@ pub fn parse_stream_body(body: &str) -> Result<Vec<StreamPiece>, String> {
                     })
                     .map(ToString::to_string)
                     .unwrap_or_default();
-                pending_tools.insert(
+                self.pending_tools.insert(
                     key,
                     PendingToolCall {
                         id,
@@ -354,7 +485,7 @@ pub fn parse_stream_body(body: &str) -> Result<Vec<StreamPiece>, String> {
                     .get("index")
                     .map(ToString::to_string)
                     .unwrap_or_else(|| "0".into());
-                if let Some(call) = pending_tools.get_mut(&key) {
+                if let Some(call) = self.pending_tools.get_mut(&key) {
                     call.arguments.push_str(partial);
                 }
             }
@@ -363,7 +494,7 @@ pub fn parse_stream_body(body: &str) -> Result<Vec<StreamPiece>, String> {
                 .get("index")
                 .map(ToString::to_string)
                 .unwrap_or_else(|| "0".into());
-            if let Some(call) = pending_tools.remove(&key)
+            if let Some(call) = self.pending_tools.remove(&key)
                 && !call.name.is_empty()
             {
                 let arguments = parse_tool_arguments(&call.arguments, &call.id)?;
@@ -372,67 +503,6 @@ pub fn parse_stream_body(body: &str) -> Result<Vec<StreamPiece>, String> {
                     name: call.name,
                     arguments,
                 });
-            }
-        } else if event_type == "response.output_item.added"
-            && value.pointer("/item/type").and_then(|v| v.as_str()) == Some("function_call")
-        {
-            let item = &value["item"];
-            let key = item
-                .get("id")
-                .or_else(|| item.get("call_id"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("call")
-                .to_string();
-            pending_tools.insert(
-                key.clone(),
-                PendingToolCall {
-                    id: item
-                        .get("call_id")
-                        .or_else(|| item.get("id"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("call")
-                        .into(),
-                    name: item
-                        .get("name")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .into(),
-                    arguments: item
-                        .get("arguments")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .into(),
-                },
-            );
-        } else if event_type == "response.function_call_arguments.delta" {
-            let key = value
-                .get("item_id")
-                .or_else(|| value.get("call_id"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("call");
-            if let Some(call) = pending_tools.get_mut(key) {
-                call.arguments
-                    .push_str(value.get("delta").and_then(|v| v.as_str()).unwrap_or(""));
-            }
-        } else if event_type == "response.function_call_arguments.done" {
-            let key = value
-                .get("item_id")
-                .or_else(|| value.get("call_id"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("call");
-            if let Some(call) = pending_tools.remove(key) {
-                let raw = value
-                    .get("arguments")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or(&call.arguments);
-                if !call.name.is_empty() {
-                    let arguments = parse_tool_arguments(raw, &call.id)?;
-                    pieces.push(StreamPiece::ToolCall {
-                        id: call.id,
-                        name: call.name,
-                        arguments,
-                    });
-                }
             }
         }
         if let Some(calls) = value
@@ -446,7 +516,7 @@ pub fn parse_stream_body(body: &str) -> Result<Vec<StreamPiece>, String> {
                     .and_then(|v| v.as_u64())
                     .map(|v| v.to_string())
                     .unwrap_or_else(|| position.to_string());
-                let pending = pending_tools.entry(key.clone()).or_default();
+                let pending = self.pending_tools.entry(key.clone()).or_default();
                 if let Some(id) = call.get("id").and_then(|v| v.as_str()) {
                     pending.id = id.to_string();
                 }
@@ -460,7 +530,7 @@ pub fn parse_stream_body(body: &str) -> Result<Vec<StreamPiece>, String> {
             .pointer("/choices/0/delta/function_call")
             .or_else(|| value.pointer("/choices/0/message/function_call"))
         {
-            let pending = pending_tools.entry("legacy".to_string()).or_default();
+            let pending = self.pending_tools.entry("legacy".to_string()).or_default();
             if let Some(name) = function.get("name").and_then(|v| v.as_str()) {
                 pending.name = name.to_string();
             }
@@ -472,23 +542,38 @@ pub fn parse_stream_body(body: &str) -> Result<Vec<StreamPiece>, String> {
                 .and_then(|v| v.as_str()),
             Some("tool_calls") | Some("function_call")
         ) {
-            drain_complete_tool_calls(&mut pending_tools, &mut pieces)?;
+            drain_complete_tool_calls(&mut self.pending_tools, &mut pieces)?;
+        }
+        Ok(pieces)
+    }
+
+    fn finish(&mut self) -> Result<Vec<StreamPiece>, String> {
+        self.responses.ensure_complete()?;
+        let mut pieces = Vec::new();
+        drain_complete_tool_calls(&mut self.pending_tools, &mut pieces)?;
+        if !self.saw_tool && pieces.is_empty() {
+            pieces.extend(extract_text_embedded_tool_calls(&self.text));
+        }
+        Ok(pieces)
+    }
+}
+
+pub fn parse_stream_body(body: &str) -> Result<Vec<StreamPiece>, String> {
+    let mut decoder = WireDecoder::default();
+    let mut parser = ModelEventParser::default();
+    let mut pieces = Vec::new();
+    for line in body.lines() {
+        if let Some(value) = decoder.line(line)? {
+            pieces.extend(parser.accept(value)?);
+        }
+        if decoder.terminal || parser.terminal {
+            break;
         }
     }
-    drain_complete_tool_calls(&mut pending_tools, &mut pieces)?;
-    if !pieces
-        .iter()
-        .any(|piece| matches!(piece, StreamPiece::ToolCall { .. }))
-    {
-        let concatenated: String = pieces
-            .iter()
-            .filter_map(|piece| match piece {
-                StreamPiece::Text(text) => Some(text.as_str()),
-                StreamPiece::ToolCall { .. } => None,
-            })
-            .collect();
-        pieces.extend(extract_text_embedded_tool_calls(&concatenated));
+    if let Some(value) = decoder.finish()? {
+        pieces.extend(parser.accept(value)?);
     }
+    pieces.extend(parser.finish()?);
     Ok(pieces)
 }
 
@@ -549,6 +634,10 @@ fn parse_embedded_tool_call(inner: &str) -> Option<(String, serde_json::Value)> 
     }
     Some((name, serde_json::Value::Object(arguments)))
 }
+
+#[cfg(test)]
+#[path = "stream_repair_tests.rs"]
+mod repair_tests;
 
 #[cfg(test)]
 mod tests {

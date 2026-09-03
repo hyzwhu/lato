@@ -13,9 +13,14 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 use tokio::sync::Mutex;
+
+static NEXT_IMPORT_FILE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FaultPoint {
@@ -133,9 +138,11 @@ impl EventStore for FileEventStore {
             })?;
             ensure_secure_directory(parent)?;
             let temp = parent.join(format!(
-                "events.jsonl.{}.{}.tmp",
+                "events.jsonl.{}.{}.{}.tmp",
                 std::process::id(),
-                now_nanos()
+                now_nanos(),
+                // Wall-clock timestamps can coincide across concurrent imports.
+                NEXT_IMPORT_FILE.fetch_add(1, Ordering::Relaxed)
             ));
             write_import_file(&temp, &envelopes)?;
             if path.exists() {

@@ -69,6 +69,45 @@ fn requested_local_facts(input: &str) -> Vec<LocalFact> {
         return vec![LocalFact::CurrentDirectory];
     }
 
+    // Only answer a complete fact query locally. Mentioning a directory or model
+    // inside a task must never bypass the model and its tool loop.
+    let mut query =
+        lower.trim_end_matches(|c: char| c.is_whitespace() || matches!(c, '?' | '？' | '。' | '.'));
+    for prefix in [
+        "please ",
+        "请告诉我",
+        "请给我一下",
+        "给我一下",
+        "请给我",
+        "告诉我",
+        "给我",
+        "请问",
+        "请",
+        "what is the ",
+        "what is your ",
+        "what's the ",
+        "tell me the ",
+        "show me the ",
+    ] {
+        if let Some(rest) = query.strip_prefix(prefix) {
+            query = rest.trim();
+        }
+    }
+    for suffix in [
+        "的路径是什么",
+        "路径是什么",
+        "的路径",
+        "路径",
+        "是什么",
+        "在哪里",
+        "是哪个",
+    ] {
+        if let Some(rest) = query.strip_suffix(suffix) {
+            query = rest.trim();
+            break;
+        }
+    }
+
     let asks_current_model = [
         "当前模型",
         "现在的模型",
@@ -79,19 +118,18 @@ fn requested_local_facts(input: &str) -> Vec<LocalFact> {
         "which model are you",
         "what model are you",
     ]
-    .iter()
-    .any(|term| lower.contains(term));
+    .contains(&query);
     let asks_current_directory = [
         "当前目录",
         "当前文件夹",
         "当前工作目录",
+        "当前工作区",
         "当前工作区路径",
         "current directory",
         "current folder",
         "working directory",
     ]
-    .iter()
-    .any(|term| lower.contains(term));
+    .contains(&query);
     let asks_grandparent = [
         "上上层目录",
         "上两层目录",
@@ -99,8 +137,7 @@ fn requested_local_facts(input: &str) -> Vec<LocalFact> {
         "grandparent directory",
         "two levels up",
     ]
-    .iter()
-    .any(|term| lower.contains(term));
+    .contains(&query);
     let asks_parent = asks_grandparent
         || [
             "上一层目录",
@@ -109,8 +146,7 @@ fn requested_local_facts(input: &str) -> Vec<LocalFact> {
             "parent directory",
             "one level up",
         ]
-        .iter()
-        .any(|term| lower.contains(term));
+        .contains(&query);
 
     let mut facts = Vec::new();
     if asks_current_model {
@@ -1056,5 +1092,39 @@ mod tests {
         assert!(requested_local_facts("which model architecture should I use?").is_empty());
         assert!(requested_local_facts("show me how path handling works").is_empty());
         assert!(requested_local_facts("解释这个 workspace 文件").is_empty());
+    }
+
+    #[test]
+    fn workspace_tasks_are_not_intercepted_by_local_fact_shortcuts() {
+        for prompt in [
+            "请在当前目录创建文件，然后读取确认",
+            "读取当前目录里的 Cargo.toml",
+            "解释当前目录的代码",
+            "Use the current model to fix this bug",
+            "Create a file in the current directory",
+            "Tell me the current directory, then create a file",
+            "当前目录是什么？然后读取 Cargo.toml",
+        ] {
+            assert!(
+                requested_local_facts(prompt).is_empty(),
+                "stole task: {prompt}"
+            );
+        }
+        assert_eq!(
+            requested_local_facts("给我一下当前文件夹路径"),
+            vec![LocalFact::CurrentDirectory]
+        );
+        assert_eq!(
+            requested_local_facts("当前目录是什么？"),
+            vec![LocalFact::CurrentDirectory]
+        );
+        assert_eq!(
+            requested_local_facts("What is the current directory?"),
+            vec![LocalFact::CurrentDirectory]
+        );
+        assert_eq!(
+            requested_local_facts("上一层目录是什么"),
+            vec![LocalFact::AncestorDirectory(1)]
+        );
     }
 }

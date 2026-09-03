@@ -53,7 +53,7 @@ pub async fn stream_sse(
     let mut bytes = response.bytes_stream();
     let mut buffered = Vec::new();
     let mut event_data = Vec::<String>::new();
-    while let Some(chunk) = bytes.next().await {
+    'read: while let Some(chunk) = bytes.next().await {
         let chunk =
             chunk.map_err(|error| CodexTransportError::with_mapper(error.to_string(), &mapper))?;
         buffered.extend_from_slice(&chunk);
@@ -64,6 +64,10 @@ pub async fn stream_sse(
                 line.pop();
             }
             accept_sse_line(&line, &mut event_data, &mut mapper, &tx).await?;
+            if mapper.terminal() {
+                buffered.clear();
+                break 'read;
+            }
         }
     }
     if !buffered.is_empty() {

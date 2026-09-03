@@ -140,18 +140,22 @@ pub(crate) fn responses_input(messages: serde_json::Value) -> serde_json::Value 
                     })];
                 }
                 if let Some(calls) = message.get("tool_calls").and_then(|v| v.as_array()) {
-                    return calls
-                        .iter()
-                        .filter_map(|call| {
-                            let function = call.get("function")?;
-                            Some(serde_json::json!({
-                                "type":"function_call",
-                                "call_id":call.get("id").cloned().unwrap_or_default(),
-                                "name":function.get("name").cloned().unwrap_or_default(),
-                                "arguments":function.get("arguments").cloned().unwrap_or_default()
-                            }))
-                        })
-                        .collect();
+                    let mut items = Vec::new();
+                    if let Some(text) = message.get("content").and_then(|v| v.as_str())
+                        && !text.is_empty()
+                    {
+                        items.push(serde_json::json!({"role":"assistant","content":text}));
+                    }
+                    items.extend(calls.iter().filter_map(|call| {
+                        let function = call.get("function")?;
+                        Some(serde_json::json!({
+                            "type":"function_call",
+                            "call_id":call.get("id").cloned().unwrap_or_default(),
+                            "name":function.get("name").cloned().unwrap_or_default(),
+                            "arguments":function.get("arguments").cloned().unwrap_or_default()
+                        }))
+                    }));
+                    return items;
                 }
                 vec![message.clone()]
             })
@@ -177,7 +181,13 @@ pub(crate) fn anthropic_messages(messages: serde_json::Value) -> (String, serde_
                 "content":[{"type":"tool_result","tool_use_id":message.get("tool_call_id").cloned().unwrap_or_default(),"content":message.get("content").cloned().unwrap_or_default()}]
             })),
             Some("assistant") if message.get("tool_calls").is_some() => {
-                let content = message
+                let mut content = Vec::new();
+                if let Some(text) = message.get("content").and_then(|v| v.as_str())
+                    && !text.is_empty()
+                {
+                    content.push(serde_json::json!({"type":"text","text":text}));
+                }
+                content.extend(message
                     .get("tool_calls")
                     .and_then(|v| v.as_array())
                     .into_iter()
@@ -196,7 +206,7 @@ pub(crate) fn anthropic_messages(messages: serde_json::Value) -> (String, serde_
                             "input":input
                         }))
                     })
-                    .collect::<Vec<_>>();
+                );
                 out.push(serde_json::json!({"role":"assistant","content":content}));
             }
             _ => out.push(message.clone()),

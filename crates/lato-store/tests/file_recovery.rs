@@ -292,29 +292,25 @@ async fn concurrent_imports_converge_without_overwriting() {
     let directory = tempfile::tempdir().unwrap();
     let store = Arc::new(FileEventStore::open(directory.path()).unwrap());
     let sid = SessionId::from("concurrent-import-session");
-    let first = {
+    let barrier = Arc::new(tokio::sync::Barrier::new(16));
+    let mut tasks = Vec::new();
+    for index in 0..16 {
         let store = store.clone();
         let sid = sid.clone();
-        tokio::spawn(async move {
-            store
-                .import_if_absent(&sid, vec![envelope(&sid, 0)])
-                .await
-                .unwrap()
-        })
-    };
-    let second = {
-        let store = store.clone();
-        let sid = sid.clone();
-        tokio::spawn(async move {
-            store
-                .import_if_absent(&sid, vec![envelope(&sid, 0), envelope(&sid, 1)])
-                .await
-                .unwrap()
-        })
-    };
-    let first = first.await.unwrap();
-    let second = second.await.unwrap();
-    assert_eq!(first.envelopes, second.envelopes);
+        let barrier = barrier.clone();
+        tasks.push(tokio::spawn(async move {
+            let mut records = vec![envelope(&sid, 0)];
+            if index % 2 == 0 {
+                records.push(envelope(&sid, 1));
+            }
+            barrier.wait().await;
+            store.import_if_absent(&sid, records).await.unwrap()
+        }));
+    }
+    let first = tasks.remove(0).await.unwrap();
+    for task in tasks {
+        assert_eq!(first.envelopes, task.await.unwrap().envelopes);
+    }
     assert_eq!(store.replay(&sid).await.unwrap().envelopes, first.envelopes);
 }
 
