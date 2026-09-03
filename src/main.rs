@@ -1,6 +1,7 @@
 mod args;
 mod cli;
 mod client;
+mod permissions;
 mod sessions;
 mod stdio;
 mod tui;

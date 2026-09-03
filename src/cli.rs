@@ -13,7 +13,7 @@ use lato_ai::{
     oauth_allowed, phase0_supported, provider_spec, refresh_openai_compatible_models,
     refresh_remote_provider_catalog_with_policy, store_oauth,
 };
-use lato_workspace::{ApprovalMode, SandboxProfile, SessionTrust};
+use lato_workspace::{ApprovalMode, SessionTrust};
 use std::{
     io::IsTerminal,
     path::PathBuf,
@@ -170,15 +170,16 @@ fn requested_local_facts(input: &str) -> Vec<LocalFact> {
 
 pub async fn run(args: Vec<String>) -> i32 {
     match crate::args::parse(args) {
-        Ok(Invocation::InteractiveNew { language }) => {
-            interactive(InteractiveStartup::New, language).await
+        Ok(Invocation::InteractiveNew { language, sandbox }) => {
+            interactive(InteractiveStartup::New, language, sandbox).await
         }
         Ok(Invocation::Prompt(args)) => prompt(args).await,
         Ok(Invocation::Sessions { json }) => crate::sessions::list(json).await,
         Ok(Invocation::Resume {
             session_id,
             language,
-        }) => interactive(InteractiveStartup::Resume(session_id), language).await,
+            sandbox,
+        }) => interactive(InteractiveStartup::Resume(session_id), language, sandbox).await,
         Ok(Invocation::Login { provider, method }) => login(provider, method).await,
         Ok(Invocation::Doctor(args)) => doctor_cmd(args).await,
         Ok(Invocation::Acp) => crate::stdio::run().await,
@@ -255,11 +256,7 @@ async fn prompt(args: PromptArgs) -> i32 {
         eprintln!("error: --ask requires a tty");
         return 2;
     }
-    let sandbox = match args.sandbox {
-        SandboxArg::Off => SandboxProfile::Off,
-        SandboxArg::Workspace => SandboxProfile::Workspace,
-        SandboxArg::ReadOnly => SandboxProfile::ReadOnly,
-    };
+    let sandbox = crate::permissions::profile(args.sandbox);
     let model_arg = args.model.or_else(|| std::env::var("LATO_MODEL").ok());
     let text = args.text;
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -301,7 +298,11 @@ enum InteractiveStartup {
     Resume(String),
 }
 
-async fn interactive(startup: InteractiveStartup, language_override: Option<Language>) -> i32 {
+async fn interactive(
+    startup: InteractiveStartup,
+    language_override: Option<Language>,
+    sandbox_override: Option<SandboxArg>,
+) -> i32 {
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         let message = match startup {
             InteractiveStartup::New => {
@@ -378,9 +379,9 @@ async fn interactive(startup: InteractiveStartup, language_override: Option<Lang
                                 cwd.display(),
                                 match language {
                                     Language::ZhCn =>
-                                        "是否信任此文件夹？允许本次会话编辑文件/执行命令",
+                                        "是否信任此文件夹？在所选沙箱范围内自动批准编辑和命令",
                                     Language::En =>
-                                        "Trust this folder for edits and commands this session?",
+                                        "Trust this folder? Auto-approve edits and commands within the selected sandbox",
                                 }
                             ),
                             &[
@@ -390,11 +391,12 @@ async fn interactive(startup: InteractiveStartup, language_override: Option<Lang
                         )
                         .await?
                         .starts_with("Yes");
-                let trust = if trusted {
-                    SessionTrust::for_interactive_auto(&cwd)
+                let sandbox = if tui_test_mode {
+                    sandbox_override.unwrap_or(SandboxArg::Workspace)
                 } else {
-                    SessionTrust::for_interactive(&cwd, false)
+                    crate::permissions::select_sandbox(&ui, language, sandbox_override).await?
                 };
+                let trust = crate::permissions::interactive_trust(&cwd, trusted, sandbox);
                 let (tui_approval, approvals) = crate::tui::backend::TuiToolApproval::channel();
                 let inline_approval = (trust.mode == ApprovalMode::Ask).then_some(tui_approval);
                 let switchable = Arc::new(lato_ai::SwitchableModelStream::new(stream));

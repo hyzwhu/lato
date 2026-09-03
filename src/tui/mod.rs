@@ -6,6 +6,7 @@ pub mod input;
 pub mod render;
 pub mod state;
 pub mod terminal;
+pub mod tool_panel;
 pub mod widgets;
 
 use self::{
@@ -53,6 +54,11 @@ pub async fn run(
         session_id,
         bootstrap.sessions,
     );
+    app.messages.push(Message {
+        role: MessageRole::System,
+        content: crate::permissions::describe(&bootstrap.trust, bootstrap.language),
+        expanded: true,
+    });
     if bootstrap.resumed {
         app.screen = state::Screen::Main;
     }
@@ -64,7 +70,7 @@ pub async fn run(
     let mut approvals_open = true;
 
     terminal
-        .draw(|frame| render::render(frame, &app))
+        .draw(|frame| render::render(frame, &mut app))
         .map_err(|error| format!("draw TUI: {error}"))?;
 
     while !app.should_exit {
@@ -115,7 +121,7 @@ pub async fn run(
         .await;
         if needs_draw {
             terminal
-                .draw(|frame| render::render(frame, &app))
+                .draw(|frame| render::render(frame, &mut app))
                 .map_err(|error| format!("draw TUI: {error}"))?;
         }
     }
@@ -293,6 +299,9 @@ fn handle_key(
     {
         return app.reduce(AppEvent::TogglePalette);
     }
+    if app.focus == state::Focus::Tools && tool_panel::handle_key(app, key) {
+        return Vec::new();
+    }
     match key.code {
         KeyCode::Tab => app.reduce(AppEvent::FocusNext),
         KeyCode::BackTab => app.reduce(AppEvent::FocusPrevious),
@@ -378,12 +387,22 @@ fn submit_or_command(app: &mut AppState, trust: &SessionTrust) -> Vec<Effect> {
             trust.allow_once();
             Vec::new()
         }
-        "/status" => {
+        "/status" | "/permissions" => {
             app.composer.clear();
             app.screen = state::Screen::Main;
             app.messages.push(Message {
                 role: MessageRole::System,
-                content: format!("{} · {}", app.model, app.workspace.display()),
+                content: format!(
+                    "{} · {}\n{}\n{}\nlato resume {} --sandbox off",
+                    app.model,
+                    app.workspace.display(),
+                    crate::permissions::describe(trust, app.language),
+                    match app.language {
+                        Language::ZhCn => "如需更改范围，请退出并恢复会话。可选 off / workspace / read-only，例如：",
+                        Language::En => "To change scope, exit and resume with off / workspace / read-only. Example:",
+                    },
+                    app.session_id
+                ),
                 expanded: true,
             });
             Vec::new()
@@ -393,7 +412,7 @@ fn submit_or_command(app: &mut AppState, trust: &SessionTrust) -> Vec<Effect> {
             app.screen = state::Screen::Main;
             app.messages.push(Message {
                 role: MessageRole::System,
-                content: "/help  /new  /clear  /sessions  /model  /login  /doctor  /search  /lang  /approve  /status  /exit".into(),
+                content: "/help  /new  /clear  /sessions  /model  /login  /doctor  /search  /lang  /approve  /status  /permissions  /exit".into(),
                 expanded: true,
             });
             Vec::new()
@@ -594,6 +613,37 @@ mod tests {
                     [Effect::Login]
                 ));
                 assert!(!app.should_exit);
+                app.overlay = None;
+                app.focus = state::Focus::Tools;
+                app.composer.insert_str("pending draft");
+                app.reduce(AppEvent::Backend(backend::BackendEvent::Update(
+                    crate::client::ClientUpdate::ToolStarted {
+                        id: "test-tool".into(),
+                        name: "read".into(),
+                        arguments: "{}".into(),
+                    },
+                )));
+                let draft = app.composer.as_str().to_string();
+                for code in [
+                    KeyCode::Enter,
+                    KeyCode::Char(' '),
+                    KeyCode::Right,
+                    KeyCode::Left,
+                    KeyCode::Home,
+                    KeyCode::End,
+                    KeyCode::PageDown,
+                ] {
+                    let effects = handle_key(
+                        &mut app,
+                        KeyEvent::new(code, KeyModifiers::NONE),
+                        &backend,
+                        &trust,
+                    );
+                    assert!(effects.is_empty());
+                    assert_eq!(app.composer.as_str(), draft);
+                    assert_eq!(app.focus, state::Focus::Tools);
+                    assert!(!app.responding);
+                }
             })
             .await;
     }

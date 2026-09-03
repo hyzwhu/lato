@@ -10,6 +10,8 @@ fn help_advertises_the_bilingual_interactive_interface() {
     let help = String::from_utf8_lossy(&output.stdout);
     assert!(help.contains("--lang"), "{help}");
     assert!(help.contains("zh-CN"), "{help}");
+    assert!(help.contains("--sandbox"), "{help}");
+    assert!(help.contains("Interactive: lato [--sandbox"), "{help}");
 }
 
 #[test]
@@ -34,4 +36,21 @@ fn interactive_mode_still_fails_cleanly_without_a_tty() {
         .unwrap();
     assert_eq!(output.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&output.stderr).contains("requires a tty"));
+}
+
+#[test]
+fn sandbox_option_reaches_interactive_startup_for_new_and_resumed_sessions() {
+    let home = tempfile::tempdir().unwrap();
+    for args in [
+        vec!["--sandbox", "off"],
+        vec!["resume", "session-1", "--sandbox", "read-only"],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_lato"))
+            .env("LATO_HOME", home.path())
+            .args(args)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("requires a tty"));
+    }
 }

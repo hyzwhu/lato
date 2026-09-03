@@ -33,6 +33,7 @@ pub struct DoctorArgs {
 pub enum Invocation {
     InteractiveNew {
         language: Option<Language>,
+        sandbox: Option<SandboxArg>,
     },
     Prompt(PromptArgs),
     Sessions {
@@ -41,6 +42,7 @@ pub enum Invocation {
     Resume {
         session_id: String,
         language: Option<Language>,
+        sandbox: Option<SandboxArg>,
     },
     Login {
         provider: String,
@@ -55,7 +57,7 @@ pub enum Invocation {
     name = "lato",
     version,
     about = "Public Beta coding agent",
-    after_help = "Run without arguments for the interactive coding CLI.\n\nHeadless: lato -p [--ask] [--sandbox off|workspace|read-only] [--model provider/model] TEXT\nDoctor: lato doctor [--json] [--strict] [--live]"
+    after_help = "Run without arguments for the interactive coding CLI.\n\nInteractive: lato [--sandbox off|workspace|read-only]\nResume: lato resume ID [--sandbox off|workspace|read-only]\nHeadless: lato -p [--ask] [--sandbox off|workspace|read-only] [--model provider/model] TEXT\nDoctor: lato doctor [--json] [--strict] [--live]"
 )]
 struct Cli {
     /// Interface language for interactive mode
@@ -70,8 +72,8 @@ struct Cli {
     #[arg(long, action = ArgAction::SetTrue)]
     ask: bool,
 
-    /// Shell sandbox profile for a headless prompt
-    #[arg(long, value_enum)]
+    /// Sandbox for interactive/resumed sessions or -p; off permits writes outside the workspace
+    #[arg(long, global = true, value_enum)]
     sandbox: Option<SandboxArg>,
 
     /// Model selection in provider/model form
@@ -128,12 +130,7 @@ enum Command {
 impl Cli {
     fn into_invocation(self) -> Result<Invocation, clap::Error> {
         if let Some(command) = self.command {
-            if self.prompt
-                || self.ask
-                || self.sandbox.is_some()
-                || self.model.is_some()
-                || !self.text.is_empty()
-            {
+            if self.prompt || self.ask || self.model.is_some() || !self.text.is_empty() {
                 return Err(semantic_error(
                     ErrorKind::ArgumentConflict,
                     "headless prompt options cannot be combined with a subcommand",
@@ -145,11 +142,18 @@ impl Cli {
                     "--lang is only available in interactive mode",
                 ));
             }
+            if self.sandbox.is_some() && !matches!(&command, Command::Resume { .. }) {
+                return Err(semantic_error(
+                    ErrorKind::ArgumentConflict,
+                    "--sandbox is only available in interactive mode, resume, or -p",
+                ));
+            }
             return Ok(match command {
                 Command::Sessions { json } => Invocation::Sessions { json },
                 Command::Resume { session_id } => Invocation::Resume {
                     session_id,
                     language: self.language,
+                    sandbox: self.sandbox,
                 },
                 Command::Login {
                     provider,
@@ -192,7 +196,7 @@ impl Cli {
             }));
         }
 
-        if self.ask || self.sandbox.is_some() || self.model.is_some() || !self.text.is_empty() {
+        if self.ask || self.model.is_some() || !self.text.is_empty() {
             return Err(semantic_error(
                 ErrorKind::MissingRequiredArgument,
                 "headless prompt options and text require -p",
@@ -200,6 +204,7 @@ impl Cli {
         }
         Ok(Invocation::InteractiveNew {
             language: self.language,
+            sandbox: self.sandbox,
         })
     }
 }
@@ -248,6 +253,74 @@ mod tests {
     fn rejects_empty_prompt() {
         let error = parse(vec!["-p".into()]).unwrap_err();
         assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn parses_sandbox_for_interactive_and_resume_in_either_order() {
+        for (name, profile) in [
+            ("off", SandboxArg::Off),
+            ("workspace", SandboxArg::Workspace),
+            ("read-only", SandboxArg::ReadOnly),
+        ] {
+            assert_eq!(
+                parse(vec!["--sandbox".into(), name.into()]).unwrap(),
+                Invocation::InteractiveNew {
+                    language: None,
+                    sandbox: Some(profile)
+                }
+            );
+            for args in [
+                vec!["--sandbox", name, "resume", "session-1"],
+                vec!["resume", "session-1", "--sandbox", name],
+            ] {
+                assert_eq!(
+                    parse(args.into_iter().map(String::from).collect()).unwrap(),
+                    Invocation::Resume {
+                        session_id: "session-1".into(),
+                        language: None,
+                        sandbox: Some(profile)
+                    }
+                );
+            }
+        }
+        assert_eq!(
+            parse(vec![]).unwrap(),
+            Invocation::InteractiveNew {
+                language: None,
+                sandbox: None
+            }
+        );
+        assert!(matches!(
+            parse(vec!["resume".into(), "session-1".into()]).unwrap(),
+            Invocation::Resume { sandbox: None, .. }
+        ));
+        assert!(matches!(
+            parse(vec!["-p".into(), "hello".into()]).unwrap(),
+            Invocation::Prompt(super::PromptArgs {
+                sandbox: SandboxArg::Off,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn rejects_sandbox_on_unrelated_subcommands_and_invalid_profiles() {
+        for command in [
+            vec!["sessions"],
+            vec!["doctor"],
+            vec!["acp"],
+            vec!["login", "openai", "--api-key", "fixture"],
+        ] {
+            let mut args = command.into_iter().map(String::from).collect::<Vec<_>>();
+            args.extend(["--sandbox".into(), "off".into()]);
+            assert_eq!(parse(args).unwrap_err().kind(), ErrorKind::ArgumentConflict);
+        }
+        assert_eq!(
+            parse(vec!["--sandbox".into(), "unknown".into()])
+                .unwrap_err()
+                .kind(),
+            ErrorKind::InvalidValue
+        );
     }
 
     #[test]
@@ -318,7 +391,8 @@ mod tests {
         assert!(matches!(
             parse(vec!["--lang".into(), "zh-CN".into()]),
             Ok(Invocation::InteractiveNew {
-                language: Some(Language::ZhCn)
+                language: Some(Language::ZhCn),
+                ..
             })
         ));
         assert!(matches!(

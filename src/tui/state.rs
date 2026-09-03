@@ -3,6 +3,7 @@ use super::{
     backend::{BackendCommand, BackendEvent},
     i18n::Language,
     input::InputBuffer,
+    tool_panel::ToolPanelState,
 };
 use crate::client::ClientUpdate;
 use std::{path::PathBuf, time::Instant};
@@ -91,6 +92,7 @@ pub enum ToolStatus {
 
 #[derive(Clone, Debug)]
 pub struct ToolCard {
+    pub expanded: bool,
     pub id: String,
     pub name: String,
     pub arguments: String,
@@ -124,6 +126,7 @@ pub struct AppState {
     pub sessions: Vec<SessionItem>,
     pub messages: Vec<Message>,
     pub tools: Vec<ToolCard>,
+    pub tool_panel: ToolPanelState,
     pub composer: InputBuffer,
     pub search: InputBuffer,
     pub focus: Focus,
@@ -193,6 +196,7 @@ impl AppState {
             sessions,
             messages: Vec::new(),
             tools: Vec::new(),
+            tool_panel: ToolPanelState::default(),
             composer: InputBuffer::new(),
             search: InputBuffer::new(),
             focus: Focus::Chat,
@@ -269,6 +273,10 @@ impl AppState {
                     };
                     return Vec::new();
                 }
+                if self.focus == Focus::Tools {
+                    self.tool_panel.select(delta, self.tools.len());
+                    return Vec::new();
+                }
                 self.scroll = if delta.is_negative() {
                     self.scroll.saturating_sub(delta.unsigned_abs())
                 } else {
@@ -291,6 +299,7 @@ impl AppState {
                 }
                 self.messages.clear();
                 self.tools.clear();
+                self.tool_panel = ToolPanelState::default();
                 self.overlay = None;
                 vec![Effect::Backend(BackendCommand::Clear)]
             }
@@ -334,6 +343,7 @@ impl AppState {
                 self.session_id = id;
                 self.messages.clear();
                 self.tools.clear();
+                self.tool_panel = ToolPanelState::default();
                 self.scroll = 0;
                 self.focus = Focus::Chat;
                 self.screen = Screen::Main;
@@ -391,15 +401,21 @@ impl AppState {
                 id,
                 name,
                 arguments,
-            } => self.tools.push(ToolCard {
-                id,
-                name,
-                arguments,
-                status: ToolStatus::Running,
-                result: None,
-                started_at: Instant::now(),
-                elapsed_ms: 0,
-            }),
+            } => {
+                self.tools.push(ToolCard {
+                    expanded: false,
+                    id,
+                    name,
+                    arguments,
+                    status: ToolStatus::Running,
+                    result: None,
+                    started_at: Instant::now(),
+                    elapsed_ms: 0,
+                });
+                if self.focus != Focus::Tools {
+                    self.tool_panel.select_last(self.tools.len());
+                }
+            }
             ClientUpdate::ToolFinished { id, result } => {
                 self.finish_tool(&id, ToolStatus::Done, result)
             }
@@ -471,6 +487,50 @@ mod tests {
             effects.as_slice(),
             [Effect::Backend(BackendCommand::Submit(text))] if text == "hello"
         ));
+    }
+
+    #[test]
+    fn tool_inspection_survives_updates_and_resets_with_conversation() {
+        let mut app = app();
+        app.apply_update(ClientUpdate::ToolStarted {
+            id: "1".into(),
+            name: "read".into(),
+            arguments: "{}".into(),
+        });
+        app.tools[0].expanded = true;
+        app.focus = Focus::Tools;
+        app.apply_update(ClientUpdate::ToolStarted {
+            id: "2".into(),
+            name: "read".into(),
+            arguments: "{}".into(),
+        });
+        app.apply_update(ClientUpdate::ToolFailed {
+            id: "1".into(),
+            error: "failed".into(),
+        });
+        assert!(app.tools[0].expanded);
+        assert_eq!(app.tools[0].status, ToolStatus::Error);
+        assert_eq!(app.tool_panel.selected, 0);
+        app.focus = Focus::Chat;
+        app.apply_update(ClientUpdate::ToolStarted {
+            id: "3".into(),
+            name: "read".into(),
+            arguments: "{}".into(),
+        });
+        assert_eq!(app.tool_panel.selected, 2);
+        app.tool_panel.scroll = 10;
+        app.reduce(AppEvent::ClearConversation);
+        assert_eq!(app.tool_panel.selected, 0);
+        assert_eq!(app.tool_panel.scroll, 0);
+        app.apply_update(ClientUpdate::ToolStarted {
+            id: "4".into(),
+            name: "read".into(),
+            arguments: "{}".into(),
+        });
+        app.tool_panel.scroll = 5;
+        app.apply_backend(BackendEvent::Resumed("other".into()));
+        assert!(app.tools.is_empty());
+        assert_eq!(app.tool_panel.scroll, 0);
     }
 
     #[test]

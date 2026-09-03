@@ -1,6 +1,6 @@
 use super::{
     i18n::{TextKey, tr},
-    state::{AppState, Focus, MessageRole, ToolStatus},
+    state::{AppState, Focus, MessageRole},
 };
 use ratatui::{
     Frame,
@@ -286,77 +286,20 @@ fn composer(frame: &mut Frame<'_>, area: Rect, app: &AppState, welcome: bool) {
     }
 }
 
-pub fn tools(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
-    let active = app.focus == Focus::Tools;
-    let style = panel_style(active);
-    let block = Block::default()
-        .title(format!(" {} ", tr(app.language, TextKey::ToolCalls)))
-        .title_style(
-            Style::default()
-                .fg(if active { TEXT } else { MUTED })
-                .add_modifier(Modifier::BOLD),
-        )
-        .borders(Borders::TOP)
-        .border_style(Style::default().fg(GLASS))
-        .style(style);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    if app.tools.is_empty() {
-        frame.render_widget(
-            Paragraph::new(tr(app.language, TextKey::WaitingTools))
-                .alignment(Alignment::Center)
-                .style(Style::default().fg(MUTED).bg(style.bg.unwrap_or(BG))),
-            inner,
-        );
-        return;
-    }
-    let mut lines = Vec::new();
-    for tool in &app.tools {
-        let (symbol, key, color) = match tool.status {
-            ToolStatus::Running => ("●", TextKey::Running, AMBER),
-            ToolStatus::Done => ("✓", TextKey::Done, BLUE),
-            ToolStatus::Error => ("✗", TextKey::Failed, ERROR),
-        };
-        lines.push(Line::from(vec![
-            Span::styled(
-                tool.name.clone(),
-                Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!("  {}ms", tool.elapsed_ms),
-                Style::default().fg(MUTED),
-            ),
-        ]));
-        lines.push(Line::styled(
-            tool.arguments.clone(),
-            Style::default().fg(MUTED),
-        ));
-        lines.push(Line::styled(
-            format!("{symbol} {}", tr(app.language, key)),
-            Style::default().fg(color),
-        ));
-        if let Some(result) = &tool.result {
-            lines.push(Line::styled(
-                format!("{}: {result}", tr(app.language, TextKey::ReturnValue)),
-                Style::default().fg(MUTED),
-            ));
-        }
-        lines.push(Line::raw(""));
-    }
-    frame.render_widget(
-        Paragraph::new(lines).style(style).wrap(Wrap { trim: true }),
-        inner,
-    );
-}
+pub use super::tool_panel::render as tools;
 
 pub fn footer(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
-    let text = format!(
-        "Tab:{}  |  Cmd/Ctrl+K:{}  |  Ctrl+C:{}  |  Ctrl+F:{}",
-        tr(app.language, TextKey::SwitchPanel),
-        tr(app.language, TextKey::Command),
-        tr(app.language, TextKey::Cancel),
-        tr(app.language, TextKey::Search),
-    );
+    let text = if app.focus == Focus::Tools {
+        tr(app.language, TextKey::ToolControls).to_string()
+    } else {
+        format!(
+            "Tab:{}  |  Cmd/Ctrl+K:{}  |  Ctrl+C:{}  |  Ctrl+F:{}",
+            tr(app.language, TextKey::SwitchPanel),
+            tr(app.language, TextKey::Command),
+            tr(app.language, TextKey::Cancel),
+            tr(app.language, TextKey::Search),
+        )
+    };
     frame.render_widget(
         Paragraph::new(text)
             .alignment(Alignment::Center)
@@ -476,7 +419,7 @@ pub fn too_small(frame: &mut Frame<'_>, app: &AppState) {
     );
 }
 
-fn panel_style(active: bool) -> Style {
+pub(super) fn panel_style(active: bool) -> Style {
     Style::default()
         .fg(if active { TEXT } else { MUTED })
         .bg(if active { RAISED } else { BG })

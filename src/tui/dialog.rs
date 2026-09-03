@@ -176,7 +176,7 @@ impl Dialog {
             _ => {}
         }
     }
-    fn render(&self, frame: &mut Frame<'_>, background: Option<&AppState>) {
+    fn render(&self, frame: &mut Frame<'_>, background: Option<&mut AppState>) {
         if let Some(app) = background {
             super::render::render(frame, app);
         }
@@ -254,7 +254,7 @@ impl Dialog {
 pub async fn run<T, F, Fut, B, S>(
     terminal: &mut ratatui::Terminal<B>,
     events: &mut S,
-    background: Option<&AppState>,
+    mut background: Option<&mut AppState>,
     operation: F,
 ) -> Result<T, String>
 where
@@ -275,7 +275,7 @@ where
     };
     loop {
         terminal
-            .draw(|frame| dialog.render(frame, background))
+            .draw(|frame| dialog.render(frame, background.as_deref_mut()))
             .map_err(|e| e.to_string())?;
         tokio::select! {
             biased;

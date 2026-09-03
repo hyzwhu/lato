@@ -44,7 +44,7 @@ with tempfile.TemporaryDirectory(prefix="lato-tui-smoke-") as root:
         "provider": "fixture", "id": "fixture-model", "api": "openai-completions",
         "base_url": f"http://127.0.0.1:{server.server_port}/v1", "env": "LATO_FIXTURE_KEY"
     }]}))
-    def launch(test_mode):
+    def launch(test_mode, extra_args=()):
         pid, fd = pty.fork()
         if pid == 0:
             os.chdir(root)
@@ -53,7 +53,7 @@ with tempfile.TemporaryDirectory(prefix="lato-tui-smoke-") as root:
             env.update(LATO_HOME=str(home), LATO_FIXTURE_KEY="fixture", TERM="xterm-256color")
             if test_mode:
                 env["LATO_TUI_TEST"] = "1"
-            os.execve(binary, [binary, "--lang", "en"], env)
+            os.execve(binary, [binary, "--lang", "en", *extra_args], env)
         fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 120, 0, 0))
         return pid, fd
 
@@ -90,6 +90,9 @@ with tempfile.TemporaryDirectory(prefix="lato-tui-smoke-") as root:
 
     try:
         expect("Enter a prompt")
+        start = send("/permissions\r")
+        expect("Sandbox: workspace", start)
+        expect("Automatic approval", start)
         send("remember marker-saffron\r")
         expect("hi")
         start = send("/model\r")
@@ -137,6 +140,7 @@ with tempfile.TemporaryDirectory(prefix="lato-tui-smoke-") as root:
         os.close(fd)
         (home / "config.json").unlink()
         output.clear()
+        previous_sessions = set((home / "sessions").iterdir())
         pid, fd = launch(False)
         expect("Provider")
         send("fixture\r")
@@ -144,7 +148,17 @@ with tempfile.TemporaryDirectory(prefix="lato-tui-smoke-") as root:
         send("\r")
         expect("Trust this folder")
         send("\r")
+        expect("Choose sandbox scope")
+        send("off\r")
         expect("Enter a prompt")
+        start = send("/permissions\r")
+        expect("Sandbox: off", start)
+        expect("Ask before mutations", start)
+        start = send("remember permission-resume-marker\r")
+        expect("switched-ok", start)
+        new_sessions = set((home / "sessions").iterdir()) - previous_sessions
+        assert len(new_sessions) == 1, new_sessions
+        resume_id = new_sessions.pop().name
         send("/exit\r")
         drain(0.5)
         _, status = os.waitpid(pid, 0)
@@ -153,6 +167,24 @@ with tempfile.TemporaryDirectory(prefix="lato-tui-smoke-") as root:
         assert output.count(b"\x1b[?1049h") == 1
         assert output.count(b"\x1b[?1049l") == 1
         print("PASS: first-run model configuration and folder trust stay inside TUI")
+        os.close(fd)
+        output.clear()
+        pid, fd = launch(False, ["resume", resume_id, "--sandbox", "read-only"])
+        expect("Trust this folder")
+        send("Yes\r")
+        start = send("/permissions\r")
+        expect("Sandbox: read-only", start)
+        expect("Automatic approval", start)
+        assert b"Choosesandboxscope" not in normalized(output), "explicit sandbox should skip picker"
+        start = send("what did I ask you to remember?\r")
+        expect("switched-ok", start)
+        assert "permission-resume-marker" in json.dumps(requests[-1]), "resume lost context"
+        send("/exit\r")
+        drain(0.5)
+        _, status = os.waitpid(pid, 0)
+        pid = None
+        assert os.waitstatus_to_exitcode(status) == 0
+        print("PASS: resume uses explicit read-only instead of previous off, independently of trust, and preserves context")
     finally:
         if pid is not None:
             os.kill(pid, signal.SIGKILL)

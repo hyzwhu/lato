@@ -8,7 +8,7 @@ use ratatui::{
     widgets::Block,
 };
 
-pub fn render(frame: &mut Frame<'_>, app: &AppState) {
+pub fn render(frame: &mut Frame<'_>, app: &mut AppState) {
     frame.render_widget(
         Block::default().style(ratatui::style::Style::default().bg(widgets::BG)),
         frame.area(),
@@ -39,7 +39,7 @@ pub fn render(frame: &mut Frame<'_>, app: &AppState) {
     widgets::approval(frame, app);
 }
 
-fn main(frame: &mut Frame<'_>, app: &AppState) {
+fn main(frame: &mut Frame<'_>, app: &mut AppState) {
     let rows = Layout::vertical([Constraint::Min(5), Constraint::Length(1)]).split(frame.area());
     match app.layout {
         LayoutMode::Wide => {
@@ -98,7 +98,7 @@ mod tests {
         if main {
             app.screen = Screen::Main;
         }
-        terminal.draw(|frame| render(frame, &app)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let buffer = terminal.backend().buffer();
         let mut output = String::new();
         for y in 0..height {
@@ -147,7 +147,7 @@ mod tests {
             app.screen = if main { Screen::Main } else { Screen::Welcome };
             for text in ["ab", "中文", "e\u{301}🙂", &"中文🙂abc".repeat(40)] {
                 app.composer = crate::tui::input::InputBuffer::from(text);
-                terminal.draw(|frame| render(frame, &app)).unwrap();
+                terminal.draw(|frame| render(frame, &mut app)).unwrap();
                 let cursor = terminal.get_cursor_position().unwrap();
                 let buffer = terminal.backend().buffer();
                 let marker = (0..width)
@@ -168,7 +168,7 @@ mod tests {
             }
             app.composer = crate::tui::input::InputBuffer::from("中文ab");
             app.composer.move_left();
-            terminal.draw(|frame| render(frame, &app)).unwrap();
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
             let cursor = terminal.get_cursor_position().unwrap();
             assert_eq!(
                 terminal.backend().buffer()[(cursor.x, cursor.y)].symbol(),
@@ -189,7 +189,7 @@ mod tests {
         );
         app.overlay = Some(Overlay::Search);
         app.search = crate::tui::input::InputBuffer::from("中文abc".repeat(30));
-        terminal.draw(|frame| render(frame, &app)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let cursor = terminal.get_cursor_position().unwrap();
         let buffer = terminal.backend().buffer();
         assert!((0..80).any(|x| buffer[(x, cursor.y)].symbol() == "/"));
