@@ -27,6 +27,50 @@ impl InputBuffer {
         self.text.is_empty()
     }
 
+    /// A single visible line, with one cell reserved for the insertion cursor.
+    pub fn viewport(&self, width: usize, masked: bool) -> (String, usize) {
+        if width == 0 {
+            return (String::new(), 0);
+        }
+        let cells = self
+            .text
+            .grapheme_indices(true)
+            .map(|(index, value)| {
+                let shown = if masked {
+                    "•".to_string()
+                } else {
+                    value
+                        .chars()
+                        .map(|c| if c.is_control() { ' ' } else { c })
+                        .collect()
+                };
+                let size = UnicodeWidthStr::width(shown.as_str());
+                (index, shown, size)
+            })
+            .collect::<Vec<_>>();
+        let cursor = cells
+            .iter()
+            .take_while(|(index, _, _)| *index < self.cursor)
+            .count();
+        let mut start = cursor;
+        let mut column = 0;
+        while start > 0 && column + cells[start - 1].2 < width {
+            start -= 1;
+            column += cells[start].2;
+        }
+        let mut text = String::new();
+        let mut used = 0;
+        for (_, shown, size) in &cells[start..] {
+            if used + size > width {
+                break;
+            }
+            text.push_str(shown);
+            used += size;
+        }
+        (text, column)
+    }
+
+    #[cfg(test)]
     pub fn cursor_width(&self) -> usize {
         UnicodeWidthStr::width(&self.text[..self.cursor])
     }
@@ -126,5 +170,21 @@ mod tests {
         input.insert_str("文");
         assert_eq!(input.as_str(), "中文ab");
         assert_eq!(input.cursor_width(), 4);
+    }
+    #[test]
+    fn viewport_handles_unicode_scrolling_and_masked_cursor() {
+        let mut input = InputBuffer::from("ab中文🙂");
+        assert_eq!(input.viewport(5, false), ("文🙂".into(), 4));
+        input.move_left();
+        assert_eq!(input.viewport(5, false), ("中文".into(), 4));
+        input.move_home();
+        assert_eq!(input.viewport(5, false), ("ab中".into(), 0));
+        input.move_end();
+        assert_eq!(input.viewport(4, true), ("•••".into(), 3));
+        assert_eq!(input.viewport(0, false), (String::new(), 0));
+        assert_eq!(
+            InputBuffer::from("a\nb").viewport(8, false),
+            ("a b".into(), 3)
+        );
     }
 }

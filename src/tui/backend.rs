@@ -8,6 +8,7 @@ pub enum BackendCommand {
     Submit(String),
     Cancel,
     Clear,
+    Resume(String),
     Shutdown,
 }
 
@@ -18,6 +19,7 @@ pub enum BackendEvent {
     TurnCompleted(String),
     TurnCancelled,
     Cleared(String),
+    Resumed(String),
     Error(String),
 }
 
@@ -117,6 +119,9 @@ pub fn spawn(
                         Some(BackendCommand::Submit(_)) => {
                             let _ = event_tx.send(BackendEvent::Error("a turn is already running".into()));
                         }
+                        Some(BackendCommand::Resume(_)) => {
+                            let _ = event_tx.send(BackendEvent::Error("cannot switch sessions while a turn is running".into()));
+                        }
                         Some(BackendCommand::Clear) => {
                             let _ = event_tx.send(BackendEvent::Error("cannot clear while a turn is running".into()));
                         }
@@ -204,6 +209,20 @@ pub fn spawn(
                         Ok(()) => {
                             let _ = event_tx
                                 .send(BackendEvent::Cleared(owned.session_id().to_string()));
+                        }
+                        Err(error) => {
+                            let _ = event_tx.send(BackendEvent::Error(error));
+                        }
+                    }
+                }
+                Some(BackendCommand::Resume(id)) => {
+                    let Some(owned) = client.as_mut() else {
+                        continue;
+                    };
+                    match owned.resume(id).await {
+                        Ok(()) => {
+                            let _ = event_tx
+                                .send(BackendEvent::Resumed(owned.session_id().to_string()));
                         }
                         Err(error) => {
                             let _ = event_tx.send(BackendEvent::Error(error));

@@ -64,6 +64,7 @@ impl LayoutMode {
 pub enum Overlay {
     CommandPalette,
     Search,
+    Configuration,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -161,6 +162,10 @@ pub enum AppEvent {
 pub enum Effect {
     Backend(BackendCommand),
     PersistLanguage(Language),
+    ConfigureModel,
+    Doctor,
+    Sessions,
+    Login,
 }
 
 impl AppState {
@@ -277,6 +282,13 @@ impl AppState {
                 vec![Effect::PersistLanguage(language)]
             }
             AppEvent::ClearConversation => {
+                if self.responding {
+                    self.error = Some(
+                        "Wait for the current response or cancel it first / 请先等待或取消当前回复"
+                            .into(),
+                    );
+                    return Vec::new();
+                }
                 self.messages.clear();
                 self.tools.clear();
                 self.overlay = None;
@@ -317,6 +329,14 @@ impl AppState {
         match event {
             BackendEvent::SessionReady(id) | BackendEvent::Cleared(id) => {
                 self.session_id = id;
+            }
+            BackendEvent::Resumed(id) => {
+                self.session_id = id;
+                self.messages.clear();
+                self.tools.clear();
+                self.scroll = 0;
+                self.focus = Focus::Chat;
+                self.screen = Screen::Main;
             }
             BackendEvent::Update(update) => self.apply_update(update),
             BackendEvent::TurnCompleted(text) => {

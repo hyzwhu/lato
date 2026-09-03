@@ -132,6 +132,7 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v6
       - uses: actions/download-artifact@v5
         with:
           pattern: release-*
@@ -160,13 +161,13 @@ jobs:
           GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          cat > release-notes.md <<'EOF'
-          Lato Public Beta release.
-
-          LIVE provider validation unavailable unless a successful manual live-provider-smoke run is linked separately.
-          EOF
+          notes="docs/releases/$GITHUB_REF_NAME.md"
+          if [[ ! -f "$notes" ]]; then
+            notes="release-notes.md"
+            echo "Lato Public Beta release." > "$notes"
+          fi
           gh release create "$GITHUB_REF_NAME" dist/* \
             --verify-tag \
             --prerelease \
             --title "Lato $GITHUB_REF_NAME" \
-            --notes-file release-notes.md
+            --notes-file "$notes"

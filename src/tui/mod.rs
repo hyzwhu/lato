@@ -1,4 +1,5 @@
 pub mod backend;
+pub mod dialog;
 pub mod event;
 pub mod i18n;
 pub mod input;
@@ -11,7 +12,6 @@ use self::{
     backend::{ApprovalPrompt, BackendCommand, BackendHandle},
     i18n::{Language, TextKey, tr},
     state::{AppEvent, AppState, ApprovalState, Effect, Message, MessageRole, Overlay},
-    terminal::TerminalGuard,
 };
 use crate::client::InteractiveAcpClient;
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -30,26 +30,18 @@ pub struct InteractiveBootstrap {
     pub home: PathBuf,
     pub sessions: Vec<String>,
     pub resumed: bool,
+    pub switchable: std::sync::Arc<lato_ai::SwitchableModelStream>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub enum TuiExit {
     #[default]
     Quit,
-    SwitchModel,
-    Login,
-    Resume(String),
 }
 
-pub async fn run(bootstrap: InteractiveBootstrap) -> Result<TuiExit, String> {
-    let (_guard, terminal) = TerminalGuard::enter()?;
-    tokio::task::LocalSet::new()
-        .run_until(run_loop(terminal, bootstrap))
-        .await
-}
-
-async fn run_loop(
-    mut terminal: terminal::TuiTerminal,
+pub async fn run(
+    terminal: &mut terminal::TuiTerminal,
+    terminal_events: &mut EventStream,
     mut bootstrap: InteractiveBootstrap,
 ) -> Result<TuiExit, String> {
     let session_id = bootstrap.client.session_id().to_string();
@@ -68,7 +60,6 @@ async fn run_loop(
         .size()
         .map_err(|error| format!("read terminal size: {error}"))?;
     app.reduce(AppEvent::Resize(size.width, size.height));
-    let mut terminal_events = EventStream::new();
     let mut tick = tokio::time::interval(std::time::Duration::from_millis(250));
     let mut approvals_open = true;
 
@@ -112,7 +103,16 @@ async fn run_loop(
                 (app.reduce(AppEvent::Tick), animating)
             },
         };
-        execute_effects(effects, &backend, &bootstrap.home, &mut app);
+        execute_effects(
+            effects,
+            &backend,
+            &bootstrap.home,
+            &mut app,
+            terminal,
+            terminal_events,
+            &bootstrap.switchable,
+        )
+        .await;
         if needs_draw {
             terminal
                 .draw(|frame| render::render(frame, &app))
@@ -123,17 +123,114 @@ async fn run_loop(
     Ok(app.exit_action)
 }
 
-fn execute_effects(
+async fn execute_effects(
     effects: Vec<Effect>,
     backend: &BackendHandle,
     home: &std::path::Path,
     app: &mut AppState,
+    terminal: &mut terminal::TuiTerminal,
+    events: &mut EventStream,
+    switchable: &lato_ai::SwitchableModelStream,
 ) {
     for effect in effects {
         match effect {
             Effect::Backend(command) => {
                 if let Err(error) = backend.send(command) {
                     app.error = Some(error);
+                }
+            }
+            Effect::Doctor => {
+                app.composer.clear();
+                app.overlay = Some(Overlay::Configuration);
+                let workspace = app.workspace.clone();
+                let result = dialog::run(terminal, events, Some(app), |ui| async move {
+                    ui.notice("Checking local configuration / 检查本地配置…");
+                    Ok(crate::cli::doctor_report(home, &workspace).await)
+                })
+                .await;
+                app.overlay = None;
+                if let Ok(report) = result {
+                    app.screen = state::Screen::Main;
+                    app.messages.push(Message {
+                        role: MessageRole::System,
+                        content: report,
+                        expanded: true,
+                    });
+                }
+            }
+            Effect::Sessions => {
+                app.composer.clear();
+                app.overlay = None;
+                if app.responding {
+                    app.error = Some(
+                        "Cancel the current response before switching sessions / 请先取消当前回复"
+                            .into(),
+                    );
+                    continue;
+                }
+                app.overlay = Some(Overlay::Configuration);
+                let workspace = app.workspace.clone();
+                let result = dialog::run(terminal, events, Some(app), |ui| async move {
+                    let sessions = crate::client::list_sessions_over_acp(workspace).await?;
+                    ui.choose("Sessions / 会话 — type to filter", &sessions)
+                        .await
+                })
+                .await;
+                app.overlay = None;
+                match result {
+                    Ok(id) if id != app.session_id => {
+                        if let Err(error) = backend.send(BackendCommand::Resume(id)) {
+                            app.error = Some(error);
+                        }
+                    }
+                    Err(error) if error != dialog::CANCELLED => app.error = Some(error),
+                    _ => {}
+                }
+            }
+            Effect::ConfigureModel | Effect::Login => {
+                if app.responding {
+                    app.error = Some(
+                        "Wait for the current response or cancel it first / 请先等待或取消当前回复"
+                            .into(),
+                    );
+                    continue;
+                }
+                let login = matches!(effect, Effect::Login);
+                app.overlay = Some(Overlay::Configuration);
+                app.composer.clear();
+                let current = app.model.clone();
+                let result = dialog::run(terminal, events, Some(app), |ui| async move {
+                    let selection = if login {
+                        let (provider, _) = current
+                            .split_once('/')
+                            .ok_or("model must be provider/model")?;
+                        crate::cli::configure_provider_auth(home, provider, true, &ui).await?;
+                        current
+                    } else {
+                        crate::cli::configure_interactively(home, &ui).await?
+                    };
+                    ui.notice("Loading model / 加载模型…");
+                    let stream = crate::cli::configured_stream(&selection).await?;
+                    Ok((selection, stream))
+                })
+                .await;
+                app.overlay = None;
+                if let Ok(size) = terminal.size() {
+                    app.reduce(AppEvent::Resize(size.width, size.height));
+                }
+                match result {
+                    Ok((selection, stream)) => {
+                        match crate::cli::persist_model_selection(home, &selection, app.language) {
+                            Ok(()) => {
+                                switchable.set(stream).await;
+                                app.model = selection;
+                                app.error = None;
+                            }
+                            Err(error) => app.error = Some(error),
+                        }
+                    }
+                    Err(error) if error == dialog::CANCELLED => {}
+                    Err(error) => app.error = Some(error),
                 }
             }
             Effect::PersistLanguage(language) => {
@@ -153,7 +250,7 @@ fn handle_terminal_event(
 ) -> Vec<Effect> {
     match event {
         Event::Resize(width, height) => app.reduce(AppEvent::Resize(width, height)),
-        Event::Paste(text) => {
+        Event::Paste(text) if app.approval.is_none() => {
             active_input(app).insert_str(&text);
             Vec::new()
         }
@@ -228,7 +325,7 @@ fn handle_key(
         }
         KeyCode::Up => app.reduce(AppEvent::Scroll(-1)),
         KeyCode::Down => app.reduce(AppEvent::Scroll(1)),
-        KeyCode::Char('/') if app.composer.is_empty() && app.screen == state::Screen::Main => {
+        KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.reduce(AppEvent::OpenSearch)
         }
         KeyCode::Char('j') if app.focus != state::Focus::Chat => app.reduce(AppEvent::Scroll(1)),
@@ -238,6 +335,7 @@ fn handle_key(
                 .modifiers
                 .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER | KeyModifiers::ALT) =>
         {
+            app.focus = state::Focus::Chat;
             app.composer.insert_char(value);
             Vec::new()
         }
@@ -255,9 +353,15 @@ fn submit_or_command(app: &mut AppState, trust: &SessionTrust) -> Vec<Effect> {
             app.composer.clear();
             app.reduce(AppEvent::Exit(TuiExit::Quit))
         }
-        "/model" => app.reduce(AppEvent::Exit(TuiExit::SwitchModel)),
-        "/login" => app.reduce(AppEvent::Exit(TuiExit::Login)),
-        "/clear" => {
+        "/model" => vec![Effect::ConfigureModel],
+        "/login" => vec![Effect::Login],
+        "/doctor" => vec![Effect::Doctor],
+        "/sessions" => vec![Effect::Sessions],
+        "/search" => {
+            app.composer.clear();
+            app.reduce(AppEvent::OpenSearch)
+        }
+        "/clear" | "/new" => {
             app.composer.clear();
             app.reduce(AppEvent::ClearConversation)
         }
@@ -289,7 +393,7 @@ fn submit_or_command(app: &mut AppState, trust: &SessionTrust) -> Vec<Effect> {
             app.screen = state::Screen::Main;
             app.messages.push(Message {
                 role: MessageRole::System,
-                content: "/help  /clear  /model  /login  /lang  /approve  /status  /exit".into(),
+                content: "/help  /new  /clear  /sessions  /model  /login  /doctor  /search  /lang  /approve  /status  /exit".into(),
                 expanded: true,
             });
             Vec::new()
@@ -310,7 +414,13 @@ fn resume_selected_session(app: &mut AppState) -> Vec<Effect> {
         app.focus = state::Focus::Chat;
         return Vec::new();
     }
-    app.reduce(AppEvent::Exit(TuiExit::Resume(session.id.clone())))
+    if app.responding {
+        app.error = Some(
+            "Wait for the current response or cancel it first / 请先等待或取消当前回复".into(),
+        );
+        return Vec::new();
+    }
+    vec![Effect::Backend(BackendCommand::Resume(session.id.clone()))]
 }
 
 fn handle_approval_key(app: &mut AppState, key: KeyEvent) -> Vec<Effect> {
@@ -340,14 +450,10 @@ fn handle_palette_key(app: &mut AppState, key: KeyEvent, trust: &SessionTrust) -
         }
         KeyCode::Enter => match app.palette_index {
             0 => app.reduce(AppEvent::ClearConversation),
-            1 => {
-                app.overlay = None;
-                app.focus = state::Focus::Sessions;
-                Vec::new()
-            }
+            1 => vec![Effect::Sessions],
             2 => app.reduce(AppEvent::ClearConversation),
-            3 => app.reduce(AppEvent::Exit(TuiExit::SwitchModel)),
-            4 => app.reduce(AppEvent::Exit(TuiExit::Login)),
+            3 => vec![Effect::ConfigureModel],
+            4 => vec![Effect::Login],
             5 => {
                 let language = match app.language {
                     Language::ZhCn => Language::En,
@@ -412,13 +518,14 @@ fn active_input(app: &mut AppState) -> &mut input::InputBuffer {
     if app.overlay == Some(Overlay::Search) {
         &mut app.search
     } else {
+        app.focus = state::Focus::Chat;
         &mut app.composer
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{TuiExit, resume_selected_session};
+    use super::{BackendCommand, Effect, resume_selected_session};
     use crate::tui::{i18n::Language, state::AppState};
     use std::path::PathBuf;
 
@@ -433,9 +540,61 @@ mod tests {
         );
         app.session_index = 1;
 
-        resume_selected_session(&mut app);
-
-        assert!(app.should_exit);
-        assert_eq!(app.exit_action, TuiExit::Resume("historical".into()));
+        let effects = resume_selected_session(&mut app);
+        assert!(!app.should_exit);
+        assert!(
+            matches!(&effects[..], [Effect::Backend(BackendCommand::Resume(id))] if id == "historical")
+        );
+    }
+    #[tokio::test]
+    async fn slash_commands_and_palette_stay_in_the_tui() {
+        use super::*;
+        let workspace = tempfile::tempdir().unwrap();
+        let trust = SessionTrust::for_interactive(workspace.path(), false);
+        let mut app = AppState::new(
+            Language::En,
+            workspace.path().to_path_buf(),
+            "provider/model".into(),
+            "current".into(),
+            vec![],
+        );
+        app.screen = state::Screen::Main;
+        let client = crate::client::InteractiveAcpClient::new_session_with_approval(
+            workspace.path().to_path_buf(),
+            trust.clone(),
+            lato_agent::default_fake_stream(),
+            None,
+        )
+        .await
+        .unwrap();
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (backend, _) = backend::spawn(client);
+                handle_key(
+                    &mut app,
+                    KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+                    &backend,
+                    &trust,
+                );
+                assert_eq!(app.composer.as_str(), "/");
+                assert!(app.overlay.is_none());
+                app.composer.insert_str("model");
+                assert!(matches!(
+                    &submit_or_command(&mut app, &trust)[..],
+                    [Effect::ConfigureModel]
+                ));
+                assert!(!app.should_exit);
+                app.palette_index = 4;
+                assert!(matches!(
+                    &handle_palette_key(
+                        &mut app,
+                        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                        &trust
+                    )[..],
+                    [Effect::Login]
+                ));
+                assert!(!app.should_exit);
+            })
+            .await;
     }
 }

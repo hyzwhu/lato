@@ -234,6 +234,24 @@ impl InteractiveAcpClient {
         Ok(())
     }
 
+    pub async fn resume(&mut self, session_id: String) -> Result<(), String> {
+        let id = self.take_id();
+        let response = self
+            .host
+            .handle(req(
+                id,
+                "session/resume",
+                serde_json::json!({"sessionId": session_id}),
+            ))
+            .await
+            .ok_or("no response")?;
+        self.session_id = response_result(&response)?["sessionId"]
+            .as_str()
+            .ok_or("no session")?
+            .to_string();
+        Ok(())
+    }
+
     pub async fn cancel(&mut self) -> Result<(), String> {
         let id = self.take_id();
         let response = self
@@ -361,5 +379,75 @@ mod tests {
                 error: "denied".into()
             }
         );
+    }
+    #[tokio::test]
+    async fn model_switch_preserves_session_and_conversation_context() {
+        use super::*;
+        use lato_ai::{StreamPiece, SwitchableModelStream};
+        struct RecordingStream {
+            text: &'static str,
+            contexts: std::sync::Mutex<Vec<serde_json::Value>>,
+        }
+        #[async_trait::async_trait]
+        impl ModelStream for RecordingStream {
+            async fn stream(
+                &self,
+                _: usize,
+                context: serde_json::Value,
+                tx: tokio::sync::mpsc::Sender<StreamPiece>,
+            ) -> Result<(), String> {
+                self.contexts.lock().unwrap().push(context);
+                tx.send(StreamPiece::Text(self.text.into()))
+                    .await
+                    .map_err(|e| e.to_string())
+            }
+        }
+        let workspace = tempfile::tempdir().unwrap();
+        let trust = SessionTrust::for_interactive(workspace.path(), false);
+        let first = Arc::new(RecordingStream {
+            text: "first-answer",
+            contexts: Default::default(),
+        });
+        let second = Arc::new(RecordingStream {
+            text: "second-answer",
+            contexts: Default::default(),
+        });
+        let switchable = Arc::new(SwitchableModelStream::new(first));
+        let mut client = InteractiveAcpClient::new_session_with_approval(
+            workspace.path().to_path_buf(),
+            trust,
+            switchable.clone(),
+            None,
+        )
+        .await
+        .unwrap();
+        let original = client.session_id().to_string();
+        assert_eq!(
+            client
+                .send_streaming("remember marker-saffron".into(), |_| {})
+                .await
+                .unwrap(),
+            "first-answer"
+        );
+        switchable.set(second.clone()).await;
+        assert_eq!(
+            client
+                .send_streaming("what did I say?".into(), |_| {})
+                .await
+                .unwrap(),
+            "second-answer"
+        );
+        assert_eq!(client.session_id(), original);
+        {
+            let contexts = second.contexts.lock().unwrap();
+            assert!(contexts[0].to_string().contains("marker-saffron"));
+            assert!(contexts[0].to_string().contains("first-answer"));
+        }
+        client.clear().await.unwrap();
+        assert_ne!(client.session_id(), original);
+        client.resume(original.clone()).await.unwrap();
+        assert_eq!(client.session_id(), original);
+        assert!(client.resume("nonexistent".into()).await.is_err());
+        assert_eq!(client.session_id(), original);
     }
 }

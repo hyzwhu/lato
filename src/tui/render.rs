@@ -34,7 +34,7 @@ pub fn render(frame: &mut Frame<'_>, app: &AppState) {
     match app.overlay {
         Some(Overlay::CommandPalette) => widgets::command_palette(frame, app),
         Some(Overlay::Search) => widgets::search_overlay(frame, app),
-        None => {}
+        Some(Overlay::Configuration) | None => {}
     }
     widgets::approval(frame, app);
 }
@@ -131,5 +131,68 @@ mod tests {
         let text = render_text(Language::En, 60, 24, true);
         assert!(text.contains("Type a message"));
         assert!(!text.contains("Tool calls"));
+    }
+    #[test]
+    fn cursor_tracks_rendered_unicode_input_across_layouts() {
+        for (width, main) in [(120, true), (90, true), (60, true), (100, false)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 30)).unwrap();
+            let mut app = AppState::new(
+                Language::En,
+                PathBuf::from("/tmp"),
+                "model".into(),
+                "session".into(),
+                vec![],
+            );
+            app.layout = LayoutMode::for_size(width, 30);
+            app.screen = if main { Screen::Main } else { Screen::Welcome };
+            for text in ["ab", "中文", "e\u{301}🙂", &"中文🙂abc".repeat(40)] {
+                app.composer = crate::tui::input::InputBuffer::from(text);
+                terminal.draw(|frame| render(frame, &app)).unwrap();
+                let cursor = terminal.get_cursor_position().unwrap();
+                let buffer = terminal.backend().buffer();
+                let marker = (0..width)
+                    .find(|x| buffer[(*x, cursor.y)].symbol() == "›")
+                    .expect("cursor must be on the input text row, not the border");
+                assert!(cursor.x >= marker + 2 && cursor.x < width);
+                assert_eq!(
+                    buffer[(cursor.x, cursor.y)].symbol(),
+                    " ",
+                    "cursor must follow the visible text"
+                );
+                if text == "中文" {
+                    assert_eq!(cursor.x, marker + 6);
+                }
+                if text == "e\u{301}🙂" {
+                    assert_eq!(cursor.x, marker + 5);
+                }
+            }
+            app.composer = crate::tui::input::InputBuffer::from("中文ab");
+            app.composer.move_left();
+            terminal.draw(|frame| render(frame, &app)).unwrap();
+            let cursor = terminal.get_cursor_position().unwrap();
+            assert_eq!(
+                terminal.backend().buffer()[(cursor.x, cursor.y)].symbol(),
+                "b"
+            );
+        }
+    }
+
+    #[test]
+    fn search_cursor_uses_content_row_and_scrolls() {
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let mut app = AppState::new(
+            Language::En,
+            PathBuf::from("/tmp"),
+            "model".into(),
+            "session".into(),
+            vec![],
+        );
+        app.overlay = Some(Overlay::Search);
+        app.search = crate::tui::input::InputBuffer::from("中文abc".repeat(30));
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let cursor = terminal.get_cursor_position().unwrap();
+        let buffer = terminal.backend().buffer();
+        assert!((0..80).any(|x| buffer[(x, cursor.y)].symbol() == "/"));
+        assert_eq!(buffer[(cursor.x, cursor.y)].symbol(), " ");
     }
 }

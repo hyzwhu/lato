@@ -156,10 +156,7 @@ pub fn chat(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
                 Style::default().fg(MUTED),
             ),
             Span::raw("    "),
-            Span::styled(
-                format!("{}: —", tr(app.language, TextKey::Token)),
-                Style::default().fg(MUTED),
-            ),
+            Span::styled(app.model.clone(), Style::default().fg(MUTED)),
         ]))
         .style(Style::default().bg(GLASS)),
         rows[0],
@@ -196,19 +193,21 @@ pub fn chat(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
                 ));
             }
             MessageRole::System => {
-                lines.push(Line::styled(
-                    message.content.clone(),
-                    Style::default().fg(MUTED),
-                ));
+                for line in message.content.lines() {
+                    lines.push(Line::styled(line.to_string(), Style::default().fg(MUTED)));
+                }
             }
         }
         lines.push(Line::raw(""));
     }
     if let Some(error) = &app.error {
-        lines.push(Line::styled(
-            format!("{}: {error}", tr(app.language, TextKey::Error)),
-            Style::default().fg(ERROR),
-        ));
+        lines.insert(
+            0,
+            Line::styled(
+                format!("{}: {error}", tr(app.language, TextKey::Error)),
+                Style::default().fg(ERROR),
+            ),
+        );
     }
     frame.render_widget(
         Paragraph::new(lines)
@@ -227,10 +226,18 @@ fn composer(frame: &mut Frame<'_>, area: Rect, app: &AppState, welcome: bool) {
     } else {
         tr(app.language, TextKey::MessagePlaceholder)
     };
+    let block = Block::default()
+        .borders(Borders::TOP)
+        .border_style(Style::default().fg(GLASS));
+    let inner = block.inner(rows[0]);
+    frame.render_widget(block.style(Style::default().bg(BG)), rows[0]);
+    let (visible, cursor) = app
+        .composer
+        .viewport(inner.width.saturating_sub(2) as usize, false);
     let content = if app.composer.is_empty() {
         Span::styled(placeholder, Style::default().fg(MUTED))
     } else {
-        Span::styled(app.composer.as_str().to_string(), Style::default().fg(TEXT))
+        Span::styled(visible, Style::default().fg(TEXT))
     };
     frame.render_widget(
         Paragraph::new(Line::from(vec![
@@ -240,13 +247,8 @@ fn composer(frame: &mut Frame<'_>, area: Rect, app: &AppState, welcome: bool) {
             ),
             content,
         ]))
-        .block(
-            Block::default()
-                .borders(Borders::TOP)
-                .border_style(Style::default().fg(GLASS)),
-        )
         .style(Style::default().bg(BG)),
-        rows[0],
+        inner,
     );
     let status = if app.responding {
         format!(
@@ -274,11 +276,13 @@ fn composer(frame: &mut Frame<'_>, area: Rect, app: &AppState, welcome: bool) {
             ),
         rows[1],
     );
-    if app.focus == Focus::Chat && app.overlay.is_none() && app.approval.is_none() {
-        let cursor = app.composer.cursor_width() as u16;
-        let x = rows[0].x.saturating_add(2).saturating_add(cursor);
-        let max_x = rows[0].right().saturating_sub(1);
-        frame.set_cursor_position((x.min(max_x), rows[0].y));
+    if app.focus == Focus::Chat
+        && app.overlay.is_none()
+        && app.approval.is_none()
+        && inner.width > 2
+        && inner.height > 0
+    {
+        frame.set_cursor_position((inner.x + 2 + cursor as u16, inner.y));
     }
 }
 
@@ -347,7 +351,7 @@ pub fn tools(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
 
 pub fn footer(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
     let text = format!(
-        "Tab:{}  |  Cmd/Ctrl+K:{}  |  Ctrl+C:{}  |  /:{}",
+        "Tab:{}  |  Cmd/Ctrl+K:{}  |  Ctrl+C:{}  |  Ctrl+F:{}",
         tr(app.language, TextKey::SwitchPanel),
         tr(app.language, TextKey::Command),
         tr(app.language, TextKey::Cancel),
@@ -402,24 +406,22 @@ pub fn command_palette(frame: &mut Frame<'_>, app: &AppState) {
 pub fn search_overlay(frame: &mut Frame<'_>, app: &AppState) {
     let area = centered_rect(frame.area(), 60, 5);
     frame.render_widget(Clear, area);
+    let block = Block::default()
+        .title(format!(" {} ", tr(app.language, TextKey::Search)))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(BLUE));
+    let inner = block.inner(area);
+    let (text, cursor) = app
+        .search
+        .viewport(inner.width.saturating_sub(2) as usize, false);
+    frame.render_widget(block.style(Style::default().bg(RAISED)), area);
     frame.render_widget(
-        Paragraph::new(format!("/ {}", app.search.as_str()))
-            .block(
-                Block::default()
-                    .title(format!(" {} ", tr(app.language, TextKey::Search)))
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(BLUE)),
-            )
-            .style(Style::default().fg(TEXT).bg(RAISED)),
-        area,
+        Paragraph::new(format!("/ {text}")).style(Style::default().fg(TEXT).bg(RAISED)),
+        inner,
     );
-    frame.set_cursor_position((
-        area.x
-            .saturating_add(3)
-            .saturating_add(app.search.cursor_width() as u16)
-            .min(area.right().saturating_sub(2)),
-        area.y.saturating_add(2),
-    ));
+    if inner.width > 2 && inner.height > 0 && app.approval.is_none() {
+        frame.set_cursor_position((inner.x + 2 + cursor as u16, inner.y));
+    }
 }
 
 pub fn approval(frame: &mut Frame<'_>, app: &AppState) {

@@ -1,18 +1,21 @@
 use crate::args::{DoctorArgs, Invocation, LoginMethod, PromptArgs, SandboxArg};
-use crate::tui::i18n::Language;
+use crate::tui::{
+    dialog::{self, Interaction},
+    i18n::Language,
+};
 use lato::doctor::{self, DoctorDependencies, DoctorOptions, LiveProbe};
 use lato_agent::default_fake_stream;
 use lato_ai::{
     AuthInteraction, AuthNotice, CATALOG, CredentialStore, CustomHttpModelStream, CustomModel,
     HttpModelStream, ModelApi, ModelStream, OpenAICodexLoginMode, ProviderModelsEntry,
     ProviderModelsStore, RemoteCatalogRefreshPolicy, adapt_model_stream, api_key_login_allowed,
-    custom_model_auth, get_auth_refreshing, load_models_json, login_oauth, login_oauth_with_mode,
-    lookup_model, oauth_allowed, phase0_supported, provider_spec, refresh_openai_compatible_models,
+    custom_model_auth, get_auth_refreshing, load_models_json, login_oauth_with_mode, lookup_model,
+    oauth_allowed, phase0_supported, provider_spec, refresh_openai_compatible_models,
     refresh_remote_provider_catalog_with_policy, store_oauth,
 };
 use lato_workspace::{ApprovalMode, SandboxProfile, SessionTrust};
 use std::{
-    io::{IsTerminal, Write},
+    io::IsTerminal,
     path::PathBuf,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -216,6 +219,15 @@ impl LiveProbe for CatalogLiveProbe {
     }
 }
 
+pub(crate) async fn doctor_report(home: &std::path::Path, workspace: &std::path::Path) -> String {
+    let deps = DoctorDependencies {
+        home: home.to_path_buf(),
+        workspace: workspace.to_path_buf(),
+        live_probe: Arc::new(CatalogLiveProbe),
+    };
+    doctor::render_human(&doctor::run(DoctorOptions { live: false }, &deps).await)
+}
+
 async fn doctor_cmd(args: DoctorArgs) -> i32 {
     let workspace = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let deps = DoctorDependencies {
@@ -318,150 +330,134 @@ async fn interactive(startup: InteractiveStartup, language_override: Option<Lang
         settings.as_ref().and_then(|settings| settings.language),
         Language::system().as_deref(),
     );
-    let mut selection = if tui_test_mode {
-        "built-in/fake".to_string()
-    } else {
-        match settings {
-            Some(settings) => settings.default_model,
-            None => match configure_interactively(&home).await {
-                Ok(selection) => selection,
-                Err(error) => {
-                    eprintln!("error: {error}");
-                    return 1;
-                }
-            },
-        }
-    };
-    if !tui_test_mode && let Err(error) = persist_language(&home, language) {
-        eprintln!("error: {error}");
-        return 1;
-    }
-    let stream = if tui_test_mode {
-        default_fake_stream()
-    } else {
-        match configured_stream(&selection).await {
-            Ok(stream) => stream,
-            Err(error) => {
-                eprintln!("The saved model cannot start: {error}");
-                match configure_interactively(&home).await {
-                    Ok(new_selection) => {
-                        selection = new_selection;
-                        match configured_stream(&selection).await {
-                            Ok(stream) => stream,
-                            Err(error) => {
-                                eprintln!("error: {error}");
-                                return 1;
-                            }
-                        }
-                    }
-                    Err(error) => {
-                        eprintln!("error: {error}");
-                        return 1;
-                    }
-                }
-            }
-        }
-    };
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let trust_prompt = match language {
-        Language::ZhCn => "是否信任此文件夹并允许本次会话编辑文件/执行命令？[y/N] ",
-        Language::En => "Trust this folder and allow edits/commands this session? [y/N] ",
-    };
-    let trusted = if tui_test_mode {
-        true
-    } else {
-        match read_line(trust_prompt) {
-            Ok(answer) => matches!(answer.to_ascii_lowercase().as_str(), "y" | "yes"),
-            Err(error) => {
-                eprintln!("error: {error}");
-                return 1;
-            }
-        }
-    };
-    let trust = if trusted {
-        SessionTrust::for_interactive_auto(&cwd)
-    } else {
-        SessionTrust::for_interactive(&cwd, false)
-    };
-    let session_trust = trust.clone();
-    let (tui_approval, approvals) = crate::tui::backend::TuiToolApproval::channel();
-    let inline_approval = (trust.mode == ApprovalMode::Ask).then_some(tui_approval);
-    let client_result = match &startup {
-        InteractiveStartup::New => {
-            crate::client::InteractiveAcpClient::new_session_with_approval(
-                cwd.clone(),
-                trust.clone(),
-                stream,
-                inline_approval.clone(),
-            )
-            .await
-        }
-        InteractiveStartup::Resume(session_id) => {
-            crate::client::InteractiveAcpClient::resume_session_with_approval(
-                cwd.clone(),
-                trust.clone(),
-                stream,
-                inline_approval.clone(),
-                session_id.clone(),
-            )
-            .await
-        }
-    };
-    let client = match client_result {
-        Ok(client) => client,
+    let (guard, mut terminal) = match crate::tui::terminal::TerminalGuard::enter() {
+        Ok(value) => value,
         Err(error) => {
             eprintln!("error: {error}");
             return 1;
         }
     };
-    let mut sessions = crate::client::list_sessions_over_acp(cwd.clone())
-        .await
-        .unwrap_or_default();
-    if !sessions.iter().any(|id| id == client.session_id()) {
-        sessions.push(client.session_id().to_string());
-    }
-    sessions.sort_by(|left, right| right.cmp(left));
-    match crate::tui::run(crate::tui::InteractiveBootstrap {
-        client,
-        approvals,
-        trust: session_trust,
-        language,
-        workspace: cwd,
-        model: selection.clone(),
-        home: home.clone(),
-        sessions,
-        resumed: matches!(startup, InteractiveStartup::Resume(_)),
-    })
-    .await
-    {
-        Ok(crate::tui::TuiExit::Quit) => 0,
-        Ok(crate::tui::TuiExit::SwitchModel) => match configure_interactively(&home).await {
-            Ok(_) => Box::pin(interactive(InteractiveStartup::New, Some(language))).await,
-            Err(error) => {
-                eprintln!("error: {error}");
-                1
-            }
-        },
-        Ok(crate::tui::TuiExit::Login) => {
-            let Some((provider, _)) = selection.split_once('/') else {
-                eprintln!("error: model must be provider/model");
-                return 1;
-            };
-            match configure_provider_auth(&home, provider, true).await {
-                Ok(()) => Box::pin(interactive(InteractiveStartup::New, Some(language))).await,
+    let mut events = crossterm::event::EventStream::new();
+    let result = tokio::task::LocalSet::new()
+        .run_until(async {
+            let prepared = dialog::run(&mut terminal, &mut events, None, |ui| async move {
+                let selection = if tui_test_mode {
+                    "built-in/fake".to_string()
+                } else {
+                    match settings {
+                        Some(settings) => settings.default_model,
+                        None => configure_interactively(&home, &ui).await?,
+                    }
+                };
+                let (selection, stream) = if tui_test_mode {
+                    (selection, default_fake_stream())
+                } else {
+                    match configured_stream(&selection).await {
+                        Ok(stream) => (selection, stream),
+                        Err(error) => {
+                            ui.input(
+                                format!("Saved model failed: {error}. Enter to configure"),
+                                false,
+                            )
+                            .await?;
+                            let selected = configure_interactively(&home, &ui).await?;
+                            let stream = configured_stream(&selected).await?;
+                            (selected, stream)
+                        }
+                    }
+                };
+                if !tui_test_mode {
+                    persist_model_selection(&home, &selection, language)?;
+                }
+                let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                let trusted = tui_test_mode
+                    || ui
+                        .choose(
+                            format!(
+                                "{}\n{}",
+                                cwd.display(),
+                                match language {
+                                    Language::ZhCn =>
+                                        "是否信任此文件夹？允许本次会话编辑文件/执行命令",
+                                    Language::En =>
+                                        "Trust this folder for edits and commands this session?",
+                                }
+                            ),
+                            &[
+                                "No / 否 — ask for approval".into(),
+                                "Yes / 是 — trust this session".into(),
+                            ],
+                        )
+                        .await?
+                        .starts_with("Yes");
+                let trust = if trusted {
+                    SessionTrust::for_interactive_auto(&cwd)
+                } else {
+                    SessionTrust::for_interactive(&cwd, false)
+                };
+                let (tui_approval, approvals) = crate::tui::backend::TuiToolApproval::channel();
+                let inline_approval = (trust.mode == ApprovalMode::Ask).then_some(tui_approval);
+                let switchable = Arc::new(lato_ai::SwitchableModelStream::new(stream));
+                let client = match &startup {
+                    InteractiveStartup::New => {
+                        crate::client::InteractiveAcpClient::new_session_with_approval(
+                            cwd.clone(),
+                            trust.clone(),
+                            switchable.clone(),
+                            inline_approval,
+                        )
+                        .await?
+                    }
+                    InteractiveStartup::Resume(id) => {
+                        crate::client::InteractiveAcpClient::resume_session_with_approval(
+                            cwd.clone(),
+                            trust.clone(),
+                            switchable.clone(),
+                            inline_approval,
+                            id.clone(),
+                        )
+                        .await?
+                    }
+                };
+                let mut sessions = crate::client::list_sessions_over_acp(cwd.clone())
+                    .await
+                    .unwrap_or_default();
+                if !sessions.iter().any(|id| id == client.session_id()) {
+                    sessions.push(client.session_id().to_string());
+                }
+                sessions.sort_by(|a, b| b.cmp(a));
+                Ok(crate::tui::InteractiveBootstrap {
+                    client,
+                    approvals,
+                    trust,
+                    language,
+                    workspace: cwd,
+                    model: selection,
+                    home: home.clone(),
+                    sessions,
+                    resumed: matches!(startup, InteractiveStartup::Resume(_)),
+                    switchable,
+                })
+            })
+            .await;
+            match prepared {
+                Ok(bootstrap) => crate::tui::run(&mut terminal, &mut events, bootstrap).await,
+                Err(error) if error == dialog::CANCELLED => Ok(crate::tui::TuiExit::Quit),
                 Err(error) => {
-                    eprintln!("error: {error}");
-                    1
+                    let message = error.clone();
+                    let _ = dialog::run(&mut terminal, &mut events, None, |ui| async move {
+                        ui.input(format!("Error / 错误: {message}. Enter to close"), false)
+                            .await
+                    })
+                    .await;
+                    Err(error)
                 }
             }
-        }
-        Ok(crate::tui::TuiExit::Resume(session_id)) => {
-            Box::pin(interactive(
-                InteractiveStartup::Resume(session_id),
-                Some(language),
-            ))
-            .await
-        }
+        })
+        .await;
+    drop(guard);
+    match result {
+        Ok(_) => 0,
         Err(error) => {
             eprintln!("error: {error}");
             1
@@ -469,7 +465,24 @@ async fn interactive(startup: InteractiveStartup, language_override: Option<Lang
     }
 }
 
-async fn configure_interactively(home: &std::path::Path) -> Result<String, String> {
+pub(crate) fn persist_model_selection(
+    home: &std::path::Path,
+    selection: &str,
+    language: Language,
+) -> Result<(), String> {
+    save_settings(
+        home,
+        &CliSettings {
+            default_model: selection.to_string(),
+            language: Some(language),
+        },
+    )
+}
+
+pub(crate) async fn configure_interactively(
+    home: &std::path::Path,
+    ui: &Interaction,
+) -> Result<String, String> {
     let custom_models = load_models_json(&home.join("models.json")).unwrap_or_default();
     let mut providers = CATALOG
         .iter()
@@ -480,14 +493,12 @@ async fn configure_interactively(home: &std::path::Path) -> Result<String, Strin
         .collect::<Vec<_>>();
     providers.sort();
     providers.dedup();
-    println!("Choose a provider:");
-    for (index, provider) in providers.iter().enumerate() {
-        println!("  {}) {provider}", index + 1);
-    }
-    let provider = choose_item("Provider: ", &providers, "provider")?;
+    let provider = ui
+        .choose("Provider / 供应商 — type to filter", &providers)
+        .await?;
     let is_catalog_provider = CATALOG.iter().any(|model| model.provider == provider);
     if is_catalog_provider {
-        configure_provider_auth(home, &provider, false).await?;
+        configure_provider_auth(home, &provider, false, ui).await?;
     }
 
     let fallback = CATALOG
@@ -519,7 +530,7 @@ async fn configure_interactively(home: &std::path::Path) -> Result<String, Strin
         } else {
             match discovered {
                 Ok(models) if !models.is_empty() => {
-                    println!("Fetched {} catalog models for {provider}.", models.len());
+                    ui.notice(format!("Fetched {} models for {provider}.", models.len()));
                     let mut merged = fallback.clone();
                     for model in models {
                         if let Some(index) = merged.iter().position(|entry| entry.id == model.id) {
@@ -531,7 +542,7 @@ async fn configure_interactively(home: &std::path::Path) -> Result<String, Strin
                     merged
                 }
                 Ok(_) => {
-                    eprintln!("Provider returned an empty model list; using built-in fallback.");
+                    ui.notice("Provider returned an empty model list; using built-in fallback.");
                     fallback
                 }
                 Err(error)
@@ -543,9 +554,7 @@ async fn configure_interactively(home: &std::path::Path) -> Result<String, Strin
                     ));
                 }
                 Err(error) => {
-                    eprintln!(
-                        "Could not fetch models from {provider}: {error}\nUsing built-in fallback models."
-                    );
+                    ui.notice(format!("Could not fetch models from {provider}: {error}\nUsing built-in fallback models."));
                     fallback
                 }
             }
@@ -557,94 +566,68 @@ async fn configure_interactively(home: &std::path::Path) -> Result<String, Strin
     if model_ids.is_empty() {
         return Err(format!("no models available for {provider}"));
     }
-    println!("Choose a model:");
-    for (index, model) in model_ids.iter().enumerate() {
-        println!("  {}) {model}", index + 1);
-    }
-    let model = choose_item("Model: ", &model_ids, "model")?;
-    let selection = format!("{provider}/{model}");
-    save_settings(
-        home,
-        &CliSettings {
-            default_model: selection.clone(),
-            language: None,
-        },
-    )?;
-    Ok(selection)
+    let model = ui
+        .choose(
+            format!("{provider} — Model / 模型 — type to filter"),
+            &model_ids,
+        )
+        .await?;
+    Ok(format!("{provider}/{model}"))
 }
 
-fn choose_item(prompt: &str, values: &[String], kind: &str) -> Result<String, String> {
-    let answer = read_line(prompt).map_err(|e| e.to_string())?;
-    resolve_item(&answer, values, kind)
-}
-
-fn resolve_item(answer: &str, values: &[String], kind: &str) -> Result<String, String> {
-    if let Some(value) = values.iter().find(|value| value.as_str() == answer) {
-        return Ok(value.clone());
-    }
-    let index: usize = answer
-        .parse()
-        .map_err(|_| format!("invalid {kind} selection: enter its number or exact name"))?;
-    values
-        .get(index.saturating_sub(1))
-        .cloned()
-        .ok_or_else(|| format!("invalid {kind} selection"))
-}
-
-async fn configure_provider_auth(
+pub(crate) async fn configure_provider_auth(
     home: &std::path::Path,
     provider: &str,
     force_replace: bool,
+    ui: &Interaction,
 ) -> Result<(), String> {
     let store = CredentialStore::open(home).map_err(|error| error.to_string())?;
     let configured = store.get(provider).is_some() || provider_env_configured(provider);
     let supports_oauth = oauth_allowed(provider);
     let supports_api_key = api_key_login_allowed(provider);
 
+    let mut methods = Vec::new();
     if configured && !force_replace {
-        let prompt = match (supports_api_key, supports_oauth) {
-            (true, true) => {
-                "Credential already configured: 1) Use existing  2) Replace API key  3) OAuth [1]: "
-            }
-            (true, false) => {
-                "Credential already configured: 1) Use existing  2) Replace API key [1]: "
-            }
-            (false, true) => {
-                "Credential already configured: 1) Use existing  2) Re-login with OAuth [1]: "
-            }
-            (false, false) => return Ok(()),
-        };
-        match read_line(prompt).map_err(|error| error.to_string())?.trim() {
-            "" | "1" => return Ok(()),
-            "2" if supports_api_key => return save_interactive_api_key(home, provider),
-            "2" if supports_oauth => return save_interactive_oauth(home, provider).await,
-            "3" if supports_oauth => return save_interactive_oauth(home, provider).await,
-            _ => return Err("invalid authentication selection".into()),
-        }
+        methods.push("Use existing credential / 使用现有凭据".to_string());
     }
-
-    match (supports_api_key, supports_oauth) {
-        (true, true) => {
-            let method = read_line("Authentication: 1) OAuth  2) API key [1]: ")
-                .map_err(|error| error.to_string())?;
-            if method.trim().is_empty() || method.trim() == "1" {
-                save_interactive_oauth(home, provider).await
-            } else if method.trim() == "2" {
-                save_interactive_api_key(home, provider)
-            } else {
-                Err("invalid authentication selection".into())
-            }
-        }
-        (true, false) => save_interactive_api_key(home, provider),
-        (false, true) => save_interactive_oauth(home, provider).await,
-        (false, false) => Err(format!(
+    if supports_api_key {
+        methods.push("API key / 密钥".to_string());
+    }
+    if supports_oauth {
+        methods.push("OAuth — browser / 浏览器登录".to_string());
+    }
+    if provider == "openai-codex" {
+        methods.push("OAuth — device code / 设备码登录".to_string());
+    }
+    if methods.is_empty() {
+        return Err(format!(
             "no interactive authentication method for {provider}"
-        )),
+        ));
+    }
+    let method = ui
+        .choose(format!("{provider} — Authentication / 认证方式"), &methods)
+        .await?;
+    if method.starts_with("Use existing") {
+        Ok(())
+    } else if method.starts_with("API key") {
+        save_interactive_api_key(home, provider, ui).await
+    } else {
+        save_interactive_oauth(home, provider, ui, method.contains("device code")).await
     }
 }
 
-async fn save_interactive_oauth(home: &std::path::Path, provider: &str) -> Result<(), String> {
-    let tokens = login_oauth(provider, &ConsoleAuthInteraction, &reqwest::Client::new()).await?;
+async fn save_interactive_oauth(
+    home: &std::path::Path,
+    provider: &str,
+    ui: &Interaction,
+    device: bool,
+) -> Result<(), String> {
+    let mode = if device {
+        OpenAICodexLoginMode::DeviceCode
+    } else {
+        OpenAICodexLoginMode::Browser
+    };
+    let tokens = login_oauth_with_mode(provider, mode, ui, &reqwest::Client::new()).await?;
     let mut store = CredentialStore::open(home).map_err(|error| error.to_string())?;
     store_oauth(
         &mut store,
@@ -670,10 +653,7 @@ fn resolve_authoritative_models(
     discovered: Result<Vec<CustomModel>, String>,
 ) -> Result<Vec<CustomModel>, String> {
     match discovered {
-        Ok(models) if !models.is_empty() => {
-            println!("Fetched {} catalog models for {provider}.", models.len());
-            Ok(models)
-        }
+        Ok(models) if !models.is_empty() => Ok(models),
         Ok(_) => Err(format!(
             "authoritative model catalog for {provider} returned no models; model selection stopped"
         )),
@@ -764,9 +744,12 @@ fn now_ms() -> i64 {
         .as_millis() as i64
 }
 
-fn save_interactive_api_key(home: &std::path::Path, provider: &str) -> Result<(), String> {
-    let key = rpassword::prompt_password(format!("API key for {provider}: "))
-        .map_err(|e| e.to_string())?;
+async fn save_interactive_api_key(
+    home: &std::path::Path,
+    provider: &str,
+    ui: &Interaction,
+) -> Result<(), String> {
+    let key = ui.input(format!("API key for {provider}"), true).await?;
     if key.trim().is_empty() {
         return Err("API key cannot be empty".into());
     }
@@ -781,7 +764,7 @@ fn save_interactive_api_key(home: &std::path::Path, provider: &str) -> Result<()
         .map_err(|e| e.to_string())
 }
 
-async fn configured_stream(selection: &str) -> Result<Arc<dyn ModelStream>, String> {
+pub(crate) async fn configured_stream(selection: &str) -> Result<Arc<dyn ModelStream>, String> {
     let (provider, model_id) = selection
         .split_once('/')
         .ok_or("model must be provider/model")?;
@@ -882,14 +865,6 @@ fn is_exit_command(command: &str) -> bool {
         command.to_ascii_lowercase().as_str(),
         "exit" | "quit" | "/exit" | "/quit"
     )
-}
-
-fn read_line(prompt: &str) -> std::io::Result<String> {
-    print!("{prompt}");
-    std::io::stdout().flush()?;
-    let mut input = String::new();
-    std::io::stdin().read_line(&mut input)?;
-    Ok(input.trim().to_string())
 }
 
 async fn login(provider: String, method: LoginMethod) -> i32 {
@@ -1026,7 +1001,7 @@ fn lato_home() -> PathBuf {
 mod tests {
     use super::{
         LocalFact, is_exit_command, requested_local_facts, requires_authoritative_remote_models,
-        resolve_authoritative_models, resolve_item, should_discover_provider_models,
+        resolve_authoritative_models, should_discover_provider_models,
     };
     use lato_ai::{CustomModel, ModelApi};
 
@@ -1089,16 +1064,6 @@ mod tests {
             resolve_authoritative_models("minimax-cn", Err("invalid JSON".to_string()))
                 .unwrap_err()
                 .contains("invalid JSON")
-        );
-    }
-
-    #[test]
-    fn model_choice_accepts_number_or_exact_model_id() {
-        let models = vec!["sensenova-6.8-flash-lite".to_string()];
-        assert_eq!(resolve_item("1", &models, "model").unwrap(), models[0]);
-        assert_eq!(
-            resolve_item("sensenova-6.8-flash-lite", &models, "model").unwrap(),
-            models[0]
         );
     }
 

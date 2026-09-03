@@ -8,24 +8,24 @@ Prebuilt binaries are available for macOS Intel, macOS Apple Silicon, Linux x86-
 
 ## Install a prebuilt binary
 
-Download the archive for your platform and `SHA256SUMS` from the [v0.1.0-beta.1 release](../../releases/tag/v0.1.0-beta.1). Verify the archive before extracting it.
+Download the archive for your platform and `SHA256SUMS` from the [v0.1.0-beta.2 release](../../releases/tag/v0.1.0-beta.2). Verify the archive before extracting it.
 
 macOS example for Apple Silicon:
 
 ```bash
 shasum -a 256 -c SHA256SUMS --ignore-missing
-tar -xzf lato-0.1.0-beta.1-aarch64-apple-darwin.tar.gz
+tar -xzf lato-0.1.0-beta.2-aarch64-apple-darwin.tar.gz
 mkdir -p "$HOME/.local/bin"
-install -m 0755 lato-0.1.0-beta.1-aarch64-apple-darwin/lato "$HOME/.local/bin/lato"
+install -m 0755 lato-0.1.0-beta.2-aarch64-apple-darwin/lato "$HOME/.local/bin/lato"
 ```
 
 Linux x86-64 example:
 
 ```bash
 sha256sum --check SHA256SUMS --ignore-missing
-tar -xzf lato-0.1.0-beta.1-x86_64-unknown-linux-gnu.tar.gz
+tar -xzf lato-0.1.0-beta.2-x86_64-unknown-linux-gnu.tar.gz
 mkdir -p "$HOME/.local/bin"
-install -m 0755 lato-0.1.0-beta.1-x86_64-unknown-linux-gnu/lato "$HOME/.local/bin/lato"
+install -m 0755 lato-0.1.0-beta.2-x86_64-unknown-linux-gnu/lato "$HOME/.local/bin/lato"
 ```
 
 Ensure `$HOME/.local/bin` is on `PATH` before running Lato.
@@ -33,12 +33,12 @@ Ensure `$HOME/.local/bin` is on `PATH` before running Lato.
 Windows PowerShell example:
 
 ```powershell
-$archive = "lato-0.1.0-beta.1-x86_64-pc-windows-msvc.zip"
+$archive = "lato-0.1.0-beta.2-x86_64-pc-windows-msvc.zip"
 Get-FileHash $archive -Algorithm SHA256
 # Compare the printed hash with this archive's entry in SHA256SUMS.
 Expand-Archive $archive -DestinationPath .
 New-Item -ItemType Directory -Force "$HOME\bin" | Out-Null
-Copy-Item ".\lato-0.1.0-beta.1-x86_64-pc-windows-msvc\lato.exe" "$HOME\bin\lato.exe"
+Copy-Item ".\lato-0.1.0-beta.2-x86_64-pc-windows-msvc\lato.exe" "$HOME\bin\lato.exe"
 ```
 
 Add `%USERPROFILE%\bin` to the user `PATH`, then verify the installation:
@@ -55,7 +55,7 @@ Run `lato` without arguments:
 lato
 ```
 
-On first launch Lato asks you to choose a model, then configures OAuth or securely reads an API key without echoing it. The selected model is saved in `~/.lato/config.json`; credentials are kept separately in the locked credential store. After setup, Lato opens a full-screen Ratatui interface with session navigation, streaming reasoning and responses, live tool-call cards, and approval dialogs.
+On first launch Lato opens its full-screen interface and guides you through provider/model selection, OAuth or a masked API-key input, and folder trust. The selected model is saved in `~/.lato/config.json`; credentials are kept separately in the locked credential store. The Ratatui interface includes session navigation, streaming reasoning and responses, live tool-call cards, and approval dialogs.
 
 The interface follows `LC_ALL`, `LC_MESSAGES`, or `LANG` on first launch and supports Chinese and English. Override and persist the language with either form below; `/lang` switches it from inside the TUI.
 
@@ -67,10 +67,10 @@ lato --lang en
 Interactive commands:
 
 ```text
-/help     /clear     /model     /login     /lang     /approve     /status     /exit
+/help  /new  /clear  /sessions  /model  /login  /doctor  /search  /lang  /approve  /status  /exit
 ```
 
-Use Tab/Shift-Tab to move between panels, Up/Down to scroll the focused panel, Enter on a selected session to resume it, Cmd/Ctrl-K to open the command palette, `/` on an empty composer to search, and Ctrl-C to cancel a streaming turn or exit while idle. `/model` and `/login` temporarily leave the full-screen view for secure terminal prompts, then return in a fresh conversation. The workspace starts untrusted. Mutating tool calls display their name and arguments and request approval exactly at the execution boundary. You can instead trust the workspace for the process or use `/approve` to pre-authorize one call. On smaller terminals, side panels collapse automatically so the conversation remains usable.
+Use Tab/Shift-Tab to move between panels, Up/Down to scroll the focused panel, Enter on a selected session to resume it, Cmd/Ctrl-K to open the command palette, Ctrl-F or `/search` to search, and Ctrl-C to cancel a streaming turn or exit while idle. `/model` and `/login` open dialogs inside the TUI. Type to filter providers and models, use arrow keys and Enter to choose, and press Esc to cancel. API keys are masked; OAuth URLs and device codes appear in the dialog. Successful model changes preserve the current session and conversation. `/sessions` opens a filterable session picker; `/doctor` shows the offline diagnostic report in the conversation. Finish or cancel a response before changing models or sessions. The input cursor follows Unicode text and scrolls long input horizontally. The workspace starts untrusted. Mutating tool calls display their name and arguments and request approval exactly at the execution boundary. You can instead trust the workspace for the process or use `/approve` to pre-authorize one call. On smaller terminals, side panels collapse automatically so the conversation remains usable.
 
 For a one-shot, script-friendly prompt:
 
