@@ -167,6 +167,104 @@ fn discovered_provider_model_cache_runs_with_persisted_provider_credential() {
     assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "dynamic-ok");
 }
 
+#[tokio::test]
+async fn discovered_codex_model_runs_with_saved_oauth_and_codex_transport() {
+    use std::time::Duration;
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        for method in ["GET", "POST"] {
+            let (socket, _) = tokio::time::timeout(Duration::from_secs(10), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            let mut socket = BufReader::new(socket);
+            let mut headers = String::new();
+            loop {
+                let mut line = String::new();
+                assert!(socket.read_line(&mut line).await.unwrap() > 0);
+                headers.push_str(&line);
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            assert!(headers.starts_with(&format!("{method} /backend-api/codex/responses ")));
+            let lower = headers.to_ascii_lowercase();
+            assert!(lower.contains("authorization: bearer saved-codex-token\r\n"));
+            assert!(lower.contains("chatgpt-account-id: saved-account\r\n"));
+            if method == "GET" {
+                socket.get_mut().write_all(b"HTTP/1.1 426 Upgrade Required\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+            } else {
+                let length: usize = lower
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length: "))
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                socket.read_exact(&mut vec![0; length]).await.unwrap();
+                let body = concat!(
+                    "data: {\"type\":\"response.output_text.delta\",\"delta\":\"codex-dynamic-ok\"}\n\n",
+                    "data: {\"type\":\"response.completed\",\"response\":{}}\n\n"
+                );
+                socket.get_mut().write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            }
+        }
+    });
+    let home = tempfile::tempdir().unwrap();
+    let mut credentials = lato_ai::CredentialStore::open(home.path()).unwrap();
+    lato_ai::store_oauth(
+        &mut credentials,
+        "openai-codex",
+        "saved-codex-token",
+        "saved-refresh",
+        i64::MAX,
+        Some("saved-account"),
+    )
+    .unwrap();
+    // Discovery must also work when another provider already populated the cache.
+    lato_ai::ProviderModelsStore::open(home.path())
+        .write("other-provider", lato_ai::ProviderModelsEntry::default())
+        .unwrap();
+    lato_ai::ProviderModelsStore::open(home.path())
+        .write(
+            "openai-codex",
+            lato_ai::ProviderModelsEntry {
+                models: vec![lato_ai::CustomModel {
+                    provider: "openai-codex".into(),
+                    id: "discovered-codex".into(),
+                    api: lato_ai::ModelApi::OpenaiCodexResponses,
+                    base_url: format!("http://{address}/backend-api"),
+                    env: "LATO_API_KEY".into(),
+                }],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let output = tokio::time::timeout(
+        Duration::from_secs(15),
+        tokio::process::Command::new(env!("CARGO_BIN_EXE_lato"))
+            .env("LATO_HOME", home.path())
+            .args(["-p", "--model", "openai-codex/discovered-codex", "hello"])
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "codex-dynamic-ok"
+    );
+    server.await.unwrap();
+}
+
 #[test]
 fn e4_1_cli_custom_model_http_sse_end_to_end() {
     use std::io::{Read, Write};

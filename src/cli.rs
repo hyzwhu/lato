@@ -662,7 +662,7 @@ fn should_discover_provider_models(provider: &str) -> bool {
 }
 
 fn requires_authoritative_remote_models(provider: &str) -> bool {
-    provider == "minimax-cn"
+    matches!(provider, "minimax-cn" | "openai-codex")
 }
 
 fn resolve_authoritative_models(
@@ -712,7 +712,9 @@ async fn discover_provider_models(
             model.provider == provider
                 && matches!(
                     model.api,
-                    ModelApi::OpenaiCompletions | ModelApi::OpenaiResponses
+                    ModelApi::OpenaiCompletions
+                        | ModelApi::OpenaiResponses
+                        | ModelApi::OpenaiCodexResponses
                 )
         })
         .ok_or("provider has no dynamic model source")?;
@@ -731,14 +733,18 @@ async fn discover_provider_models(
         .first()
         .copied()
         .unwrap_or("LATO_API_KEY");
-    let models = refresh_openai_compatible_models(
-        provider,
-        seed.api,
-        base_url,
-        env_name,
-        auth.api_key.as_deref(),
-    )
-    .await?;
+    let models = if seed.api == ModelApi::OpenaiCodexResponses {
+        lato_ai::codex::models::refresh_codex_models(base_url, &auth).await?
+    } else {
+        refresh_openai_compatible_models(
+            provider,
+            seed.api,
+            base_url,
+            env_name,
+            auth.api_key.as_deref(),
+        )
+        .await?
+    };
     ProviderModelsStore::open(home).write(
         provider,
         ProviderModelsEntry {
@@ -1043,6 +1049,23 @@ mod tests {
         assert!(requires_authoritative_remote_models("minimax-cn"));
         assert!(!requires_authoritative_remote_models("minimax"));
         assert!(!requires_authoritative_remote_models("sensenova"));
+    }
+
+    #[test]
+    fn codex_discovers_account_models_without_merging_the_builtin_fallback() {
+        assert!(should_discover_provider_models("openai-codex"));
+        assert!(requires_authoritative_remote_models("openai-codex"));
+        let remote = CustomModel {
+            provider: "openai-codex".into(),
+            id: "account-codex-model".into(),
+            api: ModelApi::OpenaiCodexResponses,
+            base_url: "https://chatgpt.com/backend-api".into(),
+            env: "LATO_API_KEY".into(),
+        };
+        let models = resolve_authoritative_models("openai-codex", Ok(vec![remote])).unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "account-codex-model");
+        assert!(resolve_authoritative_models("openai-codex", Err("HTTP 401".into())).is_err());
     }
 
     #[test]

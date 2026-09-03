@@ -112,14 +112,17 @@ impl ProviderModelsStore {
             .open(&self.path)
             .map_err(|error| error.to_string())?;
         file.lock_shared().map_err(|error| error.to_string())?;
-        let document = read_document(&file)?;
+        let document = read_document(&file)
+            .map_err(|error| format!("read model cache {}: {error}", self.path.display()))?;
         let result = document.providers.get(provider).cloned();
         let _ = file.unlock();
         Ok(result)
     }
 
     pub fn write(&self, provider: &str, entry: ProviderModelsEntry) -> Result<(), String> {
-        let file = OpenOptions::new()
+        use std::io::{Seek, Write};
+
+        let mut file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
@@ -131,7 +134,9 @@ impl ProviderModelsStore {
         document.providers.insert(provider.to_string(), entry);
         let bytes = serde_json::to_vec_pretty(&document).map_err(|error| error.to_string())?;
         file.set_len(0).map_err(|error| error.to_string())?;
-        std::io::Write::write_all(&mut &file, &bytes).map_err(|error| error.to_string())?;
+        // Reading left the cursor at EOF; truncating does not reset that cursor.
+        file.rewind().map_err(|error| error.to_string())?;
+        file.write_all(&bytes).map_err(|error| error.to_string())?;
         file.sync_all().map_err(|error| error.to_string())?;
         let _ = file.unlock();
         Ok(())
@@ -241,7 +246,11 @@ fn read_document(mut file: &std::fs::File) -> Result<ModelsStoreDocument, String
     if bytes.is_empty() {
         return Ok(ModelsStoreDocument::default());
     }
-    serde_json::from_slice(&bytes).map_err(|error| error.to_string())
+    // Older writes truncated at EOF without rewinding, leaving a NUL prefix.
+    // Recover only the intact JSON suffix; a subsequent write removes the prefix.
+    // An entirely NUL-filled or otherwise invalid cache must still be rejected.
+    let start = bytes.iter().position(|byte| *byte != 0).unwrap_or(0);
+    serde_json::from_slice(&bytes[start..]).map_err(|error| error.to_string())
 }
 
 pub async fn refresh_remote_provider_catalog(
@@ -510,6 +519,64 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cache_entry(provider: &str, id: &str) -> ProviderModelsEntry {
+        ProviderModelsEntry {
+            models: vec![CustomModel {
+                provider: provider.into(),
+                id: id.into(),
+                api: ModelApi::OpenaiCodexResponses,
+                base_url: "https://chatgpt.com/backend-api".into(),
+                env: "LATO_API_KEY".into(),
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn repeated_catalog_writes_replace_json_and_preserve_other_providers() {
+        let home = tempfile::tempdir().unwrap();
+        let store = ProviderModelsStore::open(home.path());
+        store.write("other", cache_entry("other", "kept")).unwrap();
+        for id in [
+            "a-long-initial-model-name",
+            "short",
+            "a-new-longer-model-name",
+        ] {
+            store
+                .write("openai-codex", cache_entry("openai-codex", id))
+                .unwrap();
+            let bytes = std::fs::read(home.path().join("models-store.json")).unwrap();
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap();
+            assert_eq!(
+                store.read("openai-codex").unwrap().unwrap().models[0].id,
+                id
+            );
+            assert_eq!(store.read("other").unwrap().unwrap().models[0].id, "kept");
+        }
+    }
+
+    #[test]
+    fn nul_prefixed_cache_remains_readable_and_is_repaired_on_refresh() {
+        let home = tempfile::tempdir().unwrap();
+        let store = ProviderModelsStore::open(home.path());
+        store.write("other", cache_entry("other", "kept")).unwrap();
+        let path = home.path().join("models-store.json");
+        let mut damaged = vec![0_u8; 888];
+        damaged.extend(std::fs::read(&path).unwrap());
+        std::fs::write(&path, damaged).unwrap();
+        assert_eq!(store.read("other").unwrap().unwrap().models[0].id, "kept");
+        store
+            .write("openai-codex", cache_entry("openai-codex", "new"))
+            .unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        serde_json::from_slice::<serde_json::Value>(&bytes).unwrap();
+        assert_eq!(store.read("other").unwrap().unwrap().models[0].id, "kept");
+        assert_eq!(
+            store.read("openai-codex").unwrap().unwrap().models[0].id,
+            "new"
+        );
+    }
 
     #[test]
     fn reference_provider_definitions_match_typescript_factories() {

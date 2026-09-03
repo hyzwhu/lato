@@ -15,6 +15,8 @@ tokio = { version = "1", features = ["fs", "sync", "io-util", "macros", "net", "
 tokio-stream = "0.1"
 tokio-util = { version = "0.7", features = ["rt"] }
 tokio-tungstenite = { version = "0.28", features = ["rustls-tls-native-roots"] }
+# tokio-tungstenite enables Rustls without selecting a crypto provider.
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 dirs = "6"
 reqwest = { version = "0.12", features = ["json", "stream"] }
 fs2 = "0.4"

@@ -183,6 +183,15 @@ impl ModelStream for CustomHttpModelStream {
         if prompt_bytes > CONTEXT_HARD_LIMIT_BYTES {
             return Err("context exceeds hard limit; compact required".into());
         }
+        if self.model.api == ModelApi::OpenaiCodexResponses {
+            let request = crate::codex::build_codex_request_for_model(
+                &self.model.id,
+                Some(&self.model.base_url),
+                &self.auth,
+                &context,
+            )?;
+            return crate::codex::stream_codex(&self.client, &request, tx).await;
+        }
         let request = build_custom_request(&self.model, &self.auth, context)?;
         stream_http_request_with_tool_choice_fallback(&self.client, request, tx).await
     }

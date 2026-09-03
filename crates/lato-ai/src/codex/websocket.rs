@@ -228,11 +228,43 @@ fn matches_ignore_ascii_case(value: &str, candidates: &[&str]) -> bool {
 mod tests {
     use super::*;
     use crate::{Auth, Model, ModelApi, codex::build_codex_request};
+    use tokio::io::AsyncReadExt;
     use tokio::net::TcpListener;
     use tokio_tungstenite::{
         accept_hdr_async,
         tungstenite::handshake::server::{Request, Response},
     };
+
+    #[tokio::test]
+    async fn secure_websocket_starts_tls_and_returns_handshake_errors() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut record_header = [0_u8; 5];
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                socket.read_exact(&mut record_header),
+            )
+            .await
+            .expect("client must start a TLS handshake")
+            .unwrap();
+            assert_eq!(record_header[0], 22, "expected a TLS handshake record");
+            assert_eq!(record_header[1], 3, "expected a TLS protocol version");
+            // Closing during the handshake must return a transport error, not panic.
+        });
+        let request = CodexRequest {
+            url: format!("https://{address}/codex/responses"),
+            headers: Vec::new(),
+            body: serde_json::json!({}),
+            session_key: None,
+        };
+        let (tx, _rx) = mpsc::channel(1);
+        let error = stream_websocket(&request, tx).await.unwrap_err();
+        assert!(!error.events_started);
+        assert!(!error.message.contains("timed out"));
+        server.await.unwrap();
+    }
 
     #[tokio::test]
     #[allow(clippy::result_large_err)]

@@ -1,4 +1,5 @@
 pub(crate) mod events;
+pub mod models;
 pub(crate) mod sse;
 pub(crate) mod websocket;
 
@@ -128,6 +129,15 @@ pub fn build_codex_request(
     auth: &Auth,
     context: &serde_json::Value,
 ) -> Result<CodexRequest, String> {
+    build_codex_request_for_model(model.id, model.base_url, auth, context)
+}
+
+pub(crate) fn build_codex_request_for_model(
+    model_id: &str,
+    base_url: Option<&str>,
+    auth: &Auth,
+    context: &serde_json::Value,
+) -> Result<CodexRequest, String> {
     let token = auth
         .api_key
         .as_deref()
@@ -141,7 +151,7 @@ pub fn build_codex_request(
     let base = auth
         .base_url
         .as_deref()
-        .or(model.base_url)
+        .or(base_url)
         .ok_or("missing base_url")?
         .trim_end_matches('/');
     let messages = context
@@ -187,7 +197,7 @@ pub fn build_codex_request(
         headers.push(("x-client-request-id".into(), request_id.into()));
     }
     let mut body = serde_json::json!({
-        "model": model.id,
+        "model": model_id,
         "store": false,
         "stream": true,
         "instructions": if instructions.is_empty() { "You are a helpful assistant." } else { &instructions },
