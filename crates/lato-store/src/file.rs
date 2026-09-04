@@ -2,11 +2,12 @@
 // License: Apache-2.0
 // Lato changes: generalized bounded JSONL replay to canonical per-session event journals
 
-use crate::{MAX_JOURNAL_BYTES, MAX_JOURNAL_RECORDS, writer::WriterHandle};
+use crate::{MAX_JOURNAL_BYTES, MAX_JOURNAL_RECORDS, projection, writer::WriterHandle};
 use async_trait::async_trait;
 use lato_core::{
-    EventStore, JournalDurability, JournalEnvelope, JournalError, JournalReplay, SessionId,
-    project_journal,
+    EventStore, HistoryProjectionMetadata, HistoryProjectionStore, HistoryReplacementReason,
+    JournalDurability, JournalEnvelope, JournalError, JournalReplay, ModelMessage, ProjectionError,
+    SessionId, project_journal,
 };
 use std::{
     collections::BTreeMap,
@@ -32,6 +33,24 @@ pub enum FaultPoint {
     AfterSyncData,
     BeforeRename,
     AfterRename,
+}
+
+#[async_trait]
+impl HistoryProjectionStore for FileEventStore {
+    async fn replace_history(
+        &self,
+        session_id: &SessionId,
+        messages: Vec<ModelMessage>,
+        reason: HistoryReplacementReason,
+    ) -> Result<HistoryProjectionMetadata, ProjectionError> {
+        self.writer(session_id)
+            .await
+            .map_err(|error| ProjectionError::WriteFailed {
+                message: error.to_string(),
+            })?
+            .replace_history(messages, reason)
+            .await
+    }
 }
 
 #[doc(hidden)]
@@ -80,6 +99,18 @@ impl FileEventStore {
             .join("events.jsonl"))
     }
 
+    pub fn history_path(&self, session_id: &SessionId) -> Result<PathBuf, JournalError> {
+        Ok(self
+            .journal_path(session_id)?
+            .with_file_name("history.jsonl"))
+    }
+
+    pub fn history_metadata_path(&self, session_id: &SessionId) -> Result<PathBuf, JournalError> {
+        Ok(self
+            .journal_path(session_id)?
+            .with_file_name("history.meta.json"))
+    }
+
     async fn writer(&self, session_id: &SessionId) -> Result<WriterHandle, JournalError> {
         let mut writers = self.writers.lock().await;
         if let Some(writer) = writers.get(session_id) {
@@ -111,11 +142,25 @@ impl EventStore for FileEventStore {
     async fn replay(&self, session_id: &SessionId) -> Result<JournalReplay, JournalError> {
         let session_id = session_id.clone();
         let path = self.journal_path(&session_id)?;
-        tokio::task::spawn_blocking(move || replay_path_blocking(&session_id, &path))
-            .await
-            .map_err(|error| JournalError::Io {
-                message: error.to_string(),
-            })?
+        tokio::task::spawn_blocking(move || {
+            let mut replay = replay_path_blocking(&session_id, &path)?;
+            if replay.exists {
+                let parent = path.parent().ok_or_else(|| JournalError::Io {
+                    message: "journal path has no parent".into(),
+                })?;
+                replay.projection.messages = projection::load_or_rebuild(
+                    &session_id,
+                    parent,
+                    &replay.envelopes,
+                    &replay.projection.messages,
+                )?;
+            }
+            Ok(replay)
+        })
+        .await
+        .map_err(|error| JournalError::Io {
+            message: error.to_string(),
+        })?
     }
 
     async fn import_if_absent(

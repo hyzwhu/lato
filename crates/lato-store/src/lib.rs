@@ -1,6 +1,7 @@
 mod file;
 mod memory;
 mod metadata;
+mod projection;
 mod writer;
 
 pub use file::{FaultPoint, FileEventStore, FileFaultInjector};
