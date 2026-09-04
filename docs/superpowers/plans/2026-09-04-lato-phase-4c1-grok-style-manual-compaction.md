@@ -363,6 +363,15 @@ pub struct CompactionControl {
 Extend `TurnDriver` with default methods so existing focused fixtures remain source-compatible:
 
 ```rust
+async fn history_snapshot(&self) -> Result<Vec<ModelMessage>, AgentError> {
+    Err(AgentError::new(
+        "compaction.unsupported",
+        ErrorCategory::InvalidInput,
+        "this session driver cannot snapshot model history",
+        Retryability::Never,
+    ))
+}
+
 async fn compact(
     &self,
     _request: CompactionRequest,
@@ -393,16 +402,17 @@ driver message. `handle_command` must:
 
 1. call `machine.request_compaction`;
 2. commit `CompactionRequested` with `SyncData`;
-3. snapshot `bootstrap/replay.projection.messages` through a runtime-owned
-   `current_messages` value kept current after every committed conversation
-   item;
+3. call `driver.history_snapshot` while the state machine excludes turn
+   mutation, obtaining the complete history including the initial system
+   prompt;
 4. broadcast `CompactionStarted`;
 5. spawn `driver.compact` with a child cancellation token;
 6. acknowledge command acceptance without waiting for model completion.
 
-The runtime-owned message snapshot prevents compaction from reading mutable
-driver history after command acceptance. Update it on each committed
-`ConversationItemCommitted` and after a reconciled replacement.
+The state transition happens before the snapshot, so no foreground turn can
+mutate driver history while the immutable request is built. If lifecycle
+commit or snapshot fails, restore the prior idle machine state before returning
+the command error.
 
 - [ ] **Step 6: Implement cancellation and terminal transitions without persistence replacement**
 
@@ -605,6 +615,22 @@ This step is required because `ModelStream` erases typed `ModelError`, usage,
 and terminal stop reason. The compactor must read the canonical model stream
 directly and must not classify rendered strings.
 
+To preserve the original canonical port during initial host construction, add
+this object-safe method to `ModelStream` and override it in
+`ModelPortStreamAdapter`:
+
+```rust
+fn active_model_port(&self) -> Option<ActiveModelPort> {
+    None
+}
+```
+
+`ModelPortStreamAdapter::active_model_port` returns its cloned selection,
+capabilities, and port. `AcpHost::build` uses that binding when present and
+falls back to `adapt_model_port("openai", "gpt-4.1", stream.clone())` only for
+raw test/embedding streams. This prevents a production adapted stream from
+being wrapped in a second legacy adapter that would erase typed failures.
+
 - [ ] **Step 6: Write failing model-loop tests**
 
 Add fake streams for:
@@ -730,7 +756,6 @@ match self.store.replace_history(
         self.journal_sequence = metadata.last_journal_sequence.saturating_add(1);
         self.current_checkpoint_id = metadata.active_checkpoint_id.clone();
         self.driver.install_history(candidate.messages.clone()).await?;
-        self.current_messages = candidate.messages;
         self.complete_compaction(candidate, metadata).await;
     }
     Err(error) => {
@@ -751,7 +776,7 @@ active checkpoint with the pre-operation value:
 - changed checkpoint: install replayed messages and emit
   `CompactionCompleted` with a recoverable storage-warning field;
 - unchanged checkpoint: append `CompactionFailed`, then emit failure while
-  retaining the old current messages;
+  retaining the unchanged driver history;
 - replay error or install error after a changed checkpoint: stop the session
   and emit `compaction.reconciliation_failed` without accepting later turns.
 
@@ -984,7 +1009,7 @@ git commit -m "feat: add tui compact command"
 ### Task 7: Complete restart recovery, provenance, documentation, and deployment
 
 **Files:**
-- Modify: `crates/lato-agent/tests/compaction_runtime.rs`
+- Create: `crates/lato-agent/tests/compaction_runtime.rs`
 - Modify: `tests/session_compaction_cli.rs`
 - Modify: `README.md`
 - Modify: `docs/superpowers/reference/lato-upstream-sources.md`
