@@ -475,6 +475,19 @@ fn handle_slash_completion_key(
         }
         KeyCode::Enter => {
             if app.composer.as_str().eq_ignore_ascii_case(selected.name) {
+                if selected.name == "/rename"
+                    && let Some(title) = app
+                        .sessions
+                        .iter()
+                        .find(|session| session.id == app.session_id)
+                        .map(|session| session.title.trim())
+                        .filter(|title| !title.is_empty())
+                {
+                    let command = format!("/rename {title}");
+                    app.composer.replace(&command);
+                    app.refresh_slash_completion();
+                    return Some(Vec::new());
+                }
                 Some(submit_or_command(app, trust))
             } else {
                 app.composer.replace(selected.name);
@@ -508,16 +521,12 @@ fn submit_or_command(app: &mut AppState, trust: &SessionTrust) -> Vec<Effect> {
                 .map(|index| raw_command[index..].trim())
                 .unwrap_or_default();
             if title.is_empty() {
-                let current_title = app
-                    .sessions
-                    .iter()
-                    .find(|session| session.id == app.session_id)
-                    .map(|session| session.title.clone())
-                    .unwrap_or_else(|| app.session_id.clone());
-                vec![Effect::RenameSession {
-                    session_id: app.session_id.clone(),
-                    title: current_title,
-                }]
+                app.error = Some(match app.language {
+                    Language::ZhCn => "用法：/rename <新标题>".into(),
+                    Language::En => "Usage: /rename <new title>".into(),
+                });
+                app.composer.clear();
+                Vec::new()
             } else {
                 app.composer.clear();
                 vec![Effect::Backend(BackendCommand::RenameSession {
@@ -796,6 +805,62 @@ mod tests {
             assert_eq!(app.screen, Screen::Main);
             assert_eq!(app.messages, original_messages);
         }
+    }
+
+    #[test]
+    fn exact_rename_completes_current_title_then_submits() {
+        let workspace = tempfile::tempdir().unwrap();
+        let trust = SessionTrust::for_interactive(workspace.path(), false);
+        let mut app = AppState::new_with_summaries(
+            Language::En,
+            workspace.path().to_path_buf(),
+            "provider/model".into(),
+            "current".into(),
+            vec![crate::client::SessionSummary {
+                session_id: "current".into(),
+                title: "Current Title".into(),
+                title_source: "manual".into(),
+                created_at_ms: 1,
+                updated_at_ms: 2,
+            }],
+        );
+        app.composer.insert_str("/rename");
+        app.refresh_slash_completion();
+
+        let effects = handle_slash_completion_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &trust,
+        )
+        .unwrap();
+
+        assert!(effects.is_empty());
+        assert_eq!(app.composer.as_str(), "/rename Current Title");
+
+        let effects = submit_or_command(&mut app, &trust);
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Backend(BackendCommand::RenameSession { session_id, title })]
+                if session_id == "current" && title == "Current Title"
+        ));
+    }
+
+    #[test]
+    fn bare_rename_without_current_summary_shows_usage() {
+        let workspace = tempfile::tempdir().unwrap();
+        let trust = SessionTrust::for_interactive(workspace.path(), false);
+        let mut app = AppState::new(
+            Language::En,
+            workspace.path().to_path_buf(),
+            "provider/model".into(),
+            "current".into(),
+            vec![],
+        );
+        app.composer.insert_str("/rename");
+
+        assert!(submit_or_command(&mut app, &trust).is_empty());
+        assert!(app.composer.is_empty());
+        assert_eq!(app.error.as_deref(), Some("Usage: /rename <new title>"));
     }
 
     #[test]

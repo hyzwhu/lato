@@ -499,6 +499,7 @@ impl AppState {
             }
             BackendEvent::Sessions(summaries) => self.replace_sessions(summaries),
             BackendEvent::SessionRenamed(summary) => {
+                let title = summary.title.clone();
                 if let Some(session) = self
                     .sessions
                     .iter_mut()
@@ -506,6 +507,14 @@ impl AppState {
                 {
                     *session = SessionItem::from(summary);
                 }
+                self.messages.push(Message {
+                    role: MessageRole::System,
+                    content: match self.language {
+                        Language::ZhCn => format!("会话已重命名为“{title}”"),
+                        Language::En => format!("Session renamed to \"{title}\""),
+                    },
+                    expanded: true,
+                });
                 self.error = None;
             }
             BackendEvent::SessionDeleted {
@@ -811,5 +820,48 @@ mod tests {
         );
         assert_eq!(app.sessions[1].title, "Manual title");
         assert_eq!(app.session_index, 1);
+    }
+
+    #[test]
+    fn rename_acknowledgement_updates_title_and_preserves_conversation() {
+        let mut app = AppState::new_with_summaries(
+            Language::En,
+            PathBuf::from("/tmp/lato"),
+            "test/model".into(),
+            "session-1".into(),
+            vec![SessionSummary {
+                session_id: "session-1".into(),
+                title: "Old title".into(),
+                title_source: "automatic".into(),
+                created_at_ms: 1,
+                updated_at_ms: 2,
+            }],
+        );
+        app.screen = Screen::Main;
+        app.messages.push(Message {
+            role: MessageRole::User,
+            content: "keep me".into(),
+            expanded: true,
+        });
+
+        app.apply_backend(BackendEvent::SessionRenamed(SessionSummary {
+            session_id: "session-1".into(),
+            title: "New Title".into(),
+            title_source: "manual".into(),
+            created_at_ms: 1,
+            updated_at_ms: 3,
+        }));
+
+        assert_eq!(app.sessions[0].title, "New Title");
+        assert_eq!(app.screen, Screen::Main);
+        assert_eq!(app.messages[0].content, "keep me");
+        assert!(matches!(
+            app.messages.last(),
+            Some(Message {
+                role: MessageRole::System,
+                content,
+                ..
+            }) if content == "Session renamed to \"New Title\""
+        ));
     }
 }
