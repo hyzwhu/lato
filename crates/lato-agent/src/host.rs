@@ -3,11 +3,12 @@ use crate::{
 };
 use lato_ai::{
     CATALOG, CredentialStore, CustomHttpModelStream, CustomModel, FakeModelStream, HttpModelStream,
-    ModelStream, StreamPiece, SwitchableModelStream, adapt_model_stream, api_key_login_allowed,
-    custom_model_auth, dialect_implemented, get_auth_refreshing, load_models_json, lookup_model,
-    oauth_allowed, phase0_supported, store_oauth,
+    ModelStream, StreamPiece, SwitchableModelPort, SwitchableModelStream, adapt_model_port,
+    adapt_model_stream, api_key_login_allowed, custom_model_auth, dialect_implemented,
+    get_auth_refreshing, load_models_json, lookup_model, oauth_allowed, phase0_supported,
+    store_oauth,
 };
-use lato_core::{EventStore, JournalReplay, SessionId};
+use lato_core::{EventStore, JournalReplay, SessionId, SessionStore};
 use lato_mcp::{PluginOrigin, PluginPackage, discover_plugin};
 use lato_protocol::{JsonRpcReq, METHODS_IMPLEMENTED, PROTOCOL_VERSION, err, is_implemented, ok};
 use lato_store::{FileEventStore, derive_automatic_title};
@@ -21,6 +22,7 @@ pub struct AcpHost {
     cwd: PathBuf,
     trust: SessionTrust,
     stream: Arc<SwitchableModelStream>,
+    model_port: Arc<SwitchableModelPort>,
     locks: Arc<FileLocks>,
     pub prompts_via_acp: usize,
     model: (String, String),
@@ -82,6 +84,11 @@ impl AcpHost {
         tool_approval: Option<Arc<dyn ToolApproval>>,
         lato_home: Option<PathBuf>,
     ) -> Self {
+        let active = stream.active_model_port().unwrap_or_else(|| {
+            adapt_model_port("openai", "gpt-4.1", stream.clone())
+                .expect("fallback model selection is statically valid")
+        });
+        let model_port = Arc::new(SwitchableModelPort::from_active(active));
         let stream = Arc::new(SwitchableModelStream::new(stream));
         let transcripts = lato_home
             .as_deref()
@@ -105,6 +112,7 @@ impl AcpHost {
             cwd,
             trust,
             stream,
+            model_port,
             locks: Arc::new(FileLocks::new()),
             prompts_via_acp: 0,
             model: ("openai".into(), "gpt-4.1".into()),
@@ -130,10 +138,11 @@ impl AcpHost {
                     .await
                     .map_err(|error| error.to_string())?,
             };
-            let store: Arc<dyn EventStore> = events.clone();
-            return RuntimeSession::new_with_store(
+            let store: Arc<dyn SessionStore> = events.clone();
+            return RuntimeSession::new_with_store_and_model_port(
                 sid.to_string(),
                 self.stream.clone(),
+                self.model_port.clone(),
                 self.locks.clone(),
                 self.trust.clone(),
                 self.cwd.clone(),
@@ -146,9 +155,10 @@ impl AcpHost {
             .map(Arc::new)
             .map_err(|error| error.to_string());
         }
-        Ok(Arc::new(RuntimeSession::new(
+        Ok(Arc::new(RuntimeSession::new_with_model_port(
             sid.to_string(),
             self.stream.clone(),
+            self.model_port.clone(),
             self.locks.clone(),
             self.trust.clone(),
             self.cwd.clone(),
@@ -543,6 +553,9 @@ impl AcpHost {
                                         ));
                                     }
                                 };
+                                if let Some(active) = adapted.active_model_port() {
+                                    self.model_port.set(active.selection, active.port).await;
+                                }
                                 self.stream.set(adapted).await
                             }
                             Ok(None) => {}
@@ -574,6 +587,9 @@ impl AcpHost {
                             ));
                         }
                     };
+                    if let Some(active) = adapted.active_model_port() {
+                        self.model_port.set(active.selection, active.port).await;
+                    }
                     self.stream.set(adapted).await;
                 }
                 self.model = (provider.into(), model.into());

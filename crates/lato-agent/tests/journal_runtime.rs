@@ -2,11 +2,12 @@ use async_trait::async_trait;
 use lato_agent::{LegacyTurnDriver, ToolApproval};
 use lato_ai::{FakeModelStream, StreamPiece};
 use lato_core::{
-    ApprovalRequest, Command, EventPayload, EventStore, JournalDurability, JournalEnvelope,
-    JournalError, JournalRecord, JournalReplay, PolicyMode, SandboxProfile, SessionId, SideEffect,
-    StartBehavior, StartTurn, Tool, ToolCancellation, ToolCapability, ToolConcurrency, ToolContext,
-    ToolDescriptor, ToolError, ToolIdempotency, ToolLayer, ToolName, ToolOutput, ToolSource,
-    UserInput,
+    ApprovalRequest, Command, EventPayload, EventStore, HistoryProjectionMetadata,
+    HistoryProjectionStore, HistoryReplacementReason, JournalDurability, JournalEnvelope,
+    JournalError, JournalRecord, JournalReplay, ModelMessage, PolicyMode, ProjectionError,
+    SandboxProfile, SessionId, SideEffect, StartBehavior, StartTurn, Tool, ToolCancellation,
+    ToolCapability, ToolConcurrency, ToolContext, ToolDescriptor, ToolError, ToolIdempotency,
+    ToolLayer, ToolName, ToolOutput, ToolSource, UserInput,
 };
 use lato_policy::{ApprovalLedger, PolicyEngine};
 use lato_runtime::{SessionBootstrap, spawn_session_with_store};
@@ -90,6 +91,20 @@ impl EventStore for RecordingStore {
 
     async fn shutdown(&self, session_id: &SessionId) -> Result<(), JournalError> {
         self.inner.shutdown(session_id).await
+    }
+}
+
+#[async_trait]
+impl HistoryProjectionStore for RecordingStore {
+    async fn replace_history(
+        &self,
+        session_id: &SessionId,
+        messages: Vec<ModelMessage>,
+        reason: HistoryReplacementReason,
+    ) -> Result<HistoryProjectionMetadata, ProjectionError> {
+        self.inner
+            .replace_history(session_id, messages, reason)
+            .await
     }
 }
 

@@ -1,4 +1,4 @@
-use crate::{HistoryItem, TranscriptStore};
+use crate::{HistoryItem, TranscriptStore, is_compaction_summary, wrap_compaction_summary};
 use lato_core::{
     EventStore, JOURNAL_SCHEMA_VERSION, JournalEnvelope, JournalError, JournalRecord,
     JournalRecordId, JournalReplay, ModelContent, ModelMessage, ModelRole, SessionId, ToolCallId,
@@ -24,7 +24,9 @@ pub fn model_messages_to_history(
                 (ModelRole::System, ModelContent::Text { text }) => {
                     HistoryItem::System(text.clone())
                 }
-                (ModelRole::User, ModelContent::Text { text }) => HistoryItem::User(text.clone()),
+                (ModelRole::User, ModelContent::Text { text }) => is_compaction_summary(text)
+                    .map(HistoryItem::CompactionSummary)
+                    .unwrap_or_else(|| HistoryItem::User(text.clone())),
                 (ModelRole::Assistant, ModelContent::Text { text }) => {
                     HistoryItem::AssistantText(text.clone())
                 }
@@ -129,11 +131,12 @@ fn history_item_to_message(item: &HistoryItem) -> Result<ModelMessage, JournalEr
                 output: output.clone(),
             },
         ),
-        HistoryItem::CompactionSummary(_) => {
-            return Err(migration_error(
-                "legacy compaction summaries cannot be losslessly imported",
-            ));
-        }
+        HistoryItem::CompactionSummary(text) => (
+            ModelRole::User,
+            ModelContent::Text {
+                text: wrap_compaction_summary(text),
+            },
+        ),
     };
     Ok(ModelMessage {
         role,
@@ -192,6 +195,21 @@ mod tests {
             },
         ];
         let messages = history_to_model_messages(&history).unwrap();
+        assert_eq!(model_messages_to_history(&messages).unwrap(), history);
+    }
+
+    #[test]
+    fn compaction_summary_round_trips_with_a_stable_versioned_wrapper() {
+        let history = vec![
+            HistoryItem::System("system".into()),
+            HistoryItem::User("latest objective".into()),
+            HistoryItem::CompactionSummary("earlier work".into()),
+        ];
+        let messages = history_to_model_messages(&history).unwrap();
+        assert!(matches!(
+            &messages[2].content[..],
+            [ModelContent::Text { text }] if text.contains("<conversation_summary version=\"1\">")
+        ));
         assert_eq!(model_messages_to_history(&messages).unwrap(), history);
     }
 

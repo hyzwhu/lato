@@ -1,4 +1,7 @@
-use crate::{Auth, Model, ModelApi, build_request, http_client_for_url, send_request_response};
+use crate::{
+    ActiveModelPort, Auth, Model, ModelApi, build_request, http_client_for_url,
+    send_request_response,
+};
 use async_trait::async_trait;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock, mpsc};
@@ -21,6 +24,10 @@ pub struct StreamError(pub String);
 
 #[async_trait]
 pub trait ModelStream: Send + Sync {
+    fn active_model_port(&self) -> Option<ActiveModelPort> {
+        None
+    }
+
     async fn stream(
         &self,
         prompt_bytes: usize,
@@ -31,21 +38,32 @@ pub trait ModelStream: Send + Sync {
 
 pub struct SwitchableModelStream {
     inner: RwLock<Arc<dyn ModelStream>>,
+    active: std::sync::RwLock<Option<ActiveModelPort>>,
 }
 
 impl SwitchableModelStream {
     pub fn new(initial: Arc<dyn ModelStream>) -> Self {
+        let active = initial.active_model_port();
         Self {
             inner: RwLock::new(initial),
+            active: std::sync::RwLock::new(active),
         }
     }
     pub async fn set(&self, stream: Arc<dyn ModelStream>) {
+        *self.active.write().expect("model binding lock poisoned") = stream.active_model_port();
         *self.inner.write().await = stream;
     }
 }
 
 #[async_trait]
 impl ModelStream for SwitchableModelStream {
+    fn active_model_port(&self) -> Option<ActiveModelPort> {
+        self.active
+            .read()
+            .expect("model binding lock poisoned")
+            .clone()
+    }
+
     async fn stream(
         &self,
         prompt_bytes: usize,

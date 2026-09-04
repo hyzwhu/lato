@@ -20,6 +20,7 @@ tokio-util = { version = "0.7", features = ["rt"] }
 fs2 = "0.4"
 reqwest = "0.12"
 async-trait = "0.1"
+futures-util = "0.3"
 
 [dev-dependencies]
 lato-policy = { path = "../lato-policy" }

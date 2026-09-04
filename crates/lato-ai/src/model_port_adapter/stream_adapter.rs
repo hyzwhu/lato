@@ -1,4 +1,4 @@
-use crate::{ModelStream, StreamPiece};
+use crate::{ActiveModelPort, ModelStream, StreamPiece};
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use lato_core::{
@@ -21,10 +21,10 @@ pub struct ModelPortStreamAdapter {
 }
 
 impl ModelPortStreamAdapter {
-    pub fn new(selection: ModelSelection, port: Arc<dyn ModelPort>) -> Self {
+    pub fn new(active: ActiveModelPort) -> Self {
         Self {
-            selection,
-            port,
+            selection: active.selection,
+            port: active.port,
             next_call_id: AtomicU64::new(1),
         }
     }
@@ -32,6 +32,14 @@ impl ModelPortStreamAdapter {
 
 #[async_trait]
 impl ModelStream for ModelPortStreamAdapter {
+    fn active_model_port(&self) -> Option<ActiveModelPort> {
+        Some(ActiveModelPort {
+            selection: self.selection.clone(),
+            capabilities: self.port.capabilities(),
+            port: self.port.clone(),
+        })
+    }
+
     async fn stream(
         &self,
         _prompt_bytes: usize,
@@ -272,6 +280,14 @@ mod tests {
         ModelSelection::new("openai", "gpt-test").unwrap()
     }
 
+    fn active(port: Arc<dyn ModelPort>) -> ActiveModelPort {
+        ActiveModelPort {
+            selection: selection(),
+            capabilities: port.capabilities(),
+            port,
+        }
+    }
+
     fn context() -> serde_json::Value {
         serde_json::json!({
             "messages": [{"role": "user", "content": "hello"}],
@@ -309,7 +325,7 @@ mod tests {
                 }),
             ],
         });
-        let adapter = ModelPortStreamAdapter::new(selection(), port);
+        let adapter = ModelPortStreamAdapter::new(active(port));
         let (tx, mut rx) = mpsc::channel(16);
 
         adapter.stream(5, context(), tx).await.unwrap();
@@ -363,7 +379,7 @@ mod tests {
                 }),
             ],
         });
-        let adapter = ModelPortStreamAdapter::new(selection(), port);
+        let adapter = ModelPortStreamAdapter::new(active(port));
         let (tx, _rx) = mpsc::channel(16);
 
         let error = adapter.stream(1, context(), tx).await.unwrap_err();
@@ -381,7 +397,7 @@ mod tests {
                 Retryability::AfterBackoff,
             ))],
         });
-        let adapter = ModelPortStreamAdapter::new(selection(), port);
+        let adapter = ModelPortStreamAdapter::new(active(port));
         let (tx, _rx) = mpsc::channel(16);
 
         let error = adapter.stream(1, context(), tx).await.unwrap_err();
@@ -392,12 +408,9 @@ mod tests {
     #[tokio::test]
     async fn receiver_drop_releases_pending_canonical_stream_within_250ms() {
         let stream_dropped = Arc::new(AtomicBool::new(false));
-        let adapter = Arc::new(ModelPortStreamAdapter::new(
-            selection(),
-            Arc::new(PendingPort {
-                stream_dropped: stream_dropped.clone(),
-            }),
-        ));
+        let adapter = Arc::new(ModelPortStreamAdapter::new(active(Arc::new(PendingPort {
+            stream_dropped: stream_dropped.clone(),
+        }))));
         let (tx, rx) = mpsc::channel(1);
         let task = {
             let adapter = adapter.clone();

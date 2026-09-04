@@ -1,8 +1,8 @@
 use crate::{HistoryItem, LegacyTurnDriver, ToolApproval, model_messages_to_history};
-use lato_ai::ModelStream;
+use lato_ai::{ModelStream, SwitchableModelPort, adapt_model_port};
 use lato_core::{
-    AgentError, CancelReason, Command, ErrorCategory, EventPayload, EventStore, JournalError,
-    JournalReplay, Retryability, SessionId, StartBehavior, StartTurn, TurnId, UserInput,
+    AgentError, CancelReason, Command, ErrorCategory, EventPayload, JournalError, JournalReplay,
+    Retryability, SessionId, SessionStore, StartBehavior, StartTurn, TurnId, UserInput,
 };
 use lato_runtime::{
     SessionBootstrap, SessionHandle, TurnDriver, spawn_session, spawn_session_with_store,
@@ -42,10 +42,28 @@ impl RuntimeSession {
         updates: mpsc::UnboundedSender<serde_json::Value>,
         approval: Option<Arc<dyn ToolApproval>>,
     ) -> Self {
+        let model_port = switchable_model_port(&stream);
+        Self::new_with_model_port(
+            session_id, stream, model_port, locks, trust, cwd, updates, approval,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_model_port(
+        session_id: String,
+        stream: Arc<dyn ModelStream>,
+        model_port: Arc<SwitchableModelPort>,
+        locks: Arc<FileLocks>,
+        trust: SessionTrust,
+        cwd: PathBuf,
+        updates: mpsc::UnboundedSender<serde_json::Value>,
+        approval: Option<Arc<dyn ToolApproval>>,
+    ) -> Self {
         let session_id = SessionId::from(session_id);
-        let driver = Arc::new(LegacyTurnDriver::new(
+        let driver = Arc::new(LegacyTurnDriver::new_with_model_port(
             session_id.to_string(),
             stream,
+            model_port,
             locks,
             trust,
             cwd,
@@ -73,7 +91,27 @@ impl RuntimeSession {
         cwd: PathBuf,
         updates: mpsc::UnboundedSender<serde_json::Value>,
         approval: Option<Arc<dyn ToolApproval>>,
-        store: Arc<dyn EventStore>,
+        store: Arc<dyn SessionStore>,
+        replay: JournalReplay,
+    ) -> Result<Self, AgentError> {
+        let model_port = switchable_model_port(&stream);
+        Self::new_with_store_and_model_port(
+            session_id, stream, model_port, locks, trust, cwd, updates, approval, store, replay,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn new_with_store_and_model_port(
+        session_id: String,
+        stream: Arc<dyn ModelStream>,
+        model_port: Arc<SwitchableModelPort>,
+        locks: Arc<FileLocks>,
+        trust: SessionTrust,
+        cwd: PathBuf,
+        updates: mpsc::UnboundedSender<serde_json::Value>,
+        approval: Option<Arc<dyn ToolApproval>>,
+        store: Arc<dyn SessionStore>,
         replay: JournalReplay,
     ) -> Result<Self, AgentError> {
         if let Some(unresolved) = replay.projection.unresolved_tools.first() {
@@ -82,9 +120,10 @@ impl RuntimeSession {
             }));
         }
         let session_id = SessionId::from(session_id);
-        let driver = Arc::new(LegacyTurnDriver::new(
+        let driver = Arc::new(LegacyTurnDriver::new_with_model_port(
             session_id.to_string(),
             stream,
+            model_port,
             locks,
             trust,
             cwd,
@@ -204,7 +243,11 @@ impl RuntimeSession {
                 | EventPayload::ReasoningDelta { .. }
                 | EventPayload::TurnCompleted(_)
                 | EventPayload::TurnCancelled { .. }
-                | EventPayload::TurnFailed { .. } => {}
+                | EventPayload::TurnFailed { .. }
+                | EventPayload::CompactionStarted { .. }
+                | EventPayload::CompactionCompleted { .. }
+                | EventPayload::CompactionFailed { .. }
+                | EventPayload::CompactionCancelled { .. } => {}
             }
         }
     }
@@ -259,6 +302,14 @@ impl RuntimeSession {
             *active = None;
         }
     }
+}
+
+fn switchable_model_port(stream: &Arc<dyn ModelStream>) -> Arc<SwitchableModelPort> {
+    let active = stream.active_model_port().unwrap_or_else(|| {
+        adapt_model_port("openai", "gpt-4.1", stream.clone())
+            .expect("fallback model selection is statically valid")
+    });
+    Arc::new(SwitchableModelPort::from_active(active))
 }
 
 fn event_lagged(skipped: u64) -> AgentError {

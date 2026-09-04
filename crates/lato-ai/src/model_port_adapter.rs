@@ -3,20 +3,77 @@ mod legacy_port;
 mod stream_adapter;
 
 use crate::ModelStream;
-use lato_core::{ModelPort, ModelSelection, ModelSelectionError};
+use lato_core::{ModelCapabilities, ModelPort, ModelSelection, ModelSelectionError};
 use std::sync::Arc;
 
 pub use legacy_port::LegacyModelPort;
 pub use stream_adapter::ModelPortStreamAdapter;
+
+#[derive(Clone)]
+pub struct ActiveModelPort {
+    pub selection: ModelSelection,
+    pub capabilities: ModelCapabilities,
+    pub port: Arc<dyn ModelPort>,
+}
+
+pub struct SwitchableModelPort {
+    inner: tokio::sync::RwLock<ActiveModelPort>,
+}
+
+impl SwitchableModelPort {
+    pub fn new(selection: ModelSelection, port: Arc<dyn ModelPort>) -> Self {
+        let capabilities = port.capabilities();
+        Self {
+            inner: tokio::sync::RwLock::new(ActiveModelPort {
+                selection,
+                capabilities,
+                port,
+            }),
+        }
+    }
+
+    pub fn from_active(active: ActiveModelPort) -> Self {
+        Self {
+            inner: tokio::sync::RwLock::new(active),
+        }
+    }
+
+    pub async fn snapshot(&self) -> ActiveModelPort {
+        self.inner.read().await.clone()
+    }
+
+    pub async fn set(&self, selection: ModelSelection, port: Arc<dyn ModelPort>) {
+        let capabilities = port.capabilities();
+        *self.inner.write().await = ActiveModelPort {
+            selection,
+            capabilities,
+            port,
+        };
+    }
+}
+
+pub fn adapt_model_port(
+    provider: &str,
+    model: &str,
+    stream: Arc<dyn ModelStream>,
+) -> Result<ActiveModelPort, ModelSelectionError> {
+    let selection = ModelSelection::new(provider, model)?;
+    let port: Arc<dyn ModelPort> = Arc::new(LegacyModelPort::new(selection.clone(), stream));
+    let capabilities = port.capabilities();
+    Ok(ActiveModelPort {
+        selection,
+        capabilities,
+        port,
+    })
+}
 
 pub fn adapt_model_stream(
     provider: &str,
     model: &str,
     stream: Arc<dyn ModelStream>,
 ) -> Result<Arc<dyn ModelStream>, ModelSelectionError> {
-    let selection = ModelSelection::new(provider, model)?;
-    let port: Arc<dyn ModelPort> = Arc::new(LegacyModelPort::new(selection.clone(), stream));
-    Ok(Arc::new(ModelPortStreamAdapter::new(selection, port)))
+    let active = adapt_model_port(provider, model, stream)?;
+    Ok(Arc::new(ModelPortStreamAdapter::new(active)))
 }
 
 #[cfg(test)]
