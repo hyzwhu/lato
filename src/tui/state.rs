@@ -611,7 +611,12 @@ impl AppState {
             ClientUpdate::ToolFailed { id, error } => {
                 self.finish_tool(&id, ToolStatus::Error, error)
             }
-            ClientUpdate::PermissionRequested | ClientUpdate::Unknown => {}
+            ClientUpdate::PermissionRequested
+            | ClientUpdate::CompactionStarted { .. }
+            | ClientUpdate::CompactionCompleted { .. }
+            | ClientUpdate::CompactionFailed { .. }
+            | ClientUpdate::CompactionCancelled
+            | ClientUpdate::Unknown => {}
         }
     }
 

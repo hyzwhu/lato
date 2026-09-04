@@ -14,6 +14,23 @@ pub struct SessionSummary {
     pub updated_at_ms: u64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompactionSizeResponse {
+    pub message_count: u64,
+    pub serialized_bytes: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompactionResponse {
+    pub status: String,
+    pub before: Option<CompactionSizeResponse>,
+    pub after: Option<CompactionSizeResponse>,
+    pub checkpoint_id: Option<String>,
+    pub warning: Option<lato_core::AgentError>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ClientUpdate {
     TextDelta(String),
@@ -32,6 +49,20 @@ pub enum ClientUpdate {
         error: String,
     },
     PermissionRequested,
+    CompactionStarted {
+        compaction_id: String,
+    },
+    CompactionCompleted {
+        before: CompactionSizeResponse,
+        after: CompactionSizeResponse,
+        checkpoint_id: String,
+        warning: Option<lato_core::AgentError>,
+    },
+    CompactionFailed {
+        code: String,
+        message: String,
+    },
+    CompactionCancelled,
     Unknown,
 }
 
@@ -89,6 +120,47 @@ impl ClientUpdate {
                 }
             }
             Some("session/request_permission") => Self::PermissionRequested,
+            Some("lato/session/compaction") => match params
+                .get("event")
+                .and_then(serde_json::Value::as_str)
+            {
+                Some("started") => params
+                    .get("compactionId")
+                    .and_then(serde_json::Value::as_str)
+                    .map(|value| Self::CompactionStarted {
+                        compaction_id: value.to_owned(),
+                    })
+                    .unwrap_or(Self::Unknown),
+                Some("completed") => {
+                    let before = serde_json::from_value(params["before"].clone());
+                    let after = serde_json::from_value(params["after"].clone());
+                    let checkpoint_id = params
+                        .get("checkpointId")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned);
+                    match (before, after, checkpoint_id) {
+                        (Ok(before), Ok(after), Some(checkpoint_id)) => Self::CompactionCompleted {
+                            before,
+                            after,
+                            checkpoint_id,
+                            warning: serde_json::from_value(params["warning"].clone()).ok(),
+                        },
+                        _ => Self::Unknown,
+                    }
+                }
+                Some("failed") => Self::CompactionFailed {
+                    code: params["error"]["code"]
+                        .as_str()
+                        .unwrap_or("compaction.failed")
+                        .to_owned(),
+                    message: params["error"]["message"]
+                        .as_str()
+                        .unwrap_or("compaction failed")
+                        .to_owned(),
+                },
+                Some("cancelled") => Self::CompactionCancelled,
+                _ => Self::Unknown,
+            },
             _ => Self::Unknown,
         }
     }
@@ -235,6 +307,36 @@ impl InteractiveAcpClient {
             on_event(&event);
         }
         response_result_text(response)
+    }
+
+    pub async fn compact_streaming(
+        &mut self,
+        user_context: Option<String>,
+        mut on_event: impl FnMut(&serde_json::Value),
+    ) -> Result<CompactionResponse, String> {
+        let id = self.take_id();
+        let request = req(
+            id,
+            "lato/session/compact",
+            serde_json::json!({
+                "sessionId": self.session_id,
+                "userContext": user_context,
+            }),
+        );
+        let host = &mut self.host;
+        let updates = &mut self.updates;
+        let mut response_future = Box::pin(host.handle(request));
+        let response = loop {
+            tokio::select! {
+                response = &mut response_future => break response.ok_or("no response")?,
+                event = updates.recv() => if let Some(event) = event { on_event(&event); },
+            }
+        };
+        while let Ok(event) = updates.try_recv() {
+            on_event(&event);
+        }
+        serde_json::from_value(response_result(&response)?.clone())
+            .map_err(|error| format!("invalid compaction response: {error}"))
     }
 
     pub async fn clear(&mut self) -> Result<(), String> {

@@ -12,6 +12,7 @@ pub const METHODS_IMPLEMENTED: &[&str] = &[
     "session/close",
     "session/set_model",
     "lato/session/info",
+    "lato/session/compact",
     "lato/session/list",
     "lato/session/rename",
     "lato/session/delete",

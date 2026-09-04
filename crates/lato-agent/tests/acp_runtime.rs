@@ -1,4 +1,5 @@
-use lato_agent::{AcpHost, default_fake_stream};
+use lato_agent::{AcpHost, REQUIRED_SECTIONS, default_fake_stream};
+use lato_ai::{FakeModelStream, StreamPiece};
 use lato_protocol::JsonRpcReq;
 use lato_workspace::SessionTrust;
 
@@ -143,5 +144,87 @@ async fn sequential_prompts_reuse_the_runtime_session_and_retain_history() {
             .filter(|value| value.as_str() == Some(sid.as_str()))
             .count(),
         1,
+    );
+}
+
+fn healthy_summary() -> String {
+    let detail =
+        "preserve verified decisions, implementation evidence, and pending work ".repeat(2);
+    REQUIRED_SECTIONS
+        .iter()
+        .enumerate()
+        .map(|(index, heading)| format!("{}. {}: {detail}", index + 1, heading))
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+#[tokio::test]
+async fn acp_compact_returns_checkpoint_sizes_and_streams_lifecycle_updates() {
+    let cwd = std::env::current_dir().unwrap();
+    let (updates_tx, mut updates) = tokio::sync::mpsc::unbounded_channel();
+    let stream = std::sync::Arc::new(FakeModelStream::new(vec![
+        vec![StreamPiece::Text("prior work ".repeat(2_000))],
+        vec![StreamPiece::Text(healthy_summary())],
+    ]));
+    let mut host = AcpHost::new(
+        cwd.clone(),
+        SessionTrust::for_headless_prompt(&cwd),
+        updates_tx,
+        stream,
+    );
+    let sid = new_session(&mut host).await;
+    let prompt = host
+        .handle(req(
+            2,
+            "session/prompt",
+            serde_json::json!({"sessionId": sid, "text": "finish the parser"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(prompt["result"]["status"], "complete");
+
+    let compact = host
+        .handle(req(
+            3,
+            "lato/session/compact",
+            serde_json::json!({
+                "sessionId": sid,
+                "userContext": "preserve the parser root cause"
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(compact["result"]["status"], "complete");
+    assert!(
+        compact["result"]["before"]["messageCount"]
+            .as_u64()
+            .unwrap()
+            >= 3
+    );
+    assert!(compact["result"]["after"]["messageCount"].as_u64().unwrap() >= 3);
+    assert!(compact["result"]["checkpointId"].as_str().is_some());
+
+    let lifecycle = std::iter::from_fn(|| updates.try_recv().ok())
+        .filter(|value| value["method"] == "lato/session/compaction")
+        .map(|value| value["params"]["event"].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(lifecycle, vec!["started", "completed"]);
+}
+
+#[tokio::test]
+async fn acp_compact_preserves_typed_error_data() {
+    let (mut host, _) = host();
+    let sid = new_session(&mut host).await;
+    let response = host
+        .handle(req(
+            2,
+            "lato/session/compact",
+            serde_json::json!({"sessionId": sid}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        response["error"]["data"]["code"],
+        "compaction.nothing_to_compact"
     );
 }

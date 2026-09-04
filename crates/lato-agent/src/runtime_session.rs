@@ -1,8 +1,9 @@
 use crate::{HistoryItem, LegacyTurnDriver, ToolApproval, model_messages_to_history};
 use lato_ai::{ModelStream, SwitchableModelPort, adapt_model_port};
 use lato_core::{
-    AgentError, CancelReason, Command, ErrorCategory, EventPayload, JournalError, JournalReplay,
-    Retryability, SessionId, SessionStore, StartBehavior, StartTurn, TurnId, UserInput,
+    AgentError, CancelReason, Command, CompactSession, CompactionId, CompactionSize,
+    CompactionTrigger, ErrorCategory, EventPayload, JournalError, JournalReplay, Retryability,
+    SessionId, SessionStore, StartBehavior, StartTurn, TurnId, UserInput,
 };
 use lato_runtime::{
     SessionBootstrap, SessionHandle, TurnDriver, spawn_session, spawn_session_with_store,
@@ -17,6 +18,23 @@ pub enum RuntimePromptOutcome {
     Cancelled { reason: CancelReason },
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RuntimeCompactionOutcome {
+    Complete {
+        before: CompactionSize,
+        after: CompactionSize,
+        checkpoint_id: String,
+        warning: Option<AgentError>,
+    },
+    Cancelled,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ActiveOperation {
+    Turn(TurnId),
+    Compaction(CompactionId),
+}
+
 /// Typed session facade used by protocol adapters.
 ///
 /// The submission gate closes the small window between accepting a start
@@ -27,7 +45,7 @@ pub struct RuntimeSession {
     handle: SessionHandle,
     driver: Arc<LegacyTurnDriver>,
     updates: mpsc::UnboundedSender<serde_json::Value>,
-    active_turn: Mutex<Option<TurnId>>,
+    active_operation: Mutex<Option<ActiveOperation>>,
     submission_gate: Mutex<()>,
 }
 
@@ -77,7 +95,7 @@ impl RuntimeSession {
             handle,
             driver,
             updates,
-            active_turn: Mutex::new(None),
+            active_operation: Mutex::new(None),
             submission_gate: Mutex::new(()),
         }
     }
@@ -153,7 +171,7 @@ impl RuntimeSession {
             handle,
             driver,
             updates,
-            active_turn: Mutex::new(None),
+            active_operation: Mutex::new(None),
             submission_gate: Mutex::new(()),
         })
     }
@@ -193,7 +211,7 @@ impl RuntimeSession {
                 EventPayload::TurnStarted => {
                     let turn_id = event.turn_id.ok_or_else(missing_turn_id)?;
                     observed_turn = Some(turn_id.clone());
-                    *self.active_turn.lock().await = Some(turn_id);
+                    *self.active_operation.lock().await = Some(ActiveOperation::Turn(turn_id));
                     drop(gate.take());
                 }
                 EventPayload::ModelDelta { text }
@@ -254,23 +272,26 @@ impl RuntimeSession {
 
     pub async fn cancel(&self) -> Result<(), AgentError> {
         let _gate = self.submission_gate.lock().await;
-        let turn_id = self.active_turn.lock().await.clone();
-        let Some(turn_id) = turn_id else {
+        let operation = self.active_operation.lock().await.clone();
+        let Some(operation) = operation else {
             return Ok(());
         };
-        match self
-            .handle
-            .submit(Command::CancelTurn {
+        let command = match &operation {
+            ActiveOperation::Turn(turn_id) => Command::CancelTurn {
                 turn_id: turn_id.clone(),
-            })
-            .await
-        {
+            },
+            ActiveOperation::Compaction(compaction_id) => Command::CancelCompaction {
+                compaction_id: compaction_id.clone(),
+            },
+        };
+        match self.handle.submit(command).await {
             Ok(()) => Ok(()),
             Err(error)
                 if error.code == "runtime.invalid_transition"
-                    || error.code == "runtime.no_active_turn" =>
+                    || error.code == "runtime.no_active_turn"
+                    || error.code == "compaction.not_active" =>
             {
-                self.clear_active(Some(&turn_id)).await;
+                self.clear_operation(Some(&operation)).await;
                 Ok(())
             }
             Err(error) => Err(error),
@@ -280,7 +301,7 @@ impl RuntimeSession {
     pub async fn shutdown(&self) -> Result<(), AgentError> {
         let _gate = self.submission_gate.lock().await;
         let result = self.handle.submit(Command::Shutdown).await;
-        *self.active_turn.lock().await = None;
+        *self.active_operation.lock().await = None;
         result
     }
 
@@ -293,14 +314,136 @@ impl RuntimeSession {
     }
 
     pub async fn is_active(&self) -> bool {
-        self.active_turn.lock().await.is_some()
+        self.active_operation.lock().await.is_some()
     }
 
     async fn clear_active(&self, turn_id: Option<&TurnId>) {
-        let mut active = self.active_turn.lock().await;
-        if turn_id.is_none() || active.as_ref() == turn_id {
+        let expected = turn_id.cloned().map(ActiveOperation::Turn);
+        self.clear_operation(expected.as_ref()).await;
+    }
+
+    async fn clear_operation(&self, operation: Option<&ActiveOperation>) {
+        let mut active = self.active_operation.lock().await;
+        if operation.is_none() || active.as_ref() == operation {
             *active = None;
         }
+    }
+
+    pub async fn compact(
+        &self,
+        user_context: Option<String>,
+    ) -> Result<RuntimeCompactionOutcome, AgentError> {
+        let gate = self.submission_gate.lock().await;
+        let mut events = self.handle.subscribe();
+        self.handle
+            .submit(Command::CompactSession(CompactSession {
+                user_context: user_context.and_then(|value| {
+                    let value = value.trim().to_owned();
+                    (!value.is_empty()).then_some(value)
+                }),
+                trigger: CompactionTrigger::Manual,
+            }))
+            .await?;
+        let mut observed = None;
+        let mut gate = Some(gate);
+        loop {
+            let event = events.recv().await.map_err(|error| match error {
+                broadcast::error::RecvError::Lagged(skipped) => event_lagged(skipped),
+                broadcast::error::RecvError::Closed => event_bus_closed(),
+            })?;
+            if event.session_id != self.session_id {
+                continue;
+            }
+            match event.payload {
+                EventPayload::CompactionStarted {
+                    compaction_id,
+                    trigger,
+                } if observed.is_none() => {
+                    observed = Some(compaction_id.clone());
+                    *self.active_operation.lock().await =
+                        Some(ActiveOperation::Compaction(compaction_id.clone()));
+                    drop(gate.take());
+                    self.send_compaction_update(
+                        "started",
+                        serde_json::json!({
+                            "compactionId": compaction_id,
+                            "trigger": trigger,
+                        }),
+                    );
+                }
+                EventPayload::CompactionCompleted {
+                    compaction_id,
+                    before,
+                    after,
+                    checkpoint_id,
+                    warning,
+                } if observed.as_ref() == Some(&compaction_id) => {
+                    self.clear_operation(Some(&ActiveOperation::Compaction(compaction_id.clone())))
+                        .await;
+                    self.send_compaction_update(
+                        "completed",
+                        serde_json::json!({
+                            "compactionId": compaction_id,
+                            "before": before,
+                            "after": after,
+                            "checkpointId": checkpoint_id,
+                            "warning": warning,
+                        }),
+                    );
+                    return Ok(RuntimeCompactionOutcome::Complete {
+                        before,
+                        after,
+                        checkpoint_id,
+                        warning,
+                    });
+                }
+                EventPayload::CompactionFailed {
+                    compaction_id,
+                    error,
+                } if observed.as_ref() == Some(&compaction_id) => {
+                    self.clear_operation(Some(&ActiveOperation::Compaction(compaction_id.clone())))
+                        .await;
+                    self.send_compaction_update(
+                        "failed",
+                        serde_json::json!({
+                            "compactionId": compaction_id,
+                            "error": error,
+                        }),
+                    );
+                    return Err(error);
+                }
+                EventPayload::CompactionCancelled { compaction_id }
+                    if observed.as_ref() == Some(&compaction_id) =>
+                {
+                    self.clear_operation(Some(&ActiveOperation::Compaction(compaction_id.clone())))
+                        .await;
+                    self.send_compaction_update(
+                        "cancelled",
+                        serde_json::json!({
+                            "compactionId": compaction_id,
+                        }),
+                    );
+                    return Ok(RuntimeCompactionOutcome::Cancelled);
+                }
+                EventPayload::SessionStopped => return Err(runtime_stopped()),
+                _ => {}
+            }
+        }
+    }
+
+    fn send_compaction_update(&self, event: &str, fields: serde_json::Value) {
+        let mut params = serde_json::json!({
+            "sessionId": self.session_id.as_str(),
+            "event": event,
+        });
+        if let (Some(target), Some(source)) = (params.as_object_mut(), fields.as_object()) {
+            target.extend(source.clone());
+        }
+        let _ = self.updates.send(serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "lato/session/compaction",
+            "params": params,
+        }));
     }
 }
 

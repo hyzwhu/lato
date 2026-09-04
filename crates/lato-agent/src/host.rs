@@ -1,5 +1,6 @@
 use crate::{
-    RuntimePromptOutcome, RuntimeSession, ToolApproval, TranscriptStore, import_legacy_if_needed,
+    RuntimeCompactionOutcome, RuntimePromptOutcome, RuntimeSession, ToolApproval, TranscriptStore,
+    import_legacy_if_needed,
 };
 use lato_ai::{
     CATALOG, CredentialStore, CustomHttpModelStream, CustomModel, FakeModelStream, HttpModelStream,
@@ -10,7 +11,9 @@ use lato_ai::{
 };
 use lato_core::{EventStore, JournalReplay, SessionId, SessionStore};
 use lato_mcp::{PluginOrigin, PluginPackage, discover_plugin};
-use lato_protocol::{JsonRpcReq, METHODS_IMPLEMENTED, PROTOCOL_VERSION, err, is_implemented, ok};
+use lato_protocol::{
+    JsonRpcReq, METHODS_IMPLEMENTED, PROTOCOL_VERSION, err, err_with_data, is_implemented, ok,
+};
 use lato_store::{FileEventStore, derive_automatic_title};
 use lato_workspace::{ApprovalMode, FileLocks, SessionTrust};
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
@@ -290,6 +293,51 @@ impl AcpHost {
                     let _ = session.cancel().await;
                 }
                 Some(ok(id, serde_json::json!({"status":"cancelled"})))
+            }
+            "lato/session/compact" => {
+                let params = req.params.unwrap_or_default();
+                let Some(sid) = params.get("sessionId").and_then(|value| value.as_str()) else {
+                    return Some(err(id, -32602, "sessionId is required"));
+                };
+                let user_context = params
+                    .get("userContext")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_owned);
+                let Some(session) = self.sessions.get(sid).cloned() else {
+                    return Some(err(id, -32000, "unknown session"));
+                };
+                match session.compact(user_context).await {
+                    Ok(RuntimeCompactionOutcome::Complete {
+                        before,
+                        after,
+                        checkpoint_id,
+                        warning,
+                    }) => Some(ok(
+                        id,
+                        serde_json::json!({
+                            "status": "complete",
+                            "before": {
+                                "messageCount": before.message_count,
+                                "serializedBytes": before.serialized_bytes,
+                            },
+                            "after": {
+                                "messageCount": after.message_count,
+                                "serializedBytes": after.serialized_bytes,
+                            },
+                            "checkpointId": checkpoint_id,
+                            "warning": warning,
+                        }),
+                    )),
+                    Ok(RuntimeCompactionOutcome::Cancelled) => {
+                        Some(ok(id, serde_json::json!({"status": "cancelled"})))
+                    }
+                    Err(error) => Some(err_with_data(
+                        id,
+                        -32000,
+                        error.to_string(),
+                        serde_json::to_value(&error).unwrap_or_default(),
+                    )),
+                }
             }
             "session/list" => {
                 let mut sessions: Vec<String> = self.sessions.keys().cloned().collect();

@@ -17,3 +17,12 @@ pub fn err(
 ) -> serde_json::Value {
     serde_json::json!({"jsonrpc":"2.0", "id": id, "error": {"code": code, "message": message.as_ref()}})
 }
+
+pub fn err_with_data(
+    id: Option<serde_json::Value>,
+    code: i64,
+    message: impl AsRef<str>,
+    data: serde_json::Value,
+) -> serde_json::Value {
+    serde_json::json!({"jsonrpc":"2.0", "id": id, "error": {"code": code, "message": message.as_ref(), "data": data}})
+}
