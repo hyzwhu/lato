@@ -67,12 +67,12 @@ lato --lang en
 Interactive commands:
 
 ```text
-/help  /new  /clear  /sessions  /model  /login  /doctor  /search  /lang  /approve  /status  /permissions  /exit
+/help  /new  /clear  /sessions  /rename  /delete  /model  /login  /doctor  /search  /lang  /approve  /status  /permissions  /exit
 ```
 
 Tool calls start collapsed, showing their name, status, and duration. Focus the Tool calls panel with Tab, select calls with Up/Down or j/k, and use Enter/Space to toggle details (Left collapses, Right expands). PgUp/PgDn scroll through full arguments and results; Home/End select the first/last call. A scrollbar shows the current position. Incoming calls preserve your place while you are inspecting the panel.
 
-Use Tab/Shift-Tab to move between panels, Up/Down to scroll the focused panel, Enter on a selected session to resume it, Cmd/Ctrl-K to open the command palette, Ctrl-F or `/search` to search, and Ctrl-C to cancel a streaming turn or exit while idle. `/model` and `/login` open dialogs inside the TUI. Type to filter providers and models, use arrow keys and Enter to choose, and press Esc to cancel. API keys are masked; OAuth URLs and device codes appear in the dialog. Successful model changes preserve the current session and conversation. `/sessions` opens a filterable session picker; `/doctor` shows the offline diagnostic report in the conversation. Finish or cancel a response before changing models or sessions. The input cursor follows Unicode text and scrolls long input horizontally. The workspace starts untrusted. Mutating tool calls display their name and arguments and request approval exactly at the execution boundary. You can instead trust the workspace for the process or use `/approve` to pre-authorize one call. On smaller terminals, side panels collapse automatically so the conversation remains usable.
+Use Tab/Shift-Tab to move between panels, Up/Down to scroll the focused panel, Enter on a selected session to resume it, Cmd/Ctrl-K to open the command palette, Ctrl-F or `/search` to search, and Ctrl-C to cancel a streaming turn or exit while idle. In the session panel, press `r` to rename the selected session and press `d` twice within three seconds to delete it permanently. `/rename [title]` renames the current session, while `/delete` opens an explicit permanent-delete confirmation. `/model` and `/login` open dialogs inside the TUI. Type to filter providers and models, use arrow keys and Enter to choose, and press Esc to cancel. API keys are masked; OAuth URLs and device codes appear in the dialog. Successful model changes preserve the current session and conversation. `/sessions` opens a filterable session picker that matches titles and IDs; `/doctor` shows the offline diagnostic report in the conversation. Finish or cancel a response before changing models or sessions. The input cursor follows Unicode text and scrolls long input horizontally. The workspace starts untrusted. Mutating tool calls display their name and arguments and request approval exactly at the execution boundary. You can instead trust the workspace for the process or use `/approve` to pre-authorize one call. On smaller terminals, side panels collapse automatically so the conversation remains usable.
 
 Sandbox scope and tool approval are separate. The startup sandbox picker defaults to
 `workspace`; select `off` explicitly to allow writes outside the current workspace,
@@ -106,8 +106,14 @@ Lato persists accepted turns and complete conversation state under `~/.lato/sess
 ```bash
 lato sessions
 lato sessions --json
+lato sessions rename s1788336000000-1 "Investigate parser regression"
+lato sessions delete s1788336000000-1
+# Scripts and other non-interactive callers must confirm explicitly:
+lato sessions delete s1788336000000-1 --yes
 lato resume s1788336000000-1
 ```
+
+The first accepted prompt supplies a deterministic local title; manual renames always take priority over automatic titles. Human-readable listing prints the title and durable ID. JSON listing uses schema version 2 and returns `sessionId`, `title`, `titleSource`, `createdAtMs`, and `updatedAtMs` for each session. Delete is permanent: interactive callers must confirm it, while non-interactive callers must pass `--yes`.
 
 Resume uses the currently configured default model and current working directory. It repeats the folder-trust prompt and, unless `--sandbox` is supplied, the sandbox picker. Permissions come from this invocation, not the saved journal. It fails closed instead of creating a replacement when a journal is missing, corrupt, or contains an unresolved side-effect outcome.
 
@@ -209,9 +215,7 @@ Model calls use `https://chatgpt.com/backend-api/codex/responses`, prefer a sess
 
 ## Public Beta limitations
 
-- Session entries currently use durable IDs instead of generated titles, rename, and delete controls.
 - Homebrew, Scoop, and other package-manager channels are not maintained yet.
-- Session listing exposes durable IDs, not generated titles, rename, or delete operations.
 - LIVE provider validation is reported separately and may be unavailable when repository credentials are not configured. Offline protocol and localhost end-to-end tests still run in ordinary CI.
 - `~/.lato` may contain prompts, paths, tool arguments, tool results, credentials, and policy metadata. Treat the entire directory as sensitive local data.
 
