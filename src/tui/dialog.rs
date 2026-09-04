@@ -23,6 +23,7 @@ enum Request {
     Prompt {
         title: String,
         choices: Vec<String>,
+        initial: String,
         secret: bool,
         answer: oneshot::Sender<String>,
     },
@@ -30,7 +31,17 @@ enum Request {
 }
 impl Interaction {
     pub async fn input(&self, title: impl Into<String>, secret: bool) -> Result<String, String> {
-        self.prompt(title.into(), Vec::new(), secret).await
+        self.prompt(title.into(), Vec::new(), String::new(), secret)
+            .await
+    }
+    pub async fn input_with_initial(
+        &self,
+        title: impl Into<String>,
+        initial: impl Into<String>,
+        secret: bool,
+    ) -> Result<String, String> {
+        self.prompt(title.into(), Vec::new(), initial.into(), secret)
+            .await
     }
     pub async fn choose(
         &self,
@@ -40,12 +51,14 @@ impl Interaction {
         if choices.is_empty() {
             return Err("no choices available".into());
         }
-        self.prompt(title.into(), choices.to_vec(), false).await
+        self.prompt(title.into(), choices.to_vec(), String::new(), false)
+            .await
     }
     async fn prompt(
         &self,
         title: String,
         choices: Vec<String>,
+        initial: String,
         secret: bool,
     ) -> Result<String, String> {
         let (answer, result) = oneshot::channel();
@@ -53,6 +66,7 @@ impl Interaction {
             .send(Request::Prompt {
                 title,
                 choices,
+                initial,
                 secret,
                 answer,
             })
@@ -104,13 +118,15 @@ impl Dialog {
             Request::Prompt {
                 title,
                 choices,
+                initial,
                 secret,
                 answer,
             } => {
                 self.title = title;
                 self.choices = choices;
                 self.secret = secret;
-                self.input.clear();
+                self.input = InputBuffer::new();
+                self.input.insert_str(&initial);
                 self.selected = 0;
                 self.answer = Some(answer);
                 self.notices.clear();
@@ -329,6 +345,7 @@ mod tests {
         dialog.receive(Request::Prompt {
             title: "API key".into(),
             choices: vec![],
+            initial: String::new(),
             secret: true,
             answer,
         });

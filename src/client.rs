@@ -276,6 +276,55 @@ impl InteractiveAcpClient {
         response_result(&response).map(|_| ())
     }
 
+    pub async fn list_session_summaries(&mut self) -> Result<Vec<SessionSummary>, String> {
+        let id = self.take_id();
+        let response = self
+            .host
+            .handle(req(id, "lato/session/list", serde_json::json!({})))
+            .await
+            .ok_or("no response")?;
+        serde_json::from_value(response_result(&response)?["sessions"].clone())
+            .map_err(|error| format!("invalid structured session list: {error}"))
+    }
+
+    pub async fn rename_session(
+        &mut self,
+        session_id: &str,
+        title: &str,
+    ) -> Result<SessionSummary, String> {
+        let id = self.take_id();
+        let response = self
+            .host
+            .handle(req(
+                id,
+                "lato/session/rename",
+                serde_json::json!({"sessionId": session_id, "title": title}),
+            ))
+            .await
+            .ok_or("no response")?;
+        serde_json::from_value(response_result(&response)?.clone())
+            .map_err(|error| format!("invalid rename response: {error}"))
+    }
+
+    pub async fn delete_session(&mut self, session_id: &str) -> Result<Option<String>, String> {
+        let id = self.take_id();
+        let response = self
+            .host
+            .handle(req(
+                id,
+                "lato/session/delete",
+                serde_json::json!({"sessionId": session_id}),
+            ))
+            .await
+            .ok_or("no response")?;
+        response_result(&response)?;
+        if session_id != self.session_id {
+            return Ok(None);
+        }
+        self.clear().await?;
+        Ok(Some(self.session_id.clone()))
+    }
+
     pub fn session_id(&self) -> &str {
         &self.session_id
     }
@@ -292,6 +341,7 @@ enum SessionStart {
     Resume(String),
 }
 
+#[allow(dead_code)]
 pub async fn list_sessions_over_acp(cwd: std::path::PathBuf) -> Result<Vec<String>, String> {
     let (tx, _updates) = tokio::sync::mpsc::unbounded_channel();
     let trust = SessionTrust::for_headless_prompt(&cwd);

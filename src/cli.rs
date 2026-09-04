@@ -421,13 +421,27 @@ async fn interactive(
                         .await?
                     }
                 };
-                let mut sessions = crate::client::list_sessions_over_acp(cwd.clone())
+                let mut sessions = crate::client::list_session_summaries_over_acp(cwd.clone())
                     .await
                     .unwrap_or_default();
-                if !sessions.iter().any(|id| id == client.session_id()) {
-                    sessions.push(client.session_id().to_string());
+                if !sessions
+                    .iter()
+                    .any(|session| session.session_id == client.session_id())
+                {
+                    sessions.push(crate::client::SessionSummary {
+                        session_id: client.session_id().to_string(),
+                        title: "New session".into(),
+                        title_source: "automatic".into(),
+                        created_at_ms: 0,
+                        updated_at_ms: 0,
+                    });
                 }
-                sessions.sort_by(|a, b| b.cmp(a));
+                sessions.sort_by(|left, right| {
+                    right
+                        .updated_at_ms
+                        .cmp(&left.updated_at_ms)
+                        .then_with(|| right.session_id.cmp(&left.session_id))
+                });
                 Ok(crate::tui::InteractiveBootstrap {
                     client,
                     approvals,

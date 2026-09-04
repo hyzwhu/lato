@@ -14,7 +14,7 @@ use self::{
     i18n::{Language, TextKey, tr},
     state::{AppEvent, AppState, ApprovalState, Effect, Message, MessageRole, Overlay},
 };
-use crate::client::InteractiveAcpClient;
+use crate::client::{InteractiveAcpClient, SessionSummary};
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use futures_util::StreamExt;
 use lato_workspace::SessionTrust;
@@ -29,7 +29,7 @@ pub struct InteractiveBootstrap {
     pub workspace: PathBuf,
     pub model: String,
     pub home: PathBuf,
-    pub sessions: Vec<String>,
+    pub sessions: Vec<SessionSummary>,
     pub resumed: bool,
     pub switchable: std::sync::Arc<lato_ai::SwitchableModelStream>,
 }
@@ -47,7 +47,7 @@ pub async fn run(
 ) -> Result<TuiExit, String> {
     let session_id = bootstrap.client.session_id().to_string();
     let (backend, mut backend_events) = backend::spawn(bootstrap.client);
-    let mut app = AppState::new(
+    let mut app = AppState::new_with_summaries(
         bootstrap.language,
         bootstrap.workspace,
         bootstrap.model,
@@ -177,9 +177,22 @@ async fn execute_effects(
                 app.overlay = Some(Overlay::Configuration);
                 let workspace = app.workspace.clone();
                 let result = dialog::run(terminal, events, Some(app), |ui| async move {
-                    let sessions = crate::client::list_sessions_over_acp(workspace).await?;
-                    ui.choose("Sessions / 会话 — type to filter", &sessions)
-                        .await
+                    let sessions =
+                        crate::client::list_session_summaries_over_acp(workspace).await?;
+                    let choices = sessions
+                        .iter()
+                        .map(|session| format!("{} · {}", session.title, session.session_id))
+                        .collect::<Vec<_>>();
+                    let selected = ui
+                        .choose("Sessions / 会话 — type to filter", &choices)
+                        .await?;
+                    sessions
+                        .into_iter()
+                        .zip(choices)
+                        .find_map(|(session, label)| {
+                            (label == selected).then_some(session.session_id)
+                        })
+                        .ok_or_else(|| "selected session disappeared".to_string())
                 })
                 .await;
                 app.overlay = None;
@@ -244,6 +257,64 @@ async fn execute_effects(
                     app.error = Some(error);
                 }
             }
+            Effect::RenameSession { session_id, title } => {
+                if app.responding {
+                    app.error = Some(
+                        "Wait for the current response or cancel it first / 请先等待或取消当前回复"
+                            .into(),
+                    );
+                    continue;
+                }
+                app.overlay = Some(Overlay::Configuration);
+                let prompt = match app.language {
+                    Language::ZhCn => format!("重命名会话 {session_id}（当前：{title}）"),
+                    Language::En => format!("Rename session {session_id} (current: {title})"),
+                };
+                let result = dialog::run(terminal, events, Some(app), |ui| async move {
+                    ui.input_with_initial(prompt, title, false).await
+                })
+                .await;
+                app.overlay = None;
+                match result {
+                    Ok(title) => {
+                        let _ = backend.send(BackendCommand::RenameSession { session_id, title });
+                    }
+                    Err(error) if error == dialog::CANCELLED => {}
+                    Err(error) => app.error = Some(error),
+                }
+            }
+            Effect::ConfirmDeleteSession(session_id) => {
+                if app.responding {
+                    app.error = Some(
+                        "Wait for the current response or cancel it first / 请先等待或取消当前回复"
+                            .into(),
+                    );
+                    continue;
+                }
+                app.overlay = Some(Overlay::Configuration);
+                let choices = match app.language {
+                    Language::ZhCn => vec!["永久删除".to_string(), "取消".to_string()],
+                    Language::En => vec!["Delete permanently".to_string(), "Cancel".to_string()],
+                };
+                let prompt = match app.language {
+                    Language::ZhCn => format!("永久删除会话 {session_id}？此操作无法撤销。"),
+                    Language::En => {
+                        format!("Delete session {session_id} permanently? This cannot be undone.")
+                    }
+                };
+                let result = dialog::run(terminal, events, Some(app), |ui| async move {
+                    ui.choose(prompt, &choices).await
+                })
+                .await;
+                app.overlay = None;
+                match result {
+                    Ok(answer) if answer == "永久删除" || answer == "Delete permanently" => {
+                        let _ = backend.send(BackendCommand::DeleteSession(session_id));
+                    }
+                    Err(error) if error != dialog::CANCELLED => app.error = Some(error),
+                    _ => {}
+                }
+            }
         }
     }
 }
@@ -302,11 +373,28 @@ fn handle_key(
     if app.focus == state::Focus::Tools && tool_panel::handle_key(app, key) {
         return Vec::new();
     }
+    if app.armed_session_delete.is_some() && key.code != KeyCode::Char('d') {
+        app.disarm_session_delete();
+    }
     match key.code {
         KeyCode::Tab => app.reduce(AppEvent::FocusNext),
         KeyCode::BackTab => app.reduce(AppEvent::FocusPrevious),
         KeyCode::Esc => app.reduce(AppEvent::Escape),
         KeyCode::Enter if app.focus == state::Focus::Sessions => resume_selected_session(app),
+        KeyCode::Char('r') if app.focus == state::Focus::Sessions => {
+            app.disarm_session_delete();
+            let Some(session) = app.sessions.get(app.session_index) else {
+                return Vec::new();
+            };
+            vec![Effect::RenameSession {
+                session_id: session.id.clone(),
+                title: session.title.clone(),
+            }]
+        }
+        KeyCode::Char('d') if app.focus == state::Focus::Sessions => app
+            .arm_or_confirm_selected_delete()
+            .map(|id| vec![Effect::Backend(BackendCommand::DeleteSession(id))])
+            .unwrap_or_default(),
         KeyCode::Enter => submit_or_command(app, trust),
         KeyCode::Backspace => {
             app.composer.backspace();
@@ -353,11 +441,13 @@ fn handle_key(
 }
 
 fn submit_or_command(app: &mut AppState, trust: &SessionTrust) -> Vec<Effect> {
-    let command = app.composer.as_str().trim().to_ascii_lowercase();
+    let raw_command = app.composer.as_str().trim().to_string();
+    let command = raw_command.to_ascii_lowercase();
     if !command.starts_with('/') {
         return app.reduce(AppEvent::Submit);
     }
-    match command.as_str() {
+    let name = command.split_whitespace().next().unwrap_or_default();
+    match name {
         "/exit" | "/quit" => {
             app.composer.clear();
             app.reduce(AppEvent::Exit(TuiExit::Quit))
@@ -366,6 +456,34 @@ fn submit_or_command(app: &mut AppState, trust: &SessionTrust) -> Vec<Effect> {
         "/login" => vec![Effect::Login],
         "/doctor" => vec![Effect::Doctor],
         "/sessions" => vec![Effect::Sessions],
+        "/rename" => {
+            let title = raw_command
+                .find(char::is_whitespace)
+                .map(|index| raw_command[index..].trim())
+                .unwrap_or_default();
+            if title.is_empty() {
+                let current_title = app
+                    .sessions
+                    .iter()
+                    .find(|session| session.id == app.session_id)
+                    .map(|session| session.title.clone())
+                    .unwrap_or_else(|| app.session_id.clone());
+                vec![Effect::RenameSession {
+                    session_id: app.session_id.clone(),
+                    title: current_title,
+                }]
+            } else {
+                app.composer.clear();
+                vec![Effect::Backend(BackendCommand::RenameSession {
+                    session_id: app.session_id.clone(),
+                    title: title.to_string(),
+                })]
+            }
+        }
+        "/delete" => {
+            app.composer.clear();
+            vec![Effect::ConfirmDeleteSession(app.session_id.clone())]
+        }
         "/search" => {
             app.composer.clear();
             app.reduce(AppEvent::OpenSearch)
@@ -412,7 +530,7 @@ fn submit_or_command(app: &mut AppState, trust: &SessionTrust) -> Vec<Effect> {
             app.screen = state::Screen::Main;
             app.messages.push(Message {
                 role: MessageRole::System,
-                content: "/help  /new  /clear  /sessions  /model  /login  /doctor  /search  /lang  /approve  /status  /permissions  /exit".into(),
+                content: "/help  /new  /clear  /sessions  /rename  /delete  /model  /login  /doctor  /search  /lang  /approve  /status  /permissions  /exit".into(),
                 expanded: true,
             });
             Vec::new()
@@ -544,8 +662,12 @@ fn active_input(app: &mut AppState) -> &mut input::InputBuffer {
 
 #[cfg(test)]
 mod tests {
-    use super::{BackendCommand, Effect, resume_selected_session};
-    use crate::tui::{i18n::Language, state::AppState};
+    use super::{BackendCommand, Effect, resume_selected_session, submit_or_command};
+    use crate::tui::{
+        i18n::Language,
+        state::{AppState, Screen},
+    };
+    use lato_workspace::SessionTrust;
     use std::path::PathBuf;
 
     #[test]
@@ -565,6 +687,34 @@ mod tests {
             matches!(&effects[..], [Effect::Backend(BackendCommand::Resume(id))] if id == "historical")
         );
     }
+
+    #[test]
+    fn session_slash_commands_preserve_title_and_confirm_delete() {
+        let workspace = tempfile::tempdir().unwrap();
+        let trust = SessionTrust::for_interactive(workspace.path(), false);
+        let mut app = AppState::new(
+            Language::En,
+            workspace.path().to_path_buf(),
+            "provider/model".into(),
+            "current".into(),
+            vec!["current".into()],
+        );
+        app.screen = Screen::Main;
+
+        app.composer.insert_str("/rename Keep This Case");
+        assert!(matches!(
+            &submit_or_command(&mut app, &trust)[..],
+            [Effect::Backend(BackendCommand::RenameSession { session_id, title })]
+                if session_id == "current" && title == "Keep This Case"
+        ));
+
+        app.composer.insert_str("/delete");
+        assert!(matches!(
+            &submit_or_command(&mut app, &trust)[..],
+            [Effect::ConfirmDeleteSession(session_id)] if session_id == "current"
+        ));
+    }
+
     #[tokio::test]
     async fn slash_commands_and_palette_stay_in_the_tui() {
         use super::*;

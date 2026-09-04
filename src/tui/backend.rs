@@ -1,4 +1,4 @@
-use crate::client::{ClientUpdate, InteractiveAcpClient};
+use crate::client::{ClientUpdate, InteractiveAcpClient, SessionSummary};
 use lato_agent::{ApprovalRequest, ToolApproval};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
@@ -9,6 +9,8 @@ pub enum BackendCommand {
     Cancel,
     Clear,
     Resume(String),
+    RenameSession { session_id: String, title: String },
+    DeleteSession(String),
     Shutdown,
 }
 
@@ -20,6 +22,13 @@ pub enum BackendEvent {
     TurnCancelled,
     Cleared(String),
     Resumed(String),
+    Sessions(Vec<SessionSummary>),
+    SessionRenamed(SessionSummary),
+    SessionDeleted {
+        session_id: String,
+        replacement_session_id: Option<String>,
+        sessions: Vec<SessionSummary>,
+    },
     Error(String),
 }
 
@@ -122,15 +131,21 @@ pub fn spawn(
                         Some(BackendCommand::Resume(_)) => {
                             let _ = event_tx.send(BackendEvent::Error("cannot switch sessions while a turn is running".into()));
                         }
+                        Some(BackendCommand::RenameSession { .. } | BackendCommand::DeleteSession(_)) => {
+                            let _ = event_tx.send(BackendEvent::Error("cannot change sessions while a turn is running".into()));
+                        }
                         Some(BackendCommand::Clear) => {
                             let _ = event_tx.send(BackendEvent::Error("cannot clear while a turn is running".into()));
                         }
                     },
                     result = turn => {
                         match result {
-                            Ok((returned, TurnEnd::Completed(text))) => {
-                                client = Some(returned);
+                            Ok((mut returned, TurnEnd::Completed(text))) => {
                                 let _ = event_tx.send(BackendEvent::TurnCompleted(text));
+                                if let Ok(sessions) = returned.list_session_summaries().await {
+                                    let _ = event_tx.send(BackendEvent::Sessions(sessions));
+                                }
+                                client = Some(returned);
                             }
                             Ok((returned, TurnEnd::Cancelled(cancelled))) => {
                                 client = Some(returned);
@@ -209,6 +224,9 @@ pub fn spawn(
                         Ok(()) => {
                             let _ = event_tx
                                 .send(BackendEvent::Cleared(owned.session_id().to_string()));
+                            if let Ok(sessions) = owned.list_session_summaries().await {
+                                let _ = event_tx.send(BackendEvent::Sessions(sessions));
+                            }
                         }
                         Err(error) => {
                             let _ = event_tx.send(BackendEvent::Error(error));
@@ -223,7 +241,45 @@ pub fn spawn(
                         Ok(()) => {
                             let _ = event_tx
                                 .send(BackendEvent::Resumed(owned.session_id().to_string()));
+                            if let Ok(sessions) = owned.list_session_summaries().await {
+                                let _ = event_tx.send(BackendEvent::Sessions(sessions));
+                            }
                         }
+                        Err(error) => {
+                            let _ = event_tx.send(BackendEvent::Error(error));
+                        }
+                    }
+                }
+                Some(BackendCommand::RenameSession { session_id, title }) => {
+                    let Some(owned) = client.as_mut() else {
+                        continue;
+                    };
+                    match owned.rename_session(&session_id, &title).await {
+                        Ok(summary) => {
+                            let _ = event_tx.send(BackendEvent::SessionRenamed(summary));
+                        }
+                        Err(error) => {
+                            let _ = event_tx.send(BackendEvent::Error(error));
+                        }
+                    }
+                }
+                Some(BackendCommand::DeleteSession(session_id)) => {
+                    let Some(owned) = client.as_mut() else {
+                        continue;
+                    };
+                    match owned.delete_session(&session_id).await {
+                        Ok(replacement_session_id) => match owned.list_session_summaries().await {
+                            Ok(sessions) => {
+                                let _ = event_tx.send(BackendEvent::SessionDeleted {
+                                    session_id,
+                                    replacement_session_id,
+                                    sessions,
+                                });
+                            }
+                            Err(error) => {
+                                let _ = event_tx.send(BackendEvent::Error(error));
+                            }
+                        },
                         Err(error) => {
                             let _ = event_tx.send(BackendEvent::Error(error));
                         }

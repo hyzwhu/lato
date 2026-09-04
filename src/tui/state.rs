@@ -5,8 +5,13 @@ use super::{
     input::InputBuffer,
     tool_panel::ToolPanelState,
 };
-use crate::client::ClientUpdate;
-use std::{path::PathBuf, time::Instant};
+use crate::client::{ClientUpdate, SessionSummary};
+use std::{
+    path::PathBuf,
+    time::{Duration, Instant},
+};
+
+const DELETE_CONFIRM_WINDOW: Duration = Duration::from_secs(3);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Screen {
@@ -109,6 +114,34 @@ pub struct SessionItem {
     pub timestamp: String,
 }
 
+impl From<SessionSummary> for SessionItem {
+    fn from(summary: SessionSummary) -> Self {
+        let timestamp = relative_timestamp(summary.updated_at_ms);
+        Self {
+            id: summary.session_id,
+            title: summary.title,
+            timestamp,
+        }
+    }
+}
+
+fn relative_timestamp(timestamp_ms: u64) -> String {
+    if timestamp_ms == 0 {
+        return String::new();
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let seconds = now.saturating_sub(timestamp_ms) / 1_000;
+    match seconds {
+        0..=59 => "now".into(),
+        60..=3_599 => format!("{}m", seconds / 60),
+        3_600..=86_399 => format!("{}h", seconds / 3_600),
+        _ => format!("{}d", seconds / 86_400),
+    }
+}
+
 #[derive(Debug)]
 pub struct ApprovalState {
     pub tool: String,
@@ -140,6 +173,7 @@ pub struct AppState {
     pub error: Option<String>,
     pub scroll: u16,
     pub session_index: usize,
+    pub armed_session_delete: Option<(String, Instant)>,
     pub should_exit: bool,
     pub exit_action: TuiExit,
 }
@@ -168,6 +202,8 @@ pub enum Effect {
     ConfigureModel,
     Doctor,
     Sessions,
+    RenameSession { session_id: String, title: String },
+    ConfirmDeleteSession(String),
     Login,
 }
 
@@ -210,8 +246,75 @@ impl AppState {
             error: None,
             scroll: 0,
             session_index: 0,
+            armed_session_delete: None,
             should_exit: false,
             exit_action: TuiExit::Quit,
+        }
+    }
+
+    pub fn new_with_summaries(
+        language: Language,
+        workspace: PathBuf,
+        model: String,
+        session_id: String,
+        sessions: Vec<SessionSummary>,
+    ) -> Self {
+        let mut app = Self::new(language, workspace, model, session_id, Vec::new());
+        app.sessions = sessions.into_iter().map(SessionItem::from).collect();
+        app.select_current_session();
+        app
+    }
+
+    pub fn arm_or_confirm_selected_delete(&mut self) -> Option<String> {
+        if self.responding {
+            self.error = Some(
+                "Wait for the current response or cancel it first / 请先等待或取消当前回复".into(),
+            );
+            return None;
+        }
+        let id = self.sessions.get(self.session_index)?.id.clone();
+        let confirmed = self
+            .armed_session_delete
+            .as_ref()
+            .is_some_and(|(armed, at)| armed == &id && at.elapsed() <= DELETE_CONFIRM_WINDOW);
+        if confirmed {
+            self.armed_session_delete = None;
+            Some(id)
+        } else {
+            self.armed_session_delete = Some((id, Instant::now()));
+            None
+        }
+    }
+
+    pub fn disarm_session_delete(&mut self) {
+        self.armed_session_delete = None;
+    }
+
+    fn replace_sessions(&mut self, summaries: Vec<SessionSummary>) {
+        let selected = self
+            .sessions
+            .get(self.session_index)
+            .map(|session| session.id.clone());
+        self.sessions = summaries.into_iter().map(SessionItem::from).collect();
+        self.session_index = selected
+            .as_deref()
+            .and_then(|id| self.sessions.iter().position(|session| session.id == id))
+            .unwrap_or_else(|| {
+                self.sessions
+                    .iter()
+                    .position(|session| session.id == self.session_id)
+                    .unwrap_or(0)
+            });
+        self.disarm_session_delete();
+    }
+
+    fn select_current_session(&mut self) {
+        if let Some(index) = self
+            .sessions
+            .iter()
+            .position(|session| session.id == self.session_id)
+        {
+            self.session_index = index;
         }
     }
 
@@ -231,6 +334,13 @@ impl AppState {
                         tool.elapsed_ms = tool.started_at.elapsed().as_millis();
                     }
                 }
+                if self
+                    .armed_session_delete
+                    .as_ref()
+                    .is_some_and(|(_, at)| at.elapsed() > DELETE_CONFIRM_WINDOW)
+                {
+                    self.disarm_session_delete();
+                }
                 Vec::new()
             }
             AppEvent::Resize(width, height) => {
@@ -238,10 +348,12 @@ impl AppState {
                 Vec::new()
             }
             AppEvent::FocusNext => {
+                self.disarm_session_delete();
                 self.focus = self.focus.next();
                 Vec::new()
             }
             AppEvent::FocusPrevious => {
+                self.disarm_session_delete();
                 self.focus = self.focus.previous();
                 Vec::new()
             }
@@ -258,12 +370,14 @@ impl AppState {
                 Vec::new()
             }
             AppEvent::Escape => {
+                self.disarm_session_delete();
                 self.overlay = None;
                 self.search.clear();
                 Vec::new()
             }
             AppEvent::Scroll(delta) => {
                 if self.focus == Focus::Sessions {
+                    self.disarm_session_delete();
                     let last = self.sessions.len().saturating_sub(1);
                     self.session_index = if delta.is_negative() {
                         self.session_index
@@ -341,12 +455,44 @@ impl AppState {
             }
             BackendEvent::Resumed(id) => {
                 self.session_id = id;
+                self.select_current_session();
                 self.messages.clear();
                 self.tools.clear();
                 self.tool_panel = ToolPanelState::default();
                 self.scroll = 0;
                 self.focus = Focus::Chat;
                 self.screen = Screen::Main;
+            }
+            BackendEvent::Sessions(summaries) => self.replace_sessions(summaries),
+            BackendEvent::SessionRenamed(summary) => {
+                if let Some(session) = self
+                    .sessions
+                    .iter_mut()
+                    .find(|session| session.id == summary.session_id)
+                {
+                    *session = SessionItem::from(summary);
+                }
+                self.error = None;
+            }
+            BackendEvent::SessionDeleted {
+                session_id,
+                replacement_session_id,
+                sessions,
+            } => {
+                if let Some(replacement) = replacement_session_id {
+                    self.session_id = replacement;
+                    self.messages.clear();
+                    self.tools.clear();
+                    self.tool_panel = ToolPanelState::default();
+                    self.screen = Screen::Welcome;
+                }
+                self.replace_sessions(sessions);
+                self.error = None;
+                self.messages.push(Message {
+                    role: MessageRole::System,
+                    content: format!("Deleted session {session_id} permanently."),
+                    expanded: true,
+                });
             }
             BackendEvent::Update(update) => self.apply_update(update),
             BackendEvent::TurnCompleted(text) => {
@@ -548,5 +694,59 @@ mod tests {
         assert_eq!(app.tools.len(), 1);
         assert_eq!(app.tools[0].status, ToolStatus::Done);
         assert_eq!(app.tools[0].result.as_deref(), Some("ok"));
+    }
+
+    #[test]
+    fn delete_confirmation_is_bound_to_the_selected_session() {
+        let mut app = app();
+        app.sessions = vec![
+            SessionItem {
+                id: "session-1".into(),
+                title: "First".into(),
+                timestamp: String::new(),
+            },
+            SessionItem {
+                id: "session-2".into(),
+                title: "Second".into(),
+                timestamp: String::new(),
+            },
+        ];
+        app.focus = Focus::Sessions;
+        assert_eq!(app.arm_or_confirm_selected_delete(), None);
+        app.reduce(AppEvent::Scroll(1));
+        assert!(app.armed_session_delete.is_none());
+        assert_eq!(app.arm_or_confirm_selected_delete(), None);
+        assert_eq!(
+            app.arm_or_confirm_selected_delete(),
+            Some("session-2".into())
+        );
+    }
+
+    #[test]
+    fn structured_sessions_keep_titles_and_select_the_current_session() {
+        let app = AppState::new_with_summaries(
+            Language::En,
+            PathBuf::from("/tmp/lato"),
+            "test/model".into(),
+            "session-2".into(),
+            vec![
+                SessionSummary {
+                    session_id: "session-1".into(),
+                    title: "First title".into(),
+                    title_source: "automatic".into(),
+                    created_at_ms: 1,
+                    updated_at_ms: 2,
+                },
+                SessionSummary {
+                    session_id: "session-2".into(),
+                    title: "Manual title".into(),
+                    title_source: "manual".into(),
+                    created_at_ms: 1,
+                    updated_at_ms: 3,
+                },
+            ],
+        );
+        assert_eq!(app.sessions[1].title, "Manual title");
+        assert_eq!(app.session_index, 1);
     }
 }

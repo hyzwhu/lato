@@ -114,6 +114,10 @@ pub fn sessions(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
             Span::styled(format!("{marker} "), Style::default().fg(AMBER)),
             Span::styled(session.title.clone(), Style::default().fg(TEXT)),
             Span::styled(
+                format!(" · {}", compact_id(&session.id)),
+                Style::default().fg(MUTED),
+            ),
+            Span::styled(
                 format!(" {}", session.timestamp),
                 Style::default().fg(MUTED),
             ),
@@ -289,7 +293,14 @@ fn composer(frame: &mut Frame<'_>, area: Rect, app: &AppState, welcome: bool) {
 pub use super::tool_panel::render as tools;
 
 pub fn footer(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
-    let text = if app.focus == Focus::Tools {
+    let text = if app.armed_session_delete.is_some() {
+        match app.language {
+            super::i18n::Language::ZhCn => "再次按 d 永久删除 · Esc 取消".to_string(),
+            super::i18n::Language::En => {
+                "Press d again to delete permanently · Esc cancels".to_string()
+            }
+        }
+    } else if app.focus == Focus::Tools {
         tr(app.language, TextKey::ToolControls).to_string()
     } else {
         format!(
@@ -306,6 +317,14 @@ pub fn footer(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
             .style(Style::default().fg(MUTED).bg(GLASS)),
         area,
     );
+}
+
+fn compact_id(id: &str) -> String {
+    if id.chars().count() > 12 {
+        format!("{}…", id.chars().take(11).collect::<String>())
+    } else {
+        id.to_string()
+    }
 }
 
 pub fn command_palette(frame: &mut Frame<'_>, app: &AppState) {
