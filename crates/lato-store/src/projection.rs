@@ -51,6 +51,7 @@ pub(crate) fn load_or_rebuild(
     let expected = current_messages(&paths, envelopes, canonical_messages)?;
     let active_checkpoint = active_checkpoint_id(envelopes);
     let expected_digest = history_digest(&expected)?;
+    let expected_entries = entries_for_current(envelopes, &expected)?;
     match load_valid(
         session_id,
         &paths,
@@ -58,6 +59,7 @@ pub(crate) fn load_or_rebuild(
         active_checkpoint.as_deref(),
         expected.len() as u64,
         &expected_digest,
+        &expected_entries,
     ) {
         Ok(messages) => Ok(messages),
         Err(LoadError::MissingOrStale) => {
@@ -148,6 +150,7 @@ fn load_valid(
     active_checkpoint_id: Option<&str>,
     expected_entry_count: u64,
     expected_history_digest: &str,
+    expected_entries: &[HistoryProjectionEntry],
 ) -> Result<Vec<ModelMessage>, LoadError> {
     if !paths.history.exists() && !paths.metadata.exists() {
         return Err(LoadError::MissingOrStale);
@@ -175,6 +178,9 @@ fn load_valid(
         return Err(LoadError::MissingOrStale);
     }
     let entries = read_entries(&paths.history).map_err(LoadError::Damaged)?;
+    if entries != expected_entries {
+        return Err(LoadError::MissingOrStale);
+    }
     if metadata.entry_count != entries.len() as u64 {
         return Err(LoadError::Damaged(ProjectionError::Corrupt {
             message: "history entry count mismatch".into(),
