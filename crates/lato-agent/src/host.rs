@@ -42,6 +42,16 @@ impl AcpHost {
         Self::new_with_approval(cwd, trust, updates, stream, None)
     }
 
+    pub fn new_with_home(
+        cwd: PathBuf,
+        trust: SessionTrust,
+        updates: tokio::sync::mpsc::UnboundedSender<serde_json::Value>,
+        stream: Arc<dyn ModelStream>,
+        lato_home: PathBuf,
+    ) -> Self {
+        Self::build(cwd, trust, updates, stream, None, Some(lato_home))
+    }
+
     pub fn new_with_approval(
         cwd: PathBuf,
         trust: SessionTrust,
@@ -49,8 +59,30 @@ impl AcpHost {
         stream: Arc<dyn ModelStream>,
         tool_approval: Option<Arc<dyn ToolApproval>>,
     ) -> Self {
-        let stream = Arc::new(SwitchableModelStream::new(stream));
         let lato_home = std::env::var_os("LATO_HOME").map(PathBuf::from);
+        Self::build(cwd, trust, updates, stream, tool_approval, lato_home)
+    }
+
+    pub fn new_with_approval_and_home(
+        cwd: PathBuf,
+        trust: SessionTrust,
+        updates: tokio::sync::mpsc::UnboundedSender<serde_json::Value>,
+        stream: Arc<dyn ModelStream>,
+        tool_approval: Option<Arc<dyn ToolApproval>>,
+        lato_home: PathBuf,
+    ) -> Self {
+        Self::build(cwd, trust, updates, stream, tool_approval, Some(lato_home))
+    }
+
+    fn build(
+        cwd: PathBuf,
+        trust: SessionTrust,
+        updates: tokio::sync::mpsc::UnboundedSender<serde_json::Value>,
+        stream: Arc<dyn ModelStream>,
+        tool_approval: Option<Arc<dyn ToolApproval>>,
+        lato_home: Option<PathBuf>,
+    ) -> Self {
+        let stream = Arc::new(SwitchableModelStream::new(stream));
         let transcripts = lato_home
             .as_deref()
             .and_then(|home| TranscriptStore::open(home).ok());
@@ -125,6 +157,36 @@ impl AcpHost {
         )))
     }
 
+    async fn make_new_runtime_session(&self, sid: &str) -> Result<Arc<RuntimeSession>, String> {
+        let Some(events) = &self.events else {
+            return self.make_runtime_session(sid, None).await;
+        };
+        let session_id = SessionId::from(sid);
+        events
+            .append(
+                lato_core::JournalEnvelope {
+                    schema_version: lato_core::JOURNAL_SCHEMA_VERSION,
+                    record_id: lato_core::JournalRecordId::from(format!("{sid}-journal-0")),
+                    session_id: session_id.clone(),
+                    turn_id: None,
+                    journal_sequence: 0,
+                    timestamp_ms: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64,
+                    record: lato_core::JournalRecord::SessionStarted,
+                },
+                lato_core::JournalDurability::SyncData,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let replay = events
+            .replay(&session_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        self.make_runtime_session(sid, Some(replay)).await
+    }
+
     async fn session_exists(&self, sid: &str) -> Result<bool, String> {
         if self.sessions.contains_key(sid) {
             return Ok(true);
@@ -168,7 +230,7 @@ impl AcpHost {
                     .as_millis();
                 let sid = format!("s{now}-{}", self.next_id);
                 self.next_id += 1;
-                let session = match self.make_runtime_session(&sid, None).await {
+                let session = match self.make_new_runtime_session(&sid).await {
                     Ok(session) => session,
                     Err(error) => return Some(err(id, -32000, error)),
                 };

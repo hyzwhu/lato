@@ -176,9 +176,10 @@ async fn execute_effects(
                 }
                 app.overlay = Some(Overlay::Configuration);
                 let workspace = app.workspace.clone();
+                let home = crate::cli::lato_home();
                 let result = dialog::run(terminal, events, Some(app), |ui| async move {
                     let sessions =
-                        crate::client::list_session_summaries_over_acp(workspace).await?;
+                        crate::client::list_session_summaries_over_acp(workspace, home).await?;
                     let choices = sessions
                         .iter()
                         .map(|session| format!("{} · {}", session.title, session.session_id))
@@ -730,6 +731,7 @@ mod tests {
         app.screen = state::Screen::Main;
         let client = crate::client::InteractiveAcpClient::new_session_with_approval(
             workspace.path().to_path_buf(),
+            workspace.path().join("home"),
             trust.clone(),
             lato_agent::default_fake_stream(),
             None,

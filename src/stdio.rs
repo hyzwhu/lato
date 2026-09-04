@@ -13,7 +13,13 @@ pub async fn run() -> i32 {
     };
     let trust = SessionTrust::for_interactive(&cwd, true);
     let (updates_tx, mut updates_rx) = tokio::sync::mpsc::unbounded_channel();
-    let mut host = AcpHost::new(cwd, trust, updates_tx, default_fake_stream());
+    let mut host = AcpHost::new_with_home(
+        cwd,
+        trust,
+        updates_tx,
+        default_fake_stream(),
+        crate::cli::lato_home(),
+    );
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     let mut stdout = tokio::io::stdout();
 

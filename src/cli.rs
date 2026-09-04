@@ -260,6 +260,7 @@ async fn prompt(args: PromptArgs) -> i32 {
     let model_arg = args.model.or_else(|| std::env::var("LATO_MODEL").ok());
     let text = args.text;
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let home = lato_home();
     if let Some(response) = local_fact_response(&text, &cwd, model_arg.as_deref()) {
         println!("{response}");
         return 0;
@@ -281,7 +282,7 @@ async fn prompt(args: PromptArgs) -> i32 {
     } else {
         default_fake_stream()
     };
-    match crate::client::run_prompt_over_acp_with_stream(cwd, trust, text, stream).await {
+    match crate::client::run_prompt_over_acp_with_stream(cwd, home, trust, text, stream).await {
         Ok(s) => {
             println!("{s}");
             0
@@ -404,6 +405,7 @@ async fn interactive(
                     InteractiveStartup::New => {
                         crate::client::InteractiveAcpClient::new_session_with_approval(
                             cwd.clone(),
+                            home.clone(),
                             trust.clone(),
                             switchable.clone(),
                             inline_approval,
@@ -413,6 +415,7 @@ async fn interactive(
                     InteractiveStartup::Resume(id) => {
                         crate::client::InteractiveAcpClient::resume_session_with_approval(
                             cwd.clone(),
+                            home.clone(),
                             trust.clone(),
                             switchable.clone(),
                             inline_approval,
@@ -421,9 +424,10 @@ async fn interactive(
                         .await?
                     }
                 };
-                let mut sessions = crate::client::list_session_summaries_over_acp(cwd.clone())
-                    .await
-                    .unwrap_or_default();
+                let mut sessions =
+                    crate::client::list_session_summaries_over_acp(cwd.clone(), home.clone())
+                        .await
+                        .unwrap_or_default();
                 if !sessions
                     .iter()
                     .any(|session| session.session_id == client.session_id())
@@ -1003,7 +1007,7 @@ impl AuthInteraction for ConsoleAuthInteraction {
     }
 }
 
-fn lato_home() -> PathBuf {
+pub(crate) fn lato_home() -> PathBuf {
     std::env::var_os("LATO_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| {

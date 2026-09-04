@@ -96,12 +96,13 @@ impl ClientUpdate {
 
 pub async fn run_prompt_over_acp_with_stream(
     cwd: std::path::PathBuf,
+    lato_home: std::path::PathBuf,
     trust: SessionTrust,
     text: String,
     stream: Arc<dyn ModelStream>,
 ) -> Result<String, String> {
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-    let mut host = AcpHost::new(cwd, trust, tx, stream);
+    let mut host = AcpHost::new_with_home(cwd, trust, tx, stream, lato_home);
     let _ = host
         .handle(req(1, "initialize", serde_json::json!({})))
         .await;
@@ -144,15 +145,18 @@ pub struct InteractiveAcpClient {
 impl InteractiveAcpClient {
     pub async fn new_session_with_approval(
         cwd: std::path::PathBuf,
+        lato_home: std::path::PathBuf,
         trust: SessionTrust,
         stream: Arc<dyn ModelStream>,
         approval: Option<Arc<dyn ToolApproval>>,
     ) -> Result<Self, String> {
-        Self::initialize_with_approval(cwd, trust, stream, approval, SessionStart::New).await
+        Self::initialize_with_approval(cwd, lato_home, trust, stream, approval, SessionStart::New)
+            .await
     }
 
     pub async fn resume_session_with_approval(
         cwd: std::path::PathBuf,
+        lato_home: std::path::PathBuf,
         trust: SessionTrust,
         stream: Arc<dyn ModelStream>,
         approval: Option<Arc<dyn ToolApproval>>,
@@ -160,6 +164,7 @@ impl InteractiveAcpClient {
     ) -> Result<Self, String> {
         Self::initialize_with_approval(
             cwd,
+            lato_home,
             trust,
             stream,
             approval,
@@ -170,13 +175,15 @@ impl InteractiveAcpClient {
 
     async fn initialize_with_approval(
         cwd: std::path::PathBuf,
+        lato_home: std::path::PathBuf,
         trust: SessionTrust,
         stream: Arc<dyn ModelStream>,
         approval: Option<Arc<dyn ToolApproval>>,
         start: SessionStart,
     ) -> Result<Self, String> {
         let (tx, updates) = tokio::sync::mpsc::unbounded_channel();
-        let mut host = AcpHost::new_with_approval(cwd, trust, tx, stream, approval);
+        let mut host =
+            AcpHost::new_with_approval_and_home(cwd, trust, tx, stream, approval, lato_home);
         let _ = host
             .handle(req(1, "initialize", serde_json::json!({})))
             .await;
@@ -368,19 +375,23 @@ pub async fn list_sessions_over_acp(cwd: std::path::PathBuf) -> Result<Vec<Strin
 
 pub async fn list_session_summaries_over_acp(
     cwd: std::path::PathBuf,
+    lato_home: std::path::PathBuf,
 ) -> Result<Vec<SessionSummary>, String> {
-    let result = call_session_extension(cwd, "lato/session/list", serde_json::json!({})).await?;
+    let result =
+        call_session_extension(cwd, lato_home, "lato/session/list", serde_json::json!({})).await?;
     serde_json::from_value(result["sessions"].clone())
         .map_err(|error| format!("invalid structured session list: {error}"))
 }
 
 pub async fn rename_session_over_acp(
     cwd: std::path::PathBuf,
+    lato_home: std::path::PathBuf,
     session_id: &str,
     title: &str,
 ) -> Result<SessionSummary, String> {
     let result = call_session_extension(
         cwd,
+        lato_home,
         "lato/session/rename",
         serde_json::json!({"sessionId": session_id, "title": title}),
     )
@@ -390,10 +401,12 @@ pub async fn rename_session_over_acp(
 
 pub async fn delete_session_over_acp(
     cwd: std::path::PathBuf,
+    lato_home: std::path::PathBuf,
     session_id: &str,
 ) -> Result<(), String> {
     call_session_extension(
         cwd,
+        lato_home,
         "lato/session/delete",
         serde_json::json!({"sessionId": session_id}),
     )
@@ -403,12 +416,13 @@ pub async fn delete_session_over_acp(
 
 async fn call_session_extension(
     cwd: std::path::PathBuf,
+    lato_home: std::path::PathBuf,
     method: &str,
     params: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
     let (tx, _updates) = tokio::sync::mpsc::unbounded_channel();
     let trust = SessionTrust::for_headless_prompt(&cwd);
-    let mut host = AcpHost::new(cwd, trust, tx, default_fake_stream());
+    let mut host = AcpHost::new_with_home(cwd, trust, tx, default_fake_stream(), lato_home);
     let _ = host
         .handle(req(1, "initialize", serde_json::json!({})))
         .await;
@@ -493,6 +507,38 @@ mod tests {
             }
         );
     }
+
+    #[tokio::test]
+    async fn fresh_persisted_session_can_be_renamed_before_first_prompt() {
+        use super::*;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let trust = SessionTrust::for_interactive(workspace.path(), false);
+        let mut client = InteractiveAcpClient::new_session_with_approval(
+            workspace.path().to_path_buf(),
+            home.path().to_path_buf(),
+            trust,
+            default_fake_stream(),
+            None,
+        )
+        .await
+        .unwrap();
+        let session_id = client.session_id().to_string();
+
+        let renamed = client.rename_session(&session_id, "abc").await.unwrap();
+        assert_eq!(renamed.session_id, session_id);
+        assert_eq!(renamed.title, "abc");
+        assert_eq!(renamed.title_source, "manual");
+        assert!(
+            home.path()
+                .join("sessions")
+                .join(&session_id)
+                .join("metadata.json")
+                .is_file()
+        );
+    }
+
     #[tokio::test]
     async fn model_switch_preserves_session_and_conversation_context() {
         use super::*;
@@ -528,6 +574,7 @@ mod tests {
         let switchable = Arc::new(SwitchableModelStream::new(first));
         let mut client = InteractiveAcpClient::new_session_with_approval(
             workspace.path().to_path_buf(),
+            workspace.path().join("home"),
             trust,
             switchable.clone(),
             None,

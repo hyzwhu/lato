@@ -27,7 +27,7 @@ pub async fn run(command: SessionCommand) -> i32 {
 }
 
 async fn list(json: bool) -> i32 {
-    match list_session_summaries_over_acp(current_dir()).await {
+    match list_session_summaries_over_acp(current_dir(), crate::cli::lato_home()).await {
         Ok(sessions) => {
             if json {
                 let output = SessionListOutput {
@@ -52,7 +52,7 @@ async fn list(json: bool) -> i32 {
 }
 
 async fn rename(session_id: &str, title: &str) -> i32 {
-    match rename_session_over_acp(current_dir(), session_id, title).await {
+    match rename_session_over_acp(current_dir(), crate::cli::lato_home(), session_id, title).await {
         Ok(summary) => {
             println!("Renamed {} to {}", summary.session_id, summary.title);
             0
@@ -82,7 +82,7 @@ async fn delete(session_id: &str, yes: bool) -> i32 {
             return 0;
         }
     }
-    match delete_session_over_acp(current_dir(), session_id).await {
+    match delete_session_over_acp(current_dir(), crate::cli::lato_home(), session_id).await {
         Ok(()) => {
             println!("Deleted session {session_id} permanently.");
             0
