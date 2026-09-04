@@ -1,12 +1,14 @@
 use async_trait::async_trait;
 use lato_core::{
-    CancelReason, Command, EventPayload, EventStore, JOURNAL_SCHEMA_VERSION, JournalDurability,
-    JournalEnvelope, JournalError, JournalRecord, JournalRecordId, JournalReplay, ModelContent,
-    ModelMessage, ModelRole, SessionId, StartBehavior, StartTurn, TurnOutput, UserInput,
+    CancelReason, Command, CompactSession, CompactionCandidate, CompactionError, CompactionId,
+    CompactionTrigger, EventPayload, EventStore, HistoryProjectionMetadata, HistoryProjectionStore,
+    HistoryReplacementReason, JOURNAL_SCHEMA_VERSION, JournalDurability, JournalEnvelope,
+    JournalError, JournalRecord, JournalRecordId, JournalReplay, ModelContent, ModelMessage,
+    ModelRole, ProjectionError, SessionId, StartBehavior, StartTurn, TurnOutput, UserInput,
 };
 use lato_runtime::{
-    SessionBootstrap, TurnControl, TurnDriver, TurnEventEmitter, TurnRequest, spawn_session,
-    spawn_session_with_store,
+    CompactionControl, CompactionRequest, SessionBootstrap, TurnControl, TurnDriver,
+    TurnEventEmitter, TurnRequest, spawn_session, spawn_session_with_store,
 };
 use lato_store::MemoryEventStore;
 use std::{
@@ -86,6 +88,20 @@ impl EventStore for ControlledStore {
     }
 }
 
+#[async_trait]
+impl HistoryProjectionStore for ControlledStore {
+    async fn replace_history(
+        &self,
+        session_id: &SessionId,
+        messages: Vec<ModelMessage>,
+        reason: HistoryReplacementReason,
+    ) -> Result<HistoryProjectionMetadata, ProjectionError> {
+        self.inner
+            .replace_history(session_id, messages, reason)
+            .await
+    }
+}
+
 fn record_kind(record: &JournalRecord) -> &'static str {
     match record {
         JournalRecord::SessionStarted => "session_started",
@@ -118,6 +134,40 @@ impl TurnDriver for EchoDriver {
 }
 
 struct BlockingDriver;
+
+struct BlockingCompactionDriver;
+
+#[async_trait]
+impl TurnDriver for BlockingCompactionDriver {
+    async fn run(
+        &self,
+        request: TurnRequest,
+        _control: TurnControl,
+        _events: TurnEventEmitter,
+    ) -> Result<TurnOutput, lato_core::AgentError> {
+        Ok(TurnOutput {
+            final_text: request.input.text,
+        })
+    }
+
+    async fn history_snapshot(&self) -> Result<Vec<ModelMessage>, lato_core::AgentError> {
+        Ok(vec![ModelMessage {
+            role: ModelRole::User,
+            content: vec![ModelContent::Text {
+                text: "context".repeat(400),
+            }],
+        }])
+    }
+
+    async fn compact(
+        &self,
+        _request: CompactionRequest,
+        control: CompactionControl,
+    ) -> Result<CompactionCandidate, lato_core::AgentError> {
+        control.cancellation.cancelled().await;
+        Err(CompactionError::Cancelled.into())
+    }
+}
 
 struct CommitDriver;
 
@@ -814,4 +864,117 @@ async fn bootstrap_resumes_the_next_journal_sequence_without_duplicate_start() {
         1
     );
     assert_eq!(replay.envelopes[1].journal_sequence, 1);
+}
+
+fn manual_compaction() -> Command {
+    Command::CompactSession(CompactSession {
+        user_context: None,
+        trigger: CompactionTrigger::Manual,
+    })
+}
+
+#[tokio::test]
+async fn compaction_blocks_turns_and_can_be_cancelled() {
+    let session = spawn_session(
+        "session-compaction-cancel".into(),
+        Arc::new(BlockingCompactionDriver),
+    );
+    let mut events = session.subscribe();
+
+    session.submit(manual_compaction()).await.unwrap();
+    assert!(matches!(
+        next_event(&mut events).await.payload,
+        EventPayload::SessionStarted
+    ));
+    let started = next_event(&mut events).await;
+    let EventPayload::CompactionStarted { compaction_id, .. } = started.payload else {
+        panic!("expected compaction start");
+    };
+    assert!(started.turn_id.is_none());
+
+    let error = session
+        .submit(Command::StartTurn(StartTurn {
+            input: UserInput::text("blocked"),
+            behavior: StartBehavior::Reject,
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "compaction.already_active");
+
+    session
+        .submit(Command::CancelCompaction {
+            compaction_id: compaction_id.clone(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        next_event(&mut events).await.payload,
+        EventPayload::CompactionCancelled { compaction_id }
+    );
+}
+
+#[tokio::test]
+async fn compaction_rejects_an_active_turn_and_duplicate_request() {
+    let running = spawn_session(
+        "session-compaction-running".into(),
+        Arc::new(BlockingDriver),
+    );
+    running
+        .submit(Command::StartTurn(StartTurn {
+            input: UserInput::text("wait"),
+            behavior: StartBehavior::Reject,
+        }))
+        .await
+        .unwrap();
+    let error = running.submit(manual_compaction()).await.unwrap_err();
+    assert_eq!(error.code, "compaction.active_turn");
+
+    let compacting = spawn_session(
+        "session-compaction-duplicate".into(),
+        Arc::new(BlockingCompactionDriver),
+    );
+    compacting.submit(manual_compaction()).await.unwrap();
+    let error = compacting.submit(manual_compaction()).await.unwrap_err();
+    assert_eq!(error.code, "compaction.already_active");
+}
+
+#[tokio::test]
+async fn cancel_compaction_requires_the_matching_operation_id() {
+    let session = spawn_session(
+        "session-compaction-identity".into(),
+        Arc::new(BlockingCompactionDriver),
+    );
+    session.submit(manual_compaction()).await.unwrap();
+    let error = session
+        .submit(Command::CancelCompaction {
+            compaction_id: CompactionId::from("wrong-compaction"),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "compaction.not_active");
+}
+
+#[tokio::test]
+async fn shutdown_cancels_compaction_before_stopping_the_session() {
+    let session = spawn_session(
+        "session-compaction-shutdown".into(),
+        Arc::new(BlockingCompactionDriver),
+    );
+    let mut events = session.subscribe();
+    session.submit(manual_compaction()).await.unwrap();
+    let _session_started = next_event(&mut events).await;
+    let started = next_event(&mut events).await;
+    let EventPayload::CompactionStarted { compaction_id, .. } = started.payload else {
+        panic!("expected compaction start");
+    };
+
+    session.submit(Command::Shutdown).await.unwrap();
+    assert_eq!(
+        next_event(&mut events).await.payload,
+        EventPayload::CompactionCancelled { compaction_id }
+    );
+    assert!(matches!(
+        next_event(&mut events).await.payload,
+        EventPayload::SessionStopped
+    ));
 }

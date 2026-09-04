@@ -3,13 +3,15 @@
 // Lato changes: replaced Codex protocol operations with typed Lato Command/Event values
 
 use crate::driver::{
-    DriverEvent, DriverMessage, TurnControl, TurnDriver, TurnEventEmitter, TurnRequest,
+    CompactionControl, CompactionRequest, DriverEvent, DriverMessage, TurnControl, TurnDriver,
+    TurnEventEmitter, TurnRequest,
 };
 use lato_core::{
-    AgentError, CancelReason, Command, ErrorCategory, EventEnvelope, EventId, EventPayload,
-    EventStore, JOURNAL_SCHEMA_VERSION, JournalDurability, JournalEnvelope, JournalError,
-    JournalRecord, JournalRecordId, JournalReplay, Retryability, SessionId, SessionMachine,
-    SessionPhase, StartDecision, StartTurn, TransitionError, TurnId, UserInput,
+    AgentError, CancelReason, Command, CompactSession, CompactionError, CompactionId,
+    CompactionPolicy, ErrorCategory, EventEnvelope, EventId, EventPayload, JOURNAL_SCHEMA_VERSION,
+    JournalDurability, JournalEnvelope, JournalError, JournalRecord, JournalRecordId,
+    JournalReplay, Retryability, SessionId, SessionMachine, SessionPhase, SessionStore,
+    StartDecision, StartTurn, TransitionError, TurnId, UserInput,
 };
 use lato_store::MemoryEventStore;
 use std::{
@@ -28,6 +30,7 @@ use tokio_util::sync::CancellationToken;
 const COMMAND_CAPACITY: usize = 64;
 const EVENT_CAPACITY: usize = 256;
 static NEXT_TURN_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_COMPACTION_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone)]
 pub struct SessionHandle {
@@ -53,7 +56,7 @@ impl SessionHandle {
 }
 
 pub fn spawn_session(session_id: SessionId, driver: Arc<dyn TurnDriver>) -> SessionHandle {
-    let store: Arc<dyn EventStore> = Arc::new(MemoryEventStore::new());
+    let store: Arc<dyn SessionStore> = Arc::new(MemoryEventStore::new());
     spawn_session_with_store(
         session_id.clone(),
         driver,
@@ -72,7 +75,7 @@ pub struct SessionBootstrap {
 pub fn spawn_session_with_store(
     session_id: SessionId,
     driver: Arc<dyn TurnDriver>,
-    store: Arc<dyn EventStore>,
+    store: Arc<dyn SessionStore>,
     bootstrap: SessionBootstrap,
 ) -> SessionHandle {
     debug_assert_eq!(bootstrap.replay.projection.session_id, session_id);
@@ -106,6 +109,12 @@ struct ActiveRuntimeTurn {
     task: JoinHandle<()>,
 }
 
+struct ActiveRuntimeCompaction {
+    id: CompactionId,
+    cancellation: CancellationToken,
+    task: JoinHandle<()>,
+}
+
 struct PendingStart {
     id: TurnId,
     start: StartTurn,
@@ -114,13 +123,14 @@ struct PendingStart {
 struct SessionLoop {
     session_id: SessionId,
     driver: Arc<dyn TurnDriver>,
-    store: Arc<dyn EventStore>,
+    store: Arc<dyn SessionStore>,
     machine: SessionMachine,
     command_rx: mpsc::Receiver<SubmittedCommand>,
     event_tx: broadcast::Sender<EventEnvelope>,
     driver_tx: mpsc::UnboundedSender<DriverMessage>,
     driver_rx: mpsc::UnboundedReceiver<DriverMessage>,
     active: Option<ActiveRuntimeTurn>,
+    active_compaction: Option<ActiveRuntimeCompaction>,
     pending_start: Option<PendingStart>,
     sequence: u64,
     journal_sequence: u64,
@@ -132,7 +142,7 @@ impl SessionLoop {
     fn new(
         session_id: SessionId,
         driver: Arc<dyn TurnDriver>,
-        store: Arc<dyn EventStore>,
+        store: Arc<dyn SessionStore>,
         bootstrap: SessionBootstrap,
         command_rx: mpsc::Receiver<SubmittedCommand>,
         event_tx: broadcast::Sender<EventEnvelope>,
@@ -148,6 +158,7 @@ impl SessionLoop {
             driver_tx,
             driver_rx,
             active: None,
+            active_compaction: None,
             pending_start: None,
             sequence: 0,
             journal_sequence: bootstrap.replay.projection.next_journal_sequence,
@@ -216,8 +227,96 @@ impl SessionLoop {
                 active.cancellation.cancel();
                 Ok(())
             }
+            Command::CompactSession(request) => self.request_compaction(request).await,
+            Command::CancelCompaction { compaction_id } => {
+                self.machine
+                    .request_compaction_cancel(&compaction_id)
+                    .map_err(transition_error)?;
+                let active = self.active_compaction.as_ref().ok_or_else(|| {
+                    invalid_state(
+                        "compaction.not_active",
+                        "cannot cancel an inactive compaction",
+                    )
+                })?;
+                if active.id != compaction_id {
+                    return Err(invalid_state(
+                        "compaction.not_active",
+                        "the requested compaction is not active",
+                    ));
+                }
+                active.cancellation.cancel();
+                Ok(())
+            }
             Command::Shutdown => self.shutdown().await,
         }
+    }
+
+    async fn request_compaction(&mut self, request: CompactSession) -> Result<(), AgentError> {
+        let compaction_id = next_compaction_id();
+        let previous_machine = self.machine.clone();
+        self.machine
+            .request_compaction(compaction_id.clone())
+            .map_err(|error| match error {
+                TransitionError::TurnAlreadyActive => CompactionError::ActiveTurn.into(),
+                other => transition_error(other),
+            })?;
+
+        let messages = match self.driver.history_snapshot().await {
+            Ok(messages) => messages,
+            Err(error) => {
+                self.machine = previous_machine;
+                return Err(error);
+            }
+        };
+        if let Err(error) = self
+            .commit(
+                None,
+                JournalRecord::CompactionRequested {
+                    compaction_id: compaction_id.clone(),
+                    trigger: request.trigger,
+                    user_context: request.user_context.clone(),
+                },
+                JournalDurability::SyncData,
+            )
+            .await
+        {
+            self.machine = previous_machine;
+            return Err(error);
+        }
+
+        let cancellation = CancellationToken::new();
+        let control = CompactionControl {
+            cancellation: cancellation.clone(),
+        };
+        let driver_request = CompactionRequest {
+            compaction_id: compaction_id.clone(),
+            request: request.clone(),
+            messages,
+            policy: CompactionPolicy::default(),
+        };
+        let driver = self.driver.clone();
+        let driver_tx = self.driver_tx.clone();
+        let finished_id = compaction_id.clone();
+        let task = tokio::spawn(async move {
+            let result = driver.compact(driver_request, control).await;
+            let _ = driver_tx.send(DriverMessage::CompactionFinished {
+                compaction_id: finished_id,
+                result,
+            });
+        });
+        self.active_compaction = Some(ActiveRuntimeCompaction {
+            id: compaction_id.clone(),
+            cancellation,
+            task,
+        });
+        self.emit(
+            None,
+            EventPayload::CompactionStarted {
+                compaction_id,
+                trigger: request.trigger,
+            },
+        );
+        Ok(())
     }
 
     async fn request_start(&mut self, start: StartTurn) -> Result<(), AgentError> {
@@ -431,7 +530,83 @@ impl SessionLoop {
                     }
                 }
             }
+            DriverMessage::CompactionFinished {
+                compaction_id,
+                result,
+            } => {
+                self.handle_compaction_finished(compaction_id, result).await;
+            }
         }
+    }
+
+    async fn handle_compaction_finished(
+        &mut self,
+        compaction_id: CompactionId,
+        result: Result<lato_core::CompactionCandidate, AgentError>,
+    ) {
+        let Some(active) = self.active_compaction.take() else {
+            return;
+        };
+        if active.id != compaction_id {
+            self.active_compaction = Some(active);
+            return;
+        }
+        let cancel_requested = self
+            .machine
+            .active_compaction()
+            .is_some_and(|state| state.cancel_requested);
+        if cancel_requested {
+            if self
+                .commit(
+                    None,
+                    JournalRecord::CompactionCancelled {
+                        compaction_id: compaction_id.clone(),
+                    },
+                    JournalDurability::SyncData,
+                )
+                .await
+                .is_err()
+            {
+                self.machine.stop();
+                return;
+            }
+            let _ = self.machine.finish_compaction(&compaction_id);
+            self.emit(None, EventPayload::CompactionCancelled { compaction_id });
+            return;
+        }
+
+        let error = match result {
+            Ok(_) => AgentError::new(
+                "compaction.persistence_not_connected",
+                ErrorCategory::InternalInvariant,
+                "compaction candidate is ready but persistence is not connected",
+                Retryability::Never,
+            ),
+            Err(error) => error,
+        };
+        if self
+            .commit(
+                None,
+                JournalRecord::CompactionFailed {
+                    compaction_id: compaction_id.clone(),
+                    error_code: error.code.clone(),
+                },
+                JournalDurability::SyncData,
+            )
+            .await
+            .is_err()
+        {
+            self.machine.stop();
+            return;
+        }
+        let _ = self.machine.finish_compaction(&compaction_id);
+        self.emit(
+            None,
+            EventPayload::CompactionFailed {
+                compaction_id,
+                error,
+            },
+        );
     }
 
     async fn emit_session_started_once(&mut self) -> Result<(), AgentError> {
@@ -468,6 +643,24 @@ impl SessionLoop {
                 Some(active.id),
                 EventPayload::TurnCancelled {
                     reason: CancelReason::Shutdown,
+                },
+            );
+        }
+        if let Some(active) = self.active_compaction.take() {
+            active.cancellation.cancel();
+            active.task.abort();
+            self.commit(
+                None,
+                JournalRecord::CompactionCancelled {
+                    compaction_id: active.id.clone(),
+                },
+                JournalDurability::SyncData,
+            )
+            .await?;
+            self.emit(
+                None,
+                EventPayload::CompactionCancelled {
+                    compaction_id: active.id,
                 },
             );
         }
@@ -534,6 +727,13 @@ fn next_turn_id() -> TurnId {
     ))
 }
 
+fn next_compaction_id() -> CompactionId {
+    CompactionId::from(format!(
+        "compaction-{}",
+        NEXT_COMPACTION_ID.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -544,7 +744,14 @@ fn now_ms() -> u64 {
 }
 
 fn transition_error(error: TransitionError) -> AgentError {
-    invalid_state("runtime.invalid_transition", error.to_string())
+    match error {
+        TransitionError::CompactionAlreadyActive => CompactionError::AlreadyActive.into(),
+        TransitionError::NotActiveCompaction => invalid_state(
+            "compaction.not_active",
+            "the requested compaction is not active",
+        ),
+        other => invalid_state("runtime.invalid_transition", other.to_string()),
+    }
 }
 
 fn invalid_state(code: &str, message: impl Into<String>) -> AgentError {

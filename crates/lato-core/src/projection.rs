@@ -120,6 +120,10 @@ pub trait HistoryProjectionStore: Send + Sync {
     ) -> Result<HistoryProjectionMetadata, ProjectionError>;
 }
 
+pub trait SessionStore: crate::EventStore + HistoryProjectionStore {}
+
+impl<T> SessionStore for T where T: crate::EventStore + HistoryProjectionStore + ?Sized {}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct HistoryCheckpoint {
     pub schema_version: u32,

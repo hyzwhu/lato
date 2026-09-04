@@ -36,7 +36,7 @@ pub use policy::{
 pub use projection::{
     HISTORY_PROJECTION_SCHEMA_VERSION, HistoryCheckpoint, HistoryProjectionEntry,
     HistoryProjectionMetadata, HistoryProjectionStore, HistoryReplacementReason, JournalValidation,
-    ProjectionError, SessionSnapshot, checkpoint_digest, history_digest,
+    ProjectionError, SessionSnapshot, SessionStore, checkpoint_digest, history_digest,
 };
 pub use state::{
     ActiveCompaction, ActiveTurn, SessionMachine, SessionPhase, StartDecision, TransitionError,

@@ -4,8 +4,8 @@
 
 use async_trait::async_trait;
 use lato_core::{
-    AgentError, ErrorCategory, JournalDurability, JournalRecord, Retryability, TurnId, TurnOutput,
-    UserInput,
+    AgentError, CompactSession, CompactionCandidate, CompactionId, CompactionPolicy, ErrorCategory,
+    JournalDurability, JournalRecord, ModelMessage, Retryability, TurnId, TurnOutput, UserInput,
 };
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -19,6 +19,18 @@ pub struct TurnRequest {
 pub struct TurnControl {
     pub cancellation: CancellationToken,
     pub steering: mpsc::UnboundedReceiver<UserInput>,
+}
+
+#[derive(Clone, Debug)]
+pub struct CompactionRequest {
+    pub compaction_id: CompactionId,
+    pub request: CompactSession,
+    pub messages: Vec<ModelMessage>,
+    pub policy: CompactionPolicy,
+}
+
+pub struct CompactionControl {
+    pub cancellation: CancellationToken,
 }
 
 #[derive(Clone)]
@@ -71,6 +83,22 @@ pub trait TurnDriver: Send + Sync + 'static {
         control: TurnControl,
         events: TurnEventEmitter,
     ) -> Result<TurnOutput, AgentError>;
+
+    async fn history_snapshot(&self) -> Result<Vec<ModelMessage>, AgentError> {
+        Err(unsupported_compaction())
+    }
+
+    async fn compact(
+        &self,
+        _request: CompactionRequest,
+        _control: CompactionControl,
+    ) -> Result<CompactionCandidate, AgentError> {
+        Err(unsupported_compaction())
+    }
+
+    async fn install_history(&self, _messages: Vec<ModelMessage>) -> Result<(), AgentError> {
+        Err(unsupported_compaction())
+    }
 }
 
 #[derive(Debug)]
@@ -95,6 +123,10 @@ pub(crate) enum DriverMessage {
         turn_id: TurnId,
         result: Result<TurnOutput, AgentError>,
     },
+    CompactionFinished {
+        compaction_id: CompactionId,
+        result: Result<CompactionCandidate, AgentError>,
+    },
 }
 
 fn event_bus_closed() -> AgentError {
@@ -102,6 +134,15 @@ fn event_bus_closed() -> AgentError {
         "runtime.event_bus_closed",
         ErrorCategory::InternalInvariant,
         "runtime event bus closed",
+        Retryability::Never,
+    )
+}
+
+fn unsupported_compaction() -> AgentError {
+    AgentError::new(
+        "compaction.unsupported_driver",
+        ErrorCategory::InternalInvariant,
+        "turn driver does not support context compaction",
         Retryability::Never,
     )
 }
