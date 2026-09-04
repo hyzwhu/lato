@@ -1,6 +1,7 @@
 use super::{
     TuiExit,
     backend::{BackendCommand, BackendEvent},
+    commands::{self, SlashCommand},
     i18n::Language,
     input::InputBuffer,
     tool_panel::ToolPanelState,
@@ -165,6 +166,8 @@ pub struct AppState {
     pub focus: Focus,
     pub overlay: Option<Overlay>,
     pub palette_index: usize,
+    pub slash_completion_index: usize,
+    slash_completion_dismissed: bool,
     pub approval: Option<ApprovalState>,
     pub layout: LayoutMode,
     pub responding: bool,
@@ -238,6 +241,8 @@ impl AppState {
             focus: Focus::Chat,
             overlay: None,
             palette_index: 0,
+            slash_completion_index: 0,
+            slash_completion_dismissed: false,
             approval: None,
             layout: LayoutMode::Wide,
             responding: false,
@@ -250,6 +255,26 @@ impl AppState {
             should_exit: false,
             exit_action: TuiExit::Quit,
         }
+    }
+
+    pub fn slash_completion(&self) -> Vec<&'static SlashCommand> {
+        if self.slash_completion_dismissed || self.focus != Focus::Chat {
+            Vec::new()
+        } else {
+            commands::matches(self.composer.as_str())
+        }
+    }
+
+    pub fn refresh_slash_completion(&mut self) {
+        self.slash_completion_dismissed = false;
+        let last = commands::matches(self.composer.as_str())
+            .len()
+            .saturating_sub(1);
+        self.slash_completion_index = self.slash_completion_index.min(last);
+    }
+
+    pub fn dismiss_slash_completion(&mut self) {
+        self.slash_completion_dismissed = true;
     }
 
     pub fn new_with_summaries(

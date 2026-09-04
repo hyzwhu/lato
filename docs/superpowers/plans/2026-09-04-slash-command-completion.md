@@ -93,7 +93,7 @@ git commit -m "feat: centralize slash command metadata"
 - Produces: composer-edit synchronization that resets dismissal and clamps selection.
 - Produces: completion handling for Up, Down, Enter, and Escape.
 
-- [ ] **Step 1: Add failing keyboard tests**
+- [x] **Step 1: Add failing keyboard tests**
 
 Extend the existing `slash_commands_and_palette_stay_in_the_tui` coverage and add focused tests asserting:
 
@@ -108,19 +108,19 @@ Extend the existing `slash_commands_and_palette_stay_in_the_tui` coverage and ad
 // Paste of '/sta' exposes only '/status'.
 ```
 
-- [ ] **Step 2: Run focused tests and verify failure**
+- [x] **Step 2: Run focused tests and verify failure**
 
 Run: `cargo test --bin lato slash_completion -- --nocapture`
 
 Expected: tests fail because completion state and key routing do not exist.
 
-- [ ] **Step 3: Add state and edit synchronization**
+- [x] **Step 3: Add state and edit synchronization**
 
 Add `slash_completion_index: usize` and `slash_completion_dismissed: bool` to `AppState`, initialize them to `0` and `false`, and add methods which derive candidates from the current composer. After every character insertion, paste, Backspace, Delete, and replacement, set dismissal to false and clamp the index to `candidate_count.saturating_sub(1)`.
 
 Keep cursor-only Left/Right/Home/End operations unchanged because they do not change the completion query.
 
-- [ ] **Step 4: Route completion keys**
+- [x] **Step 4: Route completion keys**
 
 Before ordinary composer handling, when non-dismissed candidates exist:
 
@@ -134,13 +134,13 @@ Enter => if composer text exactly equals the selected command (ignoring ASCII ca
 
 Do not intercept keys while approval, search, or the Cmd/Ctrl+K palette is active. Preserve Tools-panel key ownership. Replace the hard-coded `/help` message with `commands::help_line()`.
 
-- [ ] **Step 5: Run TUI behavior tests**
+- [x] **Step 5: Run TUI behavior tests**
 
 Run: `cargo test --bin lato tui:: -- --nocapture`
 
 Expected: all TUI unit tests pass, including exact-match execution and existing palette behavior.
 
-- [ ] **Step 6: Commit keyboard behavior**
+- [x] **Step 6: Commit keyboard behavior**
 
 ```bash
 git add src/tui/state.rs src/tui/mod.rs

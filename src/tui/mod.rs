@@ -330,7 +330,11 @@ fn handle_terminal_event(
     match event {
         Event::Resize(width, height) => app.reduce(AppEvent::Resize(width, height)),
         Event::Paste(text) if app.approval.is_none() => {
+            let composer_active = app.overlay != Some(Overlay::Search);
             active_input(app).insert_str(&text);
+            if composer_active {
+                app.refresh_slash_completion();
+            }
             Vec::new()
         }
         Event::Key(key) if key.kind != KeyEventKind::Release => {
@@ -375,6 +379,9 @@ fn handle_key(
     if app.focus == state::Focus::Tools && tool_panel::handle_key(app, key) {
         return Vec::new();
     }
+    if let Some(effects) = handle_slash_completion_key(app, key, trust) {
+        return effects;
+    }
     if app.armed_session_delete.is_some() && key.code != KeyCode::Char('d') {
         app.disarm_session_delete();
     }
@@ -400,10 +407,12 @@ fn handle_key(
         KeyCode::Enter => submit_or_command(app, trust),
         KeyCode::Backspace => {
             app.composer.backspace();
+            app.refresh_slash_completion();
             Vec::new()
         }
         KeyCode::Delete => {
             app.composer.delete();
+            app.refresh_slash_completion();
             Vec::new()
         }
         KeyCode::Left => {
@@ -436,9 +445,44 @@ fn handle_key(
         {
             app.focus = state::Focus::Chat;
             app.composer.insert_char(value);
+            app.refresh_slash_completion();
             Vec::new()
         }
         _ => Vec::new(),
+    }
+}
+
+fn handle_slash_completion_key(
+    app: &mut AppState,
+    key: KeyEvent,
+    trust: &SessionTrust,
+) -> Option<Vec<Effect>> {
+    let candidates = app.slash_completion();
+    let selected = candidates.get(app.slash_completion_index).copied()?;
+    match key.code {
+        KeyCode::Up => {
+            app.slash_completion_index = app.slash_completion_index.saturating_sub(1);
+            Some(Vec::new())
+        }
+        KeyCode::Down => {
+            app.slash_completion_index =
+                (app.slash_completion_index + 1).min(candidates.len().saturating_sub(1));
+            Some(Vec::new())
+        }
+        KeyCode::Esc => {
+            app.dismiss_slash_completion();
+            Some(Vec::new())
+        }
+        KeyCode::Enter => {
+            if app.composer.as_str().eq_ignore_ascii_case(selected.name) {
+                Some(submit_or_command(app, trust))
+            } else {
+                app.composer.replace(selected.name);
+                app.refresh_slash_completion();
+                Some(Vec::new())
+            }
+        }
+        _ => None,
     }
 }
 
@@ -532,7 +576,7 @@ fn submit_or_command(app: &mut AppState, trust: &SessionTrust) -> Vec<Effect> {
             app.screen = state::Screen::Main;
             app.messages.push(Message {
                 role: MessageRole::System,
-                content: "/help  /new  /clear  /sessions  /rename  /delete  /model  /login  /doctor  /search  /lang  /approve  /status  /permissions  /exit".into(),
+                content: commands::help_line(),
                 expanded: true,
             });
             Vec::new()
@@ -664,11 +708,15 @@ fn active_input(app: &mut AppState) -> &mut input::InputBuffer {
 
 #[cfg(test)]
 mod tests {
-    use super::{BackendCommand, Effect, resume_selected_session, submit_or_command};
+    use super::{
+        BackendCommand, Effect, handle_slash_completion_key, resume_selected_session,
+        submit_or_command,
+    };
     use crate::tui::{
         i18n::Language,
         state::{AppState, Screen},
     };
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use lato_workspace::SessionTrust;
     use std::path::PathBuf;
 
@@ -717,6 +765,90 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn slash_completion_filters_navigates_completes_and_executes() {
+        let workspace = tempfile::tempdir().unwrap();
+        let trust = SessionTrust::for_interactive(workspace.path(), false);
+        let mut app = AppState::new(
+            Language::En,
+            workspace.path().to_path_buf(),
+            "provider/model".into(),
+            "current".into(),
+            vec![],
+        );
+
+        app.composer.insert_str("/");
+        app.refresh_slash_completion();
+        assert_eq!(app.slash_completion().len(), 17);
+        assert!(
+            handle_slash_completion_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+                &trust,
+            )
+            .is_some()
+        );
+        assert_eq!(app.slash_completion_index, 1);
+        let effects = handle_slash_completion_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &trust,
+        )
+        .unwrap();
+        assert!(effects.is_empty());
+        assert_eq!(app.composer.as_str(), "/new");
+
+        app.composer.replace("/MO");
+        app.refresh_slash_completion();
+        assert_eq!(app.slash_completion()[0].name, "/model");
+        assert!(
+            handle_slash_completion_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                &trust,
+            )
+            .unwrap()
+            .is_empty()
+        );
+        assert_eq!(app.composer.as_str(), "/model");
+        assert!(matches!(
+            &handle_slash_completion_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                &trust,
+            )
+            .unwrap()[..],
+            [Effect::ConfigureModel]
+        ));
+    }
+
+    #[test]
+    fn slash_completion_escape_and_edits_update_visibility() {
+        let workspace = tempfile::tempdir().unwrap();
+        let trust = SessionTrust::for_interactive(workspace.path(), false);
+        let mut app = AppState::new(
+            Language::En,
+            workspace.path().to_path_buf(),
+            "provider/model".into(),
+            "current".into(),
+            vec![],
+        );
+        app.composer.insert_str("/mo");
+        app.refresh_slash_completion();
+        assert_eq!(app.slash_completion().len(), 1);
+        handle_slash_completion_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &trust,
+        );
+        assert_eq!(app.composer.as_str(), "/mo");
+        assert!(app.slash_completion().is_empty());
+
+        app.composer.backspace();
+        app.refresh_slash_completion();
+        assert!(!app.slash_completion().is_empty());
+    }
+
     #[tokio::test]
     async fn slash_commands_and_palette_stay_in_the_tui() {
         use super::*;
@@ -742,6 +874,11 @@ mod tests {
         tokio::task::LocalSet::new()
             .run_until(async {
                 let (backend, _) = backend::spawn(client);
+                handle_terminal_event(&mut app, Event::Paste("/sta".into()), &backend, &trust);
+                assert_eq!(app.slash_completion().len(), 1);
+                assert_eq!(app.slash_completion()[0].name, "/status");
+                app.composer.clear();
+                app.refresh_slash_completion();
                 handle_key(
                     &mut app,
                     KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
