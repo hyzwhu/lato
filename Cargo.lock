@@ -1128,6 +1128,7 @@ dependencies = [
  "lato-core",
  "lato-store",
  "serde_json",
+ "tempfile",
  "tokio",
  "tokio-util",
 ]

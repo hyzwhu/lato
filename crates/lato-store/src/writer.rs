@@ -4,7 +4,7 @@
 // Phase 4B derived from: Grok Build@bb7f39d5858cbf5e00de639367f59debbdcb0138:crates/codegen/xai-grok-shell/src/session/persistence.rs
 
 use crate::file::{
-    FileFaultInjector, append_envelope_blocking, replay_path_blocking,
+    FaultPoint, FileFaultInjector, append_envelope_blocking, replay_path_blocking,
     replay_with_projection_blocking, satisfy_existing_durability,
 };
 use crate::projection;
@@ -237,6 +237,9 @@ fn replace_history_blocking(
             message: "journal has no session directory".into(),
         })?;
     let paths = projection::ProjectionPaths::new(session_dir);
+    faults
+        .check(FaultPoint::BeforeCheckpointPublish)
+        .map_err(projection_journal_error)?;
     projection::publish_checkpoint(&paths, &checkpoint)?;
     let marker = JournalEnvelope {
         schema_version: lato_core::JOURNAL_SCHEMA_VERSION,
@@ -283,6 +286,7 @@ fn replace_history_blocking(
         &messages,
         generation,
         checkpoint_id,
+        faults,
     )
 }
 

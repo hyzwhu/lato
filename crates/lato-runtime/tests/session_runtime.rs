@@ -10,12 +10,12 @@ use lato_runtime::{
     CompactionControl, CompactionRequest, SessionBootstrap, TurnControl, TurnDriver,
     TurnEventEmitter, TurnRequest, spawn_session, spawn_session_with_store,
 };
-use lato_store::MemoryEventStore;
+use lato_store::{FaultPoint, FileEventStore, FileFaultInjector, MemoryEventStore};
 use std::{
     future::pending,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
 use tokio::sync::{Notify, oneshot};
@@ -30,6 +30,97 @@ struct ControlledStore {
     append_started: Notify,
     release: Notify,
     records: tokio::sync::Mutex<Vec<JournalEnvelope>>,
+}
+
+struct RuntimeFault {
+    point: FaultPoint,
+    remaining: AtomicUsize,
+}
+
+impl RuntimeFault {
+    fn once(point: FaultPoint) -> Arc<Self> {
+        Arc::new(Self {
+            point,
+            remaining: AtomicUsize::new(1),
+        })
+    }
+}
+
+impl FileFaultInjector for RuntimeFault {
+    fn check(&self, point: FaultPoint) -> Result<(), JournalError> {
+        if point == self.point
+            && self
+                .remaining
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
+                    value.checked_sub(1)
+                })
+                .is_ok()
+        {
+            return Err(JournalError::Io {
+                message: format!("injected {point:?}"),
+            });
+        }
+        Ok(())
+    }
+}
+
+struct ReconciliationFailStore {
+    inner: MemoryEventStore,
+    fail_replay: AtomicBool,
+}
+
+#[async_trait]
+impl EventStore for ReconciliationFailStore {
+    async fn append(
+        &self,
+        envelope: JournalEnvelope,
+        durability: JournalDurability,
+    ) -> Result<(), JournalError> {
+        self.inner.append(envelope, durability).await
+    }
+
+    async fn replay(&self, session_id: &SessionId) -> Result<JournalReplay, JournalError> {
+        if self.fail_replay.load(Ordering::SeqCst) {
+            return Err(JournalError::Io {
+                message: "injected reconciliation replay failure".into(),
+            });
+        }
+        self.inner.replay(session_id).await
+    }
+
+    async fn import_if_absent(
+        &self,
+        session_id: &SessionId,
+        envelopes: Vec<JournalEnvelope>,
+    ) -> Result<JournalReplay, JournalError> {
+        self.inner.import_if_absent(session_id, envelopes).await
+    }
+
+    async fn list_sessions(&self) -> Result<Vec<SessionId>, JournalError> {
+        self.inner.list_sessions().await
+    }
+
+    async fn shutdown(&self, session_id: &SessionId) -> Result<(), JournalError> {
+        self.inner.shutdown(session_id).await
+    }
+}
+
+#[async_trait]
+impl HistoryProjectionStore for ReconciliationFailStore {
+    async fn replace_history(
+        &self,
+        session_id: &SessionId,
+        messages: Vec<ModelMessage>,
+        reason: HistoryReplacementReason,
+    ) -> Result<HistoryProjectionMetadata, ProjectionError> {
+        self.inner
+            .replace_history(session_id, messages, reason)
+            .await?;
+        self.fail_replay.store(true, Ordering::SeqCst);
+        Err(ProjectionError::WriteFailed {
+            message: "injected post-marker publication failure".into(),
+        })
+    }
 }
 
 impl ControlledStore {
@@ -136,6 +227,58 @@ impl TurnDriver for EchoDriver {
 struct BlockingDriver;
 
 struct BlockingCompactionDriver;
+
+struct SuccessfulCompactionDriver {
+    source: Vec<ModelMessage>,
+    replacement: Vec<ModelMessage>,
+    installed: Arc<tokio::sync::Mutex<Vec<ModelMessage>>>,
+}
+
+#[async_trait]
+impl TurnDriver for SuccessfulCompactionDriver {
+    async fn run(
+        &self,
+        request: TurnRequest,
+        _control: TurnControl,
+        _events: TurnEventEmitter,
+    ) -> Result<TurnOutput, lato_core::AgentError> {
+        Ok(TurnOutput {
+            final_text: request.input.text,
+        })
+    }
+
+    async fn history_snapshot(&self) -> Result<Vec<ModelMessage>, lato_core::AgentError> {
+        Ok(self.source.clone())
+    }
+
+    async fn compact(
+        &self,
+        request: CompactionRequest,
+        _control: CompactionControl,
+    ) -> Result<CompactionCandidate, lato_core::AgentError> {
+        Ok(CompactionCandidate {
+            compaction_id: request.compaction_id,
+            messages: self.replacement.clone(),
+            before: lato_core::CompactionSize {
+                message_count: self.source.len() as u64,
+                serialized_bytes: 10_000,
+            },
+            after: lato_core::CompactionSize {
+                message_count: self.replacement.len() as u64,
+                serialized_bytes: 1_000,
+            },
+            summary_chars: 800,
+        })
+    }
+
+    async fn install_history(
+        &self,
+        messages: Vec<ModelMessage>,
+    ) -> Result<(), lato_core::AgentError> {
+        *self.installed.lock().await = messages;
+        Ok(())
+    }
+}
 
 #[async_trait]
 impl TurnDriver for BlockingCompactionDriver {
@@ -976,5 +1119,218 @@ async fn shutdown_cancels_compaction_before_stopping_the_session() {
     assert!(matches!(
         next_event(&mut events).await.payload,
         EventPayload::SessionStopped
+    ));
+}
+
+#[tokio::test]
+async fn compaction_persistence_installs_checkpoint_and_resynchronizes_sequence() {
+    let sid = SessionId::from("session-compaction-persistence");
+    let source = vec![ModelMessage {
+        role: ModelRole::User,
+        content: vec![ModelContent::Text {
+            text: "old context".into(),
+        }],
+    }];
+    let replacement = vec![ModelMessage {
+        role: ModelRole::User,
+        content: vec![ModelContent::Text {
+            text: "compacted context".into(),
+        }],
+    }];
+    let installed = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let driver = SuccessfulCompactionDriver {
+        source,
+        replacement: replacement.clone(),
+        installed: installed.clone(),
+    };
+    let store = Arc::new(MemoryEventStore::new());
+    let session = spawn_session_with_store(
+        sid.clone(),
+        Arc::new(driver),
+        store.clone(),
+        bootstrap(&sid),
+    );
+    let mut events = session.subscribe();
+    session.submit(manual_compaction()).await.unwrap();
+    let _session_started = next_event(&mut events).await;
+    let _compaction_started = next_event(&mut events).await;
+    let completed = next_event(&mut events).await;
+    let EventPayload::CompactionCompleted { checkpoint_id, .. } = completed.payload else {
+        panic!(
+            "expected compaction completion, got {:?}",
+            completed.payload
+        );
+    };
+    assert!(completed.turn_id.is_none());
+
+    let replay = store.replay(&sid).await.unwrap();
+    assert_eq!(
+        replay.projection.active_checkpoint_id.as_deref(),
+        Some(checkpoint_id.as_str())
+    );
+    assert_eq!(replay.projection.messages, replacement);
+    assert_eq!(*installed.lock().await, replacement);
+
+    session
+        .submit(Command::StartTurn(StartTurn {
+            input: UserInput::text("after compact"),
+            behavior: StartBehavior::Reject,
+        }))
+        .await
+        .unwrap();
+    loop {
+        if matches!(
+            next_event(&mut events).await.payload,
+            EventPayload::TurnCompleted(_)
+        ) {
+            break;
+        }
+    }
+    let replay = store.replay(&sid).await.unwrap();
+    assert_eq!(
+        replay.envelopes.last().unwrap().journal_sequence + 1,
+        replay.projection.next_journal_sequence
+    );
+}
+
+async fn seeded_file_store(directory: &std::path::Path, sid: &SessionId) -> JournalReplay {
+    let store = FileEventStore::open(directory).unwrap();
+    store
+        .append(
+            JournalEnvelope {
+                schema_version: JOURNAL_SCHEMA_VERSION,
+                record_id: JournalRecordId::from(format!("{sid}-journal-0")),
+                session_id: sid.clone(),
+                turn_id: None,
+                journal_sequence: 0,
+                timestamp_ms: 0,
+                record: JournalRecord::SessionStarted,
+            },
+            JournalDurability::SyncData,
+        )
+        .await
+        .unwrap();
+    let replay = store.replay(sid).await.unwrap();
+    store.shutdown(sid).await.unwrap();
+    replay
+}
+
+fn successful_driver() -> (SuccessfulCompactionDriver, Vec<ModelMessage>) {
+    let source = vec![ModelMessage {
+        role: ModelRole::User,
+        content: vec![ModelContent::Text {
+            text: "old context".into(),
+        }],
+    }];
+    let replacement = vec![ModelMessage {
+        role: ModelRole::User,
+        content: vec![ModelContent::Text {
+            text: "compacted context".into(),
+        }],
+    }];
+    (
+        SuccessfulCompactionDriver {
+            source,
+            replacement: replacement.clone(),
+            installed: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+        },
+        replacement,
+    )
+}
+
+#[tokio::test]
+async fn compaction_persistence_pre_marker_failure_preserves_old_checkpoint() {
+    let directory = tempfile::tempdir().unwrap();
+    let sid = SessionId::from("runtime-pre-marker-failure");
+    let replay = seeded_file_store(directory.path(), &sid).await;
+    let store = Arc::new(
+        FileEventStore::open_with_fault_injector(
+            directory.path(),
+            RuntimeFault::once(FaultPoint::BeforeCheckpointPublish),
+        )
+        .unwrap(),
+    );
+    let (driver, _) = successful_driver();
+    let session = spawn_session_with_store(
+        sid.clone(),
+        Arc::new(driver),
+        store.clone(),
+        SessionBootstrap { replay },
+    );
+    let mut events = session.subscribe();
+    session.submit(manual_compaction()).await.unwrap();
+    let _session_started = next_event(&mut events).await;
+    let _compaction_started = next_event(&mut events).await;
+    let failed = next_event(&mut events).await;
+    assert!(matches!(
+        failed.payload,
+        EventPayload::CompactionFailed { .. }
+    ));
+    let replay = store.replay(&sid).await.unwrap();
+    assert!(replay.projection.active_checkpoint_id.is_none());
+}
+
+#[tokio::test]
+async fn compaction_persistence_post_marker_failure_completes_with_warning() {
+    let directory = tempfile::tempdir().unwrap();
+    let sid = SessionId::from("runtime-post-marker-failure");
+    let replay = seeded_file_store(directory.path(), &sid).await;
+    let store = Arc::new(
+        FileEventStore::open_with_fault_injector(
+            directory.path(),
+            RuntimeFault::once(FaultPoint::BeforeMetadataPublish),
+        )
+        .unwrap(),
+    );
+    let (driver, replacement) = successful_driver();
+    let session = spawn_session_with_store(
+        sid.clone(),
+        Arc::new(driver),
+        store.clone(),
+        SessionBootstrap { replay },
+    );
+    let mut events = session.subscribe();
+    session.submit(manual_compaction()).await.unwrap();
+    let _session_started = next_event(&mut events).await;
+    let _compaction_started = next_event(&mut events).await;
+    let completed = next_event(&mut events).await;
+    let EventPayload::CompactionCompleted { warning, .. } = completed.payload else {
+        panic!("expected reconciled compaction completion");
+    };
+    assert_eq!(warning.unwrap().code, "projection.write_failed");
+    assert_eq!(
+        store.replay(&sid).await.unwrap().projection.messages,
+        replacement
+    );
+}
+
+#[tokio::test]
+async fn compaction_persistence_replay_failure_stops_without_false_completion() {
+    let sid = SessionId::from("runtime-reconciliation-failure");
+    let store = Arc::new(ReconciliationFailStore {
+        inner: MemoryEventStore::new(),
+        fail_replay: AtomicBool::new(false),
+    });
+    let (driver, _) = successful_driver();
+    let session = spawn_session_with_store(sid.clone(), Arc::new(driver), store, bootstrap(&sid));
+    let mut events = session.subscribe();
+    session.submit(manual_compaction()).await.unwrap();
+    let _session_started = next_event(&mut events).await;
+    let _compaction_started = next_event(&mut events).await;
+    let failed = next_event(&mut events).await;
+    let EventPayload::CompactionFailed { error, .. } = failed.payload else {
+        panic!("expected reconciliation failure");
+    };
+    assert_eq!(error.code, "compaction.reconciliation_failed");
+    let error = session
+        .submit(Command::StartTurn(StartTurn {
+            input: UserInput::text("must not run"),
+            behavior: StartBehavior::Reject,
+        }))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error.code.as_str(),
+        "runtime.command_bus_closed" | "runtime.reply_bus_closed"
     ));
 }

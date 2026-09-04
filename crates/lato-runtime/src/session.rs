@@ -8,10 +8,11 @@ use crate::driver::{
 };
 use lato_core::{
     AgentError, CancelReason, Command, CompactSession, CompactionError, CompactionId,
-    CompactionPolicy, ErrorCategory, EventEnvelope, EventId, EventPayload, JOURNAL_SCHEMA_VERSION,
-    JournalDurability, JournalEnvelope, JournalError, JournalRecord, JournalRecordId,
-    JournalReplay, Retryability, SessionId, SessionMachine, SessionPhase, SessionStore,
-    StartDecision, StartTurn, TransitionError, TurnId, UserInput,
+    CompactionPolicy, ErrorCategory, EventEnvelope, EventId, EventPayload,
+    HistoryReplacementReason, JOURNAL_SCHEMA_VERSION, JournalDurability, JournalEnvelope,
+    JournalError, JournalRecord, JournalRecordId, JournalReplay, ProjectionError, Retryability,
+    SessionId, SessionMachine, SessionPhase, SessionStore, StartDecision, StartTurn,
+    TransitionError, TurnId, UserInput,
 };
 use lato_store::MemoryEventStore;
 use std::{
@@ -136,6 +137,7 @@ struct SessionLoop {
     journal_sequence: u64,
     journal_exists: bool,
     started_emitted: bool,
+    current_checkpoint_id: Option<String>,
 }
 
 impl SessionLoop {
@@ -148,6 +150,7 @@ impl SessionLoop {
         event_tx: broadcast::Sender<EventEnvelope>,
     ) -> Self {
         let (driver_tx, driver_rx) = mpsc::unbounded_channel();
+        let current_checkpoint_id = bootstrap.replay.projection.active_checkpoint_id.clone();
         Self {
             session_id,
             driver,
@@ -164,6 +167,7 @@ impl SessionLoop {
             journal_sequence: bootstrap.replay.projection.next_journal_sequence,
             journal_exists: bootstrap.replay.exists,
             started_emitted: false,
+            current_checkpoint_id,
         }
     }
 
@@ -576,12 +580,10 @@ impl SessionLoop {
         }
 
         let error = match result {
-            Ok(_) => AgentError::new(
-                "compaction.persistence_not_connected",
-                ErrorCategory::InternalInvariant,
-                "compaction candidate is ready but persistence is not connected",
-                Retryability::Never,
-            ),
+            Ok(candidate) => {
+                self.persist_compaction(candidate).await;
+                return;
+            }
             Err(error) => error,
         };
         if self
@@ -600,6 +602,154 @@ impl SessionLoop {
             return;
         }
         let _ = self.machine.finish_compaction(&compaction_id);
+        self.emit(
+            None,
+            EventPayload::CompactionFailed {
+                compaction_id,
+                error,
+            },
+        );
+    }
+
+    async fn persist_compaction(&mut self, candidate: lato_core::CompactionCandidate) {
+        let before_checkpoint = self.current_checkpoint_id.clone();
+        match self
+            .store
+            .replace_history(
+                &self.session_id,
+                candidate.messages.clone(),
+                HistoryReplacementReason::ContextCompaction,
+            )
+            .await
+        {
+            Ok(metadata) => {
+                self.journal_sequence = metadata.last_journal_sequence.saturating_add(1);
+                self.current_checkpoint_id = metadata.active_checkpoint_id.clone();
+                let Some(checkpoint_id) = metadata.active_checkpoint_id else {
+                    self.stop_after_reconciliation_failure(
+                        candidate.compaction_id,
+                        "replacement returned no active checkpoint",
+                    );
+                    return;
+                };
+                if let Err(error) = self
+                    .driver
+                    .install_history(candidate.messages.clone())
+                    .await
+                {
+                    self.stop_after_reconciliation_failure(
+                        candidate.compaction_id,
+                        format!("install committed history: {error}"),
+                    );
+                    return;
+                }
+                let _ = self.machine.finish_compaction(&candidate.compaction_id);
+                self.emit(
+                    None,
+                    EventPayload::CompactionCompleted {
+                        compaction_id: candidate.compaction_id,
+                        before: candidate.before,
+                        after: candidate.after,
+                        checkpoint_id,
+                        warning: None,
+                    },
+                );
+            }
+            Err(error) => {
+                self.reconcile_compaction_failure(candidate, before_checkpoint, error)
+                    .await;
+            }
+        }
+    }
+
+    async fn reconcile_compaction_failure(
+        &mut self,
+        candidate: lato_core::CompactionCandidate,
+        before_checkpoint: Option<String>,
+        replacement_error: ProjectionError,
+    ) {
+        let warning = projection_error(replacement_error);
+        let replay = match self.store.replay(&self.session_id).await {
+            Ok(replay) => replay,
+            Err(error) => {
+                self.stop_after_reconciliation_failure(
+                    candidate.compaction_id,
+                    format!("replay after replacement error: {error}"),
+                );
+                return;
+            }
+        };
+        self.journal_sequence = replay.projection.next_journal_sequence;
+        let active_checkpoint = replay.projection.active_checkpoint_id.clone();
+        if active_checkpoint != before_checkpoint {
+            let Some(checkpoint_id) = active_checkpoint.clone() else {
+                self.stop_after_reconciliation_failure(
+                    candidate.compaction_id,
+                    "replacement changed checkpoint state without an active checkpoint",
+                );
+                return;
+            };
+            if let Err(error) = self
+                .driver
+                .install_history(replay.projection.messages.clone())
+                .await
+            {
+                self.stop_after_reconciliation_failure(
+                    candidate.compaction_id,
+                    format!("install reconciled history: {error}"),
+                );
+                return;
+            }
+            self.current_checkpoint_id = active_checkpoint;
+            let _ = self.machine.finish_compaction(&candidate.compaction_id);
+            self.emit(
+                None,
+                EventPayload::CompactionCompleted {
+                    compaction_id: candidate.compaction_id,
+                    before: candidate.before,
+                    after: candidate.after,
+                    checkpoint_id,
+                    warning: Some(warning),
+                },
+            );
+            return;
+        }
+
+        if self
+            .commit(
+                None,
+                JournalRecord::CompactionFailed {
+                    compaction_id: candidate.compaction_id.clone(),
+                    error_code: warning.code.clone(),
+                },
+                JournalDurability::SyncData,
+            )
+            .await
+            .is_err()
+        {
+            self.machine.stop();
+            return;
+        }
+        let _ = self.machine.finish_compaction(&candidate.compaction_id);
+        self.emit(
+            None,
+            EventPayload::CompactionFailed {
+                compaction_id: candidate.compaction_id,
+                error: warning,
+            },
+        );
+    }
+
+    fn stop_after_reconciliation_failure(
+        &mut self,
+        compaction_id: CompactionId,
+        message: impl Into<String>,
+    ) {
+        let error: AgentError = CompactionError::ReconciliationFailed {
+            message: message.into(),
+        }
+        .into();
+        self.machine.stop();
         self.emit(
             None,
             EventPayload::CompactionFailed {
@@ -773,6 +923,15 @@ fn bus_closed(code: &str, message: &str) -> AgentError {
 }
 
 fn journal_error(error: JournalError) -> AgentError {
+    AgentError::new(
+        error.code(),
+        ErrorCategory::Storage,
+        error.to_string(),
+        error.retryability(),
+    )
+}
+
+fn projection_error(error: ProjectionError) -> AgentError {
     AgentError::new(
         error.code(),
         ErrorCategory::Storage,

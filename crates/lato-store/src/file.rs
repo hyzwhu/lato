@@ -33,6 +33,9 @@ pub enum FaultPoint {
     AfterSyncData,
     BeforeRename,
     AfterRename,
+    BeforeCheckpointPublish,
+    BeforeHistoryPublish,
+    BeforeMetadataPublish,
 }
 
 #[async_trait]

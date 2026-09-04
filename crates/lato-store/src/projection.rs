@@ -2,7 +2,10 @@
 // License: Apache-2.0
 // Lato changes: reduced chat persistence to a canonical-journal-derived history projection
 
-use crate::{MAX_JOURNAL_BYTES, MAX_JOURNAL_RECORDS};
+use crate::{
+    MAX_JOURNAL_BYTES, MAX_JOURNAL_RECORDS,
+    file::{FaultPoint, FileFaultInjector},
+};
 use lato_core::{
     HISTORY_PROJECTION_SCHEMA_VERSION, HistoryCheckpoint, HistoryProjectionEntry,
     HistoryProjectionMetadata, JournalEnvelope, JournalError, JournalRecord, ModelMessage,
@@ -431,12 +434,13 @@ pub(crate) fn publish_replacement(
     messages: &[ModelMessage],
     generation: u64,
     checkpoint_id: String,
+    faults: &dyn FileFaultInjector,
 ) -> Result<HistoryProjectionMetadata, ProjectionError> {
     let entries = entries_for_current(envelopes, messages)?;
     let last = envelopes.last().ok_or_else(|| ProjectionError::Divergent {
         message: "replacement journal is empty".into(),
     })?;
-    write_projection(
+    write_projection_with_faults(
         session_id,
         paths,
         &entries,
@@ -445,6 +449,7 @@ pub(crate) fn publish_replacement(
         history_digest(messages)?,
         generation,
         Some(checkpoint_id),
+        Some(faults),
     )?;
     read_metadata(&paths.metadata)
 }
@@ -459,6 +464,31 @@ fn write_projection(
     digest: String,
     generation: u64,
     active_checkpoint_id: Option<String>,
+) -> Result<(), ProjectionError> {
+    write_projection_with_faults(
+        session_id,
+        paths,
+        entries,
+        last_sequence,
+        last_record_id,
+        digest,
+        generation,
+        active_checkpoint_id,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_projection_with_faults(
+    session_id: &SessionId,
+    paths: &ProjectionPaths,
+    entries: &[HistoryProjectionEntry],
+    last_sequence: u64,
+    last_record_id: lato_core::JournalRecordId,
+    digest: String,
+    generation: u64,
+    active_checkpoint_id: Option<String>,
+    faults: Option<&dyn FileFaultInjector>,
 ) -> Result<(), ProjectionError> {
     let history_bytes = encode_jsonl(entries)?;
     if history_bytes.len() as u64 > MAX_JOURNAL_BYTES || entries.len() > MAX_JOURNAL_RECORDS {
@@ -480,7 +510,21 @@ fn write_projection(
         serde_json::to_vec_pretty(&metadata).map_err(|error| ProjectionError::WriteFailed {
             message: error.to_string(),
         })?;
+    if let Some(faults) = faults {
+        faults
+            .check(FaultPoint::BeforeHistoryPublish)
+            .map_err(|error| ProjectionError::WriteFailed {
+                message: error.to_string(),
+            })?;
+    }
     atomic_write(&paths.history, &history_bytes)?;
+    if let Some(faults) = faults {
+        faults
+            .check(FaultPoint::BeforeMetadataPublish)
+            .map_err(|error| ProjectionError::WriteFailed {
+                message: error.to_string(),
+            })?;
+    }
     atomic_write(&paths.metadata, &metadata_bytes)?;
     sync_directory(paths.history.parent().expect("history has parent"))?;
     Ok(())
