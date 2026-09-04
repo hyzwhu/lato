@@ -210,7 +210,7 @@ git add src/tui/render.rs src/tui/widgets.rs tests/tui_pty_smoke.py
 git commit -m "feat: show slash command suggestions"
 ```
 
-- [ ] **Step 8: Install and smoke-test the local command**
+- [x] **Step 8: Install and smoke-test the local command**
 
 Run:
 
