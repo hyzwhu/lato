@@ -62,3 +62,4 @@ string_id!(EventId);
 string_id!(ToolCallId);
 string_id!(ModelCallId);
 string_id!(JournalRecordId);
+string_id!(CompactionId);

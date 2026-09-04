@@ -1,4 +1,6 @@
-use crate::{AgentError, EventId, SessionId, TurnId};
+use crate::{
+    AgentError, CompactionId, CompactionSize, CompactionTrigger, EventId, SessionId, TurnId,
+};
 
 pub const EVENT_SCHEMA_VERSION: u16 = 1;
 
@@ -19,11 +21,37 @@ pub struct EventEnvelope {
 pub enum EventPayload {
     SessionStarted,
     TurnStarted,
-    ModelDelta { text: String },
-    ReasoningDelta { text: String },
+    ModelDelta {
+        text: String,
+    },
+    ReasoningDelta {
+        text: String,
+    },
     TurnCompleted(TurnOutput),
-    TurnFailed { error: AgentError },
-    TurnCancelled { reason: CancelReason },
+    TurnFailed {
+        error: AgentError,
+    },
+    TurnCancelled {
+        reason: CancelReason,
+    },
+    CompactionStarted {
+        compaction_id: CompactionId,
+        trigger: CompactionTrigger,
+    },
+    CompactionCompleted {
+        compaction_id: CompactionId,
+        before: CompactionSize,
+        after: CompactionSize,
+        checkpoint_id: String,
+        warning: Option<AgentError>,
+    },
+    CompactionFailed {
+        compaction_id: CompactionId,
+        error: AgentError,
+    },
+    CompactionCancelled {
+        compaction_id: CompactionId,
+    },
     SessionStopped,
 }
 

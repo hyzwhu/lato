@@ -1,8 +1,8 @@
 use crate::{
-    AgentError, ApprovalFingerprint, CancelReason, HistoryReplacementReason, JournalValidation,
-    ModelContent, ModelMessage, ModelRole, ProjectionError, Retryability, SandboxObligation,
-    SessionId, SideEffect, ToolCallId, ToolCapability, ToolError, ToolIdempotency, ToolName,
-    ToolOutput, TurnId, TurnOutput,
+    AgentError, ApprovalFingerprint, CancelReason, CompactionId, CompactionTrigger,
+    HistoryReplacementReason, JournalValidation, ModelContent, ModelMessage, ModelRole,
+    ProjectionError, Retryability, SandboxObligation, SessionId, SideEffect, ToolCallId,
+    ToolCapability, ToolError, ToolIdempotency, ToolName, ToolOutput, TurnId, TurnOutput,
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -115,6 +115,18 @@ pub enum JournalRecord {
     },
     TurnCancelled {
         reason: CancelReason,
+    },
+    CompactionRequested {
+        compaction_id: CompactionId,
+        trigger: CompactionTrigger,
+        user_context: Option<String>,
+    },
+    CompactionFailed {
+        compaction_id: CompactionId,
+        error_code: String,
+    },
+    CompactionCancelled {
+        compaction_id: CompactionId,
     },
     SessionStopped,
     LegacyTranscriptImported {
@@ -342,6 +354,9 @@ pub fn project_journal(
         match &envelope.record {
             JournalRecord::SessionStarted
             | JournalRecord::PolicyDecisionCommitted { .. }
+            | JournalRecord::CompactionRequested { .. }
+            | JournalRecord::CompactionFailed { .. }
+            | JournalRecord::CompactionCancelled { .. }
             | JournalRecord::LegacyTranscriptImported { .. } => {}
             JournalRecord::HistoryProjectionReplaced { checkpoint_id, .. } => {
                 if requested.values().any(|call| call.prepared) {
