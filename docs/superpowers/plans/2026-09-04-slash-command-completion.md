@@ -35,17 +35,17 @@
 - Produces: `pub fn help_line() -> String` generated from the registry.
 - Produces: `InputBuffer::replace(&mut self, value: &str)` with the cursor at the new text end.
 
-- [ ] **Step 1: Add failing registry tests**
+- [x] **Step 1: Add failing registry tests**
 
 Add tests proving that `matches("/")` returns all 17 accepted names, `matches("/MO")` returns only `/model`, `matches("/rename title")` and `matches("/unknown")` are empty, aliases `/language` and `/quit` are present, and `help_line()` includes every registry name in order.
 
-- [ ] **Step 2: Run the focused tests and verify failure**
+- [x] **Step 2: Run the focused tests and verify failure**
 
 Run: `cargo test --bin lato tui::commands -- --nocapture`
 
 Expected: compilation fails because `tui::commands` and its API do not exist.
 
-- [ ] **Step 3: Implement the registry and query**
+- [x] **Step 3: Implement the registry and query**
 
 Create `src/tui/commands.rs` with the exact accepted command names and bilingual concise descriptions. Implement `matches` by rejecting empty input, non-slash input, or any whitespace, lowercasing the input, and filtering `SLASH_COMMANDS` with `command.name.starts_with(&prefix)`. Generate `/help` text with `SLASH_COMMANDS.iter().map(|command| command.name).collect::<Vec<_>>().join("  ")`.
 
@@ -67,13 +67,13 @@ pub fn replace(&mut self, value: &str) {
 
 Add a test asserting that replacement discards prior text and places subsequent inserted text at the end.
 
-- [ ] **Step 4: Run focused tests**
+- [x] **Step 4: Run focused tests**
 
 Run: `cargo test --bin lato tui:: -- --nocapture`
 
 Expected: all command-registry and input-buffer tests pass.
 
-- [ ] **Step 5: Commit the registry**
+- [x] **Step 5: Commit the registry**
 
 ```bash
 git add src/tui/commands.rs src/tui/mod.rs src/tui/input.rs

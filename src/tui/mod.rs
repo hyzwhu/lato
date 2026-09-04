@@ -1,4 +1,5 @@
 pub mod backend;
+mod commands;
 pub mod dialog;
 pub mod event;
 pub mod i18n;

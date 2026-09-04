@@ -90,6 +90,12 @@ impl InputBuffer {
         self.cursor += value.len();
     }
 
+    pub fn replace(&mut self, value: &str) {
+        self.text.clear();
+        self.text.push_str(value);
+        self.cursor = self.text.len();
+    }
+
     pub fn backspace(&mut self) {
         let Some(previous) = self.previous_boundary() else {
             return;
@@ -186,5 +192,14 @@ mod tests {
             InputBuffer::from("a\nb").viewport(8, false),
             ("a b".into(), 3)
         );
+    }
+
+    #[test]
+    fn replace_resets_text_and_moves_cursor_to_end() {
+        let mut input = InputBuffer::from("old");
+        input.move_home();
+        input.replace("/model");
+        input.insert_char('!');
+        assert_eq!(input.as_str(), "/model!");
     }
 }
