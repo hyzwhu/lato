@@ -90,6 +90,14 @@ with tempfile.TemporaryDirectory(prefix="lato-tui-smoke-") as root:
 
     try:
         expect("Enter a prompt")
+        start = send("/")
+        expect("/help", start)
+        start = send("mo")
+        expect("/model", start)
+        send("\r")
+        start = send("\r")
+        expect("Provider", start)
+        send("\x1b")
         start = send("/permissions\r")
         expect("Sandbox: workspace", start)
         expect("Automatic approval", start)

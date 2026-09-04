@@ -280,6 +280,7 @@ fn composer(frame: &mut Frame<'_>, area: Rect, app: &AppState, welcome: bool) {
             ),
         rows[1],
     );
+    slash_completion(frame, area, app);
     if app.focus == Focus::Chat
         && app.overlay.is_none()
         && app.approval.is_none()
@@ -288,6 +289,66 @@ fn composer(frame: &mut Frame<'_>, area: Rect, app: &AppState, welcome: bool) {
     {
         frame.set_cursor_position((inner.x + 2 + cursor as u16, inner.y));
     }
+}
+
+pub fn slash_completion(frame: &mut Frame<'_>, composer_area: Rect, app: &AppState) {
+    if app.overlay.is_some() || app.approval.is_some() {
+        return;
+    }
+    let candidates = app.slash_completion();
+    if candidates.is_empty() {
+        return;
+    }
+    let available_height = composer_area.y.saturating_sub(frame.area().y);
+    let popup_height = (candidates.len() as u16 + 2).min(available_height);
+    if popup_height < 3 {
+        return;
+    }
+    let visible_rows = popup_height.saturating_sub(2) as usize;
+    let selected = app
+        .slash_completion_index
+        .min(candidates.len().saturating_sub(1));
+    let start = selected
+        .saturating_add(1)
+        .saturating_sub(visible_rows)
+        .min(candidates.len().saturating_sub(visible_rows));
+    let area = Rect::new(
+        composer_area.x,
+        composer_area.y.saturating_sub(popup_height),
+        composer_area.width,
+        popup_height,
+    );
+    let items = candidates
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(visible_rows)
+        .map(|(index, command)| {
+            let selected_style = if index == selected {
+                Style::default()
+                    .fg(BG)
+                    .bg(AMBER)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(TEXT).bg(RAISED)
+            };
+            ListItem::new(Line::from(vec![
+                Span::styled(format!("  {:<14}", command.name), selected_style),
+                Span::styled(command.description(app.language), selected_style),
+            ]))
+            .style(selected_style)
+        });
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        List::new(items).block(
+            Block::default()
+                .title(format!(" {} ", tr(app.language, TextKey::Command)))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(MUTED))
+                .style(Style::default().bg(RAISED)),
+        ),
+        area,
+    );
 }
 
 pub use super::tool_panel::render as tools;

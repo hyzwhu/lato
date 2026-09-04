@@ -85,6 +85,17 @@ mod tests {
     use std::path::PathBuf;
 
     fn render_text(language: Language, width: u16, height: u16, main: bool) -> String {
+        render_text_with_input(language, width, height, main, "", 0)
+    }
+
+    fn render_text_with_input(
+        language: Language,
+        width: u16,
+        height: u16,
+        main: bool,
+        input: &str,
+        selected: usize,
+    ) -> String {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut app = AppState::new(
@@ -98,6 +109,8 @@ mod tests {
         if main {
             app.screen = Screen::Main;
         }
+        app.composer = crate::tui::input::InputBuffer::from(input);
+        app.slash_completion_index = selected;
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let buffer = terminal.backend().buffer();
         let mut output = String::new();
@@ -108,6 +121,26 @@ mod tests {
             output.push('\n');
         }
         output
+    }
+
+    #[test]
+    fn slash_completion_renders_on_welcome_and_main_screens() {
+        for main in [false, true] {
+            let all = render_text_with_input(Language::En, 100, 30, main, "/", 0);
+            assert!(all.contains("/help"), "{all}");
+            assert!(all.contains("/new"), "{all}");
+
+            let filtered = render_text_with_input(Language::En, 100, 30, main, "/mo", 0);
+            assert!(filtered.contains("/model"), "{filtered}");
+            assert!(!filtered.contains("/help"), "{filtered}");
+        }
+    }
+
+    #[test]
+    fn narrow_slash_completion_keeps_selected_command_and_composer_visible() {
+        let text = render_text_with_input(Language::En, 60, 24, true, "/", 16);
+        assert!(text.contains("/quit"), "{text}");
+        assert!(text.contains("› /"), "{text}");
     }
 
     #[test]

@@ -159,27 +159,27 @@ git commit -m "feat: navigate slash command completion"
 - Consumes: `AppState::slash_completion()` and `AppState::slash_completion_index` from Task 2.
 - Produces: `widgets::slash_completion(frame: &mut Frame<'_>, composer_area: Rect, app: &AppState)`.
 
-- [ ] **Step 1: Add failing render tests**
+- [x] **Step 1: Add failing render tests**
 
 Refactor the render-test helper to accept composer text, then assert that `/` renders the first visible candidates such as `/help` and `/new` on both `Screen::Welcome` and `Screen::Main`, `/mo` renders `/model` but not `/help`, and a 60-column narrow layout retains both the composer cursor and the selected candidate. Registry tests remain responsible for proving all 17 commands are available even when terminal height requires a scrolling window.
 
-- [ ] **Step 2: Run render tests and verify failure**
+- [x] **Step 2: Run render tests and verify failure**
 
 Run: `cargo test --bin lato tui::render::tests -- --nocapture`
 
 Expected: the new assertions fail because no completion popup is rendered.
 
-- [ ] **Step 3: Implement the popup**
+- [x] **Step 3: Implement the popup**
 
 Add `widgets::slash_completion` using `Clear`, `Block`, and `List`. Pass the composer rectangle from the shared `composer` renderer so the popup is anchored correctly in welcome, wide, medium, and narrow layouts. Place a bounded popup immediately above that rectangle, cap its height to available terminal space, keep the selected item visible by choosing a window around `slash_completion_index`, and render each row as `command.name` plus the localized description. Use `AMBER` for the selected row and existing `RAISED`, `TEXT`, and `MUTED` colors elsewhere.
 
 Call the widget at the end of the shared `composer` renderer. Do not render it when any modal overlay or approval is active; modal overlays are still drawn afterward by `render`, so they remain authoritative.
 
-- [ ] **Step 4: Extend the PTY smoke interaction**
+- [x] **Step 4: Extend the PTY smoke interaction**
 
 In `tests/tui_pty_smoke.py`, type `/`, wait for a known command such as `/permissions`, type `mo`, verify the filtered `/model` result, press Enter to complete, and press Enter again or Escape to leave the fixture in its existing deterministic state.
 
-- [ ] **Step 5: Run formatting and focused regression tests**
+- [x] **Step 5: Run formatting and focused regression tests**
 
 Run:
 
@@ -192,7 +192,7 @@ python3 tests/tui_pty_smoke.py
 
 Expected: formatting is clean; all Rust tests pass; the PTY test passes or reports a documented environment-only skip.
 
-- [ ] **Step 6: Run workspace checks**
+- [x] **Step 6: Run workspace checks**
 
 Run:
 
@@ -203,7 +203,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 Expected: all tests pass and Clippy reports no warnings.
 
-- [ ] **Step 7: Commit rendering and tests**
+- [x] **Step 7: Commit rendering and tests**
 
 ```bash
 git add src/tui/render.rs src/tui/widgets.rs tests/tui_pty_smoke.py
