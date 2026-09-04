@@ -219,6 +219,8 @@ mod tests {
         );
         assert_eq!(transcripts.load("legacy-1").unwrap(), source);
         assert!(events.journal_path(&sid).unwrap().is_file());
+        assert!(events.history_path(&sid).unwrap().is_file());
+        assert!(events.history_metadata_path(&sid).unwrap().is_file());
     }
 
     #[tokio::test]

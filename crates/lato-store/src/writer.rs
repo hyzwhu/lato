@@ -1,9 +1,11 @@
 // Derived from: Codex@633ab199cfd724aa78013c006b27a2b3d049fc3b:codex-rs/rollout/src/recorder.rs
 // License: Apache-2.0
 // Lato changes: reduced the rollout writer to a bounded per-session journal command queue
+// Phase 4B derived from: Grok Build@bb7f39d5858cbf5e00de639367f59debbdcb0138:crates/codegen/xai-grok-shell/src/session/persistence.rs
 
 use crate::file::{
-    FileFaultInjector, append_envelope_blocking, replay_path_blocking, satisfy_existing_durability,
+    FileFaultInjector, append_envelope_blocking, replay_path_blocking,
+    replay_with_projection_blocking, satisfy_existing_durability,
 };
 use crate::projection;
 use lato_core::{
@@ -34,6 +36,9 @@ enum WriterCommand {
         messages: Vec<ModelMessage>,
         reason: HistoryReplacementReason,
         ack: oneshot::Sender<Result<HistoryProjectionMetadata, ProjectionError>>,
+    },
+    Replay {
+        ack: oneshot::Sender<Result<lato_core::JournalReplay, JournalError>>,
     },
 }
 
@@ -100,6 +105,9 @@ impl WriterHandle {
                         );
                         let _ = ack.send(result);
                     }
+                    WriterCommand::Replay { ack } => {
+                        let _ = ack.send(replay_with_projection_blocking(&session_id, &path));
+                    }
                 }
             }
         });
@@ -157,6 +165,19 @@ impl WriterHandle {
                 message: format!("journal writer closed: {error}"),
             })?;
         result.await.map_err(|error| ProjectionError::WriteFailed {
+            message: format!("journal writer dropped acknowledgement: {error}"),
+        })?
+    }
+
+    pub(crate) async fn replay(&self) -> Result<lato_core::JournalReplay, JournalError> {
+        let (ack, result) = oneshot::channel();
+        self.tx
+            .send(WriterCommand::Replay { ack })
+            .await
+            .map_err(|error| JournalError::Io {
+                message: format!("journal writer closed: {error}"),
+            })?;
+        result.await.map_err(|error| JournalError::Io {
             message: format!("journal writer dropped acknowledgement: {error}"),
         })?
     }
@@ -245,16 +266,22 @@ fn replace_history_blocking(
     .map_err(projection_journal_error)?;
     let replay =
         replay_path_blocking(session_id, journal_path).map_err(projection_journal_error)?;
+    let generation = replay
+        .envelopes
+        .iter()
+        .filter(|envelope| {
+            matches!(
+                envelope.record,
+                JournalRecord::HistoryProjectionReplaced { .. }
+            )
+        })
+        .count() as u64;
     projection::publish_replacement(
         session_id,
         &paths,
         &replay.envelopes,
         &messages,
-        replay
-            .projection
-            .active_checkpoint_id
-            .as_ref()
-            .map_or(1, |_| 2),
+        generation,
         checkpoint_id,
     )
 }

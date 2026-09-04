@@ -140,27 +140,7 @@ impl EventStore for FileEventStore {
     }
 
     async fn replay(&self, session_id: &SessionId) -> Result<JournalReplay, JournalError> {
-        let session_id = session_id.clone();
-        let path = self.journal_path(&session_id)?;
-        tokio::task::spawn_blocking(move || {
-            let mut replay = replay_path_blocking(&session_id, &path)?;
-            if replay.exists {
-                let parent = path.parent().ok_or_else(|| JournalError::Io {
-                    message: "journal path has no parent".into(),
-                })?;
-                replay.projection.messages = projection::load_or_rebuild(
-                    &session_id,
-                    parent,
-                    &replay.envelopes,
-                    &replay.projection.messages,
-                )?;
-            }
-            Ok(replay)
-        })
-        .await
-        .map_err(|error| JournalError::Io {
-            message: error.to_string(),
-        })?
+        self.writer(session_id).await?.replay().await
     }
 
     async fn import_if_absent(
@@ -171,12 +151,12 @@ impl EventStore for FileEventStore {
         let projection = project_journal(session_id, &envelopes)?;
         let bytes = encoded_len(&envelopes)?;
         ensure_capacity(envelopes.len(), bytes, envelopes.len() as u64)?;
-        let session_id = session_id.clone();
-        let path = self.journal_path(&session_id)?;
+        let imported_session_id = session_id.clone();
+        let path = self.journal_path(&imported_session_id)?;
         let faults = self.faults.clone();
-        tokio::task::spawn_blocking(move || {
+        let imported = tokio::task::spawn_blocking(move || {
             if path.exists() {
-                return replay_path_blocking(&session_id, &path);
+                return replay_path_blocking(&imported_session_id, &path);
             }
             let parent = path.parent().ok_or_else(|| JournalError::MigrationFailed {
                 message: "journal path has no parent".into(),
@@ -192,14 +172,14 @@ impl EventStore for FileEventStore {
             write_import_file(&temp, &envelopes)?;
             if path.exists() {
                 let _ = fs::remove_file(&temp);
-                return replay_path_blocking(&session_id, &path);
+                return replay_path_blocking(&imported_session_id, &path);
             }
             faults.check(FaultPoint::BeforeRename)?;
             match fs::hard_link(&temp, &path) {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                     let _ = fs::remove_file(&temp);
-                    return replay_path_blocking(&session_id, &path);
+                    return replay_path_blocking(&imported_session_id, &path);
                 }
                 Err(error) => {
                     return Err(JournalError::MigrationFailed {
@@ -210,7 +190,7 @@ impl EventStore for FileEventStore {
             faults.check(FaultPoint::AfterRename)?;
             fs::remove_file(&temp).map_err(io_error)?;
             sync_directory(parent)?;
-            let replay = replay_path_blocking(&session_id, &path)?;
+            let replay = replay_path_blocking(&imported_session_id, &path)?;
             if replay.projection != projection {
                 return Err(JournalError::MigrationFailed {
                     message: "imported projection changed after rename".into(),
@@ -221,7 +201,12 @@ impl EventStore for FileEventStore {
         .await
         .map_err(|error| JournalError::MigrationFailed {
             message: error.to_string(),
-        })?
+        })??;
+        if imported.exists {
+            self.replay(session_id).await
+        } else {
+            Ok(imported)
+        }
     }
 
     async fn list_sessions(&self) -> Result<Vec<SessionId>, JournalError> {
@@ -363,6 +348,25 @@ pub(crate) fn replay_path_blocking(
         envelopes,
         projection,
     })
+}
+
+pub(crate) fn replay_with_projection_blocking(
+    session_id: &SessionId,
+    path: &Path,
+) -> Result<JournalReplay, JournalError> {
+    let mut replay = replay_path_blocking(session_id, path)?;
+    if replay.exists {
+        let parent = path.parent().ok_or_else(|| JournalError::Io {
+            message: "journal path has no parent".into(),
+        })?;
+        replay.projection.messages = projection::load_or_rebuild(
+            session_id,
+            parent,
+            &replay.envelopes,
+            &replay.projection.messages,
+        )?;
+    }
+    Ok(replay)
 }
 
 fn decode_and_repair(path: &Path, content: &[u8]) -> Result<Vec<JournalEnvelope>, JournalError> {

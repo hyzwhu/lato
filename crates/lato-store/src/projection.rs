@@ -50,7 +50,15 @@ pub(crate) fn load_or_rebuild(
     let paths = ProjectionPaths::new(session_dir);
     let expected = current_messages(&paths, envelopes, canonical_messages)?;
     let active_checkpoint = active_checkpoint_id(envelopes);
-    match load_valid(session_id, &paths, envelopes, active_checkpoint.as_deref()) {
+    let expected_digest = history_digest(&expected)?;
+    match load_valid(
+        session_id,
+        &paths,
+        envelopes,
+        active_checkpoint.as_deref(),
+        expected.len() as u64,
+        &expected_digest,
+    ) {
         Ok(messages) => Ok(messages),
         Err(LoadError::MissingOrStale) => {
             replace_cache(
@@ -90,6 +98,18 @@ pub(crate) fn apply_committed_envelope(
             message: "journal has no session directory".into(),
         })?;
     let paths = ProjectionPaths::new(session_dir);
+    let prior_metadata = if paths.metadata.exists() {
+        Some(read_metadata(&paths.metadata)?)
+    } else {
+        None
+    };
+    if let Some(metadata) = &prior_metadata
+        && metadata.last_journal_sequence.checked_add(1) != Some(envelope.journal_sequence)
+    {
+        return Err(ProjectionError::Divergent {
+            message: "history metadata cursor does not precede canonical append".into(),
+        });
+    }
     let mut entries = if paths.history.exists() {
         read_entries(&paths.history)?
     } else if envelope.journal_sequence == 0 {
@@ -114,8 +134,10 @@ pub(crate) fn apply_committed_envelope(
         envelope.journal_sequence,
         envelope.record_id.clone(),
         history_digest(&messages)?,
-        0,
-        None,
+        prior_metadata
+            .as_ref()
+            .map_or(0, |metadata| metadata.generation),
+        prior_metadata.and_then(|metadata| metadata.active_checkpoint_id),
     )
 }
 
@@ -124,6 +146,8 @@ fn load_valid(
     paths: &ProjectionPaths,
     envelopes: &[JournalEnvelope],
     active_checkpoint_id: Option<&str>,
+    expected_entry_count: u64,
+    expected_history_digest: &str,
 ) -> Result<Vec<ModelMessage>, LoadError> {
     if !paths.history.exists() && !paths.metadata.exists() {
         return Err(LoadError::MissingOrStale);
@@ -145,6 +169,8 @@ fn load_valid(
     if metadata.last_journal_sequence != last.journal_sequence
         || metadata.last_record_id != last.record_id
         || metadata.active_checkpoint_id.as_deref() != active_checkpoint_id
+        || metadata.entry_count != expected_entry_count
+        || metadata.history_digest != expected_history_digest
     {
         return Err(LoadError::MissingOrStale);
     }
@@ -285,22 +311,42 @@ fn current_messages(
     }) else {
         return Ok(canonical.to_vec());
     };
-    let (checkpoint_id, expected_digest, replacement_count, expected_history_digest) =
-        match &marker.record {
-            JournalRecord::HistoryProjectionReplaced {
-                checkpoint_id,
-                checkpoint_digest,
-                replacement_entry_count,
-                history_digest,
-                ..
-            } => (
-                checkpoint_id,
-                checkpoint_digest,
-                *replacement_entry_count,
-                history_digest,
-            ),
-            _ => unreachable!(),
-        };
+    let (
+        checkpoint_id,
+        expected_digest,
+        replaced_sequence,
+        replaced_record_id,
+        replacement_count,
+        expected_history_digest,
+    ) = match &marker.record {
+        JournalRecord::HistoryProjectionReplaced {
+            checkpoint_id,
+            checkpoint_digest,
+            replaced_through_sequence,
+            replaced_through_record_id,
+            replacement_entry_count,
+            history_digest,
+            ..
+        } => (
+            checkpoint_id,
+            checkpoint_digest,
+            *replaced_through_sequence,
+            replaced_through_record_id,
+            *replacement_entry_count,
+            history_digest,
+        ),
+        _ => unreachable!(),
+    };
+    if checkpoint_id.is_empty()
+        || !checkpoint_id
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+    {
+        return Err(ProjectionError::CheckpointMismatch {
+            message: "checkpoint id is unsafe".into(),
+        }
+        .into());
+    }
     let path = paths.checkpoints.join(format!("{checkpoint_id}.json"));
     if !path.exists() {
         return Err(ProjectionError::CheckpointMissing {
@@ -322,6 +368,10 @@ fn current_messages(
         &checkpoint.messages,
     )?;
     if checkpoint.checkpoint_id != *checkpoint_id
+        || checkpoint.schema_version != HISTORY_PROJECTION_SCHEMA_VERSION
+        || checkpoint.session_id != marker.session_id
+        || checkpoint.replaced_through_sequence != replaced_sequence
+        || checkpoint.replaced_through_record_id != *replaced_record_id
         || checkpoint.content_digest != *expected_digest
         || actual != *expected_digest
         || checkpoint.messages.len() as u64 != replacement_count

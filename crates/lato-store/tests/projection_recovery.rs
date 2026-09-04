@@ -1,7 +1,8 @@
 use lato_core::{
-    EventStore, HISTORY_PROJECTION_SCHEMA_VERSION, HistoryProjectionStore,
-    HistoryReplacementReason, JOURNAL_SCHEMA_VERSION, JournalDurability, JournalEnvelope,
-    JournalRecord, JournalRecordId, ModelContent, ModelMessage, ModelRole, SessionId,
+    EventStore, HISTORY_PROJECTION_SCHEMA_VERSION, HistoryProjectionEntry,
+    HistoryProjectionMetadata, HistoryProjectionStore, HistoryReplacementReason,
+    JOURNAL_SCHEMA_VERSION, JournalDurability, JournalEnvelope, JournalRecord, JournalRecordId,
+    ModelContent, ModelMessage, ModelRole, SessionId, history_digest,
 };
 use lato_store::FileEventStore;
 
@@ -66,6 +67,45 @@ async fn canonical_corruption_is_not_hidden_by_valid_projection() {
     assert_eq!(
         store.replay(&sid).await.unwrap_err().code(),
         "journal.parse"
+    );
+}
+
+#[tokio::test]
+async fn internally_consistent_but_divergent_projection_is_rebuilt() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = FileEventStore::open(directory.path()).unwrap();
+    let sid = SessionId::from("projection-divergent");
+    store
+        .append(
+            message_envelope(&sid, 0, "canonical"),
+            JournalDurability::SyncData,
+        )
+        .await
+        .unwrap();
+    let replacement = message("forged");
+    let entry =
+        HistoryProjectionEntry::new(0, JournalRecordId::from("record-0"), replacement.clone())
+            .unwrap();
+    let mut bytes = serde_json::to_vec(&entry).unwrap();
+    bytes.push(b'\n');
+    std::fs::write(store.history_path(&sid).unwrap(), &bytes).unwrap();
+    let metadata = HistoryProjectionMetadata::new(
+        sid.clone(),
+        0,
+        JournalRecordId::from("record-0"),
+        1,
+        bytes.len() as u64,
+        history_digest(&[replacement]).unwrap(),
+        None,
+    );
+    std::fs::write(
+        store.history_metadata_path(&sid).unwrap(),
+        serde_json::to_vec_pretty(&metadata).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        store.replay(&sid).await.unwrap().projection.messages,
+        vec![message("canonical")]
     );
 }
 
@@ -159,6 +199,44 @@ async fn missing_checkpoint_referenced_by_journal_fails_closed() {
         store.replay(&sid).await.unwrap_err().code(),
         "projection.checkpoint_missing"
     );
+}
+
+#[tokio::test]
+async fn messages_after_replacement_extend_compacted_history() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = FileEventStore::open(directory.path()).unwrap();
+    let sid = SessionId::from("projection-replacement-tail");
+    store
+        .append(
+            message_envelope(&sid, 0, "original"),
+            JournalDurability::SyncData,
+        )
+        .await
+        .unwrap();
+    store
+        .replace_history(
+            &sid,
+            vec![message("summary")],
+            HistoryReplacementReason::Repair,
+        )
+        .await
+        .unwrap();
+    store
+        .append(
+            message_envelope(&sid, 2, "tail"),
+            JournalDurability::SyncData,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store.replay(&sid).await.unwrap().projection.messages,
+        vec![message("summary"), message("tail")]
+    );
+    let metadata: HistoryProjectionMetadata =
+        serde_json::from_slice(&std::fs::read(store.history_metadata_path(&sid).unwrap()).unwrap())
+            .unwrap();
+    assert!(metadata.active_checkpoint_id.is_some());
+    assert_eq!(metadata.generation, 1);
 }
 
 fn message(text: &str) -> ModelMessage {

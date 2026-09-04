@@ -23,6 +23,8 @@ Every copied production file and its tests must add a row before merge.
 | `crates/lato-core/src/model.rs` | Codex `codex-rs/model-provider/src/provider.rs` | Structural derivation | Object-safe provider boundary and capabilities | Added normalized Lato request and stream event types |
 | `crates/lato-store/src/file.rs` | Grok Build `crates/codegen/xai-workflow/src/journal.rs` | Structural derivation | Bounded replay, torn-tail recovery, malformed-record rejection | Generalized to canonical per-session journals with strict projection and atomic legacy import |
 | `crates/lato-store/src/writer.rs` | Codex `codex-rs/rollout/src/recorder.rs` | Structural derivation | Ordered writes, acknowledgement barriers, shutdown draining | Reduced to one bounded writer queue per session with durability levels and reopen/replay retry |
+| `crates/lato-store/src/projection.rs` | Grok Build `crates/codegen/xai-grok-shell/src/session/storage/jsonl/mod.rs`, `session/persistence.rs`, `session/compaction.rs`, and `session/helpers/replay.rs` | Structural derivation | Replaceable chat history, damaged-history quarantine, checkpoint-before-marker ordering, rebuild from authoritative updates | Uses Lato's canonical journal, strict hashes and bounded recovery; excludes Grok product/cloud state |
+| `crates/lato-store/src/writer.rs` (Phase 4B additions) | Grok Build `crates/codegen/xai-grok-shell/src/session/persistence.rs` and `crates/codegen/xai-chat-state/src/persistence.rs` | Structural derivation | Single persistence actor, source/derived write ordering, full-history replacement acknowledgement | Keeps canonical append acknowledgements authoritative and serializes derived history/checkpoint work on the existing bounded writer |
 
 ## Required source header
 

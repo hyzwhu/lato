@@ -263,7 +263,18 @@ entire Lato home should be treated as sensitive local data.
 
 Legacy `$LATO_HOME/sessions/<session-id>.jsonl` transcripts are imported lazily and atomically on
 first resume. The original transcript remains unchanged for compatibility; once both formats exist,
-the canonical journal wins. Snapshotting and journal compaction are deferred to Phase 4B.
+the canonical journal wins.
+
+Phase 4B follows Grok Build's source-stream/derived-history split. The append-only
+`events.jsonl` remains the authority, while `history.jsonl` and `history.meta.json`
+materialize the current model-visible conversation. Ordinary records reach the canonical
+journal before the derived projection. Missing or stale projection files are rebuilt after
+the complete journal passes validation; damaged projection files are quarantined before
+rebuild. Logical history replacement publishes a private compaction checkpoint before its
+marker is synchronized to the canonical journal. A missing or mismatched referenced
+checkpoint, canonical corruption, or an unresolved side effect still fails closed. Phase 4B
+does not rotate, truncate, archive, or delete canonical journal records, and the Phase 4A
+64 MiB/100,000-record bounds remain in force.
 
 Copied or structurally derived upstream code is pinned in
 [`docs/superpowers/reference/lato-upstream-sources.md`](docs/superpowers/reference/lato-upstream-sources.md).
