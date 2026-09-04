@@ -1,6 +1,6 @@
 use crate::FileEventStore;
 use fs2::FileExt;
-use lato_core::{EventStore, JournalError, JournalRecord, SessionId};
+use lato_core::{EventStore, JournalError, JournalRecord, ModelContent, ModelRole, SessionId};
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, File, OpenOptions},
@@ -35,6 +35,7 @@ pub struct SessionMetadata {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SessionSummary {
     pub session_id: SessionId,
     pub title: String,
@@ -86,18 +87,15 @@ impl FileEventStore {
             let (created_at_ms, updated_at_ms) = journal_times(&replay.envelopes);
             let metadata_path = metadata_path(self, &session_id)?;
             let summary = match read_metadata(&metadata_path, &session_id) {
-                Ok(Some(metadata)) => SessionSummary::from(metadata),
+                Ok(Some(mut metadata)) => {
+                    metadata.updated_at_ms = metadata.updated_at_ms.max(updated_at_ms);
+                    SessionSummary::from(metadata)
+                }
                 Ok(None) | Err(_) => {
-                    let first_prompt = replay.envelopes.iter().find_map(|envelope| {
-                        if let JournalRecord::TurnInputAccepted { input } = &envelope.record {
-                            Some(input.text.as_str())
-                        } else {
-                            None
-                        }
-                    });
+                    let first_prompt = first_user_text(&replay.envelopes);
                     SessionSummary {
                         session_id: session_id.clone(),
-                        title: derive_automatic_title(first_prompt.unwrap_or("")),
+                        title: derive_automatic_title(first_prompt.as_deref().unwrap_or("")),
                         title_source: TitleSource::Automatic,
                         created_at_ms,
                         updated_at_ms,
@@ -131,14 +129,16 @@ impl FileEventStore {
         let times = journal_times(&replay.envelopes);
         tokio::task::spawn_blocking(move || {
             update_metadata_locked(&metadata_path, &lock_path, &session_id, |current| {
-                Ok(current.unwrap_or_else(|| SessionMetadata {
+                let mut metadata = current.unwrap_or_else(|| SessionMetadata {
                     schema_version: METADATA_SCHEMA_VERSION,
                     session_id: session_id.clone(),
                     title,
                     title_source: TitleSource::Automatic,
                     created_at_ms: times.0,
-                    updated_at_ms: times.1.max(now_ms()),
-                }))
+                    updated_at_ms: times.1,
+                });
+                metadata.updated_at_ms = metadata.updated_at_ms.max(times.1).max(now_ms());
+                Ok(metadata)
             })
             .map(SessionSummary::from)
         })
@@ -219,6 +219,23 @@ fn journal_times(envelopes: &[lato_core::JournalEnvelope]) -> (u64, u64) {
     let created = envelopes.first().map_or(0, |item| item.timestamp_ms);
     let updated = envelopes.last().map_or(created, |item| item.timestamp_ms);
     (created, updated)
+}
+
+fn first_user_text(envelopes: &[lato_core::JournalEnvelope]) -> Option<String> {
+    envelopes
+        .iter()
+        .find_map(|envelope| match &envelope.record {
+            JournalRecord::TurnInputAccepted { input } => Some(input.text.clone()),
+            JournalRecord::ConversationItemCommitted { message }
+                if message.role == ModelRole::User =>
+            {
+                message.content.iter().find_map(|content| match content {
+                    ModelContent::Text { text } => Some(text.clone()),
+                    _ => None,
+                })
+            }
+            _ => None,
+        })
 }
 
 fn session_dir(store: &FileEventStore, session_id: &SessionId) -> Result<PathBuf, JournalError> {

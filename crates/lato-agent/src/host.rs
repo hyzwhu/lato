@@ -10,7 +10,7 @@ use lato_ai::{
 use lato_core::{EventStore, JournalReplay, SessionId};
 use lato_mcp::{PluginOrigin, PluginPackage, discover_plugin};
 use lato_protocol::{JsonRpcReq, METHODS_IMPLEMENTED, PROTOCOL_VERSION, err, is_implemented, ok};
-use lato_store::FileEventStore;
+use lato_store::{FileEventStore, derive_automatic_title};
 use lato_workspace::{ApprovalMode, FileLocks, SessionTrust};
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
@@ -190,7 +190,13 @@ impl AcpHost {
                 if self.trust.mode == ApprovalMode::Ask && text.contains("tool") {
                     let _ = self.updates.send(serde_json::json!({"jsonrpc":"2.0","id":format!("permission-{sid}"),"method":"session/request_permission","params":{"sessionId": sid,"options":["allow_once","allow_session","deny","cancel"]}}));
                 }
-                match session.prompt(text).await {
+                let outcome = session.prompt(text.clone()).await;
+                if let Some(events) = &self.events {
+                    let _ = events
+                        .ensure_automatic_title(&SessionId::from(sid), &text)
+                        .await;
+                }
+                match outcome {
                     Ok(RuntimePromptOutcome::Complete { text }) => {
                         let _ = self.updates.send(serde_json::json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":sid,"text":text}}));
                         Some(ok(id, serde_json::json!({"status":"complete","text":text})))
@@ -228,6 +234,146 @@ impl AcpHost {
                 sessions.sort();
                 sessions.dedup();
                 Some(ok(id, serde_json::json!({"sessions": sessions})))
+            }
+            "lato/session/list" => {
+                let mut summaries = std::collections::BTreeMap::<String, serde_json::Value>::new();
+                if let Some(store) = &self.events {
+                    match store.list_session_summaries().await {
+                        Ok(items) => {
+                            for item in items {
+                                summaries.insert(
+                                    item.session_id.to_string(),
+                                    serde_json::to_value(item).unwrap_or_default(),
+                                );
+                            }
+                        }
+                        Err(error) => return Some(err(id, -32000, error.to_string())),
+                    }
+                }
+                if let Some(store) = &self.transcripts {
+                    let legacy = match store.list() {
+                        Ok(items) => items,
+                        Err(error) => return Some(err(id, -32000, error)),
+                    };
+                    for sid in legacy {
+                        if summaries.contains_key(&sid) {
+                            continue;
+                        }
+                        let title = store
+                            .load_optional(&sid)
+                            .ok()
+                            .flatten()
+                            .and_then(|history| {
+                                history.into_iter().find_map(|item| match item {
+                                    crate::HistoryItem::User(text) => Some(text),
+                                    _ => None,
+                                })
+                            })
+                            .map(|text| derive_automatic_title(&text))
+                            .unwrap_or_else(|| "New session".into());
+                        summaries.insert(
+                            sid.clone(),
+                            serde_json::json!({
+                                "sessionId": sid,
+                                "title": title,
+                                "titleSource": "automatic",
+                                "createdAtMs": 0,
+                                "updatedAtMs": 0,
+                            }),
+                        );
+                    }
+                }
+                for sid in self.sessions.keys() {
+                    summaries.entry(sid.clone()).or_insert_with(|| {
+                        serde_json::json!({
+                            "sessionId": sid,
+                            "title": "New session",
+                            "titleSource": "automatic",
+                            "createdAtMs": 0,
+                            "updatedAtMs": 0,
+                        })
+                    });
+                }
+                let mut summaries = summaries.into_values().collect::<Vec<_>>();
+                summaries.sort_by(|left, right| {
+                    right["updatedAtMs"]
+                        .as_u64()
+                        .cmp(&left["updatedAtMs"].as_u64())
+                        .then_with(|| right["sessionId"].as_str().cmp(&left["sessionId"].as_str()))
+                });
+                Some(ok(id, serde_json::json!({"sessions": summaries})))
+            }
+            "lato/session/rename" => {
+                let params = req.params.unwrap_or_default();
+                let Some(sid) = params.get("sessionId").and_then(|value| value.as_str()) else {
+                    return Some(err(id, -32602, "sessionId is required"));
+                };
+                let Some(title) = params.get("title").and_then(|value| value.as_str()) else {
+                    return Some(err(id, -32602, "title is required"));
+                };
+                let session_id = match SessionId::parse(sid) {
+                    Ok(session_id) => session_id,
+                    Err(error) => return Some(err(id, -32602, error.to_string())),
+                };
+                match self.session_exists(sid).await {
+                    Ok(true) => {}
+                    Ok(false) => return Some(err(id, -32000, "unknown session")),
+                    Err(error) => return Some(err(id, -32000, error)),
+                }
+                if let Some(session) = self.sessions.get(sid)
+                    && session.is_active().await
+                {
+                    return Some(err(id, -32000, "session_busy"));
+                }
+                let Some(store) = &self.events else {
+                    return Some(err(id, -32000, "session metadata unavailable"));
+                };
+                if let Err(error) =
+                    import_legacy_if_needed(&session_id, self.transcripts.as_ref(), store.as_ref())
+                        .await
+                {
+                    return Some(err(id, -32000, error.to_string()));
+                }
+                match store.rename_session(&session_id, title).await {
+                    Ok(summary) => Some(ok(id, serde_json::to_value(summary).unwrap_or_default())),
+                    Err(error) => Some(err(id, -32000, error.to_string())),
+                }
+            }
+            "lato/session/delete" => {
+                let params = req.params.unwrap_or_default();
+                let Some(sid) = params.get("sessionId").and_then(|value| value.as_str()) else {
+                    return Some(err(id, -32602, "sessionId is required"));
+                };
+                let session_id = match SessionId::parse(sid) {
+                    Ok(session_id) => session_id,
+                    Err(error) => return Some(err(id, -32602, error.to_string())),
+                };
+                match self.session_exists(sid).await {
+                    Ok(true) => {}
+                    Ok(false) => return Some(err(id, -32000, "unknown session")),
+                    Err(error) => return Some(err(id, -32000, error)),
+                }
+                if let Some(session) = self.sessions.get(sid)
+                    && session.is_active().await
+                {
+                    return Some(err(id, -32000, "session_busy"));
+                }
+                if let Some(session) = self.sessions.remove(sid)
+                    && let Err(error) = session.shutdown().await
+                {
+                    return Some(err(id, -32000, error.to_string()));
+                }
+                if let Some(store) = &self.events
+                    && let Err(error) = store.delete_session(&session_id).await
+                {
+                    return Some(err(id, -32000, error.to_string()));
+                }
+                if let Some(store) = &self.transcripts
+                    && let Err(error) = store.delete(sid)
+                {
+                    return Some(err(id, -32000, error));
+                }
+                Some(ok(id, serde_json::json!({"deleted": true})))
             }
             "session/close" => {
                 if let Some(sid) = req
@@ -893,5 +1039,65 @@ mod tests {
             response["result"]["sessions"],
             serde_json::json!(["journal-only", "legacy-only", "shared"])
         );
+    }
+
+    #[tokio::test]
+    async fn session_admin_extensions_preserve_legacy_list_shape() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut host = host();
+        host.events = Some(Arc::new(FileEventStore::open(directory.path()).unwrap()));
+        let created = host
+            .handle(req(1, "session/new", serde_json::json!({})))
+            .await
+            .unwrap();
+        let sid = created["result"]["sessionId"].as_str().unwrap().to_string();
+        host.handle(req(
+            2,
+            "session/prompt",
+            serde_json::json!({"sessionId": sid, "text": "Implement session titles"}),
+        ))
+        .await
+        .unwrap();
+
+        let legacy = host
+            .handle(req(3, "session/list", serde_json::json!({})))
+            .await
+            .unwrap();
+        assert_eq!(legacy["result"]["sessions"], serde_json::json!([sid]));
+        let listed = host
+            .handle(req(4, "lato/session/list", serde_json::json!({})))
+            .await
+            .unwrap();
+        assert_eq!(
+            listed["result"]["sessions"][0]["title"],
+            "Implement session titles"
+        );
+        assert_eq!(listed["result"]["sessions"][0]["titleSource"], "automatic");
+
+        let renamed = host
+            .handle(req(
+                5,
+                "lato/session/rename",
+                serde_json::json!({"sessionId": sid, "title": "Manual title"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(renamed["result"]["title"], "Manual title");
+        assert_eq!(renamed["result"]["titleSource"], "manual");
+
+        let deleted = host
+            .handle(req(
+                6,
+                "lato/session/delete",
+                serde_json::json!({"sessionId": sid}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(deleted["result"]["deleted"], true);
+        let listed = host
+            .handle(req(7, "session/list", serde_json::json!({})))
+            .await
+            .unwrap();
+        assert_eq!(listed["result"]["sessions"], serde_json::json!([]));
     }
 }

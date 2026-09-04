@@ -249,6 +249,10 @@ impl RuntimeSession {
         self.driver.replace_history(history).await;
     }
 
+    pub async fn is_active(&self) -> bool {
+        self.active_turn.lock().await.is_some()
+    }
+
     async fn clear_active(&self, turn_id: Option<&TurnId>) {
         let mut active = self.active_turn.lock().await;
         if turn_id.is_none() || active.as_ref() == turn_id {

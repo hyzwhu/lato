@@ -91,6 +91,15 @@ impl TranscriptStore {
         Ok(ids)
     }
 
+    pub fn delete(&self, session_id: &str) -> Result<(), String> {
+        validate_session_id(session_id)?;
+        match fs::remove_file(self.path(session_id)) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
     fn path(&self, session_id: &str) -> PathBuf {
         self.sessions_dir.join(format!("{session_id}.jsonl"))
     }
