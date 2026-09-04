@@ -1,7 +1,8 @@
 use crate::{
-    AgentError, ApprovalFingerprint, CancelReason, ModelContent, ModelMessage, ModelRole,
-    Retryability, SandboxObligation, SessionId, SideEffect, ToolCallId, ToolCapability, ToolError,
-    ToolIdempotency, ToolName, ToolOutput, TurnId, TurnOutput,
+    AgentError, ApprovalFingerprint, CancelReason, HistoryReplacementReason, JournalValidation,
+    ModelContent, ModelMessage, ModelRole, ProjectionError, Retryability, SandboxObligation,
+    SessionId, SideEffect, ToolCallId, ToolCapability, ToolError, ToolIdempotency, ToolName,
+    ToolOutput, TurnId, TurnOutput,
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -121,15 +122,26 @@ pub enum JournalRecord {
         item_count: u64,
         content_digest: String,
     },
+    HistoryProjectionReplaced {
+        checkpoint_id: String,
+        checkpoint_digest: String,
+        replaced_through_sequence: u64,
+        replaced_through_record_id: JournalRecordId,
+        replacement_entry_count: u64,
+        history_digest: String,
+        reason: HistoryReplacementReason,
+        prior_checkpoint_id: Option<String>,
+    },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 pub struct UnresolvedToolCall {
     pub call_id: ToolCallId,
     pub request_hash: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum JournalTerminal {
     TurnCompleted,
     TurnFailed,
@@ -144,6 +156,7 @@ pub struct SessionProjection {
     pub next_journal_sequence: u64,
     pub unresolved_tools: Vec<UnresolvedToolCall>,
     pub terminal: Option<JournalTerminal>,
+    pub active_checkpoint_id: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -164,6 +177,7 @@ impl JournalReplay {
                 next_journal_sequence: 0,
                 unresolved_tools: Vec::new(),
                 terminal: None,
+                active_checkpoint_id: None,
             },
         }
     }
@@ -201,6 +215,8 @@ pub enum JournalError {
     MigrationFailed { message: String },
     #[error("corrupt journal: {message}")]
     Corrupt { message: String },
+    #[error(transparent)]
+    Projection(#[from] ProjectionError),
 }
 
 impl JournalError {
@@ -218,12 +234,14 @@ impl JournalError {
             Self::IncompleteSideEffect { .. } => "journal.incomplete_side_effect",
             Self::MigrationFailed { .. } => "journal.migration_failed",
             Self::Corrupt { .. } => "journal.corrupt",
+            Self::Projection(error) => error.code(),
         }
     }
 
     pub fn retryability(&self) -> Retryability {
         match self {
             Self::Io { .. } => Retryability::AfterBackoff,
+            Self::Projection(error) => error.retryability(),
             _ => Retryability::Never,
         }
     }
@@ -292,6 +310,8 @@ pub fn project_journal(
     let mut requested = BTreeMap::<ToolCallId, Requested>::new();
     let mut messages = Vec::new();
     let mut terminal = None;
+    let mut active_checkpoint_id = None;
+    let mut checkpoint_ids = BTreeSet::new();
 
     for (index, envelope) in envelopes.iter().enumerate() {
         if envelope.schema_version != JOURNAL_SCHEMA_VERSION {
@@ -323,6 +343,19 @@ pub fn project_journal(
             JournalRecord::SessionStarted
             | JournalRecord::PolicyDecisionCommitted { .. }
             | JournalRecord::LegacyTranscriptImported { .. } => {}
+            JournalRecord::HistoryProjectionReplaced { checkpoint_id, .. } => {
+                if requested.values().any(|call| call.prepared) {
+                    return Err(JournalError::Corrupt {
+                        message: "history replaced with an unresolved prepared tool".into(),
+                    });
+                }
+                if !checkpoint_ids.insert(checkpoint_id.clone()) {
+                    return Err(JournalError::Corrupt {
+                        message: format!("duplicate history checkpoint {checkpoint_id}"),
+                    });
+                }
+                active_checkpoint_id = Some(checkpoint_id.clone());
+            }
             JournalRecord::TurnInputAccepted { input } => messages.push(ModelMessage {
                 role: ModelRole::User,
                 content: vec![ModelContent::Text {
@@ -426,7 +459,64 @@ pub fn project_journal(
         next_journal_sequence: envelopes.len() as u64,
         unresolved_tools,
         terminal,
+        active_checkpoint_id,
     })
+}
+
+pub fn validate_journal(
+    session_id: &SessionId,
+    envelopes: &[JournalEnvelope],
+) -> Result<JournalValidation, JournalError> {
+    let projection = project_journal(session_id, envelopes)?;
+    Ok(JournalValidation {
+        session_id: session_id.clone(),
+        next_journal_sequence: projection.next_journal_sequence,
+        last_record_id: envelopes.last().map(|item| item.record_id.clone()),
+        message_count: projection.messages.len() as u64,
+        history_digest: crate::history_digest(&projection.messages)?,
+        unresolved_tools: projection.unresolved_tools,
+        terminal: projection.terminal,
+        active_checkpoint_id: projection.active_checkpoint_id,
+    })
+}
+
+pub fn projection_message(record: &JournalRecord) -> Option<ModelMessage> {
+    match record {
+        JournalRecord::TurnInputAccepted { input } => Some(ModelMessage {
+            role: ModelRole::User,
+            content: vec![ModelContent::Text {
+                text: input.text.clone(),
+            }],
+        }),
+        JournalRecord::ConversationItemCommitted { message } => Some(message.clone()),
+        JournalRecord::ToolCallRequested {
+            call_id,
+            name,
+            arguments,
+            ..
+        } => Some(ModelMessage {
+            role: ModelRole::Assistant,
+            content: vec![ModelContent::ToolCall {
+                call_id: call_id.clone(),
+                name: name.clone(),
+                arguments: arguments.clone(),
+            }],
+        }),
+        JournalRecord::ToolCallCompleted {
+            call_id, result, ..
+        } => Some(tool_result(
+            call_id.clone(),
+            match result {
+                Ok(output) => output.content.clone(),
+                Err(error) => format!("ERROR [{}]: {}", error.code, error.message),
+            },
+        )),
+        JournalRecord::ToolCallRejected { call_id, error, .. } => Some(tool_result(
+            call_id.clone(),
+            format!("ERROR [{}]: {}", error.code, error.message),
+        )),
+        _ => None,
+    }
 }
 
 fn divergence(call_id: &ToolCallId, message: impl Into<String>) -> JournalError {

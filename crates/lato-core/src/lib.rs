@@ -5,6 +5,7 @@ mod id;
 mod journal;
 mod model;
 mod policy;
+mod projection;
 mod state;
 mod tool;
 
@@ -16,7 +17,7 @@ pub use journal::{
     EventStore, JOURNAL_SCHEMA_VERSION, JournalDurability, JournalEnvelope, JournalError,
     JournalRecord, JournalReplay, JournalTerminal, PolicyAuditDecision, PolicyAuditRecord,
     PolicyAuditStage, PreparedToolAudit, SessionProjection, UnresolvedToolCall, canonical_json,
-    journal_request_hash, project_journal,
+    journal_request_hash, project_journal, projection_message, validate_journal,
 };
 pub use model::{
     ModelCapabilities, ModelContent, ModelError, ModelEventStream, ModelMessage, ModelPort,
@@ -27,6 +28,11 @@ pub use policy::{
     ApprovalFingerprint, ApprovalRequest, EnvironmentPolicy, ExecutionGrant, GrantId,
     NetworkPolicy, PolicyDecision, PolicyDenial, PolicyMode, PolicyRequest, SandboxObligation,
     SandboxProfile,
+};
+pub use projection::{
+    HISTORY_PROJECTION_SCHEMA_VERSION, HistoryCheckpoint, HistoryProjectionEntry,
+    HistoryProjectionMetadata, HistoryProjectionStore, HistoryReplacementReason, JournalValidation,
+    ProjectionError, SessionSnapshot, checkpoint_digest, history_digest,
 };
 pub use state::{ActiveTurn, SessionMachine, SessionPhase, StartDecision, TransitionError};
 pub use tool::{
