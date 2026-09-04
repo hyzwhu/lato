@@ -194,7 +194,7 @@ pub enum AppEvent {
     Escape,
     Scroll(i16),
     SwitchLanguage(Language),
-    ClearConversation,
+    NewSession,
     Exit(TuiExit),
 }
 
@@ -428,7 +428,7 @@ impl AppState {
                 self.overlay = None;
                 vec![Effect::PersistLanguage(language)]
             }
-            AppEvent::ClearConversation => {
+            AppEvent::NewSession => {
                 if self.responding {
                     self.error = Some(
                         "Wait for the current response or cancel it first / 请先等待或取消当前回复"
@@ -436,11 +436,7 @@ impl AppState {
                     );
                     return Vec::new();
                 }
-                self.messages.clear();
-                self.tools.clear();
-                self.tool_panel = ToolPanelState::default();
-                self.overlay = None;
-                vec![Effect::Backend(BackendCommand::Clear)]
+                vec![Effect::Backend(BackendCommand::NewSession)]
             }
             AppEvent::Exit(action) => {
                 self.should_exit = true;
@@ -475,8 +471,21 @@ impl AppState {
 
     fn apply_backend(&mut self, event: BackendEvent) {
         match event {
-            BackendEvent::SessionReady(id) | BackendEvent::Cleared(id) => {
+            BackendEvent::SessionReady(id) => {
                 self.session_id = id;
+            }
+            BackendEvent::NewSessionCreated(id) => {
+                self.session_id = id;
+                self.messages.clear();
+                self.tools.clear();
+                self.tool_panel = ToolPanelState::default();
+                self.composer.clear();
+                self.overlay = None;
+                self.scroll = 0;
+                self.focus = Focus::Chat;
+                self.screen = Screen::Welcome;
+                self.error = None;
+                self.select_current_session();
             }
             BackendEvent::Resumed(id) => {
                 self.session_id = id;
@@ -661,6 +670,35 @@ mod tests {
     }
 
     #[test]
+    fn new_session_acknowledgement_resets_to_welcome() {
+        let mut app = app();
+        app.screen = Screen::Main;
+        app.messages.push(Message {
+            role: MessageRole::User,
+            content: "old conversation".into(),
+            expanded: true,
+        });
+        app.apply_update(ClientUpdate::ToolStarted {
+            id: "tool-1".into(),
+            name: "read".into(),
+            arguments: "{}".into(),
+        });
+        app.scroll = 4;
+        app.focus = Focus::Tools;
+        app.error = Some("old error".into());
+
+        app.apply_backend(BackendEvent::NewSessionCreated("session-2".into()));
+
+        assert_eq!(app.session_id, "session-2");
+        assert_eq!(app.screen, Screen::Welcome);
+        assert!(app.messages.is_empty());
+        assert!(app.tools.is_empty());
+        assert_eq!(app.scroll, 0);
+        assert_eq!(app.focus, Focus::Chat);
+        assert!(app.error.is_none());
+    }
+
+    #[test]
     fn tool_inspection_survives_updates_and_resets_with_conversation() {
         let mut app = app();
         app.apply_update(ClientUpdate::ToolStarted {
@@ -690,7 +728,7 @@ mod tests {
         });
         assert_eq!(app.tool_panel.selected, 2);
         app.tool_panel.scroll = 10;
-        app.reduce(AppEvent::ClearConversation);
+        app.reduce(AppEvent::NewSession);
         assert_eq!(app.tool_panel.selected, 0);
         assert_eq!(app.tool_panel.scroll, 0);
         app.apply_update(ClientUpdate::ToolStarted {

@@ -536,7 +536,7 @@ fn submit_or_command(app: &mut AppState, trust: &SessionTrust) -> Vec<Effect> {
         }
         "/clear" | "/new" => {
             app.composer.clear();
-            app.reduce(AppEvent::ClearConversation)
+            app.reduce(AppEvent::NewSession)
         }
         "/lang" | "/language" => {
             app.composer.clear();
@@ -632,9 +632,9 @@ fn handle_palette_key(app: &mut AppState, key: KeyEvent, trust: &SessionTrust) -
             Vec::new()
         }
         KeyCode::Enter => match app.palette_index {
-            0 => app.reduce(AppEvent::ClearConversation),
+            0 => app.reduce(AppEvent::NewSession),
             1 => vec![Effect::Sessions],
-            2 => app.reduce(AppEvent::ClearConversation),
+            2 => app.reduce(AppEvent::NewSession),
             3 => vec![Effect::ConfigureModel],
             4 => vec![Effect::Login],
             5 => {
@@ -763,6 +763,39 @@ mod tests {
             &submit_or_command(&mut app, &trust)[..],
             [Effect::ConfirmDeleteSession(session_id)] if session_id == "current"
         ));
+    }
+
+    #[test]
+    fn new_and_clear_request_a_fresh_session_without_premature_reset() {
+        let workspace = tempfile::tempdir().unwrap();
+        let trust = SessionTrust::for_interactive(workspace.path(), false);
+        for command in ["/new", "/clear"] {
+            let mut app = AppState::new(
+                Language::En,
+                workspace.path().to_path_buf(),
+                "provider/model".into(),
+                "current".into(),
+                vec!["current".into()],
+            );
+            app.screen = Screen::Main;
+            app.messages.push(crate::tui::state::Message {
+                role: crate::tui::state::MessageRole::User,
+                content: "keep until acknowledged".into(),
+                expanded: true,
+            });
+            let original_messages = app.messages.clone();
+            app.composer.insert_str(command);
+
+            let effects = submit_or_command(&mut app, &trust);
+
+            assert!(matches!(
+                effects.as_slice(),
+                [Effect::Backend(BackendCommand::NewSession)]
+            ));
+            assert_eq!(app.session_id, "current");
+            assert_eq!(app.screen, Screen::Main);
+            assert_eq!(app.messages, original_messages);
+        }
     }
 
     #[test]

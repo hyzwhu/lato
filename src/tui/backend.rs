@@ -7,7 +7,7 @@ use tokio::sync::{mpsc, oneshot};
 pub enum BackendCommand {
     Submit(String),
     Cancel,
-    Clear,
+    NewSession,
     Resume(String),
     RenameSession { session_id: String, title: String },
     DeleteSession(String),
@@ -20,7 +20,7 @@ pub enum BackendEvent {
     Update(ClientUpdate),
     TurnCompleted(String),
     TurnCancelled,
-    Cleared(String),
+    NewSessionCreated(String),
     Resumed(String),
     Sessions(Vec<SessionSummary>),
     SessionRenamed(SessionSummary),
@@ -134,7 +134,7 @@ pub fn spawn(
                         Some(BackendCommand::RenameSession { .. } | BackendCommand::DeleteSession(_)) => {
                             let _ = event_tx.send(BackendEvent::Error("cannot change sessions while a turn is running".into()));
                         }
-                        Some(BackendCommand::Clear) => {
+                        Some(BackendCommand::NewSession) => {
                             let _ = event_tx.send(BackendEvent::Error("cannot clear while a turn is running".into()));
                         }
                     },
@@ -215,7 +215,7 @@ pub fn spawn(
                 Some(BackendCommand::Cancel) => {
                     let _ = event_tx.send(BackendEvent::TurnCancelled);
                 }
-                Some(BackendCommand::Clear) => {
+                Some(BackendCommand::NewSession) => {
                     let Some(owned) = client.as_mut() else {
                         let _ = event_tx.send(BackendEvent::Error("session is unavailable".into()));
                         continue;
@@ -223,7 +223,7 @@ pub fn spawn(
                     match owned.clear().await {
                         Ok(()) => {
                             let _ = event_tx
-                                .send(BackendEvent::Cleared(owned.session_id().to_string()));
+                                .send(BackendEvent::NewSessionCreated(owned.session_id().to_string()));
                             if let Ok(sessions) = owned.list_session_summaries().await {
                                 let _ = event_tx.send(BackendEvent::Sessions(sessions));
                             }
