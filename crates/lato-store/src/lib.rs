@@ -1,9 +1,13 @@
 mod file;
 mod memory;
+mod metadata;
 mod writer;
 
 pub use file::{FaultPoint, FileEventStore, FileFaultInjector};
 pub use memory::MemoryEventStore;
+pub use metadata::{
+    SessionMetadata, SessionSummary, TitleSource, derive_automatic_title, normalize_manual_title,
+};
 
 pub const MAX_JOURNAL_BYTES: u64 = 64 * 1024 * 1024;
 pub const MAX_JOURNAL_RECORDS: usize = 100_000;

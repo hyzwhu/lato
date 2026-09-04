@@ -5,7 +5,9 @@ edition = "2024"
 
 [dependencies]
 async-trait = "0.1"
+fs2 = "0.4"
 lato-core = { path = "../lato-core" }
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["fs", "io-util", "rt", "sync"] }
 

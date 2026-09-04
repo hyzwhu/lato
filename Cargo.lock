@@ -1136,8 +1136,10 @@ name = "lato-store"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "fs2",
  "lato-core",
  "libc",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",
