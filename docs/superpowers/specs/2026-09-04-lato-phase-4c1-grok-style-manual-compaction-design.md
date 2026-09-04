@@ -244,11 +244,14 @@ bounded error code and safe message where existing redaction policy permits.
 Visible events are:
 
 - `CompactionStarted { compaction_id, trigger }`;
-- `CompactionCompleted { compaction_id, before, after, checkpoint_id }`;
+- `CompactionCompleted { compaction_id, before, after, checkpoint_id, warning }`;
 - `CompactionFailed { compaction_id, error }`;
 - `CompactionCancelled { compaction_id }`.
 
-`CompactionStarted` is broadcast only after `CompactionRequested` is durable.
+The optional completion warning is a typed `AgentError` used only when the
+replacement marker committed but the runtime had to rebuild derived history
+before installing the new checkpoint. `CompactionStarted` is broadcast only
+after `CompactionRequested` is durable.
 A terminal failure or cancellation is broadcast only after its canonical
 record is durable. `CompactionCompleted` is broadcast only after the runtime
 has reconciled the committed replacement and installed the corresponding
