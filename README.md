@@ -67,7 +67,7 @@ lato --lang en
 Interactive commands:
 
 ```text
-/help  /new  /clear  /sessions  /rename  /delete  /model  /login  /doctor  /search  /lang  /approve  /status  /permissions  /exit
+/help  /new  /clear  /compact  /sessions  /rename  /delete  /model  /login  /doctor  /search  /lang  /approve  /status  /permissions  /exit
 ```
 
 Tool calls start collapsed, showing their name, status, and duration. Focus the Tool calls panel with Tab, select calls with Up/Down or j/k, and use Enter/Space to toggle details (Left collapses, Right expands). PgUp/PgDn scroll through full arguments and results; Home/End select the first/last call. A scrollbar shows the current position. Incoming calls preserve your place while you are inspecting the panel.
@@ -116,6 +116,15 @@ lato resume s1788336000000-1
 The first accepted prompt supplies a deterministic local title; manual renames always take priority over automatic titles. Human-readable listing prints the title and durable ID. JSON listing uses schema version 2 and returns `sessionId`, `title`, `titleSource`, `createdAtMs`, and `updatedAtMs` for each session. Delete is permanent: interactive callers must confirm it, while non-interactive callers must pass `--yes`.
 
 Resume uses the currently configured default model and current working directory. It repeats the folder-trust prompt and, unless `--sandbox` is supplied, the sandbox picker. Permissions come from this invocation, not the saved journal. It fails closed instead of creating a replacement when a journal is missing, corrupt, or contains an unresolved side-effect outcome.
+
+In the interactive TUI, `/compact` summarizes a long current conversation and
+`/compact <context>` asks the summary to emphasize the supplied context. It uses the
+current session model, may make one to three model calls, and never exposes or runs
+tools. Ctrl-C cancels active sampling. A successful operation replaces only the
+model-visible history through a durable checkpoint; the append-only canonical journal
+is retained. Failures before the replacement marker keep the previous history active.
+Automatic threshold compaction and context-overflow resubmission remain planned for
+Phase 4C2 and Phase 4C3.
 
 ## Doctor
 
@@ -275,6 +284,15 @@ marker is synchronized to the canonical journal. A missing or mismatched referen
 checkpoint, canonical corruption, or an unresolved side effect still fails closed. Phase 4B
 does not rotate, truncate, archive, or delete canonical journal records, and the Phase 4A
 64 MiB/100,000-record bounds remain in force.
+
+Phase 4C1 adds Grok Build-style manual context compaction on top of that storage
+boundary. `CompactionRequested` is durable before sampling becomes visible. The
+summary request uses the current model with `tools: []` and `tool_choice: none`, has a
+three-attempt ceiling, and must satisfy section, size, and reduction checks. A successful
+checkpoint marker becomes authoritative even if publishing `history.jsonl` or its
+metadata fails; replay rebuilds those derived files before the new history is installed
+in memory. If reconciliation cannot prove which checkpoint is authoritative, the
+session fails closed.
 
 Copied or structurally derived upstream code is pinned in
 [`docs/superpowers/reference/lato-upstream-sources.md`](docs/superpowers/reference/lato-upstream-sources.md).

@@ -1,6 +1,7 @@
 // Derived from: Codex@633ab199cfd724aa78013c006b27a2b3d049fc3b:codex-rs/core/src/session/handlers.rs
 // License: Apache-2.0
 // Lato changes: replaced Codex protocol operations with typed Lato Command/Event values
+// Compaction orchestration derived from: Grok Build@bb7f39d5858cbf5e00de639367f59debbdcb0138:crates/codegen/xai-grok-shell/src/session/compaction.rs
 
 use crate::driver::{
     CompactionControl, CompactionRequest, DriverEvent, DriverMessage, TurnControl, TurnDriver,
@@ -798,7 +799,13 @@ impl SessionLoop {
         }
         if let Some(active) = self.active_compaction.take() {
             active.cancellation.cancel();
-            active.task.abort();
+            let mut task = active.task;
+            if tokio::time::timeout(std::time::Duration::from_secs(1), &mut task)
+                .await
+                .is_err()
+            {
+                task.abort();
+            }
             self.commit(
                 None,
                 JournalRecord::CompactionCancelled {

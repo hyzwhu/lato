@@ -591,7 +591,10 @@ fn history_to_messages(history: &[HistoryItem]) -> serde_json::Value {
                 index += 1;
             }
             HistoryItem::CompactionSummary(content) => {
-                out.push(serde_json::json!({"role":"system","content":format!("Compaction summary:\n{content}")}));
+                out.push(serde_json::json!({
+                    "role":"user",
+                    "content": crate::wrap_compaction_summary(content),
+                }));
                 index += 1;
             }
             HistoryItem::ToolResult { id, output } => {

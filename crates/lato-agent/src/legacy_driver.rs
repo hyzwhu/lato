@@ -1,3 +1,7 @@
+// Derived from: Grok Build@bb7f39d5858cbf5e00de639367f59debbdcb0138:crates/codegen/xai-grok-shell/src/session/compaction.rs
+// License: Apache-2.0
+// Lato changes: added current-model, typed-stream compaction sampling to the legacy turn adapter
+
 use crate::{
     HistoryItem, PromptKind, SessionActor, ToolApproval, build_compacted_history,
     build_compaction_prompt, compaction_size, find_compaction_anchors, history_to_model_messages,
@@ -452,8 +456,10 @@ mod compaction_tests {
     };
     use std::sync::{Arc, Mutex as StdMutex};
 
+    type ModelScript = Result<Vec<Result<ModelStreamEvent, ModelError>>, ModelError>;
+
     struct ScriptedPort {
-        scripts: StdMutex<Vec<Result<Vec<Result<ModelStreamEvent, ModelError>>, ModelError>>>,
+        scripts: StdMutex<Vec<ModelScript>>,
         requests: StdMutex<Vec<ModelRequest>>,
     }
 

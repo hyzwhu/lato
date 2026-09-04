@@ -1,3 +1,7 @@
+// Derived from: Grok Build@bb7f39d5858cbf5e00de639367f59debbdcb0138:crates/codegen/xai-grok-shell/src/session/compaction.rs and crates/codegen/xai-chat-state/src/compaction_utils.rs
+// License: Apache-2.0
+// Lato changes: reduced Grok's compaction pipeline to a bounded, tool-free manual operation over provider-neutral model messages
+
 use lato_core::{
     CompactionError, CompactionSize, MAX_COMPACTION_SUMMARY_BYTES,
     MIN_COMPACTION_REDUCTION_PERCENT, MIN_COMPACTION_SOURCE_CHARS, MIN_COMPACTION_SUMMARY_CHARS,
