@@ -138,7 +138,7 @@ mod tests {
 
     #[test]
     fn narrow_slash_completion_keeps_selected_command_and_composer_visible() {
-        let text = render_text_with_input(Language::En, 60, 24, true, "/", 16);
+        let text = render_text_with_input(Language::En, 60, 24, true, "/", 17);
         assert!(text.contains("/quit"), "{text}");
         assert!(text.contains("› /"), "{text}");
     }

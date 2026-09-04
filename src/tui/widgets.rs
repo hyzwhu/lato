@@ -1,6 +1,6 @@
 use super::{
     i18n::{TextKey, tr},
-    state::{AppState, Focus, MessageRole},
+    state::{AppState, CompactionUiState, Focus, MessageRole},
 };
 use ratatui::{
     Frame,
@@ -261,6 +261,20 @@ fn composer(frame: &mut Frame<'_>, area: Rect, app: &AppState, welcome: bool) {
             app.elapsed_seconds,
             tr(app.language, TextKey::Stop)
         )
+    } else if let CompactionUiState::Running { started_at } = &app.compaction {
+        let elapsed = started_at.elapsed().as_secs();
+        match app.language {
+            super::i18n::Language::ZhCn => {
+                format!(
+                    "● 正在压缩上下文… {elapsed}s                                      [Ctrl-C 取消]"
+                )
+            }
+            super::i18n::Language::En => {
+                format!(
+                    "● Compacting context… {elapsed}s                                      [Ctrl-C stop]"
+                )
+            }
+        }
     } else if welcome {
         tr(app.language, TextKey::WelcomeHint).to_string()
     } else {
@@ -275,7 +289,7 @@ fn composer(frame: &mut Frame<'_>, area: Rect, app: &AppState, welcome: bool) {
             })
             .style(
                 Style::default()
-                    .fg(if app.responding { AMBER } else { MUTED })
+                    .fg(if app.is_busy() { AMBER } else { MUTED })
                     .bg(BG),
             ),
         rows[1],

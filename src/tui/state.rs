@@ -6,7 +6,7 @@ use super::{
     input::InputBuffer,
     tool_panel::ToolPanelState,
 };
-use crate::client::{ClientUpdate, SessionSummary};
+use crate::client::{ClientUpdate, CompactionSizeResponse, SessionSummary};
 use std::{
     path::PathBuf,
     time::{Duration, Instant},
@@ -96,6 +96,25 @@ pub enum ToolStatus {
     Error,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CompactionUiState {
+    Idle,
+    Running {
+        started_at: Instant,
+    },
+    Completed {
+        before: CompactionSizeResponse,
+        after: CompactionSizeResponse,
+        checkpoint_id: String,
+        warning: Option<lato_core::AgentError>,
+    },
+    Failed {
+        code: String,
+        message: String,
+    },
+    Cancelled,
+}
+
 #[derive(Clone, Debug)]
 pub struct ToolCard {
     pub expanded: bool,
@@ -171,6 +190,7 @@ pub struct AppState {
     pub approval: Option<ApprovalState>,
     pub layout: LayoutMode,
     pub responding: bool,
+    pub compaction: CompactionUiState,
     pub response_started: Option<Instant>,
     pub elapsed_seconds: u64,
     pub error: Option<String>,
@@ -246,6 +266,7 @@ impl AppState {
             approval: None,
             layout: LayoutMode::Wide,
             responding: false,
+            compaction: CompactionUiState::Idle,
             response_started: None,
             elapsed_seconds: 0,
             error: None,
@@ -291,7 +312,7 @@ impl AppState {
     }
 
     pub fn arm_or_confirm_selected_delete(&mut self) -> Option<String> {
-        if self.responding {
+        if self.is_busy() {
             self.error = Some(
                 "Wait for the current response or cancel it first / 请先等待或取消当前回复".into(),
             );
@@ -429,7 +450,7 @@ impl AppState {
                 vec![Effect::PersistLanguage(language)]
             }
             AppEvent::NewSession => {
-                if self.responding {
+                if self.is_busy() {
                     self.error = Some(
                         "Wait for the current response or cancel it first / 请先等待或取消当前回复"
                             .into(),
@@ -447,7 +468,7 @@ impl AppState {
     }
 
     fn submit(&mut self) -> Vec<Effect> {
-        if self.responding || self.composer.is_empty() {
+        if self.is_busy() || self.composer.is_empty() {
             return Vec::new();
         }
         let text = self.composer.clear();
@@ -485,6 +506,7 @@ impl AppState {
                 self.focus = Focus::Chat;
                 self.screen = Screen::Welcome;
                 self.error = None;
+                self.compaction = CompactionUiState::Idle;
                 self.select_current_session();
             }
             BackendEvent::Resumed(id) => {
@@ -496,6 +518,7 @@ impl AppState {
                 self.scroll = 0;
                 self.focus = Focus::Chat;
                 self.screen = Screen::Main;
+                self.compaction = CompactionUiState::Idle;
             }
             BackendEvent::Sessions(summaries) => self.replace_sessions(summaries),
             BackendEvent::SessionRenamed(summary) => {
@@ -611,12 +634,81 @@ impl AppState {
             ClientUpdate::ToolFailed { id, error } => {
                 self.finish_tool(&id, ToolStatus::Error, error)
             }
-            ClientUpdate::PermissionRequested
-            | ClientUpdate::CompactionStarted { .. }
-            | ClientUpdate::CompactionCompleted { .. }
-            | ClientUpdate::CompactionFailed { .. }
-            | ClientUpdate::CompactionCancelled
-            | ClientUpdate::Unknown => {}
+            ClientUpdate::CompactionStarted { .. } => {
+                self.compaction = CompactionUiState::Running {
+                    started_at: Instant::now(),
+                };
+                self.error = None;
+            }
+            ClientUpdate::CompactionCompleted {
+                before,
+                after,
+                checkpoint_id,
+                warning,
+            } => {
+                let content = match self.language {
+                    Language::ZhCn => format!(
+                        "上下文压缩完成：{} 条消息 → {} 条消息{}",
+                        before.message_count,
+                        after.message_count,
+                        if warning.is_some() {
+                            "。已从提交的检查点恢复派生历史。"
+                        } else {
+                            ""
+                        }
+                    ),
+                    Language::En => format!(
+                        "Context compacted: {} messages → {} messages{}",
+                        before.message_count,
+                        after.message_count,
+                        if warning.is_some() {
+                            ". Derived history was recovered from the committed checkpoint."
+                        } else {
+                            ""
+                        }
+                    ),
+                };
+                self.messages.push(Message {
+                    role: MessageRole::System,
+                    content,
+                    expanded: true,
+                });
+                self.compaction = CompactionUiState::Completed {
+                    before,
+                    after,
+                    checkpoint_id,
+                    warning,
+                };
+            }
+            ClientUpdate::CompactionFailed { code, message } => {
+                let content = match self.language {
+                    Language::ZhCn => format!("上下文压缩失败，原历史仍然有效：{message}"),
+                    Language::En => {
+                        format!(
+                            "Context compaction failed; previous history remains active: {message}"
+                        )
+                    }
+                };
+                self.messages.push(Message {
+                    role: MessageRole::System,
+                    content,
+                    expanded: true,
+                });
+                self.error = Some(message.clone());
+                self.compaction = CompactionUiState::Failed { code, message };
+            }
+            ClientUpdate::CompactionCancelled => {
+                self.compaction = CompactionUiState::Cancelled;
+                self.messages.push(Message {
+                    role: MessageRole::System,
+                    content: match self.language {
+                        Language::ZhCn => "上下文压缩已取消。".into(),
+                        Language::En => "Context compaction cancelled.".into(),
+                    },
+                    expanded: true,
+                });
+            }
+            ClientUpdate::PermissionRequested | ClientUpdate::Unknown => {}
         }
     }
 
@@ -635,6 +727,20 @@ impl AppState {
             if tool.status == ToolStatus::Running {
                 tool.status = ToolStatus::Done;
             }
+        }
+    }
+
+    pub fn is_busy(&self) -> bool {
+        self.responding || matches!(&self.compaction, CompactionUiState::Running { .. })
+    }
+
+    pub fn compaction_status(&self) -> &'static str {
+        match &self.compaction {
+            CompactionUiState::Idle => "idle",
+            CompactionUiState::Running { .. } => "running",
+            CompactionUiState::Completed { .. } => "completed",
+            CompactionUiState::Failed { .. } => "failed",
+            CompactionUiState::Cancelled => "cancelled",
         }
     }
 }
@@ -681,6 +787,39 @@ mod tests {
             effects.as_slice(),
             [Effect::Backend(BackendCommand::Submit(text))] if text == "hello"
         ));
+    }
+
+    #[test]
+    fn compaction_updates_preserve_composer_and_render_one_terminal_system_message() {
+        let mut app = app();
+        app.composer.insert_str("draft next prompt");
+        app.apply_update(ClientUpdate::CompactionStarted {
+            compaction_id: "compact-1".into(),
+        });
+        assert!(app.is_busy());
+        assert!(!app.responding);
+        assert_eq!(app.composer.as_str(), "draft next prompt");
+
+        app.apply_update(ClientUpdate::CompactionCompleted {
+            before: CompactionSizeResponse {
+                message_count: 12,
+                serialized_bytes: 12_000,
+            },
+            after: CompactionSizeResponse {
+                message_count: 3,
+                serialized_bytes: 2_000,
+            },
+            checkpoint_id: "cp-1".into(),
+            warning: None,
+        });
+        assert!(!app.is_busy());
+        assert_eq!(app.composer.as_str(), "draft next prompt");
+        assert!(matches!(
+            app.compaction,
+            CompactionUiState::Completed { .. }
+        ));
+        assert_eq!(app.messages.len(), 1);
+        assert!(app.messages[0].content.contains("12 messages → 3 messages"));
     }
 
     #[test]

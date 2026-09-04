@@ -24,6 +24,7 @@ pub struct LegacyTurnDriver {
     state: Mutex<LegacyState>,
     passthrough: mpsc::UnboundedSender<serde_json::Value>,
     model_port: Arc<SwitchableModelPort>,
+    model_stream: Arc<dyn ModelStream>,
 }
 
 struct LegacyState {
@@ -67,9 +68,10 @@ impl LegacyTurnDriver {
         approval: Option<Arc<dyn ToolApproval>>,
     ) -> Self {
         let (actor_tx, actor_events) = mpsc::unbounded_channel();
+        let model_stream = stream.clone();
         let actor = SessionActor::new(stream, locks, trust, cwd)
             .with_interactive_events(actor_tx, session_id, approval);
-        Self::from_actor(actor, actor_events, passthrough, model_port)
+        Self::from_actor(actor, actor_events, passthrough, model_port, model_stream)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -85,9 +87,10 @@ impl LegacyTurnDriver {
     ) -> Self {
         let model_port = default_model_port(stream.clone());
         let (actor_tx, actor_events) = mpsc::unbounded_channel();
+        let model_stream = stream.clone();
         let actor = SessionActor::new_with_tool_runtime(stream, locks, trust, cwd, tool_runtime)
             .with_interactive_events(actor_tx, session_id, approval);
-        Self::from_actor(actor, actor_events, passthrough, model_port)
+        Self::from_actor(actor, actor_events, passthrough, model_port, model_stream)
     }
 
     fn from_actor(
@@ -95,6 +98,7 @@ impl LegacyTurnDriver {
         actor_events: mpsc::UnboundedReceiver<serde_json::Value>,
         passthrough: mpsc::UnboundedSender<serde_json::Value>,
         model_port: Arc<SwitchableModelPort>,
+        model_stream: Arc<dyn ModelStream>,
     ) -> Self {
         Self {
             state: Mutex::new(LegacyState {
@@ -103,6 +107,7 @@ impl LegacyTurnDriver {
             }),
             passthrough,
             model_port,
+            model_stream,
         }
     }
 
@@ -206,7 +211,10 @@ impl TurnDriver for LegacyTurnDriver {
         request: CompactionRequest,
         control: CompactionControl,
     ) -> Result<CompactionCandidate, AgentError> {
-        let active = self.model_port.snapshot().await;
+        let active = match self.model_stream.active_model_port() {
+            Some(active) => active,
+            None => self.model_port.snapshot().await,
+        };
         run_compaction(active, request, control).await
     }
 

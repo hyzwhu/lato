@@ -105,7 +105,7 @@ pub async fn run(
                 }
             },
             _ = tick.tick() => {
-                let animating = app.responding
+                let animating = app.is_busy()
                     || app.tools.iter().any(|tool| tool.status == state::ToolStatus::Running);
                 (app.reduce(AppEvent::Tick), animating)
             },
@@ -168,7 +168,7 @@ async fn execute_effects(
             Effect::Sessions => {
                 app.composer.clear();
                 app.overlay = None;
-                if app.responding {
+                if app.is_busy() {
                     app.error = Some(
                         "Cancel the current response before switching sessions / 请先取消当前回复"
                             .into(),
@@ -209,7 +209,7 @@ async fn execute_effects(
                 }
             }
             Effect::ConfigureModel | Effect::Login => {
-                if app.responding {
+                if app.is_busy() {
                     app.error = Some(
                         "Wait for the current response or cancel it first / 请先等待或取消当前回复"
                             .into(),
@@ -260,7 +260,7 @@ async fn execute_effects(
                 }
             }
             Effect::RenameSession { session_id, title } => {
-                if app.responding {
+                if app.is_busy() {
                     app.error = Some(
                         "Wait for the current response or cancel it first / 请先等待或取消当前回复"
                             .into(),
@@ -286,7 +286,7 @@ async fn execute_effects(
                 }
             }
             Effect::ConfirmDeleteSession(session_id) => {
-                if app.responding {
+                if app.is_busy() {
                     app.error = Some(
                         "Wait for the current response or cancel it first / 请先等待或取消当前回复"
                             .into(),
@@ -351,7 +351,7 @@ fn handle_key(
     trust: &SessionTrust,
 ) -> Vec<Effect> {
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-        if app.responding {
+        if app.is_busy() {
             if let Err(error) = backend.send(BackendCommand::Cancel) {
                 app.error = Some(error);
             }
@@ -547,6 +547,22 @@ fn submit_or_command(app: &mut AppState, trust: &SessionTrust) -> Vec<Effect> {
             app.composer.clear();
             app.reduce(AppEvent::NewSession)
         }
+        "/compact" => {
+            if app.is_busy() {
+                app.error = Some(
+                    "Wait for the current work or cancel it first / 请先等待或取消当前任务".into(),
+                );
+                return Vec::new();
+            }
+            let context = raw_command
+                .find(char::is_whitespace)
+                .map(|index| raw_command[index..].trim().to_owned())
+                .filter(|value| !value.is_empty());
+            app.composer.clear();
+            app.screen = state::Screen::Main;
+            app.error = None;
+            vec![Effect::Backend(BackendCommand::Compact(context))]
+        }
         "/lang" | "/language" => {
             app.composer.clear();
             let language = match app.language {
@@ -566,10 +582,11 @@ fn submit_or_command(app: &mut AppState, trust: &SessionTrust) -> Vec<Effect> {
             app.messages.push(Message {
                 role: MessageRole::System,
                 content: format!(
-                    "{} · {}\n{}\n{}\nlato resume {} --sandbox off",
+                    "{} · {}\n{}\ncompaction: {}\n{}\nlato resume {} --sandbox off",
                     app.model,
                     app.workspace.display(),
                     crate::permissions::describe(trust, app.language),
+                    app.compaction_status(),
                     match app.language {
                         Language::ZhCn => "如需更改范围，请退出并恢复会话。可选 off / workspace / read-only，例如：",
                         Language::En => "To change scope, exit and resume with off / workspace / read-only. Example:",
@@ -606,7 +623,7 @@ fn resume_selected_session(app: &mut AppState) -> Vec<Effect> {
         app.focus = state::Focus::Chat;
         return Vec::new();
     }
-    if app.responding {
+    if app.is_busy() {
         app.error = Some(
             "Wait for the current response or cancel it first / 请先等待或取消当前回复".into(),
         );
@@ -775,6 +792,31 @@ mod tests {
     }
 
     #[test]
+    fn compact_command_preserves_context_without_creating_chat_bubbles() {
+        let workspace = tempfile::tempdir().unwrap();
+        let trust = SessionTrust::for_interactive(workspace.path(), false);
+        let mut app = AppState::new(
+            Language::En,
+            workspace.path().to_path_buf(),
+            "provider/model".into(),
+            "current".into(),
+            vec!["current".into()],
+        );
+        app.composer.insert_str("/compact Preserve Parser Details");
+        let effects = submit_or_command(&mut app, &trust);
+        assert!(matches!(
+            &effects[..],
+            [Effect::Backend(BackendCommand::Compact(Some(context)))]
+                if context == "Preserve Parser Details"
+        ));
+        assert!(app.composer.is_empty());
+        assert!(app.messages.iter().all(|message| {
+            message.role != crate::tui::state::MessageRole::User
+                && message.role != crate::tui::state::MessageRole::Assistant
+        }));
+    }
+
+    #[test]
     fn new_and_clear_request_a_fresh_session_without_premature_reset() {
         let workspace = tempfile::tempdir().unwrap();
         let trust = SessionTrust::for_interactive(workspace.path(), false);
@@ -877,7 +919,7 @@ mod tests {
 
         app.composer.insert_str("/");
         app.refresh_slash_completion();
-        assert_eq!(app.slash_completion().len(), 17);
+        assert_eq!(app.slash_completion().len(), 18);
         assert!(
             handle_slash_completion_key(
                 &mut app,

@@ -1,4 +1,4 @@
-use crate::client::{ClientUpdate, InteractiveAcpClient, SessionSummary};
+use crate::client::{ClientUpdate, CompactionResponse, InteractiveAcpClient, SessionSummary};
 use lato_agent::{ApprovalRequest, ToolApproval};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
@@ -6,6 +6,7 @@ use tokio::sync::{mpsc, oneshot};
 #[derive(Debug)]
 pub enum BackendCommand {
     Submit(String),
+    Compact(Option<String>),
     Cancel,
     NewSession,
     Resume(String),
@@ -85,7 +86,13 @@ impl BackendHandle {
     }
 }
 
-type ActiveTurn = tokio::task::JoinHandle<(InteractiveAcpClient, TurnEnd)>;
+type ActiveWork = tokio::task::JoinHandle<(InteractiveAcpClient, ActiveWorkEnd)>;
+
+#[derive(Debug)]
+enum ActiveWorkEnd {
+    Turn(TurnEnd),
+    Compaction(Result<CompactionResponse, String>),
+}
 
 #[derive(Debug)]
 enum TurnEnd {
@@ -104,7 +111,7 @@ pub fn spawn(
     };
     tokio::task::spawn_local(async move {
         let mut client = Some(client);
-        let mut active: Option<ActiveTurn> = None;
+        let mut active: Option<ActiveWork> = None;
         let mut cancel: Option<oneshot::Sender<()>> = None;
         if let Some(session) = client.as_ref().map(InteractiveAcpClient::session_id) {
             let _ = event_tx.send(BackendEvent::SessionReady(session.to_string()));
@@ -125,8 +132,8 @@ pub fn spawn(
                             }
                             break;
                         }
-                        Some(BackendCommand::Submit(_)) => {
-                            let _ = event_tx.send(BackendEvent::Error("a turn is already running".into()));
+                        Some(BackendCommand::Submit(_) | BackendCommand::Compact(_)) => {
+                            let _ = event_tx.send(BackendEvent::Error("session work is already running".into()));
                         }
                         Some(BackendCommand::Resume(_)) => {
                             let _ = event_tx.send(BackendEvent::Error("cannot switch sessions while a turn is running".into()));
@@ -140,23 +147,29 @@ pub fn spawn(
                     },
                     result = turn => {
                         match result {
-                            Ok((mut returned, TurnEnd::Completed(text))) => {
+                            Ok((mut returned, ActiveWorkEnd::Turn(TurnEnd::Completed(text)))) => {
                                 let _ = event_tx.send(BackendEvent::TurnCompleted(text));
                                 if let Ok(sessions) = returned.list_session_summaries().await {
                                     let _ = event_tx.send(BackendEvent::Sessions(sessions));
                                 }
                                 client = Some(returned);
                             }
-                            Ok((returned, TurnEnd::Cancelled(cancelled))) => {
+                            Ok((returned, ActiveWorkEnd::Turn(TurnEnd::Cancelled(cancelled)))) => {
                                 client = Some(returned);
                                 match cancelled {
                                     Ok(()) => { let _ = event_tx.send(BackendEvent::TurnCancelled); }
                                     Err(error) => { let _ = event_tx.send(BackendEvent::Error(error)); }
                                 }
                             }
-                            Ok((returned, TurnEnd::Failed(error))) => {
+                            Ok((returned, ActiveWorkEnd::Turn(TurnEnd::Failed(error)))) => {
                                 client = Some(returned);
                                 let _ = event_tx.send(BackendEvent::Error(error));
+                            }
+                            Ok((returned, ActiveWorkEnd::Compaction(result))) => {
+                                client = Some(returned);
+                                if let Err(error) = result {
+                                    let _ = event_tx.send(BackendEvent::Error(error));
+                                }
                             }
                             Err(error) => {
                                 let _ = event_tx.send(BackendEvent::Error(format!("turn task failed: {error}")));
@@ -202,14 +215,62 @@ pub fn spawn(
                         }
                         if cancelled {
                             let result = owned.cancel().await;
-                            (owned, TurnEnd::Cancelled(result))
+                            (owned, ActiveWorkEnd::Turn(TurnEnd::Cancelled(result)))
                         } else {
                             let result = response.expect("completed branch sets response");
                             match result {
-                                Ok(text) => (owned, TurnEnd::Completed(text)),
-                                Err(error) => (owned, TurnEnd::Failed(error)),
+                                Ok(text) => (owned, ActiveWorkEnd::Turn(TurnEnd::Completed(text))),
+                                Err(error) => (owned, ActiveWorkEnd::Turn(TurnEnd::Failed(error))),
                             }
                         }
+                    }));
+                }
+                Some(BackendCommand::Compact(user_context)) => {
+                    let Some(mut owned) = client.take() else {
+                        let _ = event_tx.send(BackendEvent::Error("session is unavailable".into()));
+                        continue;
+                    };
+                    let updates = event_tx.clone();
+                    let (cancel_tx, cancel_rx) = oneshot::channel();
+                    cancel = Some(cancel_tx);
+                    active = Some(tokio::task::spawn_local(async move {
+                        let cancelled;
+                        let response;
+                        {
+                            let compact = owned.compact_streaming(user_context, |raw| {
+                                let update = ClientUpdate::from_json(raw);
+                                if update != ClientUpdate::Unknown {
+                                    let _ = updates.send(BackendEvent::Update(update));
+                                }
+                            });
+                            tokio::pin!(compact);
+                            tokio::select! {
+                                result = &mut compact => {
+                                    response = Some(result);
+                                    cancelled = false;
+                                }
+                                _ = cancel_rx => {
+                                    response = None;
+                                    cancelled = true;
+                                }
+                            }
+                        }
+                        let result = if cancelled {
+                            owned.cancel().await.map(|_| {
+                                let _ = updates
+                                    .send(BackendEvent::Update(ClientUpdate::CompactionCancelled));
+                                CompactionResponse {
+                                    status: "cancelled".into(),
+                                    before: None,
+                                    after: None,
+                                    checkpoint_id: None,
+                                    warning: None,
+                                }
+                            })
+                        } else {
+                            response.expect("completed branch sets response")
+                        };
+                        (owned, ActiveWorkEnd::Compaction(result))
                     }));
                 }
                 Some(BackendCommand::Cancel) => {

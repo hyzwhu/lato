@@ -4,7 +4,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use std::sync::Arc;
-use tokio::sync::{Mutex, RwLock, mpsc};
+use tokio::sync::{Mutex, mpsc};
 
 pub const CONTEXT_HARD_LIMIT_BYTES: usize = 512_000;
 
@@ -37,31 +37,27 @@ pub trait ModelStream: Send + Sync {
 }
 
 pub struct SwitchableModelStream {
-    inner: RwLock<Arc<dyn ModelStream>>,
-    active: std::sync::RwLock<Option<ActiveModelPort>>,
+    inner: std::sync::RwLock<Arc<dyn ModelStream>>,
 }
 
 impl SwitchableModelStream {
     pub fn new(initial: Arc<dyn ModelStream>) -> Self {
-        let active = initial.active_model_port();
         Self {
-            inner: RwLock::new(initial),
-            active: std::sync::RwLock::new(active),
+            inner: std::sync::RwLock::new(initial),
         }
     }
     pub async fn set(&self, stream: Arc<dyn ModelStream>) {
-        *self.active.write().expect("model binding lock poisoned") = stream.active_model_port();
-        *self.inner.write().await = stream;
+        *self.inner.write().expect("model stream lock poisoned") = stream;
     }
 }
 
 #[async_trait]
 impl ModelStream for SwitchableModelStream {
     fn active_model_port(&self) -> Option<ActiveModelPort> {
-        self.active
+        self.inner
             .read()
-            .expect("model binding lock poisoned")
-            .clone()
+            .expect("model stream lock poisoned")
+            .active_model_port()
     }
 
     async fn stream(
@@ -70,7 +66,11 @@ impl ModelStream for SwitchableModelStream {
         context: serde_json::Value,
         tx: mpsc::Sender<StreamPiece>,
     ) -> Result<(), String> {
-        let stream = self.inner.read().await.clone();
+        let stream = self
+            .inner
+            .read()
+            .expect("model stream lock poisoned")
+            .clone();
         stream.stream(prompt_bytes, context, tx).await
     }
 }

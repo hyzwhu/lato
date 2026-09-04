@@ -33,6 +33,11 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         description_en: "Clear this session",
     },
     SlashCommand {
+        name: "/compact",
+        description_zh: "压缩当前会话上下文",
+        description_en: "Compact the current session context",
+    },
+    SlashCommand {
         name: "/sessions",
         description_zh: "切换会话",
         description_en: "Switch session",
@@ -130,7 +135,7 @@ mod tests {
     #[test]
     fn slash_lists_every_command_and_alias() {
         let all = matches("/");
-        assert_eq!(all.len(), 17);
+        assert_eq!(all.len(), 18);
         assert!(all.iter().any(|command| command.name == "/language"));
         assert!(all.iter().any(|command| command.name == "/quit"));
         assert_eq!(all.len(), SLASH_COMMANDS.len());
@@ -138,6 +143,7 @@ mod tests {
 
     #[test]
     fn slash_filters_case_insensitively_and_stops_at_arguments() {
+        assert_eq!(matches("/COM")[0].name, "/compact");
         let names = matches("/MO")
             .into_iter()
             .map(|command| command.name)
