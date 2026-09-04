@@ -36,9 +36,7 @@ pub enum Invocation {
         sandbox: Option<SandboxArg>,
     },
     Prompt(PromptArgs),
-    Sessions {
-        json: bool,
-    },
+    Sessions(SessionCommand),
     Resume {
         session_id: String,
         language: Option<Language>,
@@ -50,6 +48,13 @@ pub enum Invocation {
     },
     Doctor(DoctorArgs),
     Acp,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SessionCommand {
+    List { json: bool },
+    Rename { session_id: String, title: String },
+    Delete { session_id: String, yes: bool },
 }
 
 #[derive(Debug, Parser)]
@@ -95,6 +100,8 @@ enum Command {
         /// Emit versioned JSON
         #[arg(long, action = ArgAction::SetTrue)]
         json: bool,
+        #[command(subcommand)]
+        action: Option<SessionsAction>,
     },
     /// Resume a persisted session in interactive mode
     Resume { session_id: String },
@@ -127,6 +134,23 @@ enum Command {
     Acp,
 }
 
+#[derive(Debug, Subcommand)]
+enum SessionsAction {
+    /// Assign a manual title to a persisted session
+    Rename {
+        session_id: String,
+        #[arg(value_name = "TITLE", num_args = 1..)]
+        title: Vec<String>,
+    },
+    /// Permanently delete a persisted session
+    Delete {
+        session_id: String,
+        /// Skip the interactive confirmation
+        #[arg(long, action = ArgAction::SetTrue)]
+        yes: bool,
+    },
+}
+
 impl Cli {
     fn into_invocation(self) -> Result<Invocation, clap::Error> {
         if let Some(command) = self.command {
@@ -149,7 +173,26 @@ impl Cli {
                 ));
             }
             return Ok(match command {
-                Command::Sessions { json } => Invocation::Sessions { json },
+                Command::Sessions { json, action } => {
+                    if json && action.is_some() {
+                        return Err(semantic_error(
+                            ErrorKind::ArgumentConflict,
+                            "--json cannot be combined with a sessions action",
+                        ));
+                    }
+                    Invocation::Sessions(match action {
+                        None => SessionCommand::List { json },
+                        Some(SessionsAction::Rename { session_id, title }) => {
+                            SessionCommand::Rename {
+                                session_id,
+                                title: title.join(" "),
+                            }
+                        }
+                        Some(SessionsAction::Delete { session_id, yes }) => {
+                            SessionCommand::Delete { session_id, yes }
+                        }
+                    })
+                }
                 Command::Resume { session_id } => Invocation::Resume {
                     session_id,
                     language: self.language,
@@ -219,7 +262,7 @@ pub fn parse(args: Vec<String>) -> Result<Invocation, clap::Error> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Invocation, LoginMethod, SandboxArg, parse};
+    use super::{Invocation, LoginMethod, SandboxArg, SessionCommand, parse};
     use crate::tui::i18n::Language;
     use clap::error::ErrorKind;
 
@@ -241,6 +284,37 @@ mod tests {
         assert_eq!(prompt.text, "hello world");
         assert_eq!(prompt.sandbox, SandboxArg::Workspace);
         assert_eq!(prompt.model.as_deref(), Some("openai/gpt-4.1"));
+    }
+
+    #[test]
+    fn parses_session_management_commands() {
+        assert_eq!(
+            parse(vec![
+                "sessions".into(),
+                "rename".into(),
+                "s1".into(),
+                "New".into(),
+                "title".into(),
+            ])
+            .unwrap(),
+            Invocation::Sessions(SessionCommand::Rename {
+                session_id: "s1".into(),
+                title: "New title".into(),
+            })
+        );
+        assert_eq!(
+            parse(vec![
+                "sessions".into(),
+                "delete".into(),
+                "s1".into(),
+                "--yes".into(),
+            ])
+            .unwrap(),
+            Invocation::Sessions(SessionCommand::Delete {
+                session_id: "s1".into(),
+                yes: true,
+            })
+        );
     }
 
     #[test]

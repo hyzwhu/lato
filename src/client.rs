@@ -4,6 +4,16 @@ use lato_protocol::JsonRpcReq;
 use lato_workspace::SessionTrust;
 use std::sync::Arc;
 
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionSummary {
+    pub session_id: String,
+    pub title: String,
+    pub title_source: String,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ClientUpdate {
     TextDelta(String),
@@ -304,6 +314,59 @@ pub async fn list_sessions_over_acp(cwd: std::path::PathBuf) -> Result<Vec<Strin
                 .ok_or_else(|| "invalid session id in response".to_string())
         })
         .collect()
+}
+
+pub async fn list_session_summaries_over_acp(
+    cwd: std::path::PathBuf,
+) -> Result<Vec<SessionSummary>, String> {
+    let result = call_session_extension(cwd, "lato/session/list", serde_json::json!({})).await?;
+    serde_json::from_value(result["sessions"].clone())
+        .map_err(|error| format!("invalid structured session list: {error}"))
+}
+
+pub async fn rename_session_over_acp(
+    cwd: std::path::PathBuf,
+    session_id: &str,
+    title: &str,
+) -> Result<SessionSummary, String> {
+    let result = call_session_extension(
+        cwd,
+        "lato/session/rename",
+        serde_json::json!({"sessionId": session_id, "title": title}),
+    )
+    .await?;
+    serde_json::from_value(result).map_err(|error| format!("invalid rename response: {error}"))
+}
+
+pub async fn delete_session_over_acp(
+    cwd: std::path::PathBuf,
+    session_id: &str,
+) -> Result<(), String> {
+    call_session_extension(
+        cwd,
+        "lato/session/delete",
+        serde_json::json!({"sessionId": session_id}),
+    )
+    .await
+    .map(|_| ())
+}
+
+async fn call_session_extension(
+    cwd: std::path::PathBuf,
+    method: &str,
+    params: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let (tx, _updates) = tokio::sync::mpsc::unbounded_channel();
+    let trust = SessionTrust::for_headless_prompt(&cwd);
+    let mut host = AcpHost::new(cwd, trust, tx, default_fake_stream());
+    let _ = host
+        .handle(req(1, "initialize", serde_json::json!({})))
+        .await;
+    let response = host
+        .handle(req(2, method, params))
+        .await
+        .ok_or("no response")?;
+    response_result(&response).cloned()
 }
 
 fn response_result(response: &serde_json::Value) -> Result<&serde_json::Value, String> {

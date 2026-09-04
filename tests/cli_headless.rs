@@ -51,7 +51,7 @@ fn sessions_render_empty_human_and_versioned_json() {
     assert!(json.status.success());
     assert!(json.stderr.is_empty());
     let body: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
-    assert_eq!(body["schema_version"], 1);
+    assert_eq!(body["schema_version"], 2);
     assert_eq!(body["sessions"], serde_json::json!([]));
 }
 
@@ -76,7 +76,9 @@ fn sessions_are_listed_newest_first() {
     let body: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     let sessions = body["sessions"].as_array().unwrap();
     assert_eq!(sessions.len(), 2);
-    assert!(sessions[0].as_str().unwrap() > sessions[1].as_str().unwrap());
+    assert!(
+        sessions[0]["sessionId"].as_str().unwrap() > sessions[1]["sessionId"].as_str().unwrap()
+    );
 }
 
 #[test]

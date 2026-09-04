@@ -174,7 +174,7 @@ pub async fn run(args: Vec<String>) -> i32 {
             interactive(InteractiveStartup::New, language, sandbox).await
         }
         Ok(Invocation::Prompt(args)) => prompt(args).await,
-        Ok(Invocation::Sessions { json }) => crate::sessions::list(json).await,
+        Ok(Invocation::Sessions(command)) => crate::sessions::run(command).await,
         Ok(Invocation::Resume {
             session_id,
             language,
