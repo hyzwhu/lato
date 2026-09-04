@@ -738,6 +738,7 @@ mod tests {
         assert_eq!(app.tool_panel.selected, 2);
         app.tool_panel.scroll = 10;
         app.reduce(AppEvent::NewSession);
+        app.apply_backend(BackendEvent::NewSessionCreated("session-2".into()));
         assert_eq!(app.tool_panel.selected, 0);
         assert_eq!(app.tool_panel.scroll, 0);
         app.apply_update(ClientUpdate::ToolStarted {

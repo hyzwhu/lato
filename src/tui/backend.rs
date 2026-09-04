@@ -222,8 +222,9 @@ pub fn spawn(
                     };
                     match owned.clear().await {
                         Ok(()) => {
-                            let _ = event_tx
-                                .send(BackendEvent::NewSessionCreated(owned.session_id().to_string()));
+                            let _ = event_tx.send(BackendEvent::NewSessionCreated(
+                                owned.session_id().to_string(),
+                            ));
                             if let Ok(sessions) = owned.list_session_summaries().await {
                                 let _ = event_tx.send(BackendEvent::Sessions(sessions));
                             }
