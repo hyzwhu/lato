@@ -1,13 +1,22 @@
-use crate::{CompactSession, CompactionId, TurnId};
+use crate::{CompactSession, CompactionId, ModelSelection, TurnId};
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Command {
     StartTurn(StartTurn),
     SteerTurn(UserInput),
-    CancelTurn { turn_id: TurnId },
+    CancelTurn {
+        turn_id: TurnId,
+    },
     CompactSession(CompactSession),
-    CancelCompaction { compaction_id: CompactionId },
+    CancelCompaction {
+        compaction_id: CompactionId,
+    },
+    SelectModel {
+        selection: ModelSelection,
+        model_family: Option<String>,
+        context_window: Option<u64>,
+    },
     Shutdown,
 }
 

@@ -1,13 +1,12 @@
 use crate::{
-    RuntimeCompactionOutcome, RuntimePromptOutcome, RuntimeSession, ToolApproval, TranscriptStore,
-    import_legacy_if_needed,
+    PreparedModelSwitch, RuntimeCompactionOutcome, RuntimePromptOutcome, RuntimeSession,
+    ToolApproval, TranscriptStore, import_legacy_if_needed,
 };
 use lato_ai::{
-    CATALOG, CredentialStore, CustomHttpModelStream, CustomModel, FakeModelStream, HttpModelStream,
-    ModelStream, StreamPiece, SwitchableModelPort, SwitchableModelStream, adapt_model_endpoint,
-    adapt_model_port, api_key_login_allowed, custom_model_auth, dialect_implemented,
-    get_auth_refreshing, load_models_json, lookup_model, oauth_allowed, phase0_supported,
-    store_oauth,
+    ActiveModelStream, CATALOG, CredentialStore, CustomHttpModelStream, CustomModel,
+    FakeModelStream, HttpModelStream, ModelStream, StreamPiece, adapt_model_endpoint,
+    api_key_login_allowed, custom_model_auth, dialect_implemented, get_auth_refreshing,
+    load_models_json, lookup_model, oauth_allowed, phase0_supported, store_oauth,
 };
 use lato_core::{EventStore, JournalReplay, SessionId, SessionStore};
 use lato_mcp::{PluginOrigin, PluginPackage, discover_plugin};
@@ -24,11 +23,9 @@ pub struct AcpHost {
     next_id: usize,
     cwd: PathBuf,
     trust: SessionTrust,
-    stream: Arc<SwitchableModelStream>,
-    model_port: Arc<SwitchableModelPort>,
+    default_endpoint: ActiveModelStream,
     locks: Arc<FileLocks>,
     pub prompts_via_acp: usize,
-    model: (String, String),
     transcripts: Option<TranscriptStore>,
     events: Option<Arc<FileEventStore>>,
     credentials: Option<CredentialStore>,
@@ -87,15 +84,19 @@ impl AcpHost {
         tool_approval: Option<Arc<dyn ToolApproval>>,
         lato_home: Option<PathBuf>,
     ) -> Self {
-        let active = stream.active_model_port().unwrap_or_else(|| {
-            adapt_model_port("openai", "gpt-4.1", stream.clone())
-                .expect("fallback model selection is statically valid")
-        });
-        let model_port = Arc::new(SwitchableModelPort::from_active(active.clone()));
-        let stream = Arc::new(SwitchableModelStream::new(lato_ai::ActiveModelStream {
-            stream,
-            port: active,
-        }));
+        let default_endpoint = if let Some(port) = stream.active_model_port() {
+            ActiveModelStream { stream, port }
+        } else {
+            let port = adapt_model_endpoint(
+                "openai",
+                "gpt-4.1",
+                lato_ai::ModelMetadata::default(),
+                stream.clone(),
+            )
+            .expect("fallback model selection is statically valid")
+            .port;
+            ActiveModelStream { stream, port }
+        };
         let transcripts = lato_home
             .as_deref()
             .and_then(|home| TranscriptStore::open(home).ok());
@@ -117,11 +118,9 @@ impl AcpHost {
             next_id: 1,
             cwd,
             trust,
-            stream,
-            model_port,
+            default_endpoint,
             locks: Arc::new(FileLocks::new()),
             prompts_via_acp: 0,
-            model: ("openai".into(), "gpt-4.1".into()),
             transcripts,
             events,
             credentials,
@@ -132,11 +131,11 @@ impl AcpHost {
     }
 
     async fn make_runtime_session(
-        &self,
+        &mut self,
         sid: &str,
         replay: Option<JournalReplay>,
     ) -> Result<Arc<RuntimeSession>, String> {
-        if let Some(events) = &self.events {
+        if let Some(events) = self.events.clone() {
             let replay = match replay {
                 Some(replay) => replay,
                 None => events
@@ -144,11 +143,17 @@ impl AcpHost {
                     .await
                     .map_err(|error| error.to_string())?,
             };
-            let store: Arc<dyn SessionStore> = events.clone();
-            return RuntimeSession::new_with_store_and_model_port(
+            let store: Arc<dyn SessionStore> = events;
+            let endpoint = match replay.projection.model_selection.as_ref() {
+                Some(selection) => self
+                    .prepare_model_endpoint(&selection.provider, &selection.model)
+                    .await
+                    .map_err(|error| format!("model.unavailable_on_resume: {error}"))?,
+                None => self.default_endpoint.clone(),
+            };
+            return RuntimeSession::new_with_store_and_endpoint(
                 sid.to_string(),
-                self.stream.clone(),
-                self.model_port.clone(),
+                endpoint,
                 self.locks.clone(),
                 self.trust.clone(),
                 self.cwd.clone(),
@@ -161,10 +166,9 @@ impl AcpHost {
             .map(Arc::new)
             .map_err(|error| error.to_string());
         }
-        Ok(Arc::new(RuntimeSession::new_with_model_port(
+        Ok(Arc::new(RuntimeSession::new_with_endpoint(
             sid.to_string(),
-            self.stream.clone(),
-            self.model_port.clone(),
+            self.default_endpoint.clone(),
             self.locks.clone(),
             self.trust.clone(),
             self.cwd.clone(),
@@ -173,7 +177,7 @@ impl AcpHost {
         )))
     }
 
-    async fn make_new_runtime_session(&self, sid: &str) -> Result<Arc<RuntimeSession>, String> {
+    async fn make_new_runtime_session(&mut self, sid: &str) -> Result<Arc<RuntimeSession>, String> {
         let Some(events) = &self.events else {
             return self.make_runtime_session(sid, None).await;
         };
@@ -201,6 +205,59 @@ impl AcpHost {
             .await
             .map_err(|error| error.to_string())?;
         self.make_runtime_session(sid, Some(replay)).await
+    }
+
+    async fn prepare_model_endpoint(
+        &mut self,
+        provider: &str,
+        model: &str,
+    ) -> Result<ActiveModelStream, String> {
+        if self.default_endpoint.port.selection.provider == provider
+            && self.default_endpoint.port.selection.model == model
+        {
+            return Ok(self.default_endpoint.clone());
+        }
+        if let Some(catalog_model) = lookup_model(provider, model) {
+            if !phase0_supported(catalog_model.api) {
+                return Err("dialect_unimplemented".into());
+            }
+            let store = self
+                .credentials
+                .as_mut()
+                .ok_or_else(|| "model credentials unavailable".to_string())?;
+            let auth = get_auth_refreshing(
+                store,
+                provider,
+                &|name| std::env::var(name).ok(),
+                None,
+                &reqwest::Client::new(),
+            )
+            .await
+            .map_err(|error| format!("oauth refresh failed: {error}"))?
+            .ok_or_else(|| "model credentials unavailable".to_string())?;
+            let metadata = catalog_model.metadata();
+            let raw: Arc<dyn ModelStream> = Arc::new(HttpModelStream::new(catalog_model, auth));
+            return adapt_model_endpoint(provider, model, metadata, raw)
+                .map_err(|error| format!("invalid model selection: {error}"));
+        }
+        let custom = self
+            .custom_models
+            .iter()
+            .find(|entry| entry.provider == provider && entry.id == model)
+            .cloned()
+            .ok_or_else(|| "unknown model".to_string())?;
+        if !dialect_implemented(custom.api) {
+            return Err("dialect_unimplemented".into());
+        }
+        let auth = custom_model_auth(&custom, &|name| std::env::var(name).ok())
+            .ok_or_else(|| "model credentials unavailable".to_string())?;
+        let metadata = lato_ai::ModelMetadata {
+            context_window: custom.context_window,
+            model_family: custom.model_family.clone(),
+        };
+        let raw: Arc<dyn ModelStream> = Arc::new(CustomHttpModelStream::new(custom, auth));
+        adapt_model_endpoint(provider, model, metadata, raw)
+            .map_err(|error| format!("invalid model selection: {error}"))
     }
 
     async fn session_exists(&self, sid: &str) -> Result<bool, String> {
@@ -558,16 +615,39 @@ impl AcpHost {
             }
             "session/set_model" => {
                 let p = req.params.unwrap_or_default();
-                let provider = p
-                    .get("provider")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("openai");
-                let model = p
+                let Some(sid) = p.get("sessionId").and_then(|value| value.as_str()) else {
+                    return Some(err(id, -32602, "missing sessionId"));
+                };
+                let Some(model) = p
                     .get("model")
                     .or_else(|| p.get("modelId"))
                     .and_then(|v| v.as_str())
-                    .unwrap_or("gpt-4.1");
-                let supported = lookup_model(provider, model)
+                else {
+                    return Some(err(id, -32602, "missing model"));
+                };
+                let provider = match p.get("provider").and_then(|value| value.as_str()) {
+                    Some(provider) => provider.to_owned(),
+                    None => {
+                        let mut matches = CATALOG
+                            .iter()
+                            .filter(|entry| entry.id == model)
+                            .map(|entry| entry.provider)
+                            .chain(
+                                self.custom_models
+                                    .iter()
+                                    .filter(|entry| entry.id == model)
+                                    .map(|entry| entry.provider.as_str()),
+                            )
+                            .collect::<Vec<_>>();
+                        matches.sort_unstable();
+                        matches.dedup();
+                        if matches.len() != 1 {
+                            return Some(err(id, -32000, "ambiguous or unknown modelId"));
+                        }
+                        matches[0].to_owned()
+                    }
+                };
+                let supported = lookup_model(&provider, model)
                     .map(|model| phase0_supported(model.api))
                     .or_else(|| {
                         self.custom_models
@@ -580,73 +660,40 @@ impl AcpHost {
                     Some(false) => return Some(err(id, -32000, "dialect_unimplemented")),
                     None => return Some(err(id, -32000, "unknown model")),
                 }
-                if let Some(catalog_model) = lookup_model(provider, model) {
-                    if let Some(store) = self.credentials.as_mut() {
-                        match get_auth_refreshing(
-                            store,
-                            provider,
-                            &|name| std::env::var(name).ok(),
-                            None,
-                            &reqwest::Client::new(),
-                        )
-                        .await
-                        {
-                            Ok(Some(auth)) => {
-                                let metadata = catalog_model.metadata();
-                                let raw: Arc<dyn ModelStream> =
-                                    Arc::new(HttpModelStream::new(catalog_model, auth));
-                                let endpoint =
-                                    match adapt_model_endpoint(provider, model, metadata, raw) {
-                                        Ok(endpoint) => endpoint,
-                                        Err(error) => {
-                                            return Some(err(
-                                                id,
-                                                -32000,
-                                                format!("invalid model selection: {error}"),
-                                            ));
-                                        }
-                                    };
-                                self.model_port.set_active(endpoint.port.clone()).await;
-                                self.stream.set_active(endpoint).await
-                            }
-                            Ok(None) => {}
-                            Err(error) => {
-                                return Some(err(
-                                    id,
-                                    -32000,
-                                    format!("oauth refresh failed: {error}"),
-                                ));
-                            }
-                        }
-                    }
-                } else if let Some(custom) = self
-                    .custom_models
-                    .iter()
-                    .find(|entry| entry.provider == provider && entry.id == model)
-                    .cloned()
-                    && let Some(auth) = custom_model_auth(&custom, &|name| std::env::var(name).ok())
+                let endpoint = match self.prepare_model_endpoint(&provider, model).await {
+                    Ok(endpoint) => endpoint,
+                    Err(error) => return Some(err(id, -32000, error)),
+                };
+                let Some(session) = self.sessions.get(sid).cloned() else {
+                    return Some(err(id, -32000, "unknown session"));
+                };
+                match session
+                    .switch_model(PreparedModelSwitch { active: endpoint })
+                    .await
                 {
-                    let metadata = lato_ai::ModelMetadata {
-                        context_window: custom.context_window,
-                        model_family: custom.model_family.clone(),
-                    };
-                    let raw: Arc<dyn ModelStream> =
-                        Arc::new(CustomHttpModelStream::new(custom, auth));
-                    let endpoint = match adapt_model_endpoint(provider, model, metadata, raw) {
-                        Ok(endpoint) => endpoint,
-                        Err(error) => {
-                            return Some(err(
-                                id,
-                                -32000,
-                                format!("invalid model selection: {error}"),
-                            ));
-                        }
-                    };
-                    self.model_port.set_active(endpoint.port.clone()).await;
-                    self.stream.set_active(endpoint).await;
+                    Ok(outcome) => {
+                        let _ = self.updates.send(serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "method": "lato/session/model_changed",
+                            "params": {
+                                "sessionId": sid,
+                                "provider": outcome.provider,
+                                "model": outcome.model,
+                                "compactionWarning": outcome.compaction_warning,
+                            }
+                        }));
+                        Some(ok(
+                            id,
+                            serde_json::json!({"supported": true, "provider": outcome.provider, "model": outcome.model, "compactionWarning": outcome.compaction_warning}),
+                        ))
+                    }
+                    Err(error) => Some(err_with_data(
+                        id,
+                        -32000,
+                        error.message.clone(),
+                        serde_json::json!(error),
+                    )),
                 }
-                self.model = (provider.into(), model.into());
-                Some(ok(id, serde_json::json!({"supported": true})))
             }
             "lato/models/list" => {
                 let mut models = CATALOG.iter().map(|m| serde_json::json!({"provider":m.provider,"id":m.id,"supported":phase0_supported(m.api),"reason": if phase0_supported(m.api) { serde_json::Value::Null } else { serde_json::json!("dialect_unimplemented") }})).collect::<Vec<_>>();
@@ -975,11 +1022,16 @@ mod tests {
     #[tokio::test]
     async fn a1_6_set_model_rejects_unsupported_catalog_model() {
         let mut h = host();
+        let created = h
+            .handle(req(0, "session/new", serde_json::json!({})))
+            .await
+            .unwrap();
+        let sid = created["result"]["sessionId"].as_str().unwrap();
         let e = h
             .handle(req(
                 1,
                 "session/set_model",
-                serde_json::json!({"provider":"radius","model":"radius-test"}),
+                serde_json::json!({"sessionId":sid,"provider":"radius","model":"radius-test"}),
             ))
             .await
             .unwrap();
@@ -988,7 +1040,7 @@ mod tests {
             .handle(req(
                 2,
                 "session/set_model",
-                serde_json::json!({"provider":"openai","model":"gpt-4.1"}),
+                serde_json::json!({"sessionId":sid,"provider":"openai","model":"gpt-4.1"}),
             ))
             .await
             .unwrap();

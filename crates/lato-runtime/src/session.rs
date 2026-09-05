@@ -259,6 +259,28 @@ impl SessionLoop {
                 active.cancellation.cancel();
                 Ok(())
             }
+            Command::SelectModel {
+                selection,
+                model_family,
+                context_window,
+            } => {
+                if !matches!(self.machine.phase(), SessionPhase::Idle) {
+                    return Err(invalid_state(
+                        "runtime.session_busy",
+                        "cannot switch models while the session is active",
+                    ));
+                }
+                self.commit(
+                    None,
+                    JournalRecord::ModelSelected {
+                        selection,
+                        model_family,
+                        context_window,
+                    },
+                    JournalDurability::SyncData,
+                )
+                .await
+            }
             Command::Shutdown => self.shutdown().await,
         }
     }

@@ -1,9 +1,12 @@
-use crate::{HistoryItem, LegacyTurnDriver, ToolApproval, model_messages_to_history};
-use lato_ai::{ModelStream, SwitchableModelPort, adapt_model_port};
+use crate::{
+    HistoryItem, LegacyTurnDriver, SwitchCompaction, ToolApproval, decide_switch_compaction,
+    estimate_history_tokens, model_messages_to_history,
+};
+use lato_ai::{ActiveModelStream, ModelStream, adapt_model_endpoint};
 use lato_core::{
-    AgentError, CancelReason, Command, CompactSession, CompactionId, CompactionSize,
-    CompactionTrigger, ErrorCategory, EventPayload, JournalError, JournalReplay, Retryability,
-    SessionId, SessionStore, StartBehavior, StartTurn, TurnId, UserInput,
+    AgentError, CancelReason, Command, CompactSession, CompactionId, CompactionPolicy,
+    CompactionSize, CompactionTrigger, ErrorCategory, EventPayload, JournalError, JournalReplay,
+    Retryability, SessionId, SessionStore, StartBehavior, StartTurn, TurnId, UserInput,
 };
 use lato_runtime::{
     SessionBootstrap, SessionHandle, TurnDriver, spawn_session, spawn_session_with_store,
@@ -27,6 +30,18 @@ pub enum RuntimeCompactionOutcome {
         warning: Option<AgentError>,
     },
     Cancelled,
+}
+
+pub struct PreparedModelSwitch {
+    pub active: ActiveModelStream,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelSwitchOutcome {
+    pub provider: String,
+    pub model: String,
+    pub compaction_warning: Option<AgentError>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -60,17 +75,21 @@ impl RuntimeSession {
         updates: mpsc::UnboundedSender<serde_json::Value>,
         approval: Option<Arc<dyn ToolApproval>>,
     ) -> Self {
-        let model_port = switchable_model_port(&stream);
-        Self::new_with_model_port(
-            session_id, stream, model_port, locks, trust, cwd, updates, approval,
+        Self::new_with_endpoint(
+            session_id,
+            endpoint_from_stream(stream),
+            locks,
+            trust,
+            cwd,
+            updates,
+            approval,
         )
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn new_with_model_port(
+    pub fn new_with_endpoint(
         session_id: String,
-        stream: Arc<dyn ModelStream>,
-        model_port: Arc<SwitchableModelPort>,
+        endpoint: ActiveModelStream,
         locks: Arc<FileLocks>,
         trust: SessionTrust,
         cwd: PathBuf,
@@ -78,10 +97,9 @@ impl RuntimeSession {
         approval: Option<Arc<dyn ToolApproval>>,
     ) -> Self {
         let session_id = SessionId::from(session_id);
-        let driver = Arc::new(LegacyTurnDriver::new_with_model_port(
+        let driver = Arc::new(LegacyTurnDriver::new_with_endpoint(
             session_id.to_string(),
-            stream,
-            model_port,
+            endpoint,
             locks,
             trust,
             cwd,
@@ -112,18 +130,24 @@ impl RuntimeSession {
         store: Arc<dyn SessionStore>,
         replay: JournalReplay,
     ) -> Result<Self, AgentError> {
-        let model_port = switchable_model_port(&stream);
-        Self::new_with_store_and_model_port(
-            session_id, stream, model_port, locks, trust, cwd, updates, approval, store, replay,
+        Self::new_with_store_and_endpoint(
+            session_id,
+            endpoint_from_stream(stream),
+            locks,
+            trust,
+            cwd,
+            updates,
+            approval,
+            store,
+            replay,
         )
         .await
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub async fn new_with_store_and_model_port(
+    pub async fn new_with_store_and_endpoint(
         session_id: String,
-        stream: Arc<dyn ModelStream>,
-        model_port: Arc<SwitchableModelPort>,
+        endpoint: ActiveModelStream,
         locks: Arc<FileLocks>,
         trust: SessionTrust,
         cwd: PathBuf,
@@ -138,10 +162,9 @@ impl RuntimeSession {
             }));
         }
         let session_id = SessionId::from(session_id);
-        let driver = Arc::new(LegacyTurnDriver::new_with_model_port(
+        let driver = Arc::new(LegacyTurnDriver::new_with_endpoint(
             session_id.to_string(),
-            stream,
-            model_port,
+            endpoint,
             locks,
             trust,
             cwd,
@@ -310,12 +333,80 @@ impl RuntimeSession {
         self.driver.history_snapshot().await
     }
 
+    pub async fn active_model(&self) -> lato_ai::ActiveModelPort {
+        self.driver.active_model().await
+    }
+
     pub async fn replace_history(&self, history: Vec<HistoryItem>) {
         self.driver.replace_history(history).await;
     }
 
     pub async fn is_active(&self) -> bool {
         self.active_operation.lock().await.is_some()
+    }
+
+    pub async fn switch_model(
+        &self,
+        prepared: PreparedModelSwitch,
+    ) -> Result<ModelSwitchOutcome, AgentError> {
+        let gate = self.submission_gate.lock().await;
+        if self.active_operation.lock().await.is_some() {
+            return Err(session_busy());
+        }
+
+        let previous = self.driver.active_endpoint();
+        let history = self.driver.history_snapshot().await;
+        let estimated_tokens = estimate_history_tokens(&history);
+        let switch = decide_switch_compaction(
+            &previous.port.metadata,
+            &prepared.active.port.metadata,
+            estimated_tokens,
+            crate::has_model_authored_history(&history),
+            CompactionPolicy::default().threshold_percent,
+        );
+        let selection = prepared.active.port.selection.clone();
+        let metadata = prepared.active.port.metadata.clone();
+        self.driver.activate_model(prepared.active).await;
+
+        if let Err(error) = self
+            .handle
+            .submit(Command::SelectModel {
+                selection: selection.clone(),
+                model_family: metadata.model_family,
+                context_window: metadata.context_window,
+            })
+            .await
+        {
+            self.driver.activate_model(previous).await;
+            return Err(error);
+        }
+
+        let mut compaction_warning = None;
+        match switch {
+            SwitchCompaction::Immediate => {
+                match self
+                    .compact_with_gate_held(CompactionTrigger::ModelSwitch, None, false, gate)
+                    .await
+                {
+                    Ok(RuntimeCompactionOutcome::Complete { warning, .. }) => {
+                        compaction_warning = warning;
+                    }
+                    Ok(RuntimeCompactionOutcome::Cancelled) => {}
+                    Err(error) if is_auth_failure(&error) => return Err(error),
+                    Err(error) => compaction_warning = Some(error),
+                }
+            }
+            SwitchCompaction::BeforeNextSample => {
+                self.driver.mark_model_switch_check().await;
+            }
+            SwitchCompaction::None => {}
+        }
+
+        Ok(ModelSwitchOutcome {
+            provider: selection.provider,
+            model: selection.model,
+            compaction_warning,
+        })
     }
 
     async fn clear_active(&self, turn_id: Option<&TurnId>) {
@@ -335,6 +426,17 @@ impl RuntimeSession {
         user_context: Option<String>,
     ) -> Result<RuntimeCompactionOutcome, AgentError> {
         let gate = self.submission_gate.lock().await;
+        self.compact_with_gate_held(CompactionTrigger::Manual, user_context, true, gate)
+            .await
+    }
+
+    async fn compact_with_gate_held<'a>(
+        &self,
+        trigger: CompactionTrigger,
+        user_context: Option<String>,
+        release_gate_after_start: bool,
+        gate: tokio::sync::MutexGuard<'a, ()>,
+    ) -> Result<RuntimeCompactionOutcome, AgentError> {
         let mut events = self.handle.subscribe();
         self.handle
             .submit(Command::CompactSession(CompactSession {
@@ -342,7 +444,7 @@ impl RuntimeSession {
                     let value = value.trim().to_owned();
                     (!value.is_empty()).then_some(value)
                 }),
-                trigger: CompactionTrigger::Manual,
+                trigger,
             }))
             .await?;
         let mut observed = None;
@@ -363,7 +465,9 @@ impl RuntimeSession {
                     observed = Some(compaction_id.clone());
                     *self.active_operation.lock().await =
                         Some(ActiveOperation::Compaction(compaction_id.clone()));
-                    drop(gate.take());
+                    if release_gate_after_start {
+                        drop(gate.take());
+                    }
                     self.send_compaction_update(
                         "started",
                         serde_json::json!({
@@ -448,12 +552,20 @@ impl RuntimeSession {
     }
 }
 
-fn switchable_model_port(stream: &Arc<dyn ModelStream>) -> Arc<SwitchableModelPort> {
-    let active = stream.active_model_port().unwrap_or_else(|| {
-        adapt_model_port("openai", "gpt-4.1", stream.clone())
-            .expect("fallback model selection is statically valid")
-    });
-    Arc::new(SwitchableModelPort::from_active(active))
+fn endpoint_from_stream(stream: Arc<dyn ModelStream>) -> ActiveModelStream {
+    if let Some(port) = stream.active_model_port() {
+        ActiveModelStream { stream, port }
+    } else {
+        let port = adapt_model_endpoint(
+            "openai",
+            "gpt-4.1",
+            lato_ai::ModelMetadata::default(),
+            stream.clone(),
+        )
+        .expect("fallback model selection is statically valid")
+        .port;
+        ActiveModelStream { stream, port }
+    }
 }
 
 fn event_lagged(skipped: u64) -> AgentError {
@@ -472,6 +584,24 @@ fn event_bus_closed() -> AgentError {
         "runtime event bus closed",
         Retryability::Never,
     )
+}
+
+fn session_busy() -> AgentError {
+    AgentError::new(
+        "runtime.session_busy",
+        ErrorCategory::Task,
+        "cannot switch models while the session is active",
+        Retryability::Never,
+    )
+}
+
+fn is_auth_failure(error: &AgentError) -> bool {
+    let message = error.message.to_ascii_lowercase();
+    error.code == "model.auth"
+        || message.contains("model.auth")
+        || message.contains("http 401")
+        || message.contains("http 403")
+        || message.contains("oauth refresh failed")
 }
 
 fn runtime_stopped() -> AgentError {

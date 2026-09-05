@@ -90,6 +90,13 @@ impl SwitchableModelStream {
         *self.inner.write().expect("model stream lock poisoned") = endpoint;
     }
 
+    pub fn snapshot(&self) -> crate::ActiveModelStream {
+        self.inner
+            .read()
+            .expect("model stream lock poisoned")
+            .clone()
+    }
+
     pub async fn set(&self, stream: Arc<dyn ModelStream>) {
         let endpoint = if let Some(port) = stream.active_model_port() {
             crate::ActiveModelStream { stream, port }

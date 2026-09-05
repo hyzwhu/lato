@@ -10,7 +10,10 @@ use crate::{
 };
 use async_trait::async_trait;
 use futures_util::StreamExt;
-use lato_ai::{ModelStream, SwitchableModelPort, adapt_model_port};
+use lato_ai::{
+    ActiveModelPort, ActiveModelStream, ModelStream, SwitchableModelPort, SwitchableModelStream,
+    adapt_model_endpoint,
+};
 use lato_core::{
     AgentError, CompactionCandidate, CompactionError, ErrorCategory, ModelCallId, ModelContent,
     ModelError, ModelRequest, ModelStopReason, ModelStreamEvent, Retryability, SamplingParameters,
@@ -28,7 +31,7 @@ pub struct LegacyTurnDriver {
     state: Mutex<LegacyState>,
     passthrough: mpsc::UnboundedSender<serde_json::Value>,
     model_port: Arc<SwitchableModelPort>,
-    model_stream: Arc<dyn ModelStream>,
+    model_stream: Arc<SwitchableModelStream>,
 }
 
 struct LegacyState {
@@ -47,11 +50,10 @@ impl LegacyTurnDriver {
         passthrough: mpsc::UnboundedSender<serde_json::Value>,
         approval: Option<Arc<dyn ToolApproval>>,
     ) -> Self {
-        let model_port = default_model_port(stream.clone());
-        Self::new_with_model_port(
+        let endpoint = endpoint_from_stream(stream);
+        Self::new_with_endpoint(
             session_id,
-            stream,
-            model_port,
+            endpoint,
             locks,
             trust,
             cwd,
@@ -61,19 +63,19 @@ impl LegacyTurnDriver {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn new_with_model_port(
+    pub fn new_with_endpoint(
         session_id: String,
-        stream: Arc<dyn ModelStream>,
-        model_port: Arc<SwitchableModelPort>,
+        endpoint: ActiveModelStream,
         locks: Arc<FileLocks>,
         trust: SessionTrust,
         cwd: PathBuf,
         passthrough: mpsc::UnboundedSender<serde_json::Value>,
         approval: Option<Arc<dyn ToolApproval>>,
     ) -> Self {
+        let model_port = Arc::new(SwitchableModelPort::from_active(endpoint.port.clone()));
+        let model_stream = Arc::new(SwitchableModelStream::new(endpoint));
         let (actor_tx, actor_events) = mpsc::unbounded_channel();
-        let model_stream = stream.clone();
-        let actor = SessionActor::new(stream, locks, trust, cwd)
+        let actor = SessionActor::new(model_stream.clone(), locks, trust, cwd)
             .with_interactive_events(actor_tx, session_id, approval);
         Self::from_actor(actor, actor_events, passthrough, model_port, model_stream)
     }
@@ -89,11 +91,18 @@ impl LegacyTurnDriver {
         approval: Option<Arc<dyn ToolApproval>>,
         tool_runtime: Arc<lato_tools::ToolRuntime>,
     ) -> Self {
-        let model_port = default_model_port(stream.clone());
+        let endpoint = endpoint_from_stream(stream);
+        let model_port = Arc::new(SwitchableModelPort::from_active(endpoint.port.clone()));
+        let model_stream = Arc::new(SwitchableModelStream::new(endpoint));
         let (actor_tx, actor_events) = mpsc::unbounded_channel();
-        let model_stream = stream.clone();
-        let actor = SessionActor::new_with_tool_runtime(stream, locks, trust, cwd, tool_runtime)
-            .with_interactive_events(actor_tx, session_id, approval);
+        let actor = SessionActor::new_with_tool_runtime(
+            model_stream.clone(),
+            locks,
+            trust,
+            cwd,
+            tool_runtime,
+        )
+        .with_interactive_events(actor_tx, session_id, approval);
         Self::from_actor(actor, actor_events, passthrough, model_port, model_stream)
     }
 
@@ -102,7 +111,7 @@ impl LegacyTurnDriver {
         actor_events: mpsc::UnboundedReceiver<serde_json::Value>,
         passthrough: mpsc::UnboundedSender<serde_json::Value>,
         model_port: Arc<SwitchableModelPort>,
-        model_stream: Arc<dyn ModelStream>,
+        model_stream: Arc<SwitchableModelStream>,
     ) -> Self {
         Self {
             state: Mutex::new(LegacyState {
@@ -121,6 +130,33 @@ impl LegacyTurnDriver {
 
     pub async fn replace_history(&self, history: Vec<HistoryItem>) {
         *self.state.lock().await.actor.history_mut() = history;
+    }
+
+    pub async fn active_model(&self) -> ActiveModelPort {
+        self.model_stream
+            .active_model_port()
+            .expect("switchable model stream always has an active model")
+    }
+
+    pub fn active_endpoint(&self) -> ActiveModelStream {
+        self.model_stream.snapshot()
+    }
+
+    pub async fn activate_model(&self, endpoint: ActiveModelStream) {
+        self.model_stream.set_active(endpoint).await;
+        let active = self
+            .model_stream
+            .active_model_port()
+            .expect("switchable model stream always has an active model");
+        self.model_port.set_active(active).await;
+    }
+
+    pub async fn has_model_authored_history(&self) -> bool {
+        crate::has_model_authored_history(self.state.lock().await.actor.history())
+    }
+
+    pub async fn mark_model_switch_check(&self) {
+        self.state.lock().await.actor.mark_model_switch_check();
     }
 }
 
@@ -378,12 +414,20 @@ async fn sample_summary(
     Ok(text)
 }
 
-fn default_model_port(stream: Arc<dyn ModelStream>) -> Arc<SwitchableModelPort> {
-    let active = stream.active_model_port().unwrap_or_else(|| {
-        adapt_model_port("openai", "gpt-4.1", stream)
-            .expect("fallback model selection is statically valid")
-    });
-    Arc::new(SwitchableModelPort::from_active(active))
+fn endpoint_from_stream(stream: Arc<dyn ModelStream>) -> ActiveModelStream {
+    if let Some(port) = stream.active_model_port() {
+        ActiveModelStream { stream, port }
+    } else {
+        let port = adapt_model_endpoint(
+            "openai",
+            "gpt-4.1",
+            lato_ai::ModelMetadata::default(),
+            stream.clone(),
+        )
+        .expect("fallback model selection is statically valid")
+        .port;
+        ActiveModelStream { stream, port }
+    }
 }
 
 fn model_error(error: ModelError) -> AgentError {

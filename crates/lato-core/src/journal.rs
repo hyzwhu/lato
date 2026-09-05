@@ -128,6 +128,11 @@ pub enum JournalRecord {
     CompactionCancelled {
         compaction_id: CompactionId,
     },
+    ModelSelected {
+        selection: crate::ModelSelection,
+        model_family: Option<String>,
+        context_window: Option<u64>,
+    },
     SessionStopped,
     LegacyTranscriptImported {
         source_version: u32,
@@ -169,6 +174,9 @@ pub struct SessionProjection {
     pub unresolved_tools: Vec<UnresolvedToolCall>,
     pub terminal: Option<JournalTerminal>,
     pub active_checkpoint_id: Option<String>,
+    pub model_selection: Option<crate::ModelSelection>,
+    pub model_family: Option<String>,
+    pub model_context_window: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -190,6 +198,9 @@ impl JournalReplay {
                 unresolved_tools: Vec::new(),
                 terminal: None,
                 active_checkpoint_id: None,
+                model_selection: None,
+                model_family: None,
+                model_context_window: None,
             },
         }
     }
@@ -323,6 +334,9 @@ pub fn project_journal(
     let mut messages = Vec::new();
     let mut terminal = None;
     let mut active_checkpoint_id = None;
+    let mut model_selection = None;
+    let mut model_family = None;
+    let mut model_context_window = None;
     let mut checkpoint_ids = BTreeSet::new();
 
     for (index, envelope) in envelopes.iter().enumerate() {
@@ -358,6 +372,15 @@ pub fn project_journal(
             | JournalRecord::CompactionFailed { .. }
             | JournalRecord::CompactionCancelled { .. }
             | JournalRecord::LegacyTranscriptImported { .. } => {}
+            JournalRecord::ModelSelected {
+                selection,
+                model_family: family,
+                context_window,
+            } => {
+                model_selection = Some(selection.clone());
+                model_family = family.clone();
+                model_context_window = *context_window;
+            }
             JournalRecord::HistoryProjectionReplaced { checkpoint_id, .. } => {
                 if requested.values().any(|call| call.prepared) {
                     return Err(JournalError::Corrupt {
@@ -475,6 +498,9 @@ pub fn project_journal(
         unresolved_tools,
         terminal,
         active_checkpoint_id,
+        model_selection,
+        model_family,
+        model_context_window,
     })
 }
 

@@ -1,6 +1,6 @@
 use lato_core::{
     JOURNAL_SCHEMA_VERSION, JournalEnvelope, JournalError, JournalRecord, JournalRecordId,
-    ModelContent, Retryability, SessionId, ToolCallId, ToolError, ToolName, TurnId,
+    ModelContent, ModelSelection, Retryability, SessionId, ToolCallId, ToolError, ToolName, TurnId,
     journal_request_hash, project_journal,
 };
 
@@ -12,6 +12,41 @@ fn canonical_hash_ignores_object_key_order() {
         journal_request_hash("tool", &a),
         journal_request_hash("tool", &b)
     );
+}
+
+#[test]
+fn projection_restores_the_latest_model_selection() {
+    let sid = SessionId::from("s1");
+    let first = ModelSelection::new("fixture", "large-a").unwrap();
+    let latest = ModelSelection::new("fixture", "small-b").unwrap();
+    let records = vec![
+        envelope(&sid, None, 0, JournalRecord::SessionStarted),
+        envelope(
+            &sid,
+            None,
+            1,
+            JournalRecord::ModelSelected {
+                selection: first,
+                model_family: Some("family-a".into()),
+                context_window: Some(8_000),
+            },
+        ),
+        envelope(
+            &sid,
+            None,
+            2,
+            JournalRecord::ModelSelected {
+                selection: latest.clone(),
+                model_family: Some("family-b".into()),
+                context_window: Some(4_000),
+            },
+        ),
+    ];
+
+    let projection = project_journal(&sid, &records).unwrap();
+    assert_eq!(projection.model_selection, Some(latest));
+    assert_eq!(projection.model_family.as_deref(), Some("family-b"));
+    assert_eq!(projection.model_context_window, Some(4_000));
 }
 
 #[test]
