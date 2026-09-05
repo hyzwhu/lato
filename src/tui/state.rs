@@ -200,6 +200,7 @@ pub struct AppState {
     pub responding: bool,
     pub compaction: CompactionUiState,
     pub context_usage: Option<ContextUiState>,
+    pub recovery_suppression: String,
     pub response_started: Option<Instant>,
     pub elapsed_seconds: u64,
     pub error: Option<String>,
@@ -278,6 +279,7 @@ impl AppState {
             responding: false,
             compaction: CompactionUiState::Idle,
             context_usage: None,
+            recovery_suppression: "none".into(),
             response_started: None,
             elapsed_seconds: 0,
             error: None,
@@ -525,6 +527,7 @@ impl AppState {
                 self.error = None;
                 self.compaction = CompactionUiState::Idle;
                 self.context_usage = None;
+                self.recovery_suppression = "none".into();
                 self.select_current_session();
             }
             BackendEvent::Resumed(id) => {
@@ -538,6 +541,7 @@ impl AppState {
                 self.screen = Screen::Main;
                 self.compaction = CompactionUiState::Idle;
                 self.context_usage = None;
+                self.recovery_suppression = "none".into();
             }
             BackendEvent::Sessions(summaries) => self.replace_sessions(summaries),
             BackendEvent::SessionRenamed(summary) => {
@@ -741,6 +745,9 @@ impl AppState {
                     context_window,
                     utilization_percent,
                 });
+            }
+            ClientUpdate::RecoverySuppression(suppression) => {
+                self.recovery_suppression = suppression;
             }
             ClientUpdate::ModelChanged {
                 provider,
@@ -1073,5 +1080,22 @@ mod tests {
                 ..
             }) if content == "Session renamed to \"New Title\""
         ));
+    }
+
+    #[test]
+    fn recovery_suppression_updates_status_without_adding_transcript_items() {
+        let mut app = AppState::new(
+            Language::En,
+            PathBuf::from("/tmp/lato"),
+            "test/model".into(),
+            "session-1".into(),
+            Vec::new(),
+        );
+        for mode in ["turn", "sticky", "until_success", "auth", "none"] {
+            let before = app.messages.len();
+            app.apply_update(ClientUpdate::RecoverySuppression(mode.into()));
+            assert_eq!(app.recovery_suppression, mode);
+            assert_eq!(app.messages.len(), before);
+        }
     }
 }

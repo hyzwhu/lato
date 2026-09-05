@@ -123,8 +123,16 @@ current session model, may make one to three model calls, and never exposes or r
 tools. Ctrl-C cancels active sampling. A successful operation replaces only the
 model-visible history through a durable checkpoint; the append-only canonical journal
 is retained. Failures before the replacement marker keep the previous history active.
-Automatic threshold compaction and context-overflow resubmission remain planned for
-Phase 4C2 and Phase 4C3.
+Automatic compaction now starts at 85% context utilization, with a speculative,
+non-installing first summary pass beginning at 75%. Tool output that crosses the hard
+context boundary is compacted before another provider request. A provider-reported
+context overflow may compact and rebuild the interrupted request exactly once, but only
+if no output was observed. Oversized compaction input degrades monotonically through
+Prepared, Fitted, and Lossy stages under the same three-attempt ceiling; canonical
+conversation history is never truncated in place. Deterministic failures suppress
+repeated automatic work according to their turn, context, credit, or authentication
+lifetime. Manual `/compact` remains available while automatic compaction is suppressed,
+and `/status` reports the active suppression mode.
 
 ## Doctor
 
@@ -293,6 +301,13 @@ checkpoint marker becomes authoritative even if publishing `history.jsonl` or it
 metadata fails; replay rebuilds those derived files before the new history is installed
 in memory. If reconciliation cannot prove which checkpoint is authoritative, the
 session fails closed.
+
+Phase 4C2/4C3 add provider-informed context accounting and bounded automatic recovery.
+Every provider boundary is checked before sampling; speculative prefire output is
+ephemeral and never becomes a transcript or journal record. Only a validated final
+summary is installed through the same checkpoint-before-marker protocol, so restart
+recovery sees either the old logical history or the committed compacted history, never
+an intermediate two-pass note.
 
 Copied or structurally derived upstream code is pinned in
 [`docs/superpowers/reference/lato-upstream-sources.md`](docs/superpowers/reference/lato-upstream-sources.md).

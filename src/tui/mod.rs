@@ -579,11 +579,12 @@ fn submit_or_command(app: &mut AppState, trust: &SessionTrust) -> Vec<Effect> {
             app.messages.push(Message {
                 role: MessageRole::System,
                 content: format!(
-                    "{} · {}\n{}\ncompaction: {}\n{}\nlato resume {} --sandbox off",
+                    "{} · {}\n{}\ncompaction: {}\nautomatic compaction suppression: {}\n{}\nlato resume {} --sandbox off",
                     app.model,
                     app.workspace.display(),
                     crate::permissions::describe(trust, app.language),
                     app.compaction_status(),
+                    app.recovery_suppression,
                     match app.language {
                         Language::ZhCn => "如需更改范围，请退出并恢复会话。可选 off / workspace / read-only，例如：",
                         Language::En => "To change scope, exit and resume with off / workspace / read-only. Example:",

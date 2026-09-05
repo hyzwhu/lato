@@ -78,6 +78,7 @@ pub enum ClientUpdate {
         context_window: Option<u64>,
         utilization_percent: Option<u8>,
     },
+    RecoverySuppression(String),
     ModelChanged {
         provider: String,
         model: String,
@@ -208,6 +209,11 @@ impl ClientUpdate {
                     }),
                 }
             }
+            Some("lato/session/recovery") => params
+                .get("automaticCompactionSuppression")
+                .and_then(serde_json::Value::as_str)
+                .map(|value| Self::RecoverySuppression(value.to_owned()))
+                .unwrap_or(Self::Unknown),
             Some("lato/session/model_changed") => {
                 match (
                     params.get("provider").and_then(serde_json::Value::as_str),
@@ -720,6 +726,20 @@ mod tests {
                 utilization_percent: None,
             }
         );
+    }
+
+    #[test]
+    fn converts_automatic_compaction_suppression() {
+        for value in ["none", "turn", "sticky", "until_success", "auth"] {
+            let update = serde_json::json!({
+                "method":"lato/session/recovery",
+                "params":{"automaticCompactionSuppression":value}
+            });
+            assert_eq!(
+                ClientUpdate::from_json(&update),
+                ClientUpdate::RecoverySuppression(value.into())
+            );
+        }
     }
 
     #[tokio::test]

@@ -3,8 +3,9 @@
 // Lato changes: checks context at every provider boundary and delegates durable replacement to runtime
 
 use crate::{
-    ContextTracker, HistoryItem, PREFIRE_LEAD_PERCENT, SamplingRecoveryBudget,
-    TWO_PASS_SPLIT_PERCENT, compaction_suppression_reason, fingerprint_prefix, split_for_two_pass,
+    AutoCompactionSuppression, ContextTracker, HistoryItem, PREFIRE_LEAD_PERCENT,
+    SamplingRecoveryBudget, TWO_PASS_SPLIT_PERCENT, compaction_suppression_reason,
+    fingerprint_prefix, split_for_two_pass,
 };
 use async_trait::async_trait;
 use lato_ai::{
@@ -172,7 +173,9 @@ impl SessionActor {
         self.cancelled = false;
         self.turn_id = turn_id;
         self.turn_cancellation = cancellation;
+        let previous_suppression = self.context_tracker.automatic_compaction_suppression();
         self.context_tracker.on_new_turn();
+        self.emit_suppression_if_changed(previous_suppression);
         let task_requires_workspace_change = task_requires_workspace_change(&text);
         self.history.push(HistoryItem::User(text));
         noop_hooks();
@@ -355,7 +358,9 @@ impl SessionActor {
                     return Err(error.to_string());
                 }
             };
+            let previous_suppression = self.context_tracker.automatic_compaction_suppression();
             self.context_tracker.on_provider_success();
+            self.emit_suppression_if_changed(previous_suppression);
             recovery_budget = SamplingRecoveryBudget::default();
             self.commit_assistant_text(&uncommitted_text).await?;
             if let Some(active) = active_model.as_ref()
@@ -438,7 +443,9 @@ impl SessionActor {
     }
 
     pub fn context_budget_changed(&mut self) {
+        let previous_suppression = self.context_tracker.automatic_compaction_suppression();
         self.context_tracker.on_context_budget_changed();
+        self.emit_suppression_if_changed(previous_suppression);
         self.clear_prefire();
     }
 
@@ -476,21 +483,31 @@ impl SessionActor {
             .await;
         match outcome {
             Err(error) => {
-                self.context_tracker
-                    .suppress_automatic_compaction(compaction_suppression_reason(&error));
+                if self
+                    .context_tracker
+                    .suppress_automatic_compaction(compaction_suppression_reason(&error))
+                {
+                    self.emit_recovery_suppression();
+                }
                 Err(error.to_string())
             }
             Ok(AutomaticCompactionOutcome::Compacted(messages)) => {
                 self.history = crate::model_messages_to_history(&messages)
                     .map_err(|error| error.to_string())?;
                 self.context_tracker.reseed(&self.history);
+                let previous_suppression = self.context_tracker.automatic_compaction_suppression();
                 self.context_tracker.on_compaction_success();
+                self.emit_suppression_if_changed(previous_suppression);
                 self.clear_prefire();
                 Ok(true)
             }
             Ok(AutomaticCompactionOutcome::ContinueUnchanged { error }) => {
-                self.context_tracker
-                    .suppress_automatic_compaction(compaction_suppression_reason(&error));
+                if self
+                    .context_tracker
+                    .suppress_automatic_compaction(compaction_suppression_reason(&error))
+                {
+                    self.emit_recovery_suppression();
+                }
                 Ok(false)
             }
         }
@@ -579,6 +596,30 @@ impl SessionActor {
         if let PrefireSlot::Running(handle) = std::mem::take(&mut self.prefire) {
             handle.abort();
         }
+    }
+
+    fn emit_suppression_if_changed(&self, previous: AutoCompactionSuppression) {
+        if previous != self.context_tracker.automatic_compaction_suppression() {
+            self.emit_recovery_suppression();
+        }
+    }
+
+    fn emit_recovery_suppression(&self) {
+        let Some((events, session_id)) = &self.events else {
+            return;
+        };
+        let suppression = match self.context_tracker.automatic_compaction_suppression() {
+            AutoCompactionSuppression::None => "none",
+            AutoCompactionSuppression::Turn => "turn",
+            AutoCompactionSuppression::Sticky => "sticky",
+            AutoCompactionSuppression::UntilSuccess => "until_success",
+            AutoCompactionSuppression::Auth => "auth",
+        };
+        let _ = events.send(serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "lato/session/recovery",
+            "params": {"sessionId": session_id, "automaticCompactionSuppression": suppression}
+        }));
     }
 
     async fn commit_assistant_text(&self, text: &str) -> Result<(), String> {

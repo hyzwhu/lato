@@ -1,5 +1,5 @@
 use super::{
-    i18n::{TextKey, tr},
+    i18n::{Language, TextKey, tr},
     state::{AppState, CompactionUiState, Focus, MessageRole},
 };
 use ratatui::{
@@ -260,14 +260,7 @@ fn composer(frame: &mut Frame<'_>, area: Rect, app: &AppState, welcome: bool) {
     } = &app.compaction
     {
         let elapsed = started_at.elapsed().as_secs();
-        let trigger = match (app.language, trigger.as_str()) {
-            (super::i18n::Language::ZhCn, "model_switch") => "模型切换",
-            (super::i18n::Language::ZhCn, "threshold") => "自动",
-            (super::i18n::Language::ZhCn, _) => "手动",
-            (super::i18n::Language::En, "model_switch") => "model switch",
-            (super::i18n::Language::En, "threshold") => "automatic",
-            (super::i18n::Language::En, _) => "manual",
-        };
+        let trigger = compaction_trigger_label(trigger, app.language);
         match app.language {
             super::i18n::Language::ZhCn => {
                 format!("● 正在压缩上下文（{trigger}）… {elapsed}s [Ctrl-C 取消]")
@@ -318,6 +311,46 @@ fn composer(frame: &mut Frame<'_>, area: Rect, app: &AppState, welcome: bool) {
         && inner.height > 0
     {
         frame.set_cursor_position((inner.x + 2 + cursor as u16, inner.y));
+    }
+}
+
+fn compaction_trigger_label(trigger: &str, language: Language) -> &'static str {
+    match (language, trigger) {
+        (Language::ZhCn, "model_switch") => "模型切换",
+        (Language::ZhCn, "threshold") => "自动阈值",
+        (Language::ZhCn, "preflight_overflow") => "工具输出溢出",
+        (Language::ZhCn, "provider_overflow") => "服务端上下文溢出恢复",
+        (Language::ZhCn, _) => "手动",
+        (Language::En, "model_switch") => "model switch",
+        (Language::En, "threshold") => "automatic threshold",
+        (Language::En, "preflight_overflow") => "tool-output overflow",
+        (Language::En, "provider_overflow") => "provider overflow recovery",
+        (Language::En, _) => "manual",
+    }
+}
+
+#[cfg(test)]
+mod recovery_label_tests {
+    use super::*;
+
+    #[test]
+    fn overflow_compaction_triggers_are_localized() {
+        assert_eq!(
+            compaction_trigger_label("preflight_overflow", Language::En),
+            "tool-output overflow"
+        );
+        assert_eq!(
+            compaction_trigger_label("provider_overflow", Language::En),
+            "provider overflow recovery"
+        );
+        assert_eq!(
+            compaction_trigger_label("preflight_overflow", Language::ZhCn),
+            "工具输出溢出"
+        );
+        assert_eq!(
+            compaction_trigger_label("provider_overflow", Language::ZhCn),
+            "服务端上下文溢出恢复"
+        );
     }
 }
 
