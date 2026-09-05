@@ -159,7 +159,7 @@ fn serialized_bytes(messages: &[ModelMessage]) -> u64 {
         .unwrap_or(u64::MAX)
 }
 
-fn truncate_to_budget(messages: &mut Vec<ModelMessage>, budget: u64) {
+fn truncate_to_budget(messages: &mut [ModelMessage], budget: u64) {
     while serialized_bytes(messages) > budget {
         let Some((message_index, content_index, text_len)) = messages
             .iter()

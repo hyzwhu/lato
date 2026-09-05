@@ -36,16 +36,12 @@ struct PrefireCache {
     _pass1_latency_ms: u64,
 }
 
+#[derive(Default)]
 enum PrefireSlot {
+    #[default]
     Empty,
     Running(tokio::task::JoinHandle<Result<PrefireCache, AgentError>>),
     Ready(PrefireCache),
-}
-
-impl Default for PrefireSlot {
-    fn default() -> Self {
-        Self::Empty
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -329,31 +329,6 @@ fn compaction_trigger_label(trigger: &str, language: Language) -> &'static str {
     }
 }
 
-#[cfg(test)]
-mod recovery_label_tests {
-    use super::*;
-
-    #[test]
-    fn overflow_compaction_triggers_are_localized() {
-        assert_eq!(
-            compaction_trigger_label("preflight_overflow", Language::En),
-            "tool-output overflow"
-        );
-        assert_eq!(
-            compaction_trigger_label("provider_overflow", Language::En),
-            "provider overflow recovery"
-        );
-        assert_eq!(
-            compaction_trigger_label("preflight_overflow", Language::ZhCn),
-            "工具输出溢出"
-        );
-        assert_eq!(
-            compaction_trigger_label("provider_overflow", Language::ZhCn),
-            "服务端上下文溢出恢复"
-        );
-    }
-}
-
 pub fn slash_completion(frame: &mut Frame<'_>, composer_area: Rect, app: &AppState) {
     if app.overlay.is_some() || app.approval.is_some() {
         return;
@@ -583,4 +558,29 @@ fn centered_rect(area: Rect, percent_x: u16, height: u16) -> Rect {
         available.width,
         height.min(available.height),
     )
+}
+
+#[cfg(test)]
+mod recovery_label_tests {
+    use super::*;
+
+    #[test]
+    fn overflow_compaction_triggers_are_localized() {
+        assert_eq!(
+            compaction_trigger_label("preflight_overflow", Language::En),
+            "tool-output overflow"
+        );
+        assert_eq!(
+            compaction_trigger_label("provider_overflow", Language::En),
+            "provider overflow recovery"
+        );
+        assert_eq!(
+            compaction_trigger_label("preflight_overflow", Language::ZhCn),
+            "工具输出溢出"
+        );
+        assert_eq!(
+            compaction_trigger_label("provider_overflow", Language::ZhCn),
+            "服务端上下文溢出恢复"
+        );
+    }
 }
