@@ -1,3 +1,7 @@
+// Derived from: Grok Build@bb7f39d5858cbf5e00de639367f59debbdcb0138:crates/codegen/xai-grok-shell/src/session/compaction.rs
+// License: Apache-2.0
+// Lato changes: checks context at every provider boundary and delegates durable replacement to runtime
+
 use crate::{ContextTracker, HistoryItem};
 use async_trait::async_trait;
 use lato_ai::{

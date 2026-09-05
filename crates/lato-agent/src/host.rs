@@ -1,3 +1,7 @@
+// Derived from: Grok Build@bb7f39d5858cbf5e00de639367f59debbdcb0138:crates/codegen/xai-grok-shell/src/session/acp_session_impl/model_switch.rs
+// License: Apache-2.0
+// Lato changes: ACP model selection targets one runtime session and publishes only committed changes
+
 use crate::{
     PreparedModelSwitch, RuntimeCompactionOutcome, RuntimePromptOutcome, RuntimeSession,
     ToolApproval, TranscriptStore, import_legacy_if_needed,

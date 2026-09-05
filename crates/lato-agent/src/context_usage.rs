@@ -1,3 +1,7 @@
+// Derived from: Grok Build@bb7f39d5858cbf5e00de639367f59debbdcb0138:crates/codegen/xai-chat-state/src/actor/queries.rs
+// License: Apache-2.0
+// Lato changes: provider-neutral history estimation and model-switch compaction decisions
+
 use crate::HistoryItem;
 use lato_ai::{ActiveModelPort, ModelCallReport, ModelMetadata};
 use lato_core::{ContextLedger, ContextUsage};

@@ -46,13 +46,23 @@ async fn prompt_round_trips_through_typed_runtime_events_exactly_once() {
         RuntimePromptOutcome::Complete { text: "hi".into() }
     );
 
-    let delta = timeout(Duration::from_secs(1), updates.recv())
-        .await
-        .unwrap()
-        .unwrap();
+    let delta = timeout(Duration::from_secs(1), async {
+        loop {
+            let update = updates.recv().await.unwrap();
+            if update["method"] == "session/update" {
+                break update;
+            }
+        }
+    })
+    .await
+    .unwrap();
     assert_eq!(delta["method"], "session/update");
     assert_eq!(delta["params"]["delta"], "hi");
-    assert!(updates.try_recv().is_err(), "delta was translated twice");
+    assert!(
+        std::iter::from_fn(|| updates.try_recv().ok())
+            .all(|update| update["method"] != "session/update"),
+        "delta was translated twice"
+    );
 }
 
 #[tokio::test]

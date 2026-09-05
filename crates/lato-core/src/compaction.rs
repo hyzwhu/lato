@@ -1,3 +1,7 @@
+// Derived from: Grok Build@bb7f39d5858cbf5e00de639367f59debbdcb0138:crates/codegen/xai-chat-state/src/actor/state.rs
+// License: Apache-2.0
+// Lato changes: provider-neutral context ledger with saturating estimates and checkpoint reseeding
+
 use crate::{AgentError, CompactionId, ErrorCategory, ModelMessage, ModelUsage, Retryability};
 
 pub const DEFAULT_COMPACTION_MAX_ATTEMPTS: u8 = 3;

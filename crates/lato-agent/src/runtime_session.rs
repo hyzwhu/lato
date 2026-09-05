@@ -1,3 +1,7 @@
+// Derived from: Grok Build@bb7f39d5858cbf5e00de639367f59debbdcb0138:crates/codegen/xai-grok-shell/src/agent/handlers/model_switch.rs
+// License: Apache-2.0
+// Lato changes: serialized per-session model switch with checkpoint-first immediate compaction
+
 use crate::{
     HistoryItem, LegacyTurnDriver, SwitchCompaction, ToolApproval, decide_switch_compaction,
     estimate_history_tokens, model_messages_to_history,
