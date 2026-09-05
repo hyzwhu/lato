@@ -1562,10 +1562,10 @@ async fn automatic_compaction_ordinary_failure_continues_the_turn_unchanged() {
         }
     }
     assert!(saw_failure);
-    assert_eq!(
+    assert!(matches!(
         *driver.observed.lock().await,
-        Some(AutomaticCompactionOutcome::ContinueUnchanged)
-    );
+        Some(AutomaticCompactionOutcome::ContinueUnchanged { .. })
+    ));
 }
 
 #[tokio::test]

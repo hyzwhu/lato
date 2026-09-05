@@ -159,6 +159,10 @@ impl LegacyTurnDriver {
     pub async fn mark_model_switch_check(&self) {
         self.state.lock().await.actor.mark_model_switch_check();
     }
+
+    pub async fn context_budget_changed(&self) {
+        self.state.lock().await.actor.context_budget_changed();
+    }
 }
 
 #[async_trait]

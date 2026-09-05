@@ -2,24 +2,50 @@
 // License: Apache-2.0
 // Lato changes: checks context at every provider boundary and delegates durable replacement to runtime
 
-use crate::{ContextTracker, HistoryItem};
+use crate::{
+    ContextTracker, HistoryItem, PREFIRE_LEAD_PERCENT, SamplingRecoveryBudget,
+    TWO_PASS_SPLIT_PERCENT, compaction_suppression_reason, fingerprint_prefix, split_for_two_pass,
+};
 use async_trait::async_trait;
 use lato_ai::{
     CONTEXT_HARD_LIMIT_BYTES, ModelStream, StreamPiece, extract_text_embedded_tool_calls,
 };
 pub use lato_core::ApprovalRequest;
 use lato_core::{
-    CompactionPolicy, CompactionTrigger, ContextUsage, JournalDurability, JournalRecord,
-    ModelContent, ModelMessage, ModelRole, PolicyAuditDecision, PolicyAuditStage, PolicyDecision,
-    Retryability, SessionId, ToolCallId, ToolContext, ToolError, ToolName, TurnId,
-    journal_request_hash,
+    AgentError, CompactionPolicy, CompactionTrigger, ContextUsage, JournalDurability,
+    JournalRecord, ModelContent, ModelErrorKind, ModelMessage, ModelRole, PolicyAuditDecision,
+    PolicyAuditStage, PolicyDecision, Retryability, SessionId, ToolCallId, ToolContext, ToolError,
+    ToolName, TurnId, journal_request_hash,
 };
-use lato_runtime::{AutomaticCompactionOutcome, AutomaticCompactionRequest, TurnEventEmitter};
+use lato_runtime::{
+    AutomaticCompactionOutcome, AutomaticCompactionRequest, PrefireCompactionRequest,
+    TurnEventEmitter, TwoPassCompactionInput,
+};
 use lato_tools::{BuiltinToolEnvironment, ToolRuntime, bound_tool_output, builtin_tool_runtime};
 use lato_workspace::{FileLocks, SessionTrust};
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+
+struct PrefireCache {
+    note1: String,
+    prefix_len: usize,
+    fingerprint: u64,
+    model_generation: u64,
+    _pass1_latency_ms: u64,
+}
+
+enum PrefireSlot {
+    Empty,
+    Running(tokio::task::JoinHandle<Result<PrefireCache, AgentError>>),
+    Ready(PrefireCache),
+}
+
+impl Default for PrefireSlot {
+    fn default() -> Self {
+        Self::Empty
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PromptKind {
@@ -56,6 +82,7 @@ pub struct SessionActor {
     tool_approval: Option<Arc<dyn ToolApproval>>,
     journal_events: Option<TurnEventEmitter>,
     context_tracker: ContextTracker,
+    prefire: PrefireSlot,
     #[cfg(test)]
     pub(crate) on_after_persist: Option<Box<dyn Fn() + Send + Sync>>,
 }
@@ -101,6 +128,7 @@ impl SessionActor {
             tool_approval: None,
             journal_events: None,
             context_tracker: ContextTracker::default(),
+            prefire: PrefireSlot::Empty,
             #[cfg(test)]
             on_after_persist: None,
         }
@@ -144,6 +172,7 @@ impl SessionActor {
         self.cancelled = false;
         self.turn_id = turn_id;
         self.turn_cancellation = cancellation;
+        self.context_tracker.on_new_turn();
         let task_requires_workspace_change = task_requires_workspace_change(&text);
         self.history.push(HistoryItem::User(text));
         noop_hooks();
@@ -152,6 +181,7 @@ impl SessionActor {
         let mut executed_any_tool = false;
         let mut force_workspace_tool = false;
         let mut repeated_calls: HashMap<String, usize> = HashMap::new();
+        let mut recovery_budget = SamplingRecoveryBudget::default();
         loop {
             sampling_steps += 1;
             if sampling_steps > 50 {
@@ -164,7 +194,16 @@ impl SessionActor {
                 let usage = self.context_tracker.measure(&self.history, active);
                 self.emit_context_usage(usage.clone())?;
                 let threshold = CompactionPolicy::default().threshold_percent;
-                let trigger = if self.context_tracker.take_model_switch_check() {
+                if usage.threshold_reached(threshold.saturating_sub(PREFIRE_LEAD_PERCENT))
+                    && !usage.threshold_reached(threshold)
+                {
+                    self.start_prefire(active).await?;
+                }
+                let preflight_overflow =
+                    usage.context_window > 0 && usage.estimated_input_tokens > usage.context_window;
+                let trigger = if preflight_overflow {
+                    Some(CompactionTrigger::PreflightOverflow)
+                } else if self.context_tracker.take_model_switch_check() {
                     usage
                         .threshold_reached(threshold)
                         .then_some(CompactionTrigger::ModelSwitch)
@@ -174,7 +213,16 @@ impl SessionActor {
                         .then_some(CompactionTrigger::Threshold)
                 };
                 if let Some(trigger) = trigger {
-                    compacted = self.run_automatic_compaction(trigger, usage).await?;
+                    compacted = self
+                        .run_automatic_compaction(trigger, usage, active.generation)
+                        .await?;
+                    if !compacted && preflight_overflow {
+                        self.active = false;
+                        return Err(
+                            "context.preflight_recovery_failed: automatic compaction did not reduce a known-oversized request"
+                                .into(),
+                        );
+                    }
                 }
             }
             if compacted {
@@ -205,6 +253,7 @@ impl SessionActor {
             let mut saw_tool = false;
             let mut round_text = String::new();
             let mut uncommitted_text = String::new();
+            let mut observed_output = false;
             while let Some(piece) = rx.recv().await {
                 if self.cancelled || self.turn_cancellation.is_cancelled() {
                     self.active = false;
@@ -212,6 +261,7 @@ impl SessionActor {
                 }
                 match piece {
                     StreamPiece::Text(t) => {
+                        observed_output = true;
                         if let Some((events, session_id)) = &self.events {
                             let _ = events.send(serde_json::json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":session_id,"delta":t}}));
                         }
@@ -224,6 +274,7 @@ impl SessionActor {
                         name,
                         arguments,
                     } => {
+                        observed_output = true;
                         self.commit_assistant_text(&uncommitted_text).await?;
                         uncommitted_text.clear();
                         saw_tool = true;
@@ -240,10 +291,72 @@ impl SessionActor {
                     }
                 }
             }
-            let report = stream_task
-                .await
-                .map_err(|error| error.to_string())?
-                .map_err(|error| error.to_string())?;
+            let stream_result = stream_task.await.map_err(|error| error.to_string())?;
+            let report = match stream_result {
+                Ok(report) => report,
+                Err(mut error) => {
+                    error.output_started |= observed_output;
+                    let measured = active_model
+                        .as_ref()
+                        .map(|active| self.context_tracker.measure(&self.history, active));
+                    let inferred_overflow = error.context_window.is_some_and(|window| {
+                        measured
+                            .as_ref()
+                            .is_some_and(|usage| usage.estimated_input_tokens > window)
+                    });
+                    let recoverable = !error.output_started
+                        && self
+                            .context_tracker
+                            .automatic_compaction_allowed(CompactionTrigger::ProviderOverflow)
+                        && (error.kind == ModelErrorKind::ContextOverflow || inferred_overflow)
+                        && recovery_budget.try_use_overflow_recovery();
+                    if recoverable {
+                        let mut usage = measured.unwrap_or(ContextUsage {
+                            estimated_input_tokens: u64::try_from(prompt_bytes)
+                                .unwrap_or(u64::MAX)
+                                .div_ceil(4),
+                            context_window: error.context_window.unwrap_or_default(),
+                            utilization_percent: 0,
+                        });
+                        if let Some(window) = error.context_window.filter(|window| *window > 0) {
+                            usage.context_window = window;
+                            usage.utilization_percent = usage
+                                .estimated_input_tokens
+                                .saturating_mul(100)
+                                .checked_div(window)
+                                .unwrap_or_default()
+                                .min(u64::from(u8::MAX))
+                                as u8;
+                            self.context_tracker.on_context_budget_changed();
+                        }
+                        let generation = active_model
+                            .as_ref()
+                            .map(|active| active.generation)
+                            .unwrap_or_default();
+                        match self
+                            .run_automatic_compaction(
+                                CompactionTrigger::ProviderOverflow,
+                                usage,
+                                generation,
+                            )
+                            .await
+                        {
+                            Ok(true) => continue,
+                            Ok(false) => {}
+                            Err(recovery) => {
+                                return Err(format!(
+                                    "{}; context recovery failed: {recovery}",
+                                    error
+                                ));
+                            }
+                        }
+                    }
+                    self.active = false;
+                    return Err(error.to_string());
+                }
+            };
+            self.context_tracker.on_provider_success();
+            recovery_budget = SamplingRecoveryBudget::default();
             self.commit_assistant_text(&uncommitted_text).await?;
             if let Some(active) = active_model.as_ref()
                 && self
@@ -324,6 +437,11 @@ impl SessionActor {
         self.context_tracker.mark_model_switch_check();
     }
 
+    pub fn context_budget_changed(&mut self) {
+        self.context_tracker.on_context_budget_changed();
+        self.clear_prefire();
+    }
+
     fn emit_context_usage(&self, usage: ContextUsage) -> Result<(), String> {
         match &self.journal_events {
             Some(events) => events
@@ -337,29 +455,129 @@ impl SessionActor {
         &mut self,
         trigger: CompactionTrigger,
         usage: ContextUsage,
+        model_generation: u64,
     ) -> Result<bool, String> {
+        if !self.context_tracker.automatic_compaction_allowed(trigger) {
+            return Ok(false);
+        }
         let Some(events) = self.journal_events.clone() else {
             return Ok(false);
         };
         let messages =
             crate::history_to_model_messages(&self.history).map_err(|error| error.to_string())?;
-        match events
+        let two_pass = self.take_prefire(&messages, model_generation).await;
+        let outcome = events
             .compact(AutomaticCompactionRequest {
                 trigger,
                 usage,
                 messages,
-                two_pass: None,
+                two_pass,
             })
-            .await
-            .map_err(|error| error.to_string())?
-        {
-            AutomaticCompactionOutcome::Compacted(messages) => {
+            .await;
+        match outcome {
+            Err(error) => {
+                self.context_tracker
+                    .suppress_automatic_compaction(compaction_suppression_reason(&error));
+                Err(error.to_string())
+            }
+            Ok(AutomaticCompactionOutcome::Compacted(messages)) => {
                 self.history = crate::model_messages_to_history(&messages)
                     .map_err(|error| error.to_string())?;
                 self.context_tracker.reseed(&self.history);
+                self.context_tracker.on_compaction_success();
+                self.clear_prefire();
                 Ok(true)
             }
-            AutomaticCompactionOutcome::ContinueUnchanged => Ok(false),
+            Ok(AutomaticCompactionOutcome::ContinueUnchanged { error }) => {
+                self.context_tracker
+                    .suppress_automatic_compaction(compaction_suppression_reason(&error));
+                Ok(false)
+            }
+        }
+    }
+
+    async fn start_prefire(&mut self, active: &lato_ai::ActiveModelPort) -> Result<(), String> {
+        self.refresh_prefire().await;
+        if !matches!(self.prefire, PrefireSlot::Empty)
+            || !self
+                .context_tracker
+                .automatic_compaction_allowed(CompactionTrigger::Threshold)
+        {
+            return Ok(());
+        }
+        let Some(events) = self.journal_events.clone() else {
+            return Ok(());
+        };
+        let messages =
+            crate::history_to_model_messages(&self.history).map_err(|error| error.to_string())?;
+        let split = split_for_two_pass(&messages, TWO_PASS_SPLIT_PERCENT);
+        if split.index == 0 || split.index >= messages.len() {
+            return Ok(());
+        }
+        let prefix_len = split.index;
+        let fingerprint = fingerprint_prefix(&messages, prefix_len);
+        let model_generation = active.generation;
+        let handle = tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            let result = events
+                .prefire_compaction(PrefireCompactionRequest {
+                    messages,
+                    prefix_len,
+                    policy: CompactionPolicy::default(),
+                })
+                .await?;
+            Ok(PrefireCache {
+                note1: result.note1,
+                prefix_len,
+                fingerprint,
+                model_generation,
+                _pass1_latency_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            })
+        });
+        self.prefire = PrefireSlot::Running(handle);
+        Ok(())
+    }
+
+    async fn refresh_prefire(&mut self) {
+        let finished =
+            matches!(&self.prefire, PrefireSlot::Running(handle) if handle.is_finished());
+        if !finished {
+            return;
+        }
+        let PrefireSlot::Running(handle) = std::mem::take(&mut self.prefire) else {
+            return;
+        };
+        if let Ok(Ok(cache)) = handle.await {
+            self.prefire = PrefireSlot::Ready(cache);
+        }
+    }
+
+    async fn take_prefire(
+        &mut self,
+        messages: &[ModelMessage],
+        model_generation: u64,
+    ) -> Option<TwoPassCompactionInput> {
+        let slot = std::mem::take(&mut self.prefire);
+        let cache = match slot {
+            PrefireSlot::Empty => return None,
+            PrefireSlot::Ready(cache) => cache,
+            PrefireSlot::Running(handle) => handle.await.ok()?.ok()?,
+        };
+        if cache.model_generation != model_generation
+            || cache.prefix_len > messages.len()
+            || fingerprint_prefix(messages, cache.prefix_len) != cache.fingerprint
+        {
+            return None;
+        }
+        Some(TwoPassCompactionInput {
+            note1: cache.note1,
+            prefix_len: cache.prefix_len,
+        })
+    }
+
+    fn clear_prefire(&mut self) {
+        if let PrefireSlot::Running(handle) = std::mem::take(&mut self.prefire) {
+            handle.abort();
         }
     }
 

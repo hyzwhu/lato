@@ -422,6 +422,8 @@ impl RuntimeSession {
         );
         let selection = prepared.active.port.selection.clone();
         let metadata = prepared.active.port.metadata.clone();
+        let context_budget_changed =
+            previous.port.metadata.context_window != metadata.context_window;
         self.driver.activate_model(prepared.active).await;
 
         if let Err(error) = self
@@ -435,6 +437,9 @@ impl RuntimeSession {
         {
             self.driver.activate_model(previous).await;
             return Err(error);
+        }
+        if context_budget_changed {
+            self.driver.context_budget_changed().await;
         }
 
         let mut compaction_warning = None;

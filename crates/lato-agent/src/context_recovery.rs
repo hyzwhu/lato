@@ -2,7 +2,7 @@
 // License: Apache-2.0
 // Lato changes: provider-neutral automatic-compaction suppression and single-use overflow recovery
 
-use lato_core::{CompactionTrigger, ModelError, ModelErrorKind};
+use lato_core::{AgentError, CompactionTrigger, ModelError, ModelErrorKind};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -117,6 +117,14 @@ pub fn suppression_reason(error: &ModelError) -> SuppressionReason {
             SuppressionReason::Other
         }
         ModelErrorKind::Other => legacy_suppression_reason(&error.message),
+    }
+}
+
+pub fn compaction_suppression_reason(error: &AgentError) -> SuppressionReason {
+    match error.code.as_str() {
+        "compaction.input_too_large" => SuppressionReason::Size,
+        "compaction.invalid_summary" | "compaction.degenerate_summary" => SuppressionReason::Schema,
+        _ => legacy_suppression_reason(&error.message),
     }
 }
 

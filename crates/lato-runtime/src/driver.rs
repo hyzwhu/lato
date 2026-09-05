@@ -64,7 +64,7 @@ pub struct TwoPassCompactionInput {
 #[derive(Clone, Debug, PartialEq)]
 pub enum AutomaticCompactionOutcome {
     Compacted(Vec<ModelMessage>),
-    ContinueUnchanged,
+    ContinueUnchanged { error: AgentError },
 }
 
 #[derive(Clone)]

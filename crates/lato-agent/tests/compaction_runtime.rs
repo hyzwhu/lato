@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use lato_agent::{AcpHost, REQUIRED_SECTIONS};
 use lato_ai::{ModelMetadata, ModelStream, StreamPiece, adapt_model_endpoint};
-use lato_core::{ModelError, Retryability};
+use lato_core::{ModelError, ModelErrorKind, Retryability};
 use lato_protocol::JsonRpcReq;
 use lato_workspace::SessionTrust;
 use std::sync::{Arc, Mutex};
@@ -10,6 +10,28 @@ use tokio::sync::mpsc;
 struct RecordingStream {
     scripts: tokio::sync::Mutex<Vec<Vec<StreamPiece>>>,
     contexts: Arc<Mutex<Vec<serde_json::Value>>>,
+}
+
+struct RecoveryStream {
+    scripts: tokio::sync::Mutex<Vec<Result<Vec<StreamPiece>, ModelError>>>,
+    contexts: Arc<Mutex<Vec<serde_json::Value>>>,
+}
+
+#[async_trait]
+impl ModelStream for RecoveryStream {
+    async fn stream(
+        &self,
+        _prompt_bytes: usize,
+        context: serde_json::Value,
+        tx: mpsc::Sender<StreamPiece>,
+    ) -> Result<(), ModelError> {
+        self.contexts.lock().unwrap().push(context);
+        let script = self.scripts.lock().await.remove(0)?;
+        for piece in script {
+            tx.send(piece).await.map_err(|_| ModelError::cancelled())?;
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -232,4 +254,78 @@ async fn automatic_compaction_runs_before_the_next_sample_and_rebuilds_its_reque
     assert!(rebuilt.contains("conversation_summary"));
     assert!(rebuilt.contains("continue now"));
     assert!(!rebuilt.contains("SECRET_AUTOMATIC_PRECOMPACTION_PAYLOAD"));
+}
+
+#[tokio::test]
+async fn provider_overflow_compacts_and_resubmits_the_turn_exactly_once() {
+    let workspace = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let contexts = Arc::new(Mutex::new(Vec::new()));
+    let overflow = || {
+        ModelError::new(
+            "model.context_overflow",
+            "context window exceeded",
+            Retryability::Never,
+        )
+        .with_kind(ModelErrorKind::ContextOverflow)
+        .with_context_window(100_000)
+    };
+    let raw: Arc<dyn ModelStream> = Arc::new(RecoveryStream {
+        scripts: tokio::sync::Mutex::new(vec![
+            Ok(vec![StreamPiece::Text("seed history ".repeat(2_000))]),
+            Err(overflow()),
+            Ok(vec![StreamPiece::Text(summary())]),
+            Ok(vec![StreamPiece::Text("recovered".into())]),
+        ]),
+        contexts: contexts.clone(),
+    });
+    let endpoint = adapt_model_endpoint(
+        "fixture",
+        "overflow-recovery",
+        ModelMetadata {
+            context_window: Some(1_000_000),
+            model_family: Some("fixture".into()),
+        },
+        raw,
+    )
+    .unwrap();
+    let (updates, _updates_rx) = mpsc::unbounded_channel();
+    let mut host = AcpHost::new_with_home(
+        workspace.path().to_path_buf(),
+        SessionTrust::for_headless_prompt(workspace.path()),
+        updates,
+        endpoint.stream,
+        home.path().to_path_buf(),
+    );
+    let created = host
+        .handle(req(20, "session/new", serde_json::json!({})))
+        .await
+        .unwrap();
+    let sid = created["result"]["sessionId"].as_str().unwrap();
+    assert_eq!(
+        host.handle(req(
+            21,
+            "session/prompt",
+            serde_json::json!({"sessionId":sid,"text":"seed"}),
+        ))
+        .await
+        .unwrap()["result"]["status"],
+        "complete"
+    );
+    let recovered = host
+        .handle(req(
+            22,
+            "session/prompt",
+            serde_json::json!({"sessionId":sid,"text":"continue"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(recovered["result"]["status"], "complete", "{recovered}");
+
+    let contexts = contexts.lock().unwrap();
+    assert_eq!(contexts.len(), 4, "seed, overflow, compact, resubmit");
+    assert!(!contexts[1]["tools"].as_array().unwrap().is_empty());
+    assert!(contexts[2]["tools"].as_array().unwrap().is_empty());
+    assert!(!contexts[3]["tools"].as_array().unwrap().is_empty());
+    assert!(contexts[3].to_string().contains("conversation_summary"));
 }

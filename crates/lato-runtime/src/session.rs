@@ -822,7 +822,7 @@ impl SessionLoop {
                     let outcome = if automatic_compaction_must_stop(&error) {
                         Err(error)
                     } else {
-                        Ok(AutomaticCompactionOutcome::ContinueUnchanged)
+                        Ok(AutomaticCompactionOutcome::ContinueUnchanged { error })
                     };
                     let _ = reply.send(outcome);
                 }
