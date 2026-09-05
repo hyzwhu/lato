@@ -254,29 +254,45 @@ fn composer(frame: &mut Frame<'_>, area: Rect, app: &AppState, welcome: bool) {
         .style(Style::default().bg(BG)),
         inner,
     );
-    let status = if app.responding {
+    let status = if let CompactionUiState::Running {
+        started_at,
+        trigger,
+    } = &app.compaction
+    {
+        let elapsed = started_at.elapsed().as_secs();
+        let trigger = match (app.language, trigger.as_str()) {
+            (super::i18n::Language::ZhCn, "model_switch") => "模型切换",
+            (super::i18n::Language::ZhCn, "threshold") => "自动",
+            (super::i18n::Language::ZhCn, _) => "手动",
+            (super::i18n::Language::En, "model_switch") => "model switch",
+            (super::i18n::Language::En, "threshold") => "automatic",
+            (super::i18n::Language::En, _) => "manual",
+        };
+        match app.language {
+            super::i18n::Language::ZhCn => {
+                format!("● 正在压缩上下文（{trigger}）… {elapsed}s [Ctrl-C 取消]")
+            }
+            super::i18n::Language::En => {
+                format!("● Compacting context ({trigger})… {elapsed}s [Ctrl-C stop]")
+            }
+        }
+    } else if app.responding {
         format!(
             "● {}… {}s                                      [{}]",
             tr(app.language, TextKey::Responding),
             app.elapsed_seconds,
             tr(app.language, TextKey::Stop)
         )
-    } else if let CompactionUiState::Running { started_at } = &app.compaction {
-        let elapsed = started_at.elapsed().as_secs();
-        match app.language {
-            super::i18n::Language::ZhCn => {
-                format!(
-                    "● 正在压缩上下文… {elapsed}s                                      [Ctrl-C 取消]"
-                )
-            }
-            super::i18n::Language::En => {
-                format!(
-                    "● Compacting context… {elapsed}s                                      [Ctrl-C stop]"
-                )
-            }
-        }
     } else if welcome {
         tr(app.language, TextKey::WelcomeHint).to_string()
+    } else if let Some(usage) = &app.context_usage {
+        match (usage.context_window, usage.utilization_percent) {
+            (Some(window), Some(percent)) => format!(
+                "context: {} / {} ({}%)",
+                usage.estimated_input_tokens, window, percent
+            ),
+            _ => format!("context: {}", usage.estimated_input_tokens),
+        }
     } else {
         tr(app.language, TextKey::Ready).to_string()
     };

@@ -255,6 +255,58 @@ impl RuntimeSession {
                         "params": {"sessionId": self.session_id.as_str(), "delta": text},
                     }));
                 }
+                EventPayload::ContextUsageUpdated { usage }
+                    if event.turn_id.as_ref() == observed_turn.as_ref() =>
+                {
+                    let _ = self.updates.send(serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "method": "lato/session/context",
+                        "params": {
+                            "sessionId": self.session_id.as_str(),
+                            "estimatedInputTokens": usage.estimated_input_tokens,
+                            "contextWindow": usage.context_window,
+                            "utilizationPercent": usage.utilization_percent,
+                        },
+                    }));
+                }
+                EventPayload::CompactionStarted {
+                    compaction_id,
+                    trigger,
+                } if event.turn_id.as_ref() == observed_turn.as_ref() => {
+                    self.send_compaction_update(
+                        "started",
+                        serde_json::json!({"compactionId": compaction_id, "trigger": trigger}),
+                    );
+                }
+                EventPayload::CompactionCompleted {
+                    compaction_id,
+                    before,
+                    after,
+                    checkpoint_id,
+                    warning,
+                } if event.turn_id.as_ref() == observed_turn.as_ref() => {
+                    self.send_compaction_update(
+                        "completed",
+                        serde_json::json!({"compactionId": compaction_id, "before": before, "after": after, "checkpointId": checkpoint_id, "warning": warning}),
+                    );
+                }
+                EventPayload::CompactionFailed {
+                    compaction_id,
+                    error,
+                } if event.turn_id.as_ref() == observed_turn.as_ref() => {
+                    self.send_compaction_update(
+                        "failed",
+                        serde_json::json!({"compactionId": compaction_id, "error": error}),
+                    );
+                }
+                EventPayload::CompactionCancelled { compaction_id }
+                    if event.turn_id.as_ref() == observed_turn.as_ref() =>
+                {
+                    self.send_compaction_update(
+                        "cancelled",
+                        serde_json::json!({"compactionId": compaction_id}),
+                    );
+                }
                 EventPayload::TurnCompleted(output)
                     if event.turn_id.as_ref() == observed_turn.as_ref() =>
                 {

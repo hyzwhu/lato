@@ -32,7 +32,6 @@ pub struct InteractiveBootstrap {
     pub home: PathBuf,
     pub sessions: Vec<SessionSummary>,
     pub resumed: bool,
-    pub switchable: std::sync::Arc<lato_ai::SwitchableModelStream>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -117,7 +116,6 @@ pub async fn run(
             &mut app,
             terminal,
             terminal_events,
-            &bootstrap.switchable,
         )
         .await;
         if needs_draw {
@@ -137,7 +135,6 @@ async fn execute_effects(
     app: &mut AppState,
     terminal: &mut terminal::TuiTerminal,
     events: &mut EventStream,
-    switchable: &lato_ai::SwitchableModelStream,
 ) {
     for effect in effects {
         match effect {
@@ -230,9 +227,7 @@ async fn execute_effects(
                     } else {
                         crate::cli::configure_interactively(home, &ui).await?
                     };
-                    ui.notice("Loading model / 加载模型…");
-                    let stream = crate::cli::configured_stream(&selection).await?;
-                    Ok((selection, stream))
+                    Ok(selection)
                 })
                 .await;
                 app.overlay = None;
@@ -240,14 +235,9 @@ async fn execute_effects(
                     app.reduce(AppEvent::Resize(size.width, size.height));
                 }
                 match result {
-                    Ok((selection, stream)) => {
-                        match crate::cli::persist_model_selection(home, &selection, app.language) {
-                            Ok(()) => {
-                                switchable.set(stream).await;
-                                app.model = selection;
-                                app.error = None;
-                            }
-                            Err(error) => app.error = Some(error),
+                    Ok(selection) => {
+                        if let Err(error) = backend.send(BackendCommand::SwitchModel(selection)) {
+                            app.error = Some(error);
                         }
                     }
                     Err(error) if error == dialog::CANCELLED => {}
@@ -256,6 +246,13 @@ async fn execute_effects(
             }
             Effect::PersistLanguage(language) => {
                 if let Err(error) = crate::cli::persist_language(home, language) {
+                    app.error = Some(error);
+                }
+            }
+            Effect::PersistModel(selection) => {
+                if let Err(error) =
+                    crate::cli::persist_model_selection(home, &selection, app.language)
+                {
                     app.error = Some(error);
                 }
             }

@@ -31,6 +31,15 @@ pub struct CompactionResponse {
     pub warning: Option<lato_core::AgentError>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelSwitchResponse {
+    pub supported: bool,
+    pub provider: String,
+    pub model: String,
+    pub compaction_warning: Option<lato_core::AgentError>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ClientUpdate {
     TextDelta(String),
@@ -51,6 +60,7 @@ pub enum ClientUpdate {
     PermissionRequested,
     CompactionStarted {
         compaction_id: String,
+        trigger: String,
     },
     CompactionCompleted {
         before: CompactionSizeResponse,
@@ -63,6 +73,16 @@ pub enum ClientUpdate {
         message: String,
     },
     CompactionCancelled,
+    ContextUsage {
+        estimated_input_tokens: u64,
+        context_window: Option<u64>,
+        utilization_percent: Option<u8>,
+    },
+    ModelChanged {
+        provider: String,
+        model: String,
+        warning: Option<lato_core::AgentError>,
+    },
     Unknown,
 }
 
@@ -129,6 +149,11 @@ impl ClientUpdate {
                     .and_then(serde_json::Value::as_str)
                     .map(|value| Self::CompactionStarted {
                         compaction_id: value.to_owned(),
+                        trigger: params
+                            .get("trigger")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("manual")
+                            .to_owned(),
                     })
                     .unwrap_or(Self::Unknown),
                 Some("completed") => {
@@ -161,6 +186,41 @@ impl ClientUpdate {
                 Some("cancelled") => Self::CompactionCancelled,
                 _ => Self::Unknown,
             },
+            Some("lato/session/context") => {
+                let Some(estimated_input_tokens) = params
+                    .get("estimatedInputTokens")
+                    .and_then(serde_json::Value::as_u64)
+                else {
+                    return Self::Unknown;
+                };
+                let context_window = params
+                    .get("contextWindow")
+                    .and_then(serde_json::Value::as_u64)
+                    .filter(|window| *window > 0);
+                Self::ContextUsage {
+                    estimated_input_tokens,
+                    context_window,
+                    utilization_percent: context_window.and_then(|_| {
+                        params
+                            .get("utilizationPercent")
+                            .and_then(serde_json::Value::as_u64)
+                            .and_then(|percent| u8::try_from(percent).ok())
+                    }),
+                }
+            }
+            Some("lato/session/model_changed") => {
+                match (
+                    params.get("provider").and_then(serde_json::Value::as_str),
+                    params.get("model").and_then(serde_json::Value::as_str),
+                ) {
+                    (Some(provider), Some(model)) => Self::ModelChanged {
+                        provider: provider.to_owned(),
+                        model: model.to_owned(),
+                        warning: serde_json::from_value(params["compactionWarning"].clone()).ok(),
+                    },
+                    _ => Self::Unknown,
+                }
+            }
             _ => Self::Unknown,
         }
     }
@@ -337,6 +397,30 @@ impl InteractiveAcpClient {
         }
         serde_json::from_value(response_result(&response)?.clone())
             .map_err(|error| format!("invalid compaction response: {error}"))
+    }
+
+    pub async fn set_model(&mut self, selection: &str) -> Result<ModelSwitchResponse, String> {
+        let (provider, model) = selection
+            .split_once('/')
+            .ok_or("model must be provider/model")?;
+        let id = self.take_id();
+        let response = self
+            .host
+            .handle(req(
+                id,
+                "session/set_model",
+                serde_json::json!({
+                    "sessionId": self.session_id,
+                    "provider": provider,
+                    "model": model,
+                }),
+            ))
+            .await
+            .ok_or("no response")?;
+        let result = serde_json::from_value(response_result(&response)?.clone())
+            .map_err(|error| error.to_string())?;
+        while self.updates.try_recv().is_ok() {}
+        Ok(result)
     }
 
     pub async fn clear(&mut self) -> Result<(), String> {
@@ -606,6 +690,34 @@ mod tests {
             ClientUpdate::ToolFailed {
                 id: "call-2".into(),
                 error: "denied".into()
+            }
+        );
+    }
+
+    #[test]
+    fn converts_known_and_unknown_context_usage() {
+        let known = serde_json::json!({
+            "method":"lato/session/context",
+            "params":{"sessionId":"s1","estimatedInputTokens":850,"contextWindow":1000,"utilizationPercent":85}
+        });
+        assert_eq!(
+            ClientUpdate::from_json(&known),
+            ClientUpdate::ContextUsage {
+                estimated_input_tokens: 850,
+                context_window: Some(1_000),
+                utilization_percent: Some(85),
+            }
+        );
+        let unknown = serde_json::json!({
+            "method":"lato/session/context",
+            "params":{"sessionId":"s1","estimatedInputTokens":850,"contextWindow":0,"utilizationPercent":0}
+        });
+        assert_eq!(
+            ClientUpdate::from_json(&unknown),
+            ClientUpdate::ContextUsage {
+                estimated_input_tokens: 850,
+                context_window: None,
+                utilization_percent: None,
             }
         );
     }

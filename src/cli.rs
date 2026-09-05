@@ -400,14 +400,13 @@ async fn interactive(
                 let trust = crate::permissions::interactive_trust(&cwd, trusted, sandbox);
                 let (tui_approval, approvals) = crate::tui::backend::TuiToolApproval::channel();
                 let inline_approval = (trust.mode == ApprovalMode::Ask).then_some(tui_approval);
-                let switchable = Arc::new(lato_ai::SwitchableModelStream::from_stream(stream));
                 let client = match &startup {
                     InteractiveStartup::New => {
                         crate::client::InteractiveAcpClient::new_session_with_approval(
                             cwd.clone(),
                             home.clone(),
                             trust.clone(),
-                            switchable.clone(),
+                            stream.clone(),
                             inline_approval,
                         )
                         .await?
@@ -417,7 +416,7 @@ async fn interactive(
                             cwd.clone(),
                             home.clone(),
                             trust.clone(),
-                            switchable.clone(),
+                            stream.clone(),
                             inline_approval,
                             id.clone(),
                         )
@@ -456,7 +455,6 @@ async fn interactive(
                     home: home.clone(),
                     sessions,
                     resumed: matches!(startup, InteractiveStartup::Resume(_)),
-                    switchable,
                 })
             })
             .await;

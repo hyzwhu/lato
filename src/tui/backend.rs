@@ -1,4 +1,6 @@
-use crate::client::{ClientUpdate, CompactionResponse, InteractiveAcpClient, SessionSummary};
+use crate::client::{
+    ClientUpdate, CompactionResponse, InteractiveAcpClient, ModelSwitchResponse, SessionSummary,
+};
 use lato_agent::{ApprovalRequest, ToolApproval};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
@@ -7,6 +9,7 @@ use tokio::sync::{mpsc, oneshot};
 pub enum BackendCommand {
     Submit(String),
     Compact(Option<String>),
+    SwitchModel(String),
     Cancel,
     NewSession,
     Resume(String),
@@ -25,6 +28,7 @@ pub enum BackendEvent {
     Resumed(String),
     Sessions(Vec<SessionSummary>),
     SessionRenamed(SessionSummary),
+    ModelSwitched(ModelSwitchResponse),
     SessionDeleted {
         session_id: String,
         replacement_session_id: Option<String>,
@@ -132,7 +136,7 @@ pub fn spawn(
                             }
                             break;
                         }
-                        Some(BackendCommand::Submit(_) | BackendCommand::Compact(_)) => {
+                        Some(BackendCommand::Submit(_) | BackendCommand::Compact(_) | BackendCommand::SwitchModel(_)) => {
                             let _ = event_tx.send(BackendEvent::Error("session work is already running".into()));
                         }
                         Some(BackendCommand::Resume(_)) => {
@@ -272,6 +276,20 @@ pub fn spawn(
                         };
                         (owned, ActiveWorkEnd::Compaction(result))
                     }));
+                }
+                Some(BackendCommand::SwitchModel(selection)) => {
+                    let Some(owned) = client.as_mut() else {
+                        let _ = event_tx.send(BackendEvent::Error("session is unavailable".into()));
+                        continue;
+                    };
+                    match owned.set_model(&selection).await {
+                        Ok(response) => {
+                            let _ = event_tx.send(BackendEvent::ModelSwitched(response));
+                        }
+                        Err(error) => {
+                            let _ = event_tx.send(BackendEvent::Error(error));
+                        }
+                    }
                 }
                 Some(BackendCommand::Cancel) => {
                     let _ = event_tx.send(BackendEvent::TurnCancelled);

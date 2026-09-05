@@ -152,6 +152,35 @@ mod tests {
     }
 
     #[test]
+    fn footer_renders_known_context_usage() {
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = AppState::new(
+            Language::En,
+            PathBuf::from("/tmp/lato"),
+            "openai/gpt-test".into(),
+            "session-1".into(),
+            vec!["session-1".into()],
+        );
+        app.screen = Screen::Main;
+        app.context_usage = Some(crate::tui::state::ContextUiState {
+            estimated_input_tokens: 850,
+            context_window: Some(1_000),
+            utilization_percent: Some(85),
+        });
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let mut output = String::new();
+        for y in 0..30 {
+            for x in 0..100 {
+                output.push_str(buffer[(x, y)].symbol());
+            }
+            output.push('\n');
+        }
+        assert!(output.contains("context: 850 / 1000 (85%)"), "{output}");
+    }
+
+    #[test]
     fn chinese_wide_layout_renders_three_panels() {
         let text = render_text(Language::ZhCn, 120, 30, true);
         assert!(text.contains("会 话"), "{text}");

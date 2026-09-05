@@ -101,6 +101,7 @@ pub enum CompactionUiState {
     Idle,
     Running {
         started_at: Instant,
+        trigger: String,
     },
     Completed {
         before: CompactionSizeResponse,
@@ -113,6 +114,13 @@ pub enum CompactionUiState {
         message: String,
     },
     Cancelled,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContextUiState {
+    pub estimated_input_tokens: u64,
+    pub context_window: Option<u64>,
+    pub utilization_percent: Option<u8>,
 }
 
 #[derive(Clone, Debug)]
@@ -191,6 +199,7 @@ pub struct AppState {
     pub layout: LayoutMode,
     pub responding: bool,
     pub compaction: CompactionUiState,
+    pub context_usage: Option<ContextUiState>,
     pub response_started: Option<Instant>,
     pub elapsed_seconds: u64,
     pub error: Option<String>,
@@ -222,6 +231,7 @@ pub enum AppEvent {
 pub enum Effect {
     Backend(BackendCommand),
     PersistLanguage(Language),
+    PersistModel(String),
     ConfigureModel,
     Doctor,
     Sessions,
@@ -267,6 +277,7 @@ impl AppState {
             layout: LayoutMode::Wide,
             responding: false,
             compaction: CompactionUiState::Idle,
+            context_usage: None,
             response_started: None,
             elapsed_seconds: 0,
             error: None,
@@ -367,6 +378,12 @@ impl AppState {
     pub fn reduce(&mut self, event: AppEvent) -> Vec<Effect> {
         match event {
             AppEvent::Submit => self.submit(),
+            AppEvent::Backend(BackendEvent::ModelSwitched(response)) => {
+                let selection = format!("{}/{}", response.provider, response.model);
+                self.model = selection.clone();
+                self.error = response.compaction_warning.map(|warning| warning.message);
+                vec![Effect::PersistModel(selection)]
+            }
             AppEvent::Backend(event) => {
                 self.apply_backend(event);
                 Vec::new()
@@ -507,6 +524,7 @@ impl AppState {
                 self.screen = Screen::Welcome;
                 self.error = None;
                 self.compaction = CompactionUiState::Idle;
+                self.context_usage = None;
                 self.select_current_session();
             }
             BackendEvent::Resumed(id) => {
@@ -519,6 +537,7 @@ impl AppState {
                 self.focus = Focus::Chat;
                 self.screen = Screen::Main;
                 self.compaction = CompactionUiState::Idle;
+                self.context_usage = None;
             }
             BackendEvent::Sessions(summaries) => self.replace_sessions(summaries),
             BackendEvent::SessionRenamed(summary) => {
@@ -561,6 +580,9 @@ impl AppState {
                 });
             }
             BackendEvent::Update(update) => self.apply_update(update),
+            BackendEvent::ModelSwitched(_) => {
+                unreachable!("model switch acknowledgements are reduced before generic updates")
+            }
             BackendEvent::TurnCompleted(text) => {
                 if let Some(message) = self
                     .messages
@@ -634,9 +656,10 @@ impl AppState {
             ClientUpdate::ToolFailed { id, error } => {
                 self.finish_tool(&id, ToolStatus::Error, error)
             }
-            ClientUpdate::CompactionStarted { .. } => {
+            ClientUpdate::CompactionStarted { trigger, .. } => {
                 self.compaction = CompactionUiState::Running {
                     started_at: Instant::now(),
+                    trigger,
                 };
                 self.error = None;
             }
@@ -707,6 +730,25 @@ impl AppState {
                     },
                     expanded: true,
                 });
+            }
+            ClientUpdate::ContextUsage {
+                estimated_input_tokens,
+                context_window,
+                utilization_percent,
+            } => {
+                self.context_usage = Some(ContextUiState {
+                    estimated_input_tokens,
+                    context_window,
+                    utilization_percent,
+                });
+            }
+            ClientUpdate::ModelChanged {
+                provider,
+                model,
+                warning,
+            } => {
+                self.model = format!("{provider}/{model}");
+                self.error = warning.map(|warning| warning.message);
             }
             ClientUpdate::PermissionRequested | ClientUpdate::Unknown => {}
         }
@@ -795,6 +837,7 @@ mod tests {
         app.composer.insert_str("draft next prompt");
         app.apply_update(ClientUpdate::CompactionStarted {
             compaction_id: "compact-1".into(),
+            trigger: "manual".into(),
         });
         assert!(app.is_busy());
         assert!(!app.responding);
@@ -820,6 +863,28 @@ mod tests {
         ));
         assert_eq!(app.messages.len(), 1);
         assert!(app.messages[0].content.contains("12 messages → 3 messages"));
+    }
+
+    #[test]
+    fn model_changes_only_after_backend_acknowledgement() {
+        let mut app = app();
+        let original = app.model.clone();
+        assert_eq!(app.model, original);
+
+        let effects = app.reduce(AppEvent::Backend(BackendEvent::ModelSwitched(
+            crate::client::ModelSwitchResponse {
+                supported: true,
+                provider: "fixture".into(),
+                model: "small-b".into(),
+                compaction_warning: None,
+            },
+        )));
+
+        assert_eq!(app.model, "fixture/small-b");
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::PersistModel(selection)] if selection == "fixture/small-b"
+        ));
     }
 
     #[test]
