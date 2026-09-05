@@ -16,6 +16,7 @@ pub enum SessionPhase {
 pub struct ActiveTurn {
     pub id: TurnId,
     pub cancel_requested: bool,
+    pub active_compaction: Option<ActiveCompaction>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -70,7 +71,8 @@ impl SessionMachine {
     pub fn active_compaction(&self) -> Option<&ActiveCompaction> {
         match &self.phase {
             SessionPhase::Compacting(active) => Some(active),
-            SessionPhase::Idle | SessionPhase::Running(_) | SessionPhase::Stopped => None,
+            SessionPhase::Running(active) => active.active_compaction.as_ref(),
+            SessionPhase::Idle | SessionPhase::Stopped => None,
         }
     }
 
@@ -84,8 +86,12 @@ impl SessionMachine {
                 self.phase = SessionPhase::Running(ActiveTurn {
                     id: turn_id,
                     cancel_requested: false,
+                    active_compaction: None,
                 });
                 Ok(StartDecision::StartNow)
+            }
+            (SessionPhase::Running(active), _) if active.active_compaction.is_some() => {
+                Err(TransitionError::CompactionAlreadyActive)
             }
             (SessionPhase::Running(_), StartBehavior::Reject) => {
                 Err(TransitionError::TurnAlreadyActive)
@@ -114,6 +120,9 @@ impl SessionMachine {
                 });
                 Ok(())
             }
+            SessionPhase::Running(active) if active.active_compaction.is_some() => {
+                Err(TransitionError::CompactionAlreadyActive)
+            }
             SessionPhase::Running(_) => Err(TransitionError::TurnAlreadyActive),
             SessionPhase::Compacting(_) => Err(TransitionError::CompactionAlreadyActive),
             SessionPhase::Stopped => Err(TransitionError::SessionStopped),
@@ -128,6 +137,60 @@ impl SessionMachine {
             return Err(TransitionError::NotActiveCompaction);
         };
         active.cancel_requested = true;
+        Ok(())
+    }
+
+    pub fn request_turn_compaction(
+        &mut self,
+        turn_id: &TurnId,
+        compaction_id: CompactionId,
+    ) -> Result<(), TransitionError> {
+        let Some(active) = self.active_turn_mut(turn_id) else {
+            return Err(TransitionError::NotActiveTurn);
+        };
+        if active.active_compaction.is_some() {
+            return Err(TransitionError::CompactionAlreadyActive);
+        }
+        active.active_compaction = Some(ActiveCompaction {
+            id: compaction_id,
+            cancel_requested: false,
+        });
+        Ok(())
+    }
+
+    pub fn request_turn_compaction_cancel(
+        &mut self,
+        turn_id: &TurnId,
+        compaction_id: &CompactionId,
+    ) -> Result<(), TransitionError> {
+        let Some(active) = self.active_turn_mut(turn_id) else {
+            return Err(TransitionError::NotActiveTurn);
+        };
+        let Some(compaction) = active.active_compaction.as_mut() else {
+            return Err(TransitionError::NotActiveCompaction);
+        };
+        if &compaction.id != compaction_id {
+            return Err(TransitionError::NotActiveCompaction);
+        }
+        compaction.cancel_requested = true;
+        Ok(())
+    }
+
+    pub fn finish_turn_compaction(
+        &mut self,
+        turn_id: &TurnId,
+        compaction_id: &CompactionId,
+    ) -> Result<(), TransitionError> {
+        let Some(active) = self.active_turn_mut(turn_id) else {
+            return Err(TransitionError::NotActiveTurn);
+        };
+        let Some(compaction) = active.active_compaction.as_ref() else {
+            return Err(TransitionError::NotActiveCompaction);
+        };
+        if &compaction.id != compaction_id {
+            return Err(TransitionError::NotActiveCompaction);
+        }
+        active.active_compaction = None;
         Ok(())
     }
 
@@ -150,6 +213,9 @@ impl SessionMachine {
             return Err(TransitionError::NotActiveTurn);
         };
         active.cancel_requested = true;
+        if let Some(compaction) = active.active_compaction.as_mut() {
+            compaction.cancel_requested = true;
+        }
         Ok(())
     }
 
@@ -159,6 +225,9 @@ impl SessionMachine {
         };
         if &active.id != turn_id {
             return Err(TransitionError::NotActiveTurn);
+        }
+        if active.active_compaction.is_some() {
+            return Err(TransitionError::CompactionAlreadyActive);
         }
         self.phase = SessionPhase::Idle;
         Ok(())
@@ -184,6 +253,14 @@ impl SessionMachine {
     ) -> Option<&mut ActiveCompaction> {
         match &mut self.phase {
             SessionPhase::Compacting(active) if &active.id == compaction_id => Some(active),
+            SessionPhase::Running(active)
+                if active
+                    .active_compaction
+                    .as_ref()
+                    .is_some_and(|compaction| &compaction.id == compaction_id) =>
+            {
+                active.active_compaction.as_mut()
+            }
             SessionPhase::Idle
             | SessionPhase::Running(_)
             | SessionPhase::Compacting(_)

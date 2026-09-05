@@ -82,3 +82,109 @@ fn compaction_event_round_trips_with_warning() {
         payload
     );
 }
+
+#[test]
+fn grok_default_threshold_is_eighty_five_percent() {
+    assert_eq!(CompactionPolicy::default().threshold_percent, 85);
+}
+
+#[test]
+fn provider_usage_becomes_the_confirmed_baseline_without_double_counting() {
+    let mut ledger = ContextLedger::default();
+    let usage = ModelUsage {
+        input_tokens: Some(800),
+        output_tokens: Some(100),
+        reasoning_tokens: Some(60),
+        cached_input_tokens: Some(400),
+    };
+
+    assert!(ledger.observe(&usage, 720));
+    assert_eq!(ledger.measure(760, Some(1_000)).estimated_input_tokens, 940);
+}
+
+#[test]
+fn missing_usage_does_not_erase_a_confirmed_baseline() {
+    let mut ledger = ContextLedger::default();
+    assert!(ledger.observe(
+        &ModelUsage {
+            input_tokens: Some(700),
+            output_tokens: Some(100),
+            reasoning_tokens: None,
+            cached_input_tokens: None,
+        },
+        600,
+    ));
+    assert!(!ledger.observe(
+        &ModelUsage {
+            input_tokens: None,
+            output_tokens: None,
+            reasoning_tokens: Some(20),
+            cached_input_tokens: Some(50),
+        },
+        650,
+    ));
+    assert_eq!(ledger.measure(700, None).estimated_input_tokens, 900);
+}
+
+#[test]
+fn threshold_is_inclusive_and_unknown_windows_do_not_trigger() {
+    let at = ContextLedger::default().measure(850, Some(1_000));
+    let below = ContextLedger::default().measure(849, Some(1_000));
+    let unknown = ContextLedger::default().measure(999_999, None);
+
+    assert!(at.threshold_reached(85));
+    assert!(!below.threshold_reached(85));
+    assert!(!unknown.threshold_reached(85));
+    assert_eq!(unknown.context_window, 0);
+}
+
+#[test]
+fn replacement_reseed_scales_provider_overhead_and_caps_growth() {
+    let mut ledger = ContextLedger::default();
+    assert!(ledger.observe(
+        &ModelUsage {
+            input_tokens: Some(900),
+            output_tokens: Some(100),
+            reasoning_tokens: None,
+            cached_input_tokens: None,
+        },
+        800,
+    ));
+
+    ledger.reseed(200);
+    assert_eq!(ledger.measure(200, Some(2_000)).estimated_input_tokens, 250);
+
+    ledger.reseed(2_000);
+    assert_eq!(
+        ledger.measure(2_000, Some(3_000)).estimated_input_tokens,
+        250
+    );
+}
+
+#[test]
+fn context_usage_event_has_a_stable_wire_shape() {
+    let payload = EventPayload::ContextUsageUpdated {
+        usage: ContextUsage {
+            estimated_input_tokens: 850,
+            context_window: 1_000,
+            utilization_percent: 85,
+        },
+    };
+
+    let value = serde_json::to_value(&payload).unwrap();
+    assert_eq!(
+        value,
+        serde_json::json!({
+            "type": "context_usage_updated",
+            "usage": {
+                "estimated_input_tokens": 850,
+                "context_window": 1_000,
+                "utilization_percent": 85
+            }
+        })
+    );
+    assert_eq!(
+        serde_json::from_value::<EventPayload>(value).unwrap(),
+        payload
+    );
+}

@@ -1,5 +1,6 @@
 use crate::{
-    AgentError, CompactionId, CompactionSize, CompactionTrigger, EventId, SessionId, TurnId,
+    AgentError, CompactionId, CompactionSize, CompactionTrigger, ContextUsage, EventId, SessionId,
+    TurnId,
 };
 
 pub const EVENT_SCHEMA_VERSION: u16 = 1;
@@ -33,6 +34,9 @@ pub enum EventPayload {
     },
     TurnCancelled {
         reason: CancelReason,
+    },
+    ContextUsageUpdated {
+        usage: ContextUsage,
     },
     CompactionStarted {
         compaction_id: CompactionId,
