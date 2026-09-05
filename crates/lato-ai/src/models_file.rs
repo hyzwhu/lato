@@ -231,9 +231,7 @@ impl ModelStream for CustomHttpModelStream {
                 &context,
             )
             .map_err(legacy_model_error)?;
-            return crate::codex::stream_codex_with_report(&self.client, &request, tx)
-                .await
-                .map_err(legacy_model_error);
+            return crate::codex::stream_codex_with_report(&self.client, &request, tx).await;
         }
         let request =
             build_custom_request(&self.model, &self.auth, context).map_err(legacy_model_error)?;

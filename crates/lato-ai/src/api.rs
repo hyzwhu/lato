@@ -405,6 +405,58 @@ pub async fn send_request_response(
     ))
 }
 
+pub async fn send_sampling_response(
+    client: &reqwest::Client,
+    spec: &HttpRequestSpec,
+) -> Result<reqwest::Response, lato_core::ModelError> {
+    let method = reqwest::Method::from_bytes(spec.method.as_bytes()).map_err(|error| {
+        lato_core::ModelError::new(
+            "model.invalid_request",
+            error.to_string(),
+            lato_core::Retryability::Never,
+        )
+        .with_kind(lato_core::ModelErrorKind::InvalidRequest)
+    })?;
+    let mut last_error = None;
+    for attempt in 0..3 {
+        let mut request = client.request(method.clone(), &spec.url);
+        for (key, value) in &spec.headers {
+            request = request.header(key, value);
+        }
+        match request.json(&spec.body).send().await {
+            Ok(response) => {
+                let status = response.status();
+                if status.is_success() {
+                    return Ok(response);
+                }
+                let body = response.text().await.unwrap_or_default();
+                let error = crate::classify_provider_failure(status.as_u16(), &body);
+                let retryable = retryable_status(status.as_u16());
+                last_error = Some(error.clone());
+                if !retryable {
+                    return Err(error);
+                }
+            }
+            Err(error) => {
+                let retryable = error.is_timeout() || error.is_connect();
+                let typed = crate::provider_error::classify_transport_failure(error.to_string());
+                last_error = Some(typed.clone());
+                if !retryable {
+                    return Err(typed);
+                }
+            }
+        }
+        if attempt < 2 {
+            tokio::time::sleep(std::time::Duration::from_millis(100 * (1 << attempt))).await;
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        crate::provider_error::classify_transport_failure(
+            "sampling failed after transient attempts",
+        )
+    }))
+}
+
 pub async fn send_request(
     client: &reqwest::Client,
     spec: &HttpRequestSpec,

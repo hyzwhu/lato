@@ -21,13 +21,25 @@ pub struct TransportOutcome {
 pub struct CodexTransportError {
     pub message: String,
     pub events_started: bool,
+    pub model_error: lato_core::ModelError,
 }
 
 impl CodexTransportError {
     pub(crate) fn before_stream(message: impl Into<String>) -> Self {
+        let message = safe_error_excerpt(&message.into());
         Self {
-            message: safe_error_excerpt(&message.into()),
+            model_error: crate::provider_error::classify_transport_failure(message.clone()),
+            message,
             events_started: false,
+        }
+    }
+
+    pub(crate) fn from_http(status: u16, body: &str) -> Self {
+        let model_error = crate::classify_provider_failure(status, body);
+        Self {
+            message: model_error.message.clone(),
+            events_started: false,
+            model_error,
         }
     }
 
@@ -35,10 +47,18 @@ impl CodexTransportError {
         message: impl Into<String>,
         mapper: &events::CodexEventMapper,
     ) -> Self {
+        let message = safe_error_excerpt(&message.into());
         Self {
-            message: safe_error_excerpt(&message.into()),
+            model_error: crate::provider_error::classify_transport_failure(message.clone())
+                .with_output_started(mapper.started()),
+            message,
             events_started: mapper.started(),
         }
+    }
+
+    pub(crate) fn into_model_error(self) -> lato_core::ModelError {
+        let observed = self.model_error.output_started || self.events_started;
+        self.model_error.with_output_started(observed)
     }
 }
 
@@ -59,7 +79,7 @@ pub async fn stream_codex(
     client: &reqwest::Client,
     request: &CodexRequest,
     tx: mpsc::Sender<StreamPiece>,
-) -> Result<(), String> {
+) -> Result<(), lato_core::ModelError> {
     stream_codex_with_report(client, request, tx)
         .await
         .map(|_| ())
@@ -69,7 +89,7 @@ pub(crate) async fn stream_codex_with_report(
     client: &reqwest::Client,
     request: &CodexRequest,
     tx: mpsc::Sender<StreamPiece>,
-) -> Result<crate::ModelCallReport, String> {
+) -> Result<crate::ModelCallReport, lato_core::ModelError> {
     let fallback_active = request.session_key.as_ref().is_some_and(|session| {
         websocket_fallback_sessions()
             .lock()
@@ -83,7 +103,7 @@ pub(crate) async fn stream_codex_with_report(
                 usage: outcome.usage,
                 generation: 0,
             })
-            .map_err(|error| error.message);
+            .map_err(CodexTransportError::into_model_error);
     }
     let mut websocket_result = websocket::stream_websocket(request, tx.clone()).await;
     if websocket_result
@@ -111,13 +131,16 @@ pub(crate) async fn stream_codex_with_report(
                     generation: 0,
                 })
                 .map_err(|sse_error| {
-                    format!(
+                    let observed = sse_error.events_started;
+                    let mut typed = sse_error.into_model_error();
+                    typed.message = safe_error_excerpt(&format!(
                         "Codex WebSocket failed before streaming ({}); SSE fallback failed: {}",
-                        error.message, sse_error.message
-                    )
+                        error.message, typed.message
+                    ));
+                    typed.with_output_started(observed)
                 })
         }
-        Err(error) => Err(error.message),
+        Err(error) => Err(error.into_model_error()),
     }
 }
 
@@ -501,7 +524,7 @@ mod tests {
         let error = stream_codex(&crate::http_client_for_url(&request.url), &request, tx)
             .await
             .unwrap_err();
-        assert!(error.contains("closed"));
+        assert!(error.message.contains("closed"));
         assert!(matches!(rx.recv().await, Some(StreamPiece::Text(text)) if text == "started"));
         assert!(!server.await.unwrap(), "SSE replay must not be attempted");
     }

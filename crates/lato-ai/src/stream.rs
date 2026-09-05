@@ -1,6 +1,6 @@
 use crate::{
     ActiveModelPort, Auth, Model, ModelApi, build_request, http_client_for_url,
-    send_request_response,
+    send_sampling_response,
 };
 use async_trait::async_trait;
 use lato_core::{ModelError, ModelErrorKind, Retryability};
@@ -257,9 +257,7 @@ impl ModelStream for HttpModelStream {
         if self.model.api == ModelApi::OpenaiCodexResponses {
             let request = crate::codex::build_codex_request(&self.model, &self.auth, &context)
                 .map_err(legacy_model_error)?;
-            crate::codex::stream_codex_with_report(&self.client, &request, tx)
-                .await
-                .map_err(legacy_model_error)
+            crate::codex::stream_codex_with_report(&self.client, &request, tx).await
         } else {
             let request =
                 build_request(&self.model, &self.auth, context).map_err(legacy_model_error)?;
@@ -297,7 +295,7 @@ pub(crate) async fn stream_http_request_with_tool_choice_fallback_with_report(
 fn tool_choice_required_rejected(error: &ModelError, request: &crate::HttpRequestSpec) -> bool {
     let lower = error.message.to_ascii_lowercase();
     request.body.get("tool_choice").and_then(|v| v.as_str()) == Some("required")
-        && lower.contains("http 400")
+        && (error.status_code == Some(400) || lower.contains("http 400"))
         && (lower.contains("tool_choice") || lower.contains("tool choice"))
 }
 
@@ -316,9 +314,7 @@ pub async fn stream_http_request_with_report(
     request: &crate::HttpRequestSpec,
     tx: mpsc::Sender<StreamPiece>,
 ) -> Result<ModelCallReport, ModelError> {
-    let mut response = send_request_response(client, request)
-        .await
-        .map_err(legacy_model_error)?;
+    let mut response = send_sampling_response(client, request).await?;
     let mut buffered = Vec::<u8>::new();
     let mut decoder = WireDecoder::default();
     let mut parser = ModelEventParser::default();

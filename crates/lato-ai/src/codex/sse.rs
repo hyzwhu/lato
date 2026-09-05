@@ -44,9 +44,7 @@ pub async fn stream_sse(
     let status = response.status();
     if !status.is_success() {
         let body = response.text().await.unwrap_or_default();
-        return Err(CodexTransportError::before_stream(format!(
-            "http {status}: {body}"
-        )));
+        return Err(CodexTransportError::from_http(status.as_u16(), &body));
     }
 
     let mut mapper = CodexEventMapper::default();

@@ -7,6 +7,7 @@ pub mod models_file;
 pub mod oauth;
 pub mod presets;
 pub mod provider;
+pub mod provider_error;
 pub mod store;
 pub mod stream;
 
@@ -18,5 +19,6 @@ pub use models_file::*;
 pub use oauth::*;
 pub use presets::*;
 pub use provider::*;
+pub use provider_error::*;
 pub use store::*;
 pub use stream::*;
