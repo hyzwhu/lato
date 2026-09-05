@@ -3,10 +3,10 @@
 // Lato changes: added current-model, typed-stream compaction sampling to the legacy turn adapter
 
 use crate::{
-    HistoryItem, PromptKind, SessionActor, ToolApproval, build_compacted_history,
-    build_compaction_prompt, compaction_size, find_compaction_anchors, history_to_model_messages,
-    model_messages_to_history, normalize_summary, prepare_compaction_messages, validate_reduction,
-    validate_source_size, validate_summary,
+    CompactionInputStage, HistoryItem, PromptKind, SessionActor, ToolApproval,
+    build_compacted_history, build_compaction_prompt, compaction_size, find_compaction_anchors,
+    history_to_model_messages, model_messages_to_history, normalize_summary,
+    prepare_compaction_input, validate_reduction, validate_source_size, validate_summary,
 };
 use async_trait::async_trait;
 use futures_util::StreamExt;
@@ -16,8 +16,8 @@ use lato_ai::{
 };
 use lato_core::{
     AgentError, CompactionCandidate, CompactionError, ErrorCategory, ModelCallId, ModelContent,
-    ModelError, ModelRequest, ModelStopReason, ModelStreamEvent, Retryability, SamplingParameters,
-    ToolChoice, TurnOutput, UserInput,
+    ModelError, ModelErrorKind, ModelRequest, ModelStopReason, ModelStreamEvent, Retryability,
+    SamplingParameters, ToolChoice, TurnOutput, UserInput,
 };
 use lato_runtime::{
     CompactionControl, CompactionRequest, TurnControl, TurnDriver, TurnEventEmitter, TurnRequest,
@@ -274,33 +274,58 @@ async fn run_compaction(
     control: CompactionControl,
 ) -> Result<CompactionCandidate, AgentError> {
     validate_source_size(&request.messages).map_err(AgentError::from)?;
-    let prepared = prepare_compaction_messages(&request.messages).map_err(AgentError::from)?;
     let (system, latest_user) =
         find_compaction_anchors(&request.messages).map_err(AgentError::from)?;
-    let mut model_messages = prepared;
-    model_messages.push(lato_core::ModelMessage {
-        role: lato_core::ModelRole::User,
-        content: vec![ModelContent::Text {
-            text: build_compaction_prompt(request.request.user_context.as_deref()),
-        }],
-    });
-    let request_bytes = serde_json::to_vec(&model_messages)
-        .map_err(|error| CompactionError::InvalidSummary {
-            message: error.to_string(),
-        })?
-        .len() as u64;
-    if let Some(window) = active.capabilities.context_window {
-        let estimated_tokens = request_bytes.div_ceil(4);
-        if estimated_tokens.saturating_add(request.policy.summary_reserve_tokens) > window {
-            return Err(CompactionError::InputTooLarge.into());
-        }
-    }
-
     let max_attempts = request.policy.max_attempts.max(1);
     let mut last_error = None;
+    let mut stage = CompactionInputStage::Prepared;
+    let mut context_window = active
+        .metadata
+        .context_window
+        .or(active.capabilities.context_window);
+    let compaction_prompt = build_compaction_prompt(request.request.user_context.as_deref());
+    let protocol_overhead_tokens = u64::try_from(compaction_prompt.len())
+        .unwrap_or(u64::MAX)
+        .div_ceil(4)
+        .saturating_add(256);
     for attempt in 1..=max_attempts {
         if control.cancellation.is_cancelled() {
             return Err(CompactionError::Cancelled.into());
+        }
+        let input_budget = match (stage, context_window) {
+            (CompactionInputStage::Prepared, _) | (_, None) => u64::MAX / 4,
+            (CompactionInputStage::Fitted, Some(window)) => window
+                .saturating_sub(request.policy.summary_reserve_tokens)
+                .saturating_sub(protocol_overhead_tokens),
+            (CompactionInputStage::Lossy, Some(window)) => window
+                .saturating_mul(7)
+                .checked_div(10)
+                .unwrap_or_default()
+                .saturating_sub(request.policy.summary_reserve_tokens)
+                .saturating_sub(protocol_overhead_tokens),
+        };
+        let mut model_messages = prepare_compaction_input(&request.messages, stage, input_budget)
+            .map_err(AgentError::from)?;
+        model_messages.push(lato_core::ModelMessage {
+            role: lato_core::ModelRole::User,
+            content: vec![ModelContent::Text {
+                text: compaction_prompt.clone(),
+            }],
+        });
+        if let Some(window) = context_window {
+            let estimated_tokens = serde_json::to_vec(&model_messages)
+                .map_err(|error| CompactionError::InvalidSummary {
+                    message: error.to_string(),
+                })?
+                .len()
+                .div_ceil(4) as u64;
+            if estimated_tokens.saturating_add(request.policy.summary_reserve_tokens) > window {
+                let Some(next) = stage.next() else {
+                    return Err(CompactionError::InputTooLarge.into());
+                };
+                stage = next;
+                continue;
+            }
         }
         let model_request = ModelRequest {
             call_id: ModelCallId::from(format!("{}-attempt-{attempt}", request.compaction_id)),
@@ -338,12 +363,28 @@ async fn run_compaction(
                     }
                 }
             }
-            Err(error) => {
+            Err(CompactionSampleError::Model(error))
+                if error.kind == ModelErrorKind::ContextOverflow =>
+            {
+                if let Some(window) = error.context_window {
+                    context_window = Some(context_window.map_or(window, |old| old.min(window)));
+                }
+                let Some(next) = stage.next() else {
+                    return Err(CompactionError::InputTooLarge.into());
+                };
+                stage = next;
+                last_error = Some(model_error(error));
+            }
+            Err(CompactionSampleError::Model(error)) => {
                 let retryable = error.retryability != Retryability::Never;
-                last_error = Some(error);
+                last_error = Some(model_error(error));
                 if !retryable {
                     break;
                 }
+            }
+            Err(CompactionSampleError::Compaction(error)) => {
+                last_error = Some(AgentError::from(error));
+                break;
             }
         }
         if attempt < max_attempts {
@@ -362,13 +403,13 @@ async fn sample_summary(
     port: &Arc<dyn lato_core::ModelPort>,
     request: ModelRequest,
     control: &CompactionControl,
-) -> Result<String, AgentError> {
+) -> Result<String, CompactionSampleError> {
     let cancellation = control.cancellation.clone();
     let mut stream = tokio::select! {
         biased;
-        _ = cancellation.cancelled() => return Err(CompactionError::Cancelled.into()),
+        _ = cancellation.cancelled() => return Err(CompactionSampleError::Compaction(CompactionError::Cancelled)),
         result = port.stream(request, cancellation.clone()) => {
-            result.map_err(model_error)?
+            result.map_err(CompactionSampleError::Model)?
         }
     };
     let mut text = String::new();
@@ -376,17 +417,18 @@ async fn sample_summary(
     loop {
         let event = tokio::select! {
             biased;
-            _ = cancellation.cancelled() => return Err(CompactionError::Cancelled.into()),
+            _ = cancellation.cancelled() => return Err(CompactionSampleError::Compaction(CompactionError::Cancelled)),
             event = stream.next() => event,
         };
         match event {
             Some(Ok(ModelStreamEvent::TextDelta { text: delta })) => text.push_str(&delta),
             Some(Ok(ModelStreamEvent::ReasoningDelta { .. } | ModelStreamEvent::Usage(_))) => {}
             Some(Ok(ModelStreamEvent::ToolCallDelta(_))) => {
-                return Err(CompactionError::InvalidSummary {
-                    message: "compaction model attempted a tool call".into(),
-                }
-                .into());
+                return Err(CompactionSampleError::Compaction(
+                    CompactionError::InvalidSummary {
+                        message: "compaction model attempted a tool call".into(),
+                    },
+                ));
             }
             Some(Ok(ModelStreamEvent::Completed {
                 reason: ModelStopReason::Completed,
@@ -395,23 +437,29 @@ async fn sample_summary(
                 break;
             }
             Some(Ok(ModelStreamEvent::Completed { reason })) => {
-                return Err(CompactionError::InvalidSummary {
-                    message: format!("compaction stream stopped with {reason:?}"),
-                }
-                .into());
+                return Err(CompactionSampleError::Compaction(
+                    CompactionError::InvalidSummary {
+                        message: format!("compaction stream stopped with {reason:?}"),
+                    },
+                ));
             }
-            Some(Err(error)) => return Err(model_error(error)),
+            Some(Err(error)) => return Err(CompactionSampleError::Model(error)),
             None => break,
         }
     }
     if !completed {
-        return Err(model_error(ModelError::new(
+        return Err(CompactionSampleError::Model(ModelError::new(
             "model.stream_interrupted",
             "compaction model stream ended before completion",
             Retryability::AfterBackoff,
         )));
     }
     Ok(text)
+}
+
+enum CompactionSampleError {
+    Model(ModelError),
+    Compaction(CompactionError),
 }
 
 fn endpoint_from_stream(stream: Arc<dyn ModelStream>) -> ActiveModelStream {
@@ -733,6 +781,99 @@ mod compaction_tests {
             .await
             .is_err()
         );
+        assert_eq!(port.requests.lock().unwrap().len(), 3);
+    }
+
+    fn overflow(window: u64) -> ModelError {
+        ModelError::new(
+            "model.context_overflow",
+            "context window exceeded",
+            Retryability::Never,
+        )
+        .with_kind(ModelErrorKind::ContextOverflow)
+        .with_context_window(window)
+    }
+
+    fn ladder_request() -> CompactionRequest {
+        let mut value = request();
+        value.messages = vec![ModelMessage {
+            role: ModelRole::System,
+            content: vec![ModelContent::Text {
+                text: "system".into(),
+            }],
+        }];
+        for index in 0..40 {
+            value.messages.push(ModelMessage {
+                role: ModelRole::User,
+                content: vec![ModelContent::Text {
+                    text: format!("objective-{index} {}", "x".repeat(2_000)),
+                }],
+            });
+        }
+        value.messages.push(ModelMessage {
+            role: ModelRole::User,
+            content: vec![ModelContent::Text {
+                text: "latest objective".into(),
+            }],
+        });
+        value
+    }
+
+    #[tokio::test]
+    async fn overflow_advances_through_three_decreasing_input_stages() {
+        let port = Arc::new(ScriptedPort {
+            scripts: StdMutex::new(vec![
+                Err(overflow(20_000)),
+                Err(overflow(20_000)),
+                Ok(completed(summary())),
+            ]),
+            requests: StdMutex::new(Vec::new()),
+        });
+        let candidate = run_compaction(
+            active(port.clone()),
+            ladder_request(),
+            CompactionControl {
+                cancellation: tokio_util::sync::CancellationToken::new(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(candidate.after.serialized_bytes < candidate.before.serialized_bytes);
+        let requests = port.requests.lock().unwrap();
+        let sizes = requests
+            .iter()
+            .map(|request| serde_json::to_vec(&request.messages).unwrap().len())
+            .collect::<Vec<_>>();
+        assert_eq!(sizes.len(), 3);
+        assert!(sizes[0] > sizes[1] && sizes[1] > sizes[2], "{sizes:?}");
+        assert!(
+            requests[2]
+                .messages
+                .iter()
+                .any(|message| crate::message_text(message).contains("latest objective"))
+        );
+    }
+
+    #[tokio::test]
+    async fn third_overflow_is_terminal_without_a_fourth_submission() {
+        let port = Arc::new(ScriptedPort {
+            scripts: StdMutex::new(vec![
+                Err(overflow(20_000)),
+                Err(overflow(20_000)),
+                Err(overflow(20_000)),
+            ]),
+            requests: StdMutex::new(Vec::new()),
+        });
+        let error = run_compaction(
+            active(port.clone()),
+            ladder_request(),
+            CompactionControl {
+                cancellation: tokio_util::sync::CancellationToken::new(),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, "compaction.input_too_large");
         assert_eq!(port.requests.lock().unwrap().len(), 3);
     }
 
