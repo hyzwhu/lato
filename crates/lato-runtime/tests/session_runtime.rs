@@ -9,8 +9,8 @@ use lato_core::{
 };
 use lato_runtime::{
     AutomaticCompactionOutcome, AutomaticCompactionRequest, CompactionControl, CompactionRequest,
-    SessionBootstrap, TurnControl, TurnDriver, TurnEventEmitter, TurnRequest, spawn_session,
-    spawn_session_with_store,
+    PrefireCompactionRequest, PrefireCompactionResult, SessionBootstrap, TurnControl, TurnDriver,
+    TurnEventEmitter, TurnRequest, spawn_session, spawn_session_with_store,
 };
 use lato_store::{FaultPoint, FileEventStore, FileFaultInjector, MemoryEventStore};
 use std::{
@@ -274,6 +274,7 @@ impl TurnDriver for AutomaticFailureDriver {
                         text: "old context".into(),
                     }],
                 }],
+                two_pass: None,
             })
             .await?;
         *self.observed.lock().await = Some(outcome);
@@ -333,6 +334,7 @@ impl TurnDriver for AutomaticCompactionDriver {
                     utilization_percent: 90,
                 },
                 messages: self.source.clone(),
+                two_pass: None,
             })
             .await?;
         if let AutomaticCompactionOutcome::Compacted(messages) = outcome {
@@ -604,6 +606,103 @@ async fn next_event(
         .await
         .expect("event timeout")
         .expect("event channel closed")
+}
+
+struct BlockingPrefireDriver {
+    started: Notify,
+    install_called: AtomicBool,
+}
+
+#[async_trait]
+impl TurnDriver for BlockingPrefireDriver {
+    async fn run(
+        &self,
+        request: TurnRequest,
+        _control: TurnControl,
+        events: TurnEventEmitter,
+    ) -> Result<TurnOutput, lato_core::AgentError> {
+        events.model_delta("ordinary delta")?;
+        let _ = events
+            .prefire_compaction(PrefireCompactionRequest {
+                messages: vec![ModelMessage {
+                    role: ModelRole::User,
+                    content: vec![ModelContent::Text {
+                        text: request.input.text,
+                    }],
+                }],
+                prefix_len: 1,
+                policy: lato_core::CompactionPolicy::default(),
+            })
+            .await;
+        Ok(TurnOutput {
+            final_text: String::new(),
+        })
+    }
+
+    async fn prefire_compaction(
+        &self,
+        _request: PrefireCompactionRequest,
+        control: CompactionControl,
+    ) -> Result<PrefireCompactionResult, lato_core::AgentError> {
+        self.started.notify_one();
+        control.cancellation.cancelled().await;
+        Err(lato_core::ModelError::cancelled().into())
+    }
+
+    async fn install_history(
+        &self,
+        _messages: Vec<ModelMessage>,
+    ) -> Result<(), lato_core::AgentError> {
+        self.install_called.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn prefire_is_non_installing_and_cancellable_without_compaction_events() {
+    let driver = Arc::new(BlockingPrefireDriver {
+        started: Notify::new(),
+        install_called: AtomicBool::new(false),
+    });
+    let session = spawn_session("session-prefire".into(), driver.clone());
+    let mut events = session.subscribe();
+    session
+        .submit(Command::StartTurn(StartTurn {
+            input: UserInput::text("large history"),
+            behavior: StartBehavior::Reject,
+        }))
+        .await
+        .unwrap();
+    assert!(matches!(
+        next_event(&mut events).await.payload,
+        EventPayload::SessionStarted
+    ));
+    let started = next_event(&mut events).await;
+    let turn_id = started.turn_id.clone().unwrap();
+    assert!(matches!(started.payload, EventPayload::TurnStarted));
+    assert_eq!(
+        next_event(&mut events).await.payload,
+        EventPayload::ModelDelta {
+            text: "ordinary delta".into()
+        }
+    );
+    driver.started.notified().await;
+    assert!(
+        timeout(Duration::from_millis(25), events.recv())
+            .await
+            .is_err()
+    );
+    assert!(!driver.install_called.load(Ordering::SeqCst));
+    session
+        .submit(Command::CancelTurn { turn_id })
+        .await
+        .unwrap();
+    assert!(matches!(
+        next_event(&mut events).await.payload,
+        EventPayload::TurnCancelled {
+            reason: CancelReason::User
+        }
+    ));
 }
 
 #[tokio::test]

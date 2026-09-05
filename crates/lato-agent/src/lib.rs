@@ -10,6 +10,7 @@ pub mod journal;
 pub mod legacy_driver;
 pub mod runtime_session;
 pub mod transcript;
+mod two_pass;
 
 pub use actor::*;
 pub use compaction::*;
@@ -23,3 +24,4 @@ pub use journal::*;
 pub use legacy_driver::*;
 pub use runtime_session::*;
 pub use transcript::*;
+pub(crate) use two_pass::*;

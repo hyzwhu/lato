@@ -20,7 +20,8 @@ use lato_core::{
     SamplingParameters, ToolChoice, TurnOutput, UserInput,
 };
 use lato_runtime::{
-    CompactionControl, CompactionRequest, TurnControl, TurnDriver, TurnEventEmitter, TurnRequest,
+    CompactionControl, CompactionRequest, PrefireCompactionRequest, PrefireCompactionResult,
+    TurnControl, TurnDriver, TurnEventEmitter, TurnRequest,
 };
 use lato_workspace::{FileLocks, SessionTrust};
 use std::{path::PathBuf, sync::Arc};
@@ -258,6 +259,54 @@ impl TurnDriver for LegacyTurnDriver {
         run_compaction(active, request, control).await
     }
 
+    async fn prefire_compaction(
+        &self,
+        request: PrefireCompactionRequest,
+        control: CompactionControl,
+    ) -> Result<PrefireCompactionResult, AgentError> {
+        if request.prefix_len == 0 || request.prefix_len > request.messages.len() {
+            return Err(AgentError::new(
+                "compaction.invalid_prefire_prefix",
+                ErrorCategory::InvalidInput,
+                "prefire prefix is outside the history snapshot",
+                Retryability::Never,
+            ));
+        }
+        let active = match self.model_stream.active_model_port() {
+            Some(active) => active,
+            None => self.model_port.snapshot().await,
+        };
+        let messages = crate::build_pass_one_history(
+            &request.messages[..request.prefix_len],
+            &build_compaction_prompt(None),
+        );
+        let model_request = ModelRequest {
+            call_id: ModelCallId::from("compaction-prefire-pass-one"),
+            selection: active.selection,
+            messages,
+            tools: Vec::new(),
+            parameters: SamplingParameters {
+                temperature: Some(0.0),
+                max_output_tokens: Some(request.policy.summary_reserve_tokens),
+                tool_choice: Some(ToolChoice::None),
+                response_schema: None,
+            },
+        };
+        let raw = sample_summary(&active.port, model_request, &control)
+            .await
+            .map_err(compaction_sample_error)?;
+        let note1 = crate::note_for_pass_two(&raw);
+        if note1.is_empty() {
+            return Err(AgentError::new(
+                "compaction.empty_prefire_summary",
+                ErrorCategory::Task,
+                "prefire compaction returned an empty first-pass note",
+                Retryability::Never,
+            ));
+        }
+        Ok(PrefireCompactionResult { note1 })
+    }
+
     async fn install_history(
         &self,
         messages: Vec<lato_core::ModelMessage>,
@@ -288,6 +337,7 @@ async fn run_compaction(
         .unwrap_or(u64::MAX)
         .div_ceil(4)
         .saturating_add(256);
+    let mut two_pass = request.two_pass.clone();
     for attempt in 1..=max_attempts {
         if control.cancellation.is_cancelled() {
             return Err(CompactionError::Cancelled.into());
@@ -304,14 +354,32 @@ async fn run_compaction(
                 .saturating_sub(request.policy.summary_reserve_tokens)
                 .saturating_sub(protocol_overhead_tokens),
         };
-        let mut model_messages = prepare_compaction_input(&request.messages, stage, input_budget)
-            .map_err(AgentError::from)?;
-        model_messages.push(lato_core::ModelMessage {
-            role: lato_core::ModelRole::User,
-            content: vec![ModelContent::Text {
-                text: compaction_prompt.clone(),
-            }],
-        });
+        let model_messages = if let Some(pass) = two_pass.take() {
+            if pass.prefix_len == 0 || pass.prefix_len > request.messages.len() {
+                return Err(AgentError::new(
+                    "compaction.invalid_two_pass_prefix",
+                    ErrorCategory::InvalidInput,
+                    "two-pass prefix is outside the compaction history",
+                    Retryability::Never,
+                ));
+            }
+            crate::build_pass_two_history(
+                &request.messages[..pass.prefix_len],
+                &request.messages[pass.prefix_len..],
+                &pass.note1,
+                &compaction_prompt,
+            )
+        } else {
+            let mut messages = prepare_compaction_input(&request.messages, stage, input_budget)
+                .map_err(AgentError::from)?;
+            messages.push(lato_core::ModelMessage {
+                role: lato_core::ModelRole::User,
+                content: vec![ModelContent::Text {
+                    text: compaction_prompt.clone(),
+                }],
+            });
+            messages
+        };
         if let Some(window) = context_window {
             let estimated_tokens = serde_json::to_vec(&model_messages)
                 .map_err(|error| CompactionError::InvalidSummary {
@@ -460,6 +528,13 @@ async fn sample_summary(
 enum CompactionSampleError {
     Model(ModelError),
     Compaction(CompactionError),
+}
+
+fn compaction_sample_error(error: CompactionSampleError) -> AgentError {
+    match error {
+        CompactionSampleError::Model(error) => model_error(error),
+        CompactionSampleError::Compaction(error) => error.into(),
+    }
 }
 
 fn endpoint_from_stream(stream: Arc<dyn ModelStream>) -> ActiveModelStream {
@@ -651,6 +726,7 @@ mod compaction_tests {
             },
             messages: source(),
             policy: CompactionPolicy::default(),
+            two_pass: None,
         }
     }
 

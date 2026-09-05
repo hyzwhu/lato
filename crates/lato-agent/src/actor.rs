@@ -348,6 +348,7 @@ impl SessionActor {
                 trigger,
                 usage,
                 messages,
+                two_pass: None,
             })
             .await
             .map_err(|error| error.to_string())?

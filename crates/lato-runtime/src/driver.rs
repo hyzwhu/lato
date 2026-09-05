@@ -28,6 +28,7 @@ pub struct CompactionRequest {
     pub request: CompactSession,
     pub messages: Vec<ModelMessage>,
     pub policy: CompactionPolicy,
+    pub two_pass: Option<TwoPassCompactionInput>,
 }
 
 pub struct CompactionControl {
@@ -39,6 +40,25 @@ pub struct AutomaticCompactionRequest {
     pub trigger: CompactionTrigger,
     pub usage: ContextUsage,
     pub messages: Vec<ModelMessage>,
+    pub two_pass: Option<TwoPassCompactionInput>,
+}
+
+#[derive(Clone, Debug)]
+pub struct PrefireCompactionRequest {
+    pub messages: Vec<ModelMessage>,
+    pub prefix_len: usize,
+    pub policy: CompactionPolicy,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PrefireCompactionResult {
+    pub note1: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct TwoPassCompactionInput {
+    pub note1: String,
+    pub prefix_len: usize,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -98,6 +118,21 @@ impl TurnEventEmitter {
         result.await.map_err(|_| event_bus_closed())?
     }
 
+    pub async fn prefire_compaction(
+        &self,
+        request: PrefireCompactionRequest,
+    ) -> Result<PrefireCompactionResult, AgentError> {
+        let (reply, result) = oneshot::channel();
+        self.tx
+            .send(DriverMessage::PrefireCompactionRequested {
+                turn_id: self.turn_id.clone(),
+                request,
+                reply,
+            })
+            .map_err(|_| event_bus_closed())?;
+        result.await.map_err(|_| event_bus_closed())?
+    }
+
     fn send(&self, event: DriverEvent) -> Result<(), AgentError> {
         self.tx
             .send(DriverMessage::LiveEvent {
@@ -126,6 +161,14 @@ pub trait TurnDriver: Send + Sync + 'static {
         _request: CompactionRequest,
         _control: CompactionControl,
     ) -> Result<CompactionCandidate, AgentError> {
+        Err(unsupported_compaction())
+    }
+
+    async fn prefire_compaction(
+        &self,
+        _request: PrefireCompactionRequest,
+        _control: CompactionControl,
+    ) -> Result<PrefireCompactionResult, AgentError> {
         Err(unsupported_compaction())
     }
 
@@ -165,6 +208,11 @@ pub(crate) enum DriverMessage {
         turn_id: TurnId,
         request: AutomaticCompactionRequest,
         reply: oneshot::Sender<Result<AutomaticCompactionOutcome, AgentError>>,
+    },
+    PrefireCompactionRequested {
+        turn_id: TurnId,
+        request: PrefireCompactionRequest,
+        reply: oneshot::Sender<Result<PrefireCompactionResult, AgentError>>,
     },
 }
 

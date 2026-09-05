@@ -327,6 +327,7 @@ impl SessionLoop {
             request: request.clone(),
             messages,
             policy: CompactionPolicy::default(),
+            two_pass: None,
         };
         let driver = self.driver.clone();
         let driver_tx = self.driver_tx.clone();
@@ -583,6 +584,34 @@ impl SessionLoop {
                 self.request_automatic_compaction(turn_id, request, reply)
                     .await;
             }
+            DriverMessage::PrefireCompactionRequested {
+                turn_id,
+                request,
+                reply,
+            } => {
+                let Some(active) = self.active.as_ref() else {
+                    let _ = reply.send(Err(invalid_state(
+                        "runtime.stale_turn_prefire",
+                        "cannot prefire compaction for an inactive turn",
+                    )));
+                    return;
+                };
+                if active.id != turn_id {
+                    let _ = reply.send(Err(invalid_state(
+                        "runtime.stale_turn_prefire",
+                        "cannot prefire compaction for a different turn",
+                    )));
+                    return;
+                }
+                let driver = self.driver.clone();
+                let cancellation = active.cancellation.child_token();
+                tokio::spawn(async move {
+                    let result = driver
+                        .prefire_compaction(request, CompactionControl { cancellation })
+                        .await;
+                    let _ = reply.send(result);
+                });
+            }
         }
     }
 
@@ -637,6 +666,7 @@ impl SessionLoop {
             },
             messages: request.messages,
             policy: CompactionPolicy::default(),
+            two_pass: request.two_pass,
         };
         let driver = self.driver.clone();
         let driver_tx = self.driver_tx.clone();
