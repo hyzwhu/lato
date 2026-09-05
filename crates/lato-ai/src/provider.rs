@@ -495,6 +495,11 @@ fn parse_remote_catalog(
                     .copied()
                     .unwrap_or("LATO_API_KEY")
                     .to_string(),
+                context_window: entry.get("context_window").and_then(|value| value.as_u64()),
+                model_family: entry
+                    .get("model_family")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_owned),
             })
         })
         .collect())
@@ -528,6 +533,8 @@ mod tests {
                 api: ModelApi::OpenaiCodexResponses,
                 base_url: "https://chatgpt.com/backend-api".into(),
                 env: "LATO_API_KEY".into(),
+                context_window: None,
+                model_family: Some("openai".into()),
             }],
             ..Default::default()
         }

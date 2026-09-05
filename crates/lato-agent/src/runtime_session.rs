@@ -259,6 +259,7 @@ impl RuntimeSession {
                 EventPayload::SessionStarted
                 | EventPayload::ModelDelta { .. }
                 | EventPayload::ReasoningDelta { .. }
+                | EventPayload::ContextUsageUpdated { .. }
                 | EventPayload::TurnCompleted(_)
                 | EventPayload::TurnCancelled { .. }
                 | EventPayload::TurnFailed { .. }

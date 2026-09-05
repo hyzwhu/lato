@@ -449,6 +449,8 @@ mod tests {
             id: "llama",
             api: ModelApi::OpenaiCompletions,
             base_url: Some("https://api.groq.com/openai/v1"),
+            context_window: None,
+            model_family: None,
         };
         let xai = lookup_model("xai", "grok-4").unwrap();
         let a = build_request(&groq, &auth(), serde_json::json!([])).unwrap();
@@ -495,6 +497,8 @@ mod tests {
                 id: "llama",
                 api: ModelApi::OpenaiCompletions,
                 base_url: Some("https://fixture/v1"),
+                context_window: None,
+                model_family: None,
             },
             lookup_model("openai", "gpt-4.1").unwrap(),
             lookup_model("kimi-coding", "kimi-k2").unwrap(),
@@ -572,6 +576,8 @@ mod tests {
             id: "llama",
             api: ModelApi::OpenaiCompletions,
             base_url: Some("https://h"),
+            context_window: None,
+            model_family: None,
         };
         let r = build_request(
             &m,
@@ -596,6 +602,8 @@ mod tests {
             id: "glm-5.2",
             api: ModelApi::OpenaiCompletions,
             base_url: Some("https://token.sensenova.cn/v1"),
+            context_window: None,
+            model_family: None,
         };
         let r = build_request(
             &m,
@@ -620,6 +628,8 @@ mod tests {
             id: "glm-5.2",
             api: ModelApi::OpenaiCompletions,
             base_url: Some("https://token.sensenova.cn/v1"),
+            context_window: None,
+            model_family: None,
         };
         let r = build_request(
             &m,
@@ -751,6 +761,8 @@ mod tests {
             id: "@cf/meta/llama",
             api: ModelApi::OpenaiCompletions,
             base_url: Some("https://api.cloudflare.com/client/v4/accounts/a/ai/v1"),
+            context_window: None,
+            model_family: None,
         };
         assert!(
             build_request(&cloudflare, &auth(), serde_json::json!([]))
@@ -767,6 +779,8 @@ mod tests {
             id: "claude",
             api: ModelApi::AnthropicMessages,
             base_url: Some("https://api.anthropic.com"),
+            context_window: None,
+            model_family: None,
         };
         let bearer = Auth {
             api_key: None,

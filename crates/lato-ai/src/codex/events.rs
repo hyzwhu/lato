@@ -9,6 +9,7 @@ pub struct CodexEventMapper {
     unkeyed_text: bool,
     started: bool,
     terminal: bool,
+    usage: Option<lato_core::ModelUsage>,
 }
 
 #[derive(Default)]
@@ -24,6 +25,9 @@ impl CodexEventMapper {
     }
     pub fn terminal(&self) -> bool {
         self.terminal
+    }
+    pub fn usage(&self) -> Option<&lato_core::ModelUsage> {
+        self.usage.as_ref()
     }
 
     pub fn ensure_complete(&self) -> Result<(), String> {
@@ -96,6 +100,9 @@ impl CodexEventMapper {
     pub fn accept(&mut self, value: serde_json::Value) -> Result<Vec<StreamPiece>, String> {
         if self.terminal {
             return Ok(Vec::new());
+        }
+        if let Some(usage) = crate::stream::usage_from_event(&value) {
+            crate::stream::merge_usage(&mut self.usage, usage);
         }
         let event_type = value.get("type").and_then(|v| v.as_str()).unwrap_or("");
         match event_type {
@@ -219,6 +226,32 @@ fn required_string(value: &serde_json::Value, key: &str) -> Result<String, Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_codex_event_retains_usage() {
+        let mut mapper = CodexEventMapper::default();
+        mapper
+            .accept(serde_json::json!({
+                "type":"response.completed",
+                "response":{"output":[],"usage":{
+                    "input_tokens":80,
+                    "output_tokens":20,
+                    "output_tokens_details":{"reasoning_tokens":5},
+                    "input_tokens_details":{"cached_tokens":40}
+                }}
+            }))
+            .unwrap();
+
+        assert_eq!(
+            mapper.usage(),
+            Some(&lato_core::ModelUsage {
+                input_tokens: Some(80),
+                output_tokens: Some(20),
+                reasoning_tokens: Some(5),
+                cached_input_tokens: Some(40),
+            })
+        );
+    }
 
     #[test]
     fn maps_text_and_emits_function_call_exactly_once() {

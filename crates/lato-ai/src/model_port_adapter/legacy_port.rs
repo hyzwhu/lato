@@ -114,7 +114,7 @@ async fn run_legacy_bridge(
     cancellation: CancellationToken,
 ) {
     let (legacy_tx, mut legacy_rx) = mpsc::channel(16);
-    let provider = legacy.stream(prompt_bytes, context, legacy_tx);
+    let provider = legacy.stream_with_report(prompt_bytes, context, legacy_tx);
     tokio::pin!(provider);
     let mut next_tool_index = 0_u32;
     let mut saw_tool_call = false;
@@ -161,13 +161,20 @@ async fn run_legacy_bridge(
     }
 
     let final_event = match provider_result {
-        Ok(()) => Ok(ModelStreamEvent::Completed {
-            reason: if saw_tool_call {
-                ModelStopReason::ToolCalls
-            } else {
-                ModelStopReason::Completed
-            },
-        }),
+        Ok(report) => {
+            if let Some(usage) = report.usage
+                && !send_event(&event_tx, &cancellation, Ok(ModelStreamEvent::Usage(usage))).await
+            {
+                return;
+            }
+            Ok(ModelStreamEvent::Completed {
+                reason: if saw_tool_call {
+                    ModelStopReason::ToolCalls
+                } else {
+                    ModelStopReason::Completed
+                },
+            })
+        }
         Err(message) => Err(ModelError::new(
             "model.stream_interrupted",
             message,

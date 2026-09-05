@@ -1,7 +1,8 @@
 use crate::{
-    Auth, CONTEXT_HARD_LIMIT_BYTES, HttpRequestSpec, ModelApi, ModelStream, StreamPiece,
+    Auth, CONTEXT_HARD_LIMIT_BYTES, HttpRequestSpec, ModelApi, ModelCallReport, ModelStream,
+    StreamPiece,
     api::{anthropic_request_body, openai_chat_body, responses_request_body},
-    http_client_for_url, stream_http_request_with_tool_choice_fallback,
+    http_client_for_url, stream_http_request_with_tool_choice_fallback_with_report,
 };
 use async_trait::async_trait;
 use std::path::Path;
@@ -13,6 +14,26 @@ pub struct CustomModel {
     pub api: ModelApi,
     pub base_url: String,
     pub env: String,
+    #[serde(default)]
+    pub context_window: Option<u64>,
+    #[serde(default)]
+    pub model_family: Option<String>,
+}
+
+#[cfg(test)]
+mod metadata_tests {
+    use super::*;
+
+    #[test]
+    fn old_custom_model_files_keep_optional_metadata_empty() {
+        let model: CustomModel = serde_json::from_value(serde_json::json!({
+            "provider":"p", "id":"m", "api":"openai-responses",
+            "base_url":"https://example.invalid", "env":"KEY"
+        }))
+        .unwrap();
+        assert_eq!(model.context_window, None);
+        assert_eq!(model.model_family, None);
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -57,6 +78,8 @@ pub fn refresh_models_from_openai_response(
             api,
             base_url: base_url.into(),
             env: env.into(),
+            context_window: None,
+            model_family: None,
         })
         .collect())
 }
@@ -180,6 +203,17 @@ impl ModelStream for CustomHttpModelStream {
         context: serde_json::Value,
         tx: tokio::sync::mpsc::Sender<StreamPiece>,
     ) -> Result<(), String> {
+        self.stream_with_report(prompt_bytes, context, tx)
+            .await
+            .map(|_| ())
+    }
+
+    async fn stream_with_report(
+        &self,
+        prompt_bytes: usize,
+        context: serde_json::Value,
+        tx: tokio::sync::mpsc::Sender<StreamPiece>,
+    ) -> Result<ModelCallReport, String> {
         if prompt_bytes > CONTEXT_HARD_LIMIT_BYTES {
             return Err("context exceeds hard limit; compact required".into());
         }
@@ -190,10 +224,10 @@ impl ModelStream for CustomHttpModelStream {
                 &self.auth,
                 &context,
             )?;
-            return crate::codex::stream_codex(&self.client, &request, tx).await;
+            return crate::codex::stream_codex_with_report(&self.client, &request, tx).await;
         }
         let request = build_custom_request(&self.model, &self.auth, context)?;
-        stream_http_request_with_tool_choice_fallback(&self.client, request, tx).await
+        stream_http_request_with_tool_choice_fallback_with_report(&self.client, request, tx).await
     }
 }
 

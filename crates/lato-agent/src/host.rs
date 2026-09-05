@@ -4,8 +4,8 @@ use crate::{
 };
 use lato_ai::{
     CATALOG, CredentialStore, CustomHttpModelStream, CustomModel, FakeModelStream, HttpModelStream,
-    ModelStream, StreamPiece, SwitchableModelPort, SwitchableModelStream, adapt_model_port,
-    adapt_model_stream, api_key_login_allowed, custom_model_auth, dialect_implemented,
+    ModelStream, StreamPiece, SwitchableModelPort, SwitchableModelStream, adapt_model_endpoint,
+    adapt_model_port, api_key_login_allowed, custom_model_auth, dialect_implemented,
     get_auth_refreshing, load_models_json, lookup_model, oauth_allowed, phase0_supported,
     store_oauth,
 };
@@ -91,8 +91,11 @@ impl AcpHost {
             adapt_model_port("openai", "gpt-4.1", stream.clone())
                 .expect("fallback model selection is statically valid")
         });
-        let model_port = Arc::new(SwitchableModelPort::from_active(active));
-        let stream = Arc::new(SwitchableModelStream::new(stream));
+        let model_port = Arc::new(SwitchableModelPort::from_active(active.clone()));
+        let stream = Arc::new(SwitchableModelStream::new(lato_ai::ActiveModelStream {
+            stream,
+            port: active,
+        }));
         let transcripts = lato_home
             .as_deref()
             .and_then(|home| TranscriptStore::open(home).ok());
@@ -589,22 +592,22 @@ impl AcpHost {
                         .await
                         {
                             Ok(Some(auth)) => {
+                                let metadata = catalog_model.metadata();
                                 let raw: Arc<dyn ModelStream> =
                                     Arc::new(HttpModelStream::new(catalog_model, auth));
-                                let adapted = match adapt_model_stream(provider, model, raw) {
-                                    Ok(adapted) => adapted,
-                                    Err(error) => {
-                                        return Some(err(
-                                            id,
-                                            -32000,
-                                            format!("invalid model selection: {error}"),
-                                        ));
-                                    }
-                                };
-                                if let Some(active) = adapted.active_model_port() {
-                                    self.model_port.set(active.selection, active.port).await;
-                                }
-                                self.stream.set(adapted).await
+                                let endpoint =
+                                    match adapt_model_endpoint(provider, model, metadata, raw) {
+                                        Ok(endpoint) => endpoint,
+                                        Err(error) => {
+                                            return Some(err(
+                                                id,
+                                                -32000,
+                                                format!("invalid model selection: {error}"),
+                                            ));
+                                        }
+                                    };
+                                self.model_port.set_active(endpoint.port.clone()).await;
+                                self.stream.set_active(endpoint).await
                             }
                             Ok(None) => {}
                             Err(error) => {
@@ -623,10 +626,14 @@ impl AcpHost {
                     .cloned()
                     && let Some(auth) = custom_model_auth(&custom, &|name| std::env::var(name).ok())
                 {
+                    let metadata = lato_ai::ModelMetadata {
+                        context_window: custom.context_window,
+                        model_family: custom.model_family.clone(),
+                    };
                     let raw: Arc<dyn ModelStream> =
                         Arc::new(CustomHttpModelStream::new(custom, auth));
-                    let adapted = match adapt_model_stream(provider, model, raw) {
-                        Ok(adapted) => adapted,
+                    let endpoint = match adapt_model_endpoint(provider, model, metadata, raw) {
+                        Ok(endpoint) => endpoint,
                         Err(error) => {
                             return Some(err(
                                 id,
@@ -635,10 +642,8 @@ impl AcpHost {
                             ));
                         }
                     };
-                    if let Some(active) = adapted.active_model_port() {
-                        self.model_port.set(active.selection, active.port).await;
-                    }
-                    self.stream.set(adapted).await;
+                    self.model_port.set_active(endpoint.port.clone()).await;
+                    self.stream.set_active(endpoint).await;
                 }
                 self.model = (provider.into(), model.into());
                 Some(ok(id, serde_json::json!({"supported": true})))
@@ -809,7 +814,7 @@ mod tests {
     #[test]
     fn acp_model_constructors_cross_the_canonical_model_port_boundary() {
         let source = include_str!("host.rs");
-        let boundary_call = ["adapt_model_stream", "(provider, model"].concat();
+        let boundary_call = ["adapt_model_endpoint", "(provider, model"].concat();
         assert_eq!(source.matches(&boundary_call).count(), 2);
     }
 

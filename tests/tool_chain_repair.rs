@@ -223,6 +223,8 @@ async fn cli_tool_chain(api: ModelApi) {
                     api,
                     base_url: format!("http://{address}/v1"),
                     env: "REPAIR_FIXTURE_KEY".into(),
+                    context_window: None,
+                    model_family: None,
                 }],
                 ..Default::default()
             },

@@ -8,7 +8,7 @@ use lato_agent::default_fake_stream;
 use lato_ai::{
     AuthInteraction, AuthNotice, CATALOG, CredentialStore, CustomHttpModelStream, CustomModel,
     HttpModelStream, ModelApi, ModelStream, OpenAICodexLoginMode, ProviderModelsEntry,
-    ProviderModelsStore, RemoteCatalogRefreshPolicy, adapt_model_stream, api_key_login_allowed,
+    ProviderModelsStore, RemoteCatalogRefreshPolicy, adapt_model_endpoint, api_key_login_allowed,
     custom_model_auth, get_auth_refreshing, load_models_json, login_oauth_with_mode, lookup_model,
     oauth_allowed, phase0_supported, provider_spec, refresh_openai_compatible_models,
     refresh_remote_provider_catalog_with_policy, store_oauth,
@@ -400,7 +400,7 @@ async fn interactive(
                 let trust = crate::permissions::interactive_trust(&cwd, trusted, sandbox);
                 let (tui_approval, approvals) = crate::tui::backend::TuiToolApproval::channel();
                 let inline_approval = (trust.mode == ApprovalMode::Ask).then_some(tui_approval);
-                let switchable = Arc::new(lato_ai::SwitchableModelStream::new(stream));
+                let switchable = Arc::new(lato_ai::SwitchableModelStream::from_stream(stream));
                 let client = match &startup {
                     InteractiveStartup::New => {
                         crate::client::InteractiveAcpClient::new_session_with_approval(
@@ -534,6 +534,8 @@ pub(crate) async fn configure_interactively(
                 .copied()
                 .unwrap_or("LATO_API_KEY")
                 .to_string(),
+            context_window: model.context_window,
+            model_family: model.model_family.map(str::to_owned),
         })
         .chain(
             custom_models
@@ -799,8 +801,11 @@ pub(crate) async fn configured_stream(selection: &str) -> Result<Arc<dyn ModelSt
         )
         .await?
         .ok_or_else(|| format!("no credential configured for {provider}"))?;
+        let metadata = model.metadata();
         let raw: Arc<dyn ModelStream> = Arc::new(HttpModelStream::new(model, auth));
-        adapt_model_stream(provider, model_id, raw).map_err(|error| error.to_string())
+        adapt_model_endpoint(provider, model_id, metadata, raw)
+            .map(|endpoint| endpoint.stream)
+            .map_err(|error| error.to_string())
     } else {
         let home = lato_home();
         if let Some(custom) = load_models_json(&home.join("models.json"))
@@ -810,8 +815,14 @@ pub(crate) async fn configured_stream(selection: &str) -> Result<Arc<dyn ModelSt
         {
             let auth = custom_model_auth(&custom, &|name| std::env::var(name).ok())
                 .ok_or_else(|| format!("environment variable {} is not configured", custom.env))?;
+            let metadata = lato_ai::ModelMetadata {
+                context_window: custom.context_window,
+                model_family: custom.model_family.clone(),
+            };
             let raw: Arc<dyn ModelStream> = Arc::new(CustomHttpModelStream::new(custom, auth));
-            return adapt_model_stream(provider, model_id, raw).map_err(|error| error.to_string());
+            return adapt_model_endpoint(provider, model_id, metadata, raw)
+                .map(|endpoint| endpoint.stream)
+                .map_err(|error| error.to_string());
         }
         let cached = ProviderModelsStore::open(&home)
             .read(provider)?
@@ -832,8 +843,14 @@ pub(crate) async fn configured_stream(selection: &str) -> Result<Arc<dyn ModelSt
         )
         .await?
         .ok_or_else(|| format!("no credential configured for {provider}"))?;
+        let metadata = lato_ai::ModelMetadata {
+            context_window: cached.context_window,
+            model_family: cached.model_family.clone(),
+        };
         let raw: Arc<dyn ModelStream> = Arc::new(CustomHttpModelStream::new(cached, auth));
-        adapt_model_stream(provider, model_id, raw).map_err(|error| error.to_string())
+        adapt_model_endpoint(provider, model_id, metadata, raw)
+            .map(|endpoint| endpoint.stream)
+            .map_err(|error| error.to_string())
     }
 }
 
@@ -1056,6 +1073,8 @@ mod tests {
             api: ModelApi::OpenaiCodexResponses,
             base_url: "https://chatgpt.com/backend-api".into(),
             env: "LATO_API_KEY".into(),
+            context_window: None,
+            model_family: Some("openai".into()),
         };
         let models = resolve_authoritative_models("openai-codex", Ok(vec![remote])).unwrap();
         assert_eq!(models.len(), 1);
@@ -1071,6 +1090,8 @@ mod tests {
             api: ModelApi::AnthropicMessages,
             base_url: "https://api.minimaxi.com/anthropic".to_string(),
             env: "MINIMAX_CN_API_KEY".to_string(),
+            context_window: None,
+            model_family: Some("minimax".into()),
         };
         let models = resolve_authoritative_models("minimax-cn", Ok(vec![remote])).unwrap();
         assert_eq!(models.len(), 1);

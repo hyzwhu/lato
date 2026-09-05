@@ -8,7 +8,7 @@ use tokio::sync::{Mutex, mpsc};
 
 pub const CONTEXT_HARD_LIMIT_BYTES: usize = 512_000;
 
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum StreamPiece {
     Text(String),
     ToolCall {
@@ -22,6 +22,12 @@ pub enum StreamPiece {
 #[error("{0}")]
 pub struct StreamError(pub String);
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ModelCallReport {
+    pub usage: Option<lato_core::ModelUsage>,
+    pub generation: u64,
+}
+
 #[async_trait]
 pub trait ModelStream: Send + Sync {
     fn active_model_port(&self) -> Option<ActiveModelPort> {
@@ -34,30 +40,88 @@ pub trait ModelStream: Send + Sync {
         context: serde_json::Value,
         tx: mpsc::Sender<StreamPiece>,
     ) -> Result<(), String>;
+
+    async fn stream_with_report(
+        &self,
+        prompt_bytes: usize,
+        context: serde_json::Value,
+        tx: mpsc::Sender<StreamPiece>,
+    ) -> Result<ModelCallReport, String> {
+        self.stream(prompt_bytes, context, tx).await?;
+        Ok(ModelCallReport::default())
+    }
 }
 
 pub struct SwitchableModelStream {
-    inner: std::sync::RwLock<Arc<dyn ModelStream>>,
+    inner: std::sync::RwLock<crate::ActiveModelStream>,
+    generation: std::sync::atomic::AtomicU64,
 }
 
 impl SwitchableModelStream {
-    pub fn new(initial: Arc<dyn ModelStream>) -> Self {
+    pub fn new(mut initial: crate::ActiveModelStream) -> Self {
+        initial.port.generation = 0;
         Self {
             inner: std::sync::RwLock::new(initial),
+            generation: std::sync::atomic::AtomicU64::new(0),
         }
     }
+
+    pub fn from_stream(stream: Arc<dyn ModelStream>) -> Self {
+        let endpoint = if let Some(port) = stream.active_model_port() {
+            crate::ActiveModelStream { stream, port }
+        } else {
+            crate::adapt_model_endpoint(
+                "openai",
+                "gpt-4.1",
+                crate::ModelMetadata::default(),
+                stream,
+            )
+            .expect("fallback model selection is statically valid")
+        };
+        Self::new(endpoint)
+    }
+
+    pub async fn set_active(&self, mut endpoint: crate::ActiveModelStream) {
+        let generation = self
+            .generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            .saturating_add(1);
+        endpoint.port.generation = generation;
+        *self.inner.write().expect("model stream lock poisoned") = endpoint;
+    }
+
     pub async fn set(&self, stream: Arc<dyn ModelStream>) {
-        *self.inner.write().expect("model stream lock poisoned") = stream;
+        let endpoint = if let Some(port) = stream.active_model_port() {
+            crate::ActiveModelStream { stream, port }
+        } else {
+            let current = self
+                .inner
+                .read()
+                .expect("model stream lock poisoned")
+                .port
+                .clone();
+            crate::adapt_model_endpoint(
+                &current.selection.provider,
+                &current.selection.model,
+                current.metadata,
+                stream,
+            )
+            .expect("active model selection remains valid")
+        };
+        self.set_active(endpoint).await;
     }
 }
 
 #[async_trait]
 impl ModelStream for SwitchableModelStream {
     fn active_model_port(&self) -> Option<ActiveModelPort> {
-        self.inner
-            .read()
-            .expect("model stream lock poisoned")
-            .active_model_port()
+        Some(
+            self.inner
+                .read()
+                .expect("model stream lock poisoned")
+                .port
+                .clone(),
+        )
     }
 
     async fn stream(
@@ -70,8 +134,28 @@ impl ModelStream for SwitchableModelStream {
             .inner
             .read()
             .expect("model stream lock poisoned")
+            .stream
             .clone();
         stream.stream(prompt_bytes, context, tx).await
+    }
+
+    async fn stream_with_report(
+        &self,
+        prompt_bytes: usize,
+        context: serde_json::Value,
+        tx: mpsc::Sender<StreamPiece>,
+    ) -> Result<ModelCallReport, String> {
+        let endpoint = self
+            .inner
+            .read()
+            .expect("model stream lock poisoned")
+            .clone();
+        let mut report = endpoint
+            .stream
+            .stream_with_report(prompt_bytes, context, tx)
+            .await?;
+        report.generation = endpoint.port.generation;
+        Ok(report)
     }
 }
 
@@ -144,29 +228,51 @@ impl ModelStream for HttpModelStream {
         context: serde_json::Value,
         tx: mpsc::Sender<StreamPiece>,
     ) -> Result<(), String> {
+        self.stream_with_report(prompt_bytes, context, tx)
+            .await
+            .map(|_| ())
+    }
+
+    async fn stream_with_report(
+        &self,
+        prompt_bytes: usize,
+        context: serde_json::Value,
+        tx: mpsc::Sender<StreamPiece>,
+    ) -> Result<ModelCallReport, String> {
         if prompt_bytes > CONTEXT_HARD_LIMIT_BYTES {
             return Err("context exceeds hard limit; compact required".into());
         }
         if self.model.api == ModelApi::OpenaiCodexResponses {
             let request = crate::codex::build_codex_request(&self.model, &self.auth, &context)?;
-            crate::codex::stream_codex(&self.client, &request, tx).await
+            crate::codex::stream_codex_with_report(&self.client, &request, tx).await
         } else {
             let request = build_request(&self.model, &self.auth, context)?;
-            stream_http_request_with_tool_choice_fallback(&self.client, request, tx).await
+            stream_http_request_with_tool_choice_fallback_with_report(&self.client, request, tx)
+                .await
         }
     }
 }
 
-pub(crate) async fn stream_http_request_with_tool_choice_fallback(
+pub async fn stream_http_request_with_tool_choice_fallback(
+    client: &reqwest::Client,
+    request: crate::HttpRequestSpec,
+    tx: mpsc::Sender<StreamPiece>,
+) -> Result<(), String> {
+    stream_http_request_with_tool_choice_fallback_with_report(client, request, tx)
+        .await
+        .map(|_| ())
+}
+
+pub(crate) async fn stream_http_request_with_tool_choice_fallback_with_report(
     client: &reqwest::Client,
     mut request: crate::HttpRequestSpec,
     tx: mpsc::Sender<StreamPiece>,
-) -> Result<(), String> {
-    match stream_http_request(client, &request, tx.clone()).await {
-        Ok(()) => Ok(()),
+) -> Result<ModelCallReport, String> {
+    match stream_http_request_with_report(client, &request, tx.clone()).await {
+        Ok(report) => Ok(report),
         Err(error) if tool_choice_required_rejected(&error, &request) => {
             request.body["tool_choice"] = serde_json::json!("auto");
-            stream_http_request(client, &request, tx).await
+            stream_http_request_with_report(client, &request, tx).await
         }
         Err(error) => Err(error),
     }
@@ -184,6 +290,16 @@ pub async fn stream_http_request(
     request: &crate::HttpRequestSpec,
     tx: mpsc::Sender<StreamPiece>,
 ) -> Result<(), String> {
+    stream_http_request_with_report(client, request, tx)
+        .await
+        .map(|_| ())
+}
+
+pub async fn stream_http_request_with_report(
+    client: &reqwest::Client,
+    request: &crate::HttpRequestSpec,
+    tx: mpsc::Sender<StreamPiece>,
+) -> Result<ModelCallReport, String> {
     let mut response = send_request_response(client, request).await?;
     let mut buffered = Vec::<u8>::new();
     let mut decoder = WireDecoder::default();
@@ -223,7 +339,11 @@ pub async fn stream_http_request(
     if let Some(value) = decoder.finish()? {
         send_pieces(&tx, parser.accept(value)?).await?;
     }
-    send_pieces(&tx, parser.finish()?).await
+    send_pieces(&tx, parser.finish()?).await?;
+    Ok(ModelCallReport {
+        usage: parser.usage,
+        generation: 0,
+    })
 }
 
 async fn send_pieces(
@@ -357,10 +477,14 @@ struct ModelEventParser {
     terminal: bool,
     text: String,
     saw_tool: bool,
+    usage: Option<lato_core::ModelUsage>,
 }
 
 impl ModelEventParser {
     fn accept(&mut self, value: serde_json::Value) -> Result<Vec<StreamPiece>, String> {
+        if let Some(usage) = usage_from_event(&value) {
+            merge_usage(&mut self.usage, usage);
+        }
         let pieces = self.accept_event(value)?;
         for piece in &pieces {
             match piece {
@@ -576,7 +700,96 @@ impl ModelEventParser {
     }
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ParsedModelOutput {
+    pub pieces: Vec<StreamPiece>,
+    pub usage: Option<lato_core::ModelUsage>,
+}
+
+pub(crate) fn usage_from_event(value: &serde_json::Value) -> Option<lato_core::ModelUsage> {
+    let usage = value
+        .pointer("/response/usage")
+        .or_else(|| value.get("usage"))
+        .or_else(|| value.get("usageMetadata"))
+        .or_else(|| value.pointer("/metadata/usage"))
+        .or_else(|| value.pointer("/message/usage"))?;
+    let token = |keys: &[&str]| {
+        keys.iter()
+            .find_map(|key| usage.get(*key).and_then(serde_json::Value::as_u64))
+    };
+    let input_tokens = token(&[
+        "input_tokens",
+        "prompt_tokens",
+        "promptTokenCount",
+        "inputTokens",
+    ]);
+    let output_tokens = token(&[
+        "output_tokens",
+        "completion_tokens",
+        "candidatesTokenCount",
+        "outputTokens",
+    ]);
+    let reasoning_tokens = token(&["reasoning_tokens", "thoughtsTokenCount"]).or_else(|| {
+        usage
+            .pointer("/output_tokens_details/reasoning_tokens")
+            .and_then(serde_json::Value::as_u64)
+            .or_else(|| {
+                usage
+                    .pointer("/completion_tokens_details/reasoning_tokens")
+                    .and_then(serde_json::Value::as_u64)
+            })
+    });
+    let cached_input_tokens = token(&[
+        "cache_read_input_tokens",
+        "cached_input_tokens",
+        "cachedContentTokenCount",
+        "cacheReadInputTokens",
+    ])
+    .or_else(|| {
+        usage
+            .pointer("/input_tokens_details/cached_tokens")
+            .and_then(serde_json::Value::as_u64)
+            .or_else(|| {
+                usage
+                    .pointer("/prompt_tokens_details/cached_tokens")
+                    .and_then(serde_json::Value::as_u64)
+            })
+    });
+    (input_tokens.is_some()
+        || output_tokens.is_some()
+        || reasoning_tokens.is_some()
+        || cached_input_tokens.is_some())
+    .then_some(lato_core::ModelUsage {
+        input_tokens,
+        output_tokens,
+        reasoning_tokens,
+        cached_input_tokens,
+    })
+}
+
+pub(crate) fn merge_usage(
+    current: &mut Option<lato_core::ModelUsage>,
+    update: lato_core::ModelUsage,
+) {
+    let previous = current.take().unwrap_or(lato_core::ModelUsage {
+        input_tokens: None,
+        output_tokens: None,
+        reasoning_tokens: None,
+        cached_input_tokens: None,
+    });
+    *current = Some(lato_core::ModelUsage {
+        input_tokens: update.input_tokens.or(previous.input_tokens),
+        output_tokens: update.output_tokens.or(previous.output_tokens),
+        reasoning_tokens: update.reasoning_tokens.or(previous.reasoning_tokens),
+        cached_input_tokens: update.cached_input_tokens.or(previous.cached_input_tokens),
+    });
+}
+
 pub fn parse_stream_body(body: &str) -> Result<Vec<StreamPiece>, String> {
+    Ok(parse_stream_body_with_report(body)?.pieces)
+}
+
+pub fn parse_stream_body_with_report(body: &str) -> Result<ParsedModelOutput, String> {
     let mut decoder = WireDecoder::default();
     let mut parser = ModelEventParser::default();
     let mut pieces = Vec::new();
@@ -592,7 +805,10 @@ pub fn parse_stream_body(body: &str) -> Result<Vec<StreamPiece>, String> {
         pieces.extend(parser.accept(value)?);
     }
     pieces.extend(parser.finish()?);
-    Ok(pieces)
+    Ok(ParsedModelOutput {
+        pieces,
+        usage: parser.usage,
+    })
 }
 
 pub fn extract_text_embedded_tool_calls(text: &str) -> Vec<StreamPiece> {
@@ -661,6 +877,73 @@ mod repair_tests;
 mod tests {
     use super::*;
     use crate::HttpRequestSpec;
+
+    fn usage(input: u64, output: u64, reasoning: u64, cached: u64) -> lato_core::ModelUsage {
+        lato_core::ModelUsage {
+            input_tokens: Some(input),
+            output_tokens: Some(output),
+            reasoning_tokens: Some(reasoning),
+            cached_input_tokens: Some(cached),
+        }
+    }
+
+    #[test]
+    fn provider_usage_dialects_normalize_to_the_canonical_shape() {
+        let cases = [
+            vec![serde_json::json!({
+                "type":"response.completed",
+                "response":{"usage":{"input_tokens":80,"output_tokens":20,
+                    "output_tokens_details":{"reasoning_tokens":5},
+                    "input_tokens_details":{"cached_tokens":40}}}
+            })],
+            vec![serde_json::json!({
+                "choices":[],
+                "usage":{"prompt_tokens":80,"completion_tokens":20,
+                    "completion_tokens_details":{"reasoning_tokens":5},
+                    "prompt_tokens_details":{"cached_tokens":40}}
+            })],
+            vec![
+                serde_json::json!({"type":"message_start","message":{"usage":{
+                    "input_tokens":80,"cache_read_input_tokens":40}}}),
+                serde_json::json!({"type":"message_delta","usage":{
+                    "output_tokens":20,"reasoning_tokens":5}}),
+            ],
+            vec![serde_json::json!({
+                "usageMetadata":{"promptTokenCount":80,"candidatesTokenCount":20,
+                    "thoughtsTokenCount":5,"cachedContentTokenCount":40}
+            })],
+            vec![serde_json::json!({
+                "metadata":{"usage":{"inputTokens":80,"outputTokens":20,
+                    "reasoning_tokens":5,"cacheReadInputTokens":40}}
+            })],
+            vec![serde_json::json!({
+                "usage":{"prompt_tokens":80,"completion_tokens":20,
+                    "reasoning_tokens":5,"cached_input_tokens":40}
+            })],
+        ];
+
+        for events in cases {
+            let mut parser = ModelEventParser::default();
+            for event in events {
+                parser.accept(event).unwrap();
+            }
+            assert_eq!(parser.usage, Some(usage(80, 20, 5, 40)));
+        }
+    }
+
+    #[test]
+    fn stream_body_report_retains_terminal_responses_usage() {
+        let output = parse_stream_body_with_report(
+            r#"data: {"type":"response.completed","response":{"output":[],"usage":{"input_tokens":80,"output_tokens":20,"output_tokens_details":{"reasoning_tokens":5},"input_tokens_details":{"cached_tokens":40}}}}
+
+data: [DONE]
+
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(output.usage, Some(usage(80, 20, 5, 40)));
+    }
 
     #[test]
     fn malformed_structured_tool_arguments_are_rejected() {
@@ -734,6 +1017,8 @@ mod tests {
                 id: "model",
                 api: crate::ModelApi::OpenaiCompletions,
                 base_url: Some(base_url),
+                context_window: None,
+                model_family: None,
             },
             Auth {
                 api_key: Some("key".into()),

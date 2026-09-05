@@ -565,7 +565,9 @@ mod compaction_tests {
     fn active(port: Arc<dyn ModelPort>) -> lato_ai::ActiveModelPort {
         lato_ai::ActiveModelPort {
             selection: ModelSelection::new("openai", "test").unwrap(),
+            metadata: lato_ai::ModelMetadata::default(),
             capabilities: port.capabilities(),
+            generation: 0,
             port,
         }
     }

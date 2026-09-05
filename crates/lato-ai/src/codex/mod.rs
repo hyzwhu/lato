@@ -9,10 +9,11 @@ use std::collections::HashSet;
 use std::sync::{Mutex, OnceLock};
 use tokio::sync::mpsc;
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct TransportOutcome {
     pub events_started: bool,
     pub terminal: bool,
+    pub usage: Option<lato_core::ModelUsage>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -54,11 +55,21 @@ fn websocket_fallback_sessions() -> &'static Mutex<HashSet<String>> {
     SESSIONS.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
-pub(crate) async fn stream_codex(
+pub async fn stream_codex(
     client: &reqwest::Client,
     request: &CodexRequest,
     tx: mpsc::Sender<StreamPiece>,
 ) -> Result<(), String> {
+    stream_codex_with_report(client, request, tx)
+        .await
+        .map(|_| ())
+}
+
+pub(crate) async fn stream_codex_with_report(
+    client: &reqwest::Client,
+    request: &CodexRequest,
+    tx: mpsc::Sender<StreamPiece>,
+) -> Result<crate::ModelCallReport, String> {
     let fallback_active = request.session_key.as_ref().is_some_and(|session| {
         websocket_fallback_sessions()
             .lock()
@@ -68,7 +79,10 @@ pub(crate) async fn stream_codex(
     if fallback_active {
         return sse::stream_sse(client, request, tx)
             .await
-            .map(|_| ())
+            .map(|outcome| crate::ModelCallReport {
+                usage: outcome.usage,
+                generation: 0,
+            })
             .map_err(|error| error.message);
     }
     let mut websocket_result = websocket::stream_websocket(request, tx.clone()).await;
@@ -79,7 +93,10 @@ pub(crate) async fn stream_codex(
         websocket_result = websocket::stream_websocket(request, tx.clone()).await;
     }
     match websocket_result {
-        Ok(_) => Ok(()),
+        Ok(outcome) => Ok(crate::ModelCallReport {
+            usage: outcome.usage,
+            generation: 0,
+        }),
         Err(error) if !error.events_started => {
             if let Some(session) = &request.session_key {
                 websocket_fallback_sessions()
@@ -89,7 +106,10 @@ pub(crate) async fn stream_codex(
             }
             sse::stream_sse(client, request, tx)
                 .await
-                .map(|_| ())
+                .map(|outcome| crate::ModelCallReport {
+                    usage: outcome.usage,
+                    generation: 0,
+                })
                 .map_err(|sse_error| {
                     format!(
                         "Codex WebSocket failed before streaming ({}); SSE fallback failed: {}",
@@ -344,6 +364,8 @@ mod tests {
             id: "gpt-5-codex",
             api: ModelApi::OpenaiCodexResponses,
             base_url: Some("https://chatgpt.com/backend-api"),
+            context_window: None,
+            model_family: None,
         };
         let auth = Auth {
             api_key: Some("secret".into()),
@@ -390,6 +412,8 @@ mod tests {
             id: "gpt-5-codex",
             api: ModelApi::OpenaiCodexResponses,
             base_url: Some("https://chatgpt.com/backend-api"),
+            context_window: None,
+            model_family: None,
         };
         assert!(build_codex_request(&model, &Auth::default(), &serde_json::json!([])).is_err());
     }
@@ -401,6 +425,8 @@ mod tests {
                 id: "gpt-5-codex",
                 api: ModelApi::OpenaiCodexResponses,
                 base_url: Some(base_url),
+                context_window: None,
+                model_family: None,
             },
             &Auth {
                 api_key: Some("token".into()),

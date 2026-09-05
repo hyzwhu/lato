@@ -1,4 +1,4 @@
-use crate::{ActiveModelPort, ModelStream, StreamPiece};
+use crate::{ActiveModelPort, ModelCallReport, ModelMetadata, ModelStream, StreamPiece};
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use lato_core::{
@@ -16,6 +16,9 @@ use tokio_util::sync::CancellationToken;
 
 pub struct ModelPortStreamAdapter {
     selection: ModelSelection,
+    metadata: ModelMetadata,
+    capabilities: lato_core::ModelCapabilities,
+    generation: u64,
     port: Arc<dyn ModelPort>,
     next_call_id: AtomicU64,
 }
@@ -24,6 +27,9 @@ impl ModelPortStreamAdapter {
     pub fn new(active: ActiveModelPort) -> Self {
         Self {
             selection: active.selection,
+            metadata: active.metadata,
+            capabilities: active.capabilities,
+            generation: active.generation,
             port: active.port,
             next_call_id: AtomicU64::new(1),
         }
@@ -35,7 +41,9 @@ impl ModelStream for ModelPortStreamAdapter {
     fn active_model_port(&self) -> Option<ActiveModelPort> {
         Some(ActiveModelPort {
             selection: self.selection.clone(),
-            capabilities: self.port.capabilities(),
+            metadata: self.metadata.clone(),
+            capabilities: self.capabilities.clone(),
+            generation: self.generation,
             port: self.port.clone(),
         })
     }
@@ -46,6 +54,17 @@ impl ModelStream for ModelPortStreamAdapter {
         context: serde_json::Value,
         tx: mpsc::Sender<StreamPiece>,
     ) -> Result<(), String> {
+        self.stream_with_report(_prompt_bytes, context, tx)
+            .await
+            .map(|_| ())
+    }
+
+    async fn stream_with_report(
+        &self,
+        _prompt_bytes: usize,
+        context: serde_json::Value,
+        tx: mpsc::Sender<StreamPiece>,
+    ) -> Result<ModelCallReport, String> {
         let sequence = self.next_call_id.fetch_add(1, Ordering::Relaxed);
         let request = super::codec::decode_legacy_request(
             ModelCallId::from(format!("legacy-model-call-{sequence}")),
@@ -56,32 +75,46 @@ impl ModelStream for ModelPortStreamAdapter {
         let cancellation = CancellationToken::new();
         let _cancel_on_drop = CancelOnDrop(cancellation.clone());
         let mut events = tokio::select! {
-            _ = tx.closed() => return Ok(()),
+            _ = tx.closed() => return Ok(ModelCallReport {
+                usage: None,
+                generation: self.generation,
+            }),
             result = self.port.stream(request, cancellation.clone()) => {
                 result.map_err(|error| error.to_string())?
             }
         };
         let mut pending_tools = BTreeMap::<u32, PendingToolCall>::new();
+        let mut usage = None;
 
         loop {
             let event = tokio::select! {
-                _ = tx.closed() => return Ok(()),
+                _ = tx.closed() => return Ok(ModelCallReport {
+                    usage,
+                    generation: self.generation,
+                }),
                 event = events.next() => event,
             };
             match event {
                 Some(Ok(ModelStreamEvent::TextDelta { text })) => {
                     if !send_piece(&tx, StreamPiece::Text(text)).await {
-                        return Ok(());
+                        return Ok(ModelCallReport {
+                            usage,
+                            generation: self.generation,
+                        });
                     }
                 }
                 Some(Ok(ModelStreamEvent::ToolCallDelta(delta))) => {
                     merge_tool_delta(&mut pending_tools, delta)
                         .map_err(|error| error.to_string())?;
                 }
-                Some(Ok(ModelStreamEvent::ReasoningDelta { .. }))
-                | Some(Ok(ModelStreamEvent::Usage(_))) => {}
+                Some(Ok(ModelStreamEvent::ReasoningDelta { .. })) => {}
+                Some(Ok(ModelStreamEvent::Usage(current))) => usage = Some(current),
                 Some(Ok(ModelStreamEvent::Completed { .. })) => {
-                    return flush_tool_calls(sequence, pending_tools, &tx).await;
+                    flush_tool_calls(sequence, pending_tools, &tx).await?;
+                    return Ok(ModelCallReport {
+                        usage,
+                        generation: self.generation,
+                    });
                 }
                 Some(Err(error)) => return Err(error.to_string()),
                 None => {
@@ -205,8 +238,46 @@ mod tests {
     use futures_util::Stream;
     use lato_core::{
         ModelCapabilities, ModelError, ModelEventStream, ModelRequest, ModelStopReason,
-        ModelStreamEvent, Retryability, ToolCallDelta, ToolCallId, ToolName,
+        ModelStreamEvent, ModelUsage, Retryability, ToolCallDelta, ToolCallId, ToolName,
     };
+
+    #[tokio::test]
+    async fn canonical_usage_returns_in_the_call_report() {
+        let usage = ModelUsage {
+            input_tokens: Some(80),
+            output_tokens: Some(20),
+            reasoning_tokens: Some(5),
+            cached_input_tokens: Some(40),
+        };
+        let port: Arc<dyn ModelPort> = Arc::new(ScriptedPort {
+            events: vec![
+                Ok(ModelStreamEvent::Usage(usage.clone())),
+                Ok(ModelStreamEvent::Completed {
+                    reason: ModelStopReason::Completed,
+                }),
+            ],
+            request: Arc::new(Mutex::new(None)),
+        });
+        let stream = ModelPortStreamAdapter::new(ActiveModelPort {
+            selection: ModelSelection::new("p", "m1").unwrap(),
+            metadata: ModelMetadata {
+                context_window: Some(2_000),
+                model_family: Some("family-a".into()),
+            },
+            capabilities: port.capabilities(),
+            generation: 0,
+            port,
+        });
+        let (tx, mut rx) = mpsc::channel(4);
+
+        let report = stream
+            .stream_with_report(0, serde_json::json!({"messages":[], "tools":[]}), tx)
+            .await
+            .unwrap();
+
+        assert!(rx.recv().await.is_none());
+        assert_eq!(report.usage, Some(usage));
+    }
     use std::{
         pin::Pin,
         sync::{
@@ -283,7 +354,9 @@ mod tests {
     fn active(port: Arc<dyn ModelPort>) -> ActiveModelPort {
         ActiveModelPort {
             selection: selection(),
+            metadata: ModelMetadata::default(),
             capabilities: port.capabilities(),
+            generation: 0,
             port,
         }
     }

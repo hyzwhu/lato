@@ -673,7 +673,7 @@ mod tests {
             text: "second-answer",
             contexts: Default::default(),
         });
-        let switchable = Arc::new(SwitchableModelStream::new(first));
+        let switchable = Arc::new(SwitchableModelStream::from_stream(first));
         let mut client = InteractiveAcpClient::new_session_with_approval(
             workspace.path().to_path_buf(),
             workspace.path().join("home"),

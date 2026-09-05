@@ -100,6 +100,7 @@ pub async fn stream_websocket(
             break Ok(TransportOutcome {
                 events_started: mapper.started(),
                 terminal: true,
+                usage: mapper.usage().cloned(),
             });
         }
     };
@@ -313,6 +314,8 @@ mod tests {
                 id: "gpt-5-codex",
                 api: ModelApi::OpenaiCodexResponses,
                 base_url: Some(base_url),
+                context_window: None,
+                model_family: None,
             },
             &Auth {
                 api_key: Some("token".into()),

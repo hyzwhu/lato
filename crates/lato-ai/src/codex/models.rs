@@ -68,6 +68,8 @@ fn selectable_models(
             api: ModelApi::OpenaiCodexResponses,
             base_url: base_url.trim_end_matches('/').into(),
             env: "LATO_API_KEY".into(),
+            context_window: None,
+            model_family: Some("openai".into()),
         })
         .collect();
     if models.is_empty() {

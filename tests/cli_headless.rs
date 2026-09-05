@@ -239,6 +239,8 @@ async fn discovered_codex_model_runs_with_saved_oauth_and_codex_transport() {
                     api: lato_ai::ModelApi::OpenaiCodexResponses,
                     base_url: format!("http://{address}/backend-api"),
                     env: "LATO_API_KEY".into(),
+                    context_window: None,
+                    model_family: Some("openai".into()),
                 }],
                 ..Default::default()
             },

@@ -83,6 +83,7 @@ pub async fn stream_sse(
     Ok(TransportOutcome {
         events_started: mapper.started(),
         terminal: mapper.terminal(),
+        usage: mapper.usage().cloned(),
     })
 }
 
@@ -187,6 +188,8 @@ mod tests {
                 id: "gpt-5-codex",
                 api: ModelApi::OpenaiCodexResponses,
                 base_url: Some(base_url),
+                context_window: None,
+                model_family: None,
             },
             &Auth {
                 api_key: Some("token".into()),

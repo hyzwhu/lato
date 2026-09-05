@@ -114,6 +114,8 @@ fn custom_model(provider: &str, id: &str) -> CustomModel {
         api: ModelApi::OpenaiCompletions,
         base_url: "http://127.0.0.1:8080/v1".into(),
         env: "LOCAL_KEY".into(),
+        context_window: None,
+        model_family: None,
     }
 }
 
