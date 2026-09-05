@@ -17,6 +17,7 @@ pub enum CompactionTrigger {
     Manual,
     Threshold,
     PreflightOverflow,
+    ProviderOverflow,
     ModelSwitch,
 }
 

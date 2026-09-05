@@ -1,5 +1,6 @@
 pub mod actor;
 pub mod compaction;
+pub mod context_recovery;
 pub mod context_usage;
 pub mod history;
 pub mod hooks;
@@ -11,6 +12,7 @@ pub mod transcript;
 
 pub use actor::*;
 pub use compaction::*;
+pub use context_recovery::*;
 pub use context_usage::*;
 pub use history::*;
 pub use hooks::*;

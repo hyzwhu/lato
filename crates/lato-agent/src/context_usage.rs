@@ -2,7 +2,7 @@
 // License: Apache-2.0
 // Lato changes: provider-neutral history estimation and model-switch compaction decisions
 
-use crate::HistoryItem;
+use crate::{AutoCompactionSuppression, AutomaticRecoveryState, HistoryItem, SuppressionReason};
 use lato_ai::{ActiveModelPort, ModelCallReport, ModelMetadata};
 use lato_core::{ContextLedger, ContextUsage};
 
@@ -17,6 +17,7 @@ pub enum SwitchCompaction {
 pub struct ContextTracker {
     ledger: ContextLedger,
     pending_model_switch: bool,
+    recovery: AutomaticRecoveryState,
 }
 
 impl ContextTracker {
@@ -55,6 +56,38 @@ impl ContextTracker {
 
     pub fn take_model_switch_check(&mut self) -> bool {
         std::mem::take(&mut self.pending_model_switch)
+    }
+
+    pub fn automatic_compaction_allowed(&self, trigger: lato_core::CompactionTrigger) -> bool {
+        self.recovery.allows(trigger)
+    }
+
+    pub fn automatic_compaction_suppression(&self) -> AutoCompactionSuppression {
+        self.recovery.suppression()
+    }
+
+    pub fn suppress_automatic_compaction(&mut self, reason: SuppressionReason) -> bool {
+        self.recovery.suppress(reason)
+    }
+
+    pub fn on_new_turn(&mut self) {
+        self.recovery.on_new_turn();
+    }
+
+    pub fn on_context_budget_changed(&mut self) {
+        self.recovery.on_context_budget_changed();
+    }
+
+    pub fn on_compaction_success(&mut self) {
+        self.recovery.on_compaction_success();
+    }
+
+    pub fn on_provider_success(&mut self) {
+        self.recovery.on_provider_success();
+    }
+
+    pub fn on_auth_refreshed(&mut self) {
+        self.recovery.on_auth_refreshed();
     }
 }
 

@@ -89,6 +89,18 @@ fn grok_default_threshold_is_eighty_five_percent() {
 }
 
 #[test]
+fn provider_overflow_trigger_has_a_stable_wire_shape() {
+    assert_eq!(
+        serde_json::to_value(CompactionTrigger::ProviderOverflow).unwrap(),
+        serde_json::json!("provider_overflow")
+    );
+    assert_eq!(
+        serde_json::from_value::<CompactionTrigger>(serde_json::json!("threshold")).unwrap(),
+        CompactionTrigger::Threshold
+    );
+}
+
+#[test]
 fn provider_usage_becomes_the_confirmed_baseline_without_double_counting() {
     let mut ledger = ContextLedger::default();
     let usage = ModelUsage {
