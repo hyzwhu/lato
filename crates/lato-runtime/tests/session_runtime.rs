@@ -1,14 +1,16 @@
 use async_trait::async_trait;
 use lato_core::{
     CancelReason, Command, CompactSession, CompactionCandidate, CompactionError, CompactionId,
-    CompactionTrigger, EventPayload, EventStore, HistoryProjectionMetadata, HistoryProjectionStore,
-    HistoryReplacementReason, JOURNAL_SCHEMA_VERSION, JournalDurability, JournalEnvelope,
-    JournalError, JournalRecord, JournalRecordId, JournalReplay, ModelContent, ModelMessage,
-    ModelRole, ProjectionError, SessionId, StartBehavior, StartTurn, TurnOutput, UserInput,
+    CompactionTrigger, ContextUsage, EventPayload, EventStore, HistoryProjectionMetadata,
+    HistoryProjectionStore, HistoryReplacementReason, JOURNAL_SCHEMA_VERSION, JournalDurability,
+    JournalEnvelope, JournalError, JournalRecord, JournalRecordId, JournalReplay, ModelContent,
+    ModelMessage, ModelRole, ProjectionError, SessionId, StartBehavior, StartTurn, TurnOutput,
+    UserInput,
 };
 use lato_runtime::{
-    CompactionControl, CompactionRequest, SessionBootstrap, TurnControl, TurnDriver,
-    TurnEventEmitter, TurnRequest, spawn_session, spawn_session_with_store,
+    AutomaticCompactionOutcome, AutomaticCompactionRequest, CompactionControl, CompactionRequest,
+    SessionBootstrap, TurnControl, TurnDriver, TurnEventEmitter, TurnRequest, spawn_session,
+    spawn_session_with_store,
 };
 use lato_store::{FaultPoint, FileEventStore, FileFaultInjector, MemoryEventStore};
 use std::{
@@ -232,6 +234,151 @@ struct SuccessfulCompactionDriver {
     source: Vec<ModelMessage>,
     replacement: Vec<ModelMessage>,
     installed: Arc<tokio::sync::Mutex<Vec<ModelMessage>>>,
+}
+
+struct AutomaticCompactionDriver {
+    trigger: CompactionTrigger,
+    source: Vec<ModelMessage>,
+    replacement: Vec<ModelMessage>,
+    installed_inside_turn: tokio::sync::Mutex<Vec<ModelMessage>>,
+    compaction_started: Notify,
+    release_compaction: Notify,
+    block_compaction: bool,
+    install_history_called: AtomicBool,
+}
+
+struct AutomaticFailureDriver {
+    error: lato_core::AgentError,
+    observed: tokio::sync::Mutex<Option<AutomaticCompactionOutcome>>,
+}
+
+#[async_trait]
+impl TurnDriver for AutomaticFailureDriver {
+    async fn run(
+        &self,
+        request: TurnRequest,
+        _control: TurnControl,
+        events: TurnEventEmitter,
+    ) -> Result<TurnOutput, lato_core::AgentError> {
+        let outcome = events
+            .compact(AutomaticCompactionRequest {
+                trigger: CompactionTrigger::Threshold,
+                usage: ContextUsage {
+                    estimated_input_tokens: 900,
+                    context_window: 1_000,
+                    utilization_percent: 90,
+                },
+                messages: vec![ModelMessage {
+                    role: ModelRole::User,
+                    content: vec![ModelContent::Text {
+                        text: "old context".into(),
+                    }],
+                }],
+            })
+            .await?;
+        *self.observed.lock().await = Some(outcome);
+        Ok(TurnOutput {
+            final_text: request.input.text,
+        })
+    }
+
+    async fn compact(
+        &self,
+        _request: CompactionRequest,
+        _control: CompactionControl,
+    ) -> Result<CompactionCandidate, lato_core::AgentError> {
+        Err(self.error.clone())
+    }
+}
+
+impl AutomaticCompactionDriver {
+    fn new(trigger: CompactionTrigger, block_compaction: bool) -> Self {
+        Self {
+            trigger,
+            source: vec![ModelMessage {
+                role: ModelRole::User,
+                content: vec![ModelContent::Text {
+                    text: "old context".into(),
+                }],
+            }],
+            replacement: vec![ModelMessage {
+                role: ModelRole::User,
+                content: vec![ModelContent::Text {
+                    text: "compacted context".into(),
+                }],
+            }],
+            installed_inside_turn: tokio::sync::Mutex::new(Vec::new()),
+            compaction_started: Notify::new(),
+            release_compaction: Notify::new(),
+            block_compaction,
+            install_history_called: AtomicBool::new(false),
+        }
+    }
+}
+
+#[async_trait]
+impl TurnDriver for AutomaticCompactionDriver {
+    async fn run(
+        &self,
+        request: TurnRequest,
+        _control: TurnControl,
+        events: TurnEventEmitter,
+    ) -> Result<TurnOutput, lato_core::AgentError> {
+        let outcome = events
+            .compact(AutomaticCompactionRequest {
+                trigger: self.trigger,
+                usage: ContextUsage {
+                    estimated_input_tokens: 900,
+                    context_window: 1_000,
+                    utilization_percent: 90,
+                },
+                messages: self.source.clone(),
+            })
+            .await?;
+        if let AutomaticCompactionOutcome::Compacted(messages) = outcome {
+            *self.installed_inside_turn.lock().await = messages;
+        }
+        Ok(TurnOutput {
+            final_text: request.input.text,
+        })
+    }
+
+    async fn compact(
+        &self,
+        request: CompactionRequest,
+        control: CompactionControl,
+    ) -> Result<CompactionCandidate, lato_core::AgentError> {
+        self.compaction_started.notify_one();
+        if self.block_compaction {
+            tokio::select! {
+                _ = control.cancellation.cancelled() => {
+                    return Err(CompactionError::Cancelled.into());
+                }
+                _ = self.release_compaction.notified() => {}
+            }
+        }
+        Ok(CompactionCandidate {
+            compaction_id: request.compaction_id,
+            messages: self.replacement.clone(),
+            before: lato_core::CompactionSize {
+                message_count: request.messages.len() as u64,
+                serialized_bytes: 10_000,
+            },
+            after: lato_core::CompactionSize {
+                message_count: self.replacement.len() as u64,
+                serialized_bytes: 1_000,
+            },
+            summary_chars: 800,
+        })
+    }
+
+    async fn install_history(
+        &self,
+        _messages: Vec<ModelMessage>,
+    ) -> Result<(), lato_core::AgentError> {
+        self.install_history_called.store(true, Ordering::SeqCst);
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -1014,6 +1161,352 @@ fn manual_compaction() -> Command {
         user_context: None,
         trigger: CompactionTrigger::Manual,
     })
+}
+
+#[tokio::test]
+async fn automatic_compaction_persists_and_returns_history_inside_the_same_turn() {
+    let sid = SessionId::from("session-automatic-threshold");
+    let driver = Arc::new(AutomaticCompactionDriver::new(
+        CompactionTrigger::Threshold,
+        false,
+    ));
+    let replacement = driver.replacement.clone();
+    let store = Arc::new(MemoryEventStore::new());
+    let session =
+        spawn_session_with_store(sid.clone(), driver.clone(), store.clone(), bootstrap(&sid));
+    let mut events = session.subscribe();
+
+    session
+        .submit(Command::StartTurn(StartTurn {
+            input: UserInput::text("continue"),
+            behavior: StartBehavior::Reject,
+        }))
+        .await
+        .unwrap();
+
+    let mut observed_turn_id = None;
+    let mut compaction_triggers = Vec::new();
+    loop {
+        let event = next_event(&mut events).await;
+        if matches!(event.payload, EventPayload::TurnStarted) {
+            observed_turn_id = event.turn_id.clone();
+        }
+        match event.payload {
+            EventPayload::CompactionStarted { trigger, .. } => {
+                assert_eq!(event.turn_id, observed_turn_id);
+                compaction_triggers.push(trigger);
+            }
+            EventPayload::CompactionCompleted { .. } => {
+                assert_eq!(event.turn_id, observed_turn_id);
+            }
+            EventPayload::TurnCompleted(_) => {
+                assert_eq!(event.turn_id, observed_turn_id);
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    assert_eq!(compaction_triggers, vec![CompactionTrigger::Threshold]);
+    assert_eq!(
+        store.replay(&sid).await.unwrap().projection.messages,
+        replacement
+    );
+    assert_eq!(*driver.installed_inside_turn.lock().await, replacement);
+    assert!(!driver.install_history_called.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn automatic_compaction_preserves_model_switch_trigger_and_turn_identity() {
+    let driver = Arc::new(AutomaticCompactionDriver::new(
+        CompactionTrigger::ModelSwitch,
+        false,
+    ));
+    let session = spawn_session("session-automatic-model-switch".into(), driver);
+    let mut events = session.subscribe();
+
+    session
+        .submit(Command::StartTurn(StartTurn {
+            input: UserInput::text("switch"),
+            behavior: StartBehavior::Reject,
+        }))
+        .await
+        .unwrap();
+
+    let mut turn_id = None;
+    let mut saw_model_switch = false;
+    loop {
+        let event = next_event(&mut events).await;
+        if matches!(event.payload, EventPayload::TurnStarted) {
+            turn_id = event.turn_id.clone();
+        }
+        if let EventPayload::CompactionStarted { trigger, .. } = event.payload {
+            assert_eq!(trigger, CompactionTrigger::ModelSwitch);
+            assert_eq!(event.turn_id, turn_id);
+            saw_model_switch = true;
+        } else if matches!(event.payload, EventPayload::TurnCompleted(_)) {
+            assert_eq!(event.turn_id, turn_id);
+            break;
+        }
+    }
+    assert!(saw_model_switch);
+}
+
+#[tokio::test]
+async fn automatic_compaction_is_cancelled_with_its_turn_and_rejects_manual_overlap() {
+    let driver = Arc::new(AutomaticCompactionDriver::new(
+        CompactionTrigger::Threshold,
+        true,
+    ));
+    let session = spawn_session("session-automatic-cancel".into(), driver.clone());
+    let mut events = session.subscribe();
+
+    session
+        .submit(Command::StartTurn(StartTurn {
+            input: UserInput::text("wait"),
+            behavior: StartBehavior::Reject,
+        }))
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(1), driver.compaction_started.notified())
+        .await
+        .expect("automatic compaction did not start");
+
+    let error = session.submit(manual_compaction()).await.unwrap_err();
+    assert_eq!(error.code, "compaction.already_active");
+
+    let mut turn_id = None;
+    let mut compaction_id = None;
+    while compaction_id.is_none() {
+        let event = next_event(&mut events).await;
+        match event.payload {
+            EventPayload::TurnStarted => turn_id = event.turn_id,
+            EventPayload::CompactionStarted {
+                compaction_id: id, ..
+            } => {
+                assert_eq!(event.turn_id, turn_id);
+                compaction_id = Some(id);
+            }
+            _ => {}
+        }
+    }
+    let turn_id = turn_id.expect("turn start missing");
+    let compaction_id = compaction_id.unwrap();
+    session
+        .submit(Command::CancelTurn {
+            turn_id: turn_id.clone(),
+        })
+        .await
+        .unwrap();
+
+    let mut saw_compaction_cancel = false;
+    loop {
+        let event = next_event(&mut events).await;
+        match event.payload {
+            EventPayload::CompactionCancelled {
+                compaction_id: cancelled,
+            } => {
+                assert_eq!(cancelled, compaction_id);
+                assert_eq!(event.turn_id.as_ref(), Some(&turn_id));
+                saw_compaction_cancel = true;
+            }
+            EventPayload::TurnCancelled {
+                reason: CancelReason::User,
+            } => {
+                assert_eq!(event.turn_id.as_ref(), Some(&turn_id));
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(saw_compaction_cancel);
+}
+
+#[tokio::test]
+async fn automatic_compaction_pre_marker_failure_retains_old_history() {
+    let directory = tempfile::tempdir().unwrap();
+    let sid = SessionId::from("automatic-pre-marker-failure");
+    let replay = seeded_file_store(directory.path(), &sid).await;
+    let store = Arc::new(
+        FileEventStore::open_with_fault_injector(
+            directory.path(),
+            RuntimeFault::once(FaultPoint::BeforeCheckpointPublish),
+        )
+        .unwrap(),
+    );
+    let driver = Arc::new(AutomaticCompactionDriver::new(
+        CompactionTrigger::Threshold,
+        false,
+    ));
+    let session = spawn_session_with_store(
+        sid.clone(),
+        driver.clone(),
+        store.clone(),
+        SessionBootstrap { replay },
+    );
+    let mut events = session.subscribe();
+
+    session
+        .submit(Command::StartTurn(StartTurn {
+            input: UserInput::text("continue"),
+            behavior: StartBehavior::Reject,
+        }))
+        .await
+        .unwrap();
+
+    let mut saw_storage_failure = false;
+    loop {
+        let event = next_event(&mut events).await;
+        match event.payload {
+            EventPayload::CompactionFailed { error, .. } => {
+                assert_eq!(error.category, lato_core::ErrorCategory::Storage);
+                saw_storage_failure = true;
+            }
+            EventPayload::TurnFailed { .. } => break,
+            _ => {}
+        }
+    }
+    assert!(saw_storage_failure);
+    assert!(
+        store
+            .replay(&sid)
+            .await
+            .unwrap()
+            .projection
+            .active_checkpoint_id
+            .is_none()
+    );
+    assert!(driver.installed_inside_turn.lock().await.is_empty());
+    assert!(!driver.install_history_called.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn automatic_compaction_post_marker_reconciliation_returns_committed_history() {
+    let directory = tempfile::tempdir().unwrap();
+    let sid = SessionId::from("automatic-post-marker-failure");
+    let replay = seeded_file_store(directory.path(), &sid).await;
+    let store = Arc::new(
+        FileEventStore::open_with_fault_injector(
+            directory.path(),
+            RuntimeFault::once(FaultPoint::BeforeMetadataPublish),
+        )
+        .unwrap(),
+    );
+    let driver = Arc::new(AutomaticCompactionDriver::new(
+        CompactionTrigger::Threshold,
+        false,
+    ));
+    let replacement = driver.replacement.clone();
+    let session = spawn_session_with_store(
+        sid.clone(),
+        driver.clone(),
+        store.clone(),
+        SessionBootstrap { replay },
+    );
+    let mut events = session.subscribe();
+
+    session
+        .submit(Command::StartTurn(StartTurn {
+            input: UserInput::text("continue"),
+            behavior: StartBehavior::Reject,
+        }))
+        .await
+        .unwrap();
+
+    let mut saw_warning = false;
+    loop {
+        let event = next_event(&mut events).await;
+        match event.payload {
+            EventPayload::CompactionCompleted { warning, .. } => {
+                assert_eq!(warning.unwrap().code, "projection.write_failed");
+                saw_warning = true;
+            }
+            EventPayload::TurnCompleted(_) => break,
+            _ => {}
+        }
+    }
+    assert!(saw_warning);
+    assert_eq!(*driver.installed_inside_turn.lock().await, replacement);
+    assert_eq!(
+        store.replay(&sid).await.unwrap().projection.messages,
+        replacement
+    );
+    assert!(!driver.install_history_called.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn automatic_compaction_ordinary_failure_continues_the_turn_unchanged() {
+    let driver = Arc::new(AutomaticFailureDriver {
+        error: CompactionError::NothingToCompact.into(),
+        observed: tokio::sync::Mutex::new(None),
+    });
+    let session = spawn_session("automatic-ordinary-failure".into(), driver.clone());
+    let mut events = session.subscribe();
+
+    session
+        .submit(Command::StartTurn(StartTurn {
+            input: UserInput::text("continue"),
+            behavior: StartBehavior::Reject,
+        }))
+        .await
+        .unwrap();
+
+    let mut saw_failure = false;
+    loop {
+        match next_event(&mut events).await.payload {
+            EventPayload::CompactionFailed { error, .. } => {
+                assert_eq!(error.code, "compaction.nothing_to_compact");
+                saw_failure = true;
+            }
+            EventPayload::TurnCompleted(_) => break,
+            _ => {}
+        }
+    }
+    assert!(saw_failure);
+    assert_eq!(
+        *driver.observed.lock().await,
+        Some(AutomaticCompactionOutcome::ContinueUnchanged)
+    );
+}
+
+#[tokio::test]
+async fn automatic_compaction_auth_failure_stops_the_turn() {
+    let driver = Arc::new(AutomaticFailureDriver {
+        error: lato_core::AgentError::new(
+            "model.auth",
+            lato_core::ErrorCategory::Model,
+            "HTTP 401 from provider",
+            lato_core::Retryability::RequiresDecision,
+        ),
+        observed: tokio::sync::Mutex::new(None),
+    });
+    let session = spawn_session("automatic-auth-failure".into(), driver.clone());
+    let mut events = session.subscribe();
+
+    session
+        .submit(Command::StartTurn(StartTurn {
+            input: UserInput::text("continue"),
+            behavior: StartBehavior::Reject,
+        }))
+        .await
+        .unwrap();
+
+    let mut saw_compaction_failure = false;
+    loop {
+        match next_event(&mut events).await.payload {
+            EventPayload::CompactionFailed { error, .. } => {
+                assert_eq!(error.code, "model.auth");
+                saw_compaction_failure = true;
+            }
+            EventPayload::TurnFailed { error } => {
+                assert_eq!(error.code, "model.auth");
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(saw_compaction_failure);
+    assert_eq!(*driver.observed.lock().await, None);
 }
 
 #[tokio::test]

@@ -4,8 +4,8 @@
 // Compaction orchestration derived from: Grok Build@bb7f39d5858cbf5e00de639367f59debbdcb0138:crates/codegen/xai-grok-shell/src/session/compaction.rs
 
 use crate::driver::{
-    CompactionControl, CompactionRequest, DriverEvent, DriverMessage, TurnControl, TurnDriver,
-    TurnEventEmitter, TurnRequest,
+    AutomaticCompactionOutcome, AutomaticCompactionRequest, CompactionControl, CompactionRequest,
+    DriverEvent, DriverMessage, TurnControl, TurnDriver, TurnEventEmitter, TurnRequest,
 };
 use lato_core::{
     AgentError, CancelReason, Command, CompactSession, CompactionError, CompactionId,
@@ -113,8 +113,10 @@ struct ActiveRuntimeTurn {
 
 struct ActiveRuntimeCompaction {
     id: CompactionId,
+    owner_turn: Option<TurnId>,
     cancellation: CancellationToken,
     task: JoinHandle<()>,
+    reply: Option<oneshot::Sender<Result<AutomaticCompactionOutcome, AgentError>>>,
 }
 
 struct PendingStart {
@@ -230,6 +232,11 @@ impl SessionLoop {
                 }
                 active.cancel_reason = Some(CancelReason::User);
                 active.cancellation.cancel();
+                if let Some(compaction) = self.active_compaction.as_ref()
+                    && compaction.owner_turn.as_ref() == Some(&turn_id)
+                {
+                    compaction.cancellation.cancel();
+                }
                 Ok(())
             }
             Command::CompactSession(request) => self.request_compaction(request).await,
@@ -311,8 +318,10 @@ impl SessionLoop {
         });
         self.active_compaction = Some(ActiveRuntimeCompaction {
             id: compaction_id.clone(),
+            owner_turn: None,
             cancellation,
             task,
+            reply: None,
         });
         self.emit(
             None,
@@ -541,7 +550,93 @@ impl SessionLoop {
             } => {
                 self.handle_compaction_finished(compaction_id, result).await;
             }
+            DriverMessage::AutomaticCompactionRequested {
+                turn_id,
+                request,
+                reply,
+            } => {
+                self.request_automatic_compaction(turn_id, request, reply)
+                    .await;
+            }
         }
+    }
+
+    async fn request_automatic_compaction(
+        &mut self,
+        turn_id: TurnId,
+        request: AutomaticCompactionRequest,
+        reply: oneshot::Sender<Result<AutomaticCompactionOutcome, AgentError>>,
+    ) {
+        if self.active.as_ref().map(|active| &active.id) != Some(&turn_id) {
+            let _ = reply.send(Err(invalid_state(
+                "runtime.stale_turn_compaction",
+                "cannot compact history for an inactive turn",
+            )));
+            return;
+        }
+        let compaction_id = next_compaction_id();
+        let previous_machine = self.machine.clone();
+        if let Err(error) = self
+            .machine
+            .request_turn_compaction(&turn_id, compaction_id.clone())
+        {
+            let _ = reply.send(Err(transition_error(error)));
+            return;
+        }
+        if let Err(error) = self
+            .commit(
+                Some(turn_id.clone()),
+                JournalRecord::CompactionRequested {
+                    compaction_id: compaction_id.clone(),
+                    trigger: request.trigger,
+                    user_context: None,
+                },
+                JournalDurability::SyncData,
+            )
+            .await
+        {
+            self.machine = previous_machine;
+            let _ = reply.send(Err(error));
+            return;
+        }
+
+        let cancellation = CancellationToken::new();
+        let control = CompactionControl {
+            cancellation: cancellation.clone(),
+        };
+        let driver_request = CompactionRequest {
+            compaction_id: compaction_id.clone(),
+            request: CompactSession {
+                user_context: None,
+                trigger: request.trigger,
+            },
+            messages: request.messages,
+            policy: CompactionPolicy::default(),
+        };
+        let driver = self.driver.clone();
+        let driver_tx = self.driver_tx.clone();
+        let finished_id = compaction_id.clone();
+        let task = tokio::spawn(async move {
+            let result = driver.compact(driver_request, control).await;
+            let _ = driver_tx.send(DriverMessage::CompactionFinished {
+                compaction_id: finished_id,
+                result,
+            });
+        });
+        self.active_compaction = Some(ActiveRuntimeCompaction {
+            id: compaction_id.clone(),
+            owner_turn: Some(turn_id.clone()),
+            cancellation,
+            task,
+            reply: Some(reply),
+        });
+        self.emit(
+            Some(turn_id),
+            EventPayload::CompactionStarted {
+                compaction_id,
+                trigger: request.trigger,
+            },
+        );
     }
 
     async fn handle_compaction_finished(
@@ -549,7 +644,7 @@ impl SessionLoop {
         compaction_id: CompactionId,
         result: Result<lato_core::CompactionCandidate, AgentError>,
     ) {
-        let Some(active) = self.active_compaction.take() else {
+        let Some(mut active) = self.active_compaction.take() else {
             return;
         };
         if active.id != compaction_id {
@@ -561,22 +656,37 @@ impl SessionLoop {
             .active_compaction()
             .is_some_and(|state| state.cancel_requested);
         if cancel_requested {
-            if self
+            let cancellation_error: AgentError = CompactionError::Cancelled.into();
+            if let Err(error) = self
                 .commit(
-                    None,
+                    active.owner_turn.clone(),
                     JournalRecord::CompactionCancelled {
                         compaction_id: compaction_id.clone(),
                     },
                     JournalDurability::SyncData,
                 )
                 .await
-                .is_err()
             {
                 self.machine.stop();
+                if let Some(reply) = active.reply.take() {
+                    let _ = reply.send(Err(error));
+                }
                 return;
             }
-            let _ = self.machine.finish_compaction(&compaction_id);
-            self.emit(None, EventPayload::CompactionCancelled { compaction_id });
+            self.finish_runtime_compaction(active.owner_turn.as_ref(), &compaction_id);
+            self.emit(
+                active.owner_turn.clone(),
+                EventPayload::CompactionCancelled { compaction_id },
+            );
+            if let Some(reply) = active.reply.take() {
+                let _ = reply.send(Err(cancellation_error));
+            }
+            return;
+        }
+
+        if let Some(owner_turn) = active.owner_turn.clone() {
+            self.handle_automatic_compaction_finished(active, owner_turn, result)
+                .await;
             return;
         }
 
@@ -610,6 +720,213 @@ impl SessionLoop {
                 error,
             },
         );
+    }
+
+    async fn handle_automatic_compaction_finished(
+        &mut self,
+        mut active: ActiveRuntimeCompaction,
+        owner_turn: TurnId,
+        result: Result<lato_core::CompactionCandidate, AgentError>,
+    ) {
+        match result {
+            Ok(candidate) => {
+                let outcome = self
+                    .persist_automatic_compaction(&owner_turn, candidate)
+                    .await;
+                if let Some(reply) = active.reply.take() {
+                    let _ = reply.send(outcome);
+                }
+            }
+            Err(error) => {
+                let commit_result = self
+                    .commit(
+                        Some(owner_turn.clone()),
+                        JournalRecord::CompactionFailed {
+                            compaction_id: active.id.clone(),
+                            error_code: error.code.clone(),
+                        },
+                        JournalDurability::SyncData,
+                    )
+                    .await;
+                if let Err(storage_error) = commit_result {
+                    self.machine.stop();
+                    if let Some(reply) = active.reply.take() {
+                        let _ = reply.send(Err(storage_error));
+                    }
+                    return;
+                }
+                self.finish_runtime_compaction(Some(&owner_turn), &active.id);
+                self.emit(
+                    Some(owner_turn),
+                    EventPayload::CompactionFailed {
+                        compaction_id: active.id,
+                        error: error.clone(),
+                    },
+                );
+                if let Some(reply) = active.reply.take() {
+                    let outcome = if automatic_compaction_must_stop(&error) {
+                        Err(error)
+                    } else {
+                        Ok(AutomaticCompactionOutcome::ContinueUnchanged)
+                    };
+                    let _ = reply.send(outcome);
+                }
+            }
+        }
+    }
+
+    async fn persist_automatic_compaction(
+        &mut self,
+        owner_turn: &TurnId,
+        candidate: lato_core::CompactionCandidate,
+    ) -> Result<AutomaticCompactionOutcome, AgentError> {
+        let before_checkpoint = self.current_checkpoint_id.clone();
+        match self
+            .store
+            .replace_history(
+                &self.session_id,
+                candidate.messages.clone(),
+                HistoryReplacementReason::ContextCompaction,
+            )
+            .await
+        {
+            Ok(metadata) => {
+                self.journal_sequence = metadata.last_journal_sequence.saturating_add(1);
+                self.current_checkpoint_id = metadata.active_checkpoint_id.clone();
+                let Some(checkpoint_id) = metadata.active_checkpoint_id else {
+                    return self.stop_automatic_after_reconciliation_failure(
+                        owner_turn,
+                        candidate.compaction_id,
+                        "replacement returned no active checkpoint",
+                    );
+                };
+                self.finish_runtime_compaction(Some(owner_turn), &candidate.compaction_id);
+                self.emit(
+                    Some(owner_turn.clone()),
+                    EventPayload::CompactionCompleted {
+                        compaction_id: candidate.compaction_id,
+                        before: candidate.before,
+                        after: candidate.after,
+                        checkpoint_id,
+                        warning: None,
+                    },
+                );
+                Ok(AutomaticCompactionOutcome::Compacted(candidate.messages))
+            }
+            Err(error) => {
+                self.reconcile_automatic_compaction_failure(
+                    owner_turn,
+                    candidate,
+                    before_checkpoint,
+                    error,
+                )
+                .await
+            }
+        }
+    }
+
+    async fn reconcile_automatic_compaction_failure(
+        &mut self,
+        owner_turn: &TurnId,
+        candidate: lato_core::CompactionCandidate,
+        before_checkpoint: Option<String>,
+        replacement_error: ProjectionError,
+    ) -> Result<AutomaticCompactionOutcome, AgentError> {
+        let warning = projection_error(replacement_error);
+        let replay = match self.store.replay(&self.session_id).await {
+            Ok(replay) => replay,
+            Err(error) => {
+                return self.stop_automatic_after_reconciliation_failure(
+                    owner_turn,
+                    candidate.compaction_id,
+                    format!("replay after replacement error: {error}"),
+                );
+            }
+        };
+        self.journal_sequence = replay.projection.next_journal_sequence;
+        let active_checkpoint = replay.projection.active_checkpoint_id.clone();
+        if active_checkpoint != before_checkpoint {
+            let Some(checkpoint_id) = active_checkpoint.clone() else {
+                return self.stop_automatic_after_reconciliation_failure(
+                    owner_turn,
+                    candidate.compaction_id,
+                    "replacement changed checkpoint state without an active checkpoint",
+                );
+            };
+            self.current_checkpoint_id = active_checkpoint;
+            self.finish_runtime_compaction(Some(owner_turn), &candidate.compaction_id);
+            self.emit(
+                Some(owner_turn.clone()),
+                EventPayload::CompactionCompleted {
+                    compaction_id: candidate.compaction_id,
+                    before: candidate.before,
+                    after: candidate.after,
+                    checkpoint_id,
+                    warning: Some(warning),
+                },
+            );
+            return Ok(AutomaticCompactionOutcome::Compacted(
+                replay.projection.messages,
+            ));
+        }
+
+        let storage_error = warning.clone();
+        if let Err(error) = self
+            .commit(
+                Some(owner_turn.clone()),
+                JournalRecord::CompactionFailed {
+                    compaction_id: candidate.compaction_id.clone(),
+                    error_code: warning.code.clone(),
+                },
+                JournalDurability::SyncData,
+            )
+            .await
+        {
+            self.machine.stop();
+            return Err(error);
+        }
+        self.finish_runtime_compaction(Some(owner_turn), &candidate.compaction_id);
+        self.emit(
+            Some(owner_turn.clone()),
+            EventPayload::CompactionFailed {
+                compaction_id: candidate.compaction_id,
+                error: warning,
+            },
+        );
+        Err(storage_error)
+    }
+
+    fn stop_automatic_after_reconciliation_failure(
+        &mut self,
+        owner_turn: &TurnId,
+        compaction_id: CompactionId,
+        message: impl Into<String>,
+    ) -> Result<AutomaticCompactionOutcome, AgentError> {
+        let error: AgentError = CompactionError::ReconciliationFailed {
+            message: message.into(),
+        }
+        .into();
+        self.machine.stop();
+        self.emit(
+            Some(owner_turn.clone()),
+            EventPayload::CompactionFailed {
+                compaction_id,
+                error: error.clone(),
+            },
+        );
+        Err(error)
+    }
+
+    fn finish_runtime_compaction(
+        &mut self,
+        owner_turn: Option<&TurnId>,
+        compaction_id: &CompactionId,
+    ) {
+        if let Some(turn_id) = owner_turn {
+            let _ = self.machine.finish_turn_compaction(turn_id, compaction_id);
+        } else {
+            let _ = self.machine.finish_compaction(compaction_id);
+        }
     }
 
     async fn persist_compaction(&mut self, candidate: lato_core::CompactionCandidate) {
@@ -807,7 +1124,7 @@ impl SessionLoop {
                 task.abort();
             }
             self.commit(
-                None,
+                active.owner_turn.clone(),
                 JournalRecord::CompactionCancelled {
                     compaction_id: active.id.clone(),
                 },
@@ -815,7 +1132,7 @@ impl SessionLoop {
             )
             .await?;
             self.emit(
-                None,
+                active.owner_turn,
                 EventPayload::CompactionCancelled {
                     compaction_id: active.id,
                 },
@@ -945,4 +1262,15 @@ fn projection_error(error: ProjectionError) -> AgentError {
         error.to_string(),
         error.retryability(),
     )
+}
+
+fn automatic_compaction_must_stop(error: &AgentError) -> bool {
+    let message = error.message.to_ascii_lowercase();
+    error.code == "compaction.cancelled"
+        || error.category == ErrorCategory::Storage
+        || error.code == "model.auth"
+        || message.contains("model.auth")
+        || message.contains("http 401")
+        || message.contains("http 403")
+        || message.contains("oauth refresh failed")
 }

@@ -4,8 +4,9 @@
 
 use async_trait::async_trait;
 use lato_core::{
-    AgentError, CompactSession, CompactionCandidate, CompactionId, CompactionPolicy, ErrorCategory,
-    JournalDurability, JournalRecord, ModelMessage, Retryability, TurnId, TurnOutput, UserInput,
+    AgentError, CompactSession, CompactionCandidate, CompactionId, CompactionPolicy,
+    CompactionTrigger, ContextUsage, ErrorCategory, JournalDurability, JournalRecord, ModelMessage,
+    Retryability, TurnId, TurnOutput, UserInput,
 };
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -31,6 +32,19 @@ pub struct CompactionRequest {
 
 pub struct CompactionControl {
     pub cancellation: CancellationToken,
+}
+
+#[derive(Clone, Debug)]
+pub struct AutomaticCompactionRequest {
+    pub trigger: CompactionTrigger,
+    pub usage: ContextUsage,
+    pub messages: Vec<ModelMessage>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum AutomaticCompactionOutcome {
+    Compacted(Vec<ModelMessage>),
+    ContinueUnchanged,
 }
 
 #[derive(Clone)]
@@ -60,6 +74,21 @@ impl TurnEventEmitter {
                 record,
                 durability,
                 ack,
+            })
+            .map_err(|_| event_bus_closed())?;
+        result.await.map_err(|_| event_bus_closed())?
+    }
+
+    pub async fn compact(
+        &self,
+        request: AutomaticCompactionRequest,
+    ) -> Result<AutomaticCompactionOutcome, AgentError> {
+        let (reply, result) = oneshot::channel();
+        self.tx
+            .send(DriverMessage::AutomaticCompactionRequested {
+                turn_id: self.turn_id.clone(),
+                request,
+                reply,
             })
             .map_err(|_| event_bus_closed())?;
         result.await.map_err(|_| event_bus_closed())?
@@ -126,6 +155,11 @@ pub(crate) enum DriverMessage {
     CompactionFinished {
         compaction_id: CompactionId,
         result: Result<CompactionCandidate, AgentError>,
+    },
+    AutomaticCompactionRequested {
+        turn_id: TurnId,
+        request: AutomaticCompactionRequest,
+        reply: oneshot::Sender<Result<AutomaticCompactionOutcome, AgentError>>,
     },
 }
 
