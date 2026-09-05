@@ -62,6 +62,10 @@ impl TurnEventEmitter {
         self.send(DriverEvent::ReasoningDelta(text.into()))
     }
 
+    pub fn context_usage(&self, usage: ContextUsage) -> Result<(), AgentError> {
+        self.send(DriverEvent::ContextUsageUpdated(usage))
+    }
+
     pub async fn commit(
         &self,
         record: JournalRecord,
@@ -134,6 +138,7 @@ pub trait TurnDriver: Send + Sync + 'static {
 pub(crate) enum DriverEvent {
     ModelDelta(String),
     ReasoningDelta(String),
+    ContextUsageUpdated(ContextUsage),
 }
 
 #[derive(Debug)]

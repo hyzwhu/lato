@@ -1,15 +1,16 @@
-use crate::HistoryItem;
+use crate::{ContextTracker, HistoryItem};
 use async_trait::async_trait;
 use lato_ai::{
     CONTEXT_HARD_LIMIT_BYTES, ModelStream, StreamPiece, extract_text_embedded_tool_calls,
 };
 pub use lato_core::ApprovalRequest;
 use lato_core::{
-    JournalDurability, JournalRecord, ModelContent, ModelMessage, ModelRole, PolicyAuditDecision,
-    PolicyAuditStage, PolicyDecision, Retryability, SessionId, ToolCallId, ToolContext, ToolError,
-    ToolName, TurnId, journal_request_hash,
+    CompactionPolicy, CompactionTrigger, ContextUsage, JournalDurability, JournalRecord,
+    ModelContent, ModelMessage, ModelRole, PolicyAuditDecision, PolicyAuditStage, PolicyDecision,
+    Retryability, SessionId, ToolCallId, ToolContext, ToolError, ToolName, TurnId,
+    journal_request_hash,
 };
-use lato_runtime::TurnEventEmitter;
+use lato_runtime::{AutomaticCompactionOutcome, AutomaticCompactionRequest, TurnEventEmitter};
 use lato_tools::{BuiltinToolEnvironment, ToolRuntime, bound_tool_output, builtin_tool_runtime};
 use lato_workspace::{FileLocks, SessionTrust};
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
@@ -50,6 +51,7 @@ pub struct SessionActor {
     events: Option<(mpsc::UnboundedSender<serde_json::Value>, String)>,
     tool_approval: Option<Arc<dyn ToolApproval>>,
     journal_events: Option<TurnEventEmitter>,
+    context_tracker: ContextTracker,
     #[cfg(test)]
     pub(crate) on_after_persist: Option<Box<dyn Fn() + Send + Sync>>,
 }
@@ -94,6 +96,7 @@ impl SessionActor {
             events: None,
             tool_approval: None,
             journal_events: None,
+            context_tracker: ContextTracker::default(),
             #[cfg(test)]
             on_after_persist: None,
         }
@@ -151,9 +154,31 @@ impl SessionActor {
                 self.active = false;
                 return Err("maximum sampling steps exceeded".into());
             }
+            let active_model = self.stream.active_model_port();
+            let mut compacted = false;
+            if let Some(active) = active_model.as_ref() {
+                let usage = self.context_tracker.measure(&self.history, active);
+                self.emit_context_usage(usage.clone())?;
+                let threshold = CompactionPolicy::default().threshold_percent;
+                let trigger = if self.context_tracker.take_model_switch_check() {
+                    usage
+                        .threshold_reached(threshold)
+                        .then_some(CompactionTrigger::ModelSwitch)
+                } else {
+                    usage
+                        .threshold_reached(threshold)
+                        .then_some(CompactionTrigger::Threshold)
+                };
+                if let Some(trigger) = trigger {
+                    compacted = self.run_automatic_compaction(trigger, usage).await?;
+                }
+            }
+            if compacted {
+                continue;
+            }
             if self.encoded_len() > CONTEXT_HARD_LIMIT_BYTES {
                 self.active = false;
-                return Err("context exceeds hard limit; compact not implemented".into());
+                return Err("context exceeds hard limit; automatic compaction unavailable".into());
             }
             let (tx, mut rx) = mpsc::channel(16);
             let tool_runtime = self.tool_runtime.clone();
@@ -170,7 +195,9 @@ impl SessionActor {
             let stream = self.stream.clone();
             let prompt_bytes = self.encoded_len();
             let stream_task =
-                tokio::spawn(async move { stream.stream(prompt_bytes, context, tx).await });
+                tokio::spawn(
+                    async move { stream.stream_with_report(prompt_bytes, context, tx).await },
+                );
             let mut saw_tool = false;
             let mut round_text = String::new();
             let mut uncommitted_text = String::new();
@@ -209,8 +236,16 @@ impl SessionActor {
                     }
                 }
             }
-            stream_task.await.map_err(|error| error.to_string())??;
+            let report = stream_task.await.map_err(|error| error.to_string())??;
             self.commit_assistant_text(&uncommitted_text).await?;
+            if let Some(active) = active_model.as_ref()
+                && self
+                    .context_tracker
+                    .observe(&self.history, &report, active.generation)
+            {
+                let usage = self.context_tracker.measure(&self.history, active);
+                self.emit_context_usage(usage)?;
+            }
             if !saw_tool {
                 for piece in extract_text_embedded_tool_calls(&round_text) {
                     let StreamPiece::ToolCall {
@@ -276,6 +311,48 @@ impl SessionActor {
         serde_json::to_vec(&self.history)
             .map(|v| v.len())
             .unwrap_or(usize::MAX)
+    }
+
+    pub fn mark_model_switch_check(&mut self) {
+        self.context_tracker.mark_model_switch_check();
+    }
+
+    fn emit_context_usage(&self, usage: ContextUsage) -> Result<(), String> {
+        match &self.journal_events {
+            Some(events) => events
+                .context_usage(usage)
+                .map_err(|error| error.to_string()),
+            None => Ok(()),
+        }
+    }
+
+    async fn run_automatic_compaction(
+        &mut self,
+        trigger: CompactionTrigger,
+        usage: ContextUsage,
+    ) -> Result<bool, String> {
+        let Some(events) = self.journal_events.clone() else {
+            return Ok(false);
+        };
+        let messages =
+            crate::history_to_model_messages(&self.history).map_err(|error| error.to_string())?;
+        match events
+            .compact(AutomaticCompactionRequest {
+                trigger,
+                usage,
+                messages,
+            })
+            .await
+            .map_err(|error| error.to_string())?
+        {
+            AutomaticCompactionOutcome::Compacted(messages) => {
+                self.history = crate::model_messages_to_history(&messages)
+                    .map_err(|error| error.to_string())?;
+                self.context_tracker.reseed(&self.history);
+                Ok(true)
+            }
+            AutomaticCompactionOutcome::ContinueUnchanged => Ok(false),
+        }
     }
 
     async fn commit_assistant_text(&self, text: &str) -> Result<(), String> {

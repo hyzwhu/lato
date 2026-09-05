@@ -428,6 +428,9 @@ impl SessionLoop {
                 let payload = match event {
                     DriverEvent::ModelDelta(text) => EventPayload::ModelDelta { text },
                     DriverEvent::ReasoningDelta(text) => EventPayload::ReasoningDelta { text },
+                    DriverEvent::ContextUsageUpdated(usage) => {
+                        EventPayload::ContextUsageUpdated { usage }
+                    }
                 };
                 self.emit(Some(turn_id), payload);
             }

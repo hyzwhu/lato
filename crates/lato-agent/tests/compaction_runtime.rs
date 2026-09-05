@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use lato_agent::{AcpHost, REQUIRED_SECTIONS};
-use lato_ai::{ModelStream, StreamPiece};
+use lato_ai::{ModelMetadata, ModelStream, StreamPiece, adapt_model_endpoint};
 use lato_protocol::JsonRpcReq;
 use lato_workspace::SessionTrust;
 use std::sync::{Arc, Mutex};
@@ -158,4 +158,71 @@ async fn persisted_compaction_rebuilds_after_cache_corruption_and_continues() {
     assert!(encoded.contains("<conversation_summary version=\\\"1\\\">"));
     assert!(encoded.contains("continue now"));
     assert!(!encoded.contains("SECRET_RAW_PRECOMPACTION_PAYLOAD"));
+}
+
+#[tokio::test]
+async fn automatic_compaction_runs_before_the_next_sample_and_rebuilds_its_request() {
+    let workspace = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let trust = SessionTrust::for_headless_prompt(workspace.path());
+    let contexts = Arc::new(Mutex::new(Vec::new()));
+    let raw_payload = "SECRET_AUTOMATIC_PRECOMPACTION_PAYLOAD ".repeat(11_000);
+    let raw: Arc<dyn ModelStream> = Arc::new(RecordingStream {
+        scripts: tokio::sync::Mutex::new(vec![
+            vec![StreamPiece::Text(raw_payload.clone())],
+            vec![StreamPiece::Text(summary())],
+            vec![StreamPiece::Text("continued".into())],
+        ]),
+        contexts: contexts.clone(),
+    });
+    let endpoint = adapt_model_endpoint(
+        "fixture",
+        "automatic",
+        ModelMetadata {
+            context_window: Some(120_000),
+            model_family: Some("fixture".into()),
+        },
+        raw,
+    )
+    .unwrap();
+    let (updates, _updates_rx) = mpsc::unbounded_channel();
+    let mut host = AcpHost::new_with_home(
+        workspace.path().to_path_buf(),
+        trust,
+        updates,
+        endpoint.stream,
+        home.path().to_path_buf(),
+    );
+    let created = host
+        .handle(req(10, "session/new", serde_json::json!({})))
+        .await
+        .unwrap();
+    let sid = created["result"]["sessionId"].as_str().unwrap();
+
+    let first = host
+        .handle(req(
+            11,
+            "session/prompt",
+            serde_json::json!({"sessionId":sid,"text":"remember this large result"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(first["result"]["status"], "complete");
+    let second = host
+        .handle(req(
+            12,
+            "session/prompt",
+            serde_json::json!({"sessionId":sid,"text":"continue now"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(second["result"]["status"], "complete");
+
+    let contexts = contexts.lock().unwrap();
+    assert_eq!(contexts.len(), 3, "expected sample, compact, sample");
+    assert!(contexts[1]["tools"].as_array().unwrap().is_empty());
+    let rebuilt = contexts[2].to_string();
+    assert!(rebuilt.contains("conversation_summary"));
+    assert!(rebuilt.contains("continue now"));
+    assert!(!rebuilt.contains("SECRET_AUTOMATIC_PRECOMPACTION_PAYLOAD"));
 }
