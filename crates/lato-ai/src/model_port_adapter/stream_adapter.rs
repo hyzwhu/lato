@@ -53,7 +53,7 @@ impl ModelStream for ModelPortStreamAdapter {
         _prompt_bytes: usize,
         context: serde_json::Value,
         tx: mpsc::Sender<StreamPiece>,
-    ) -> Result<(), String> {
+    ) -> Result<(), ModelError> {
         self.stream_with_report(_prompt_bytes, context, tx)
             .await
             .map(|_| ())
@@ -64,14 +64,13 @@ impl ModelStream for ModelPortStreamAdapter {
         _prompt_bytes: usize,
         context: serde_json::Value,
         tx: mpsc::Sender<StreamPiece>,
-    ) -> Result<ModelCallReport, String> {
+    ) -> Result<ModelCallReport, ModelError> {
         let sequence = self.next_call_id.fetch_add(1, Ordering::Relaxed);
         let request = super::codec::decode_legacy_request(
             ModelCallId::from(format!("legacy-model-call-{sequence}")),
             self.selection.clone(),
             context,
-        )
-        .map_err(|error| error.to_string())?;
+        )?;
         let cancellation = CancellationToken::new();
         let _cancel_on_drop = CancelOnDrop(cancellation.clone());
         let mut events = tokio::select! {
@@ -80,11 +79,12 @@ impl ModelStream for ModelPortStreamAdapter {
                 generation: self.generation,
             }),
             result = self.port.stream(request, cancellation.clone()) => {
-                result.map_err(|error| error.to_string())?
+                result?
             }
         };
         let mut pending_tools = BTreeMap::<u32, PendingToolCall>::new();
         let mut usage = None;
+        let mut output_started = false;
 
         loop {
             let event = tokio::select! {
@@ -96,6 +96,7 @@ impl ModelStream for ModelPortStreamAdapter {
             };
             match event {
                 Some(Ok(ModelStreamEvent::TextDelta { text })) => {
+                    output_started = true;
                     if !send_piece(&tx, StreamPiece::Text(text)).await {
                         return Ok(ModelCallReport {
                             usage,
@@ -104,11 +105,14 @@ impl ModelStream for ModelPortStreamAdapter {
                     }
                 }
                 Some(Ok(ModelStreamEvent::ToolCallDelta(delta))) => {
-                    merge_tool_delta(&mut pending_tools, delta)
-                        .map_err(|error| error.to_string())?;
+                    output_started = true;
+                    merge_tool_delta(&mut pending_tools, delta)?;
                 }
-                Some(Ok(ModelStreamEvent::ReasoningDelta { .. })) => {}
-                Some(Ok(ModelStreamEvent::Usage(current))) => usage = Some(current),
+                Some(Ok(ModelStreamEvent::ReasoningDelta { .. })) => output_started = true,
+                Some(Ok(ModelStreamEvent::Usage(current))) => {
+                    output_started = true;
+                    usage = Some(current);
+                }
                 Some(Ok(ModelStreamEvent::Completed { .. })) => {
                     flush_tool_calls(sequence, pending_tools, &tx).await?;
                     return Ok(ModelCallReport {
@@ -116,14 +120,17 @@ impl ModelStream for ModelPortStreamAdapter {
                         generation: self.generation,
                     });
                 }
-                Some(Err(error)) => return Err(error.to_string()),
+                Some(Err(error)) => {
+                    let observed = error.output_started || output_started;
+                    return Err(error.with_output_started(observed));
+                }
                 None => {
                     return Err(ModelError::new(
                         "model.stream_interrupted",
                         "canonical model stream ended before completion",
                         lato_core::Retryability::AfterBackoff,
                     )
-                    .to_string());
+                    .with_output_started(output_started));
                 }
             }
         }
@@ -180,26 +187,24 @@ async fn flush_tool_calls(
     sequence: u64,
     pending: BTreeMap<u32, PendingToolCall>,
     tx: &mpsc::Sender<StreamPiece>,
-) -> Result<(), String> {
+) -> Result<(), ModelError> {
     for (index, call) in pending {
         let call_id = call
             .call_id
             .map(|call_id| call_id.to_string())
             .unwrap_or_else(|| format!("legacy-tool-call-{sequence}-{index}"));
         let name = call.name.ok_or_else(|| {
-            invalid_response(format!("tool call {index} completed without a name")).to_string()
+            invalid_response(format!("tool call {index} completed without a name"))
         })?;
         if name.namespace() != "legacy" {
-            return Err(
-                invalid_response(format!("tool call {index} used non-legacy tool {name}"))
-                    .to_string(),
-            );
+            return Err(invalid_response(format!(
+                "tool call {index} used non-legacy tool {name}"
+            )));
         }
         let arguments = serde_json::from_str(&call.arguments).map_err(|error| {
             invalid_response(format!(
                 "tool call {index} completed with invalid arguments: {error}"
             ))
-            .to_string()
         })?;
         if !send_piece(
             tx,
@@ -457,7 +462,7 @@ mod tests {
 
         let error = adapter.stream(1, context(), tx).await.unwrap_err();
 
-        assert!(error.starts_with("model.invalid_response:"));
+        assert_eq!(error.code, "model.invalid_response");
     }
 
     #[tokio::test]
@@ -475,7 +480,40 @@ mod tests {
 
         let error = adapter.stream(1, context(), tx).await.unwrap_err();
 
-        assert_eq!(error, "model.rate_limited: slow down");
+        assert_eq!(error.code, "model.rate_limited");
+        assert_eq!(error.message, "slow down");
+    }
+
+    #[tokio::test]
+    async fn canonical_stream_error_records_prior_output_without_losing_metadata() {
+        use lato_core::ModelErrorKind;
+
+        let port = Arc::new(ScriptedPort {
+            request: Arc::new(Mutex::new(None)),
+            events: vec![
+                Ok(ModelStreamEvent::TextDelta {
+                    text: "partial".into(),
+                }),
+                Err(ModelError::new(
+                    "model.context_overflow",
+                    "context too long",
+                    Retryability::Never,
+                )
+                .with_kind(ModelErrorKind::ContextOverflow)
+                .with_status(400)
+                .with_context_window(128_000)),
+            ],
+        });
+        let adapter = ModelPortStreamAdapter::new(active(port));
+        let (tx, mut rx) = mpsc::channel(16);
+
+        let error = adapter.stream(1, context(), tx).await.unwrap_err();
+
+        assert!(matches!(rx.recv().await, Some(StreamPiece::Text(text)) if text == "partial"));
+        assert_eq!(error.kind, ModelErrorKind::ContextOverflow);
+        assert_eq!(error.status_code, Some(400));
+        assert_eq!(error.context_window, Some(128_000));
+        assert!(error.output_started);
     }
 
     #[tokio::test]

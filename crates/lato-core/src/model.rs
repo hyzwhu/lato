@@ -152,12 +152,34 @@ pub enum ModelStreamEvent {
     Completed { reason: ModelStopReason },
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelErrorKind {
+    ContextOverflow,
+    Authentication,
+    Credit,
+    RateLimited,
+    InvalidRequest,
+    Transport,
+    Cancelled,
+    #[default]
+    Other,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize, thiserror::Error)]
 #[error("{code}: {message}")]
 pub struct ModelError {
     pub code: String,
     pub message: String,
     pub retryability: Retryability,
+    #[serde(default)]
+    pub kind: ModelErrorKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_code: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
+    #[serde(default)]
+    pub output_started: bool,
 }
 
 impl ModelError {
@@ -170,7 +192,31 @@ impl ModelError {
             code: code.into(),
             message: message.into(),
             retryability,
+            kind: ModelErrorKind::Other,
+            status_code: None,
+            context_window: None,
+            output_started: false,
         }
+    }
+
+    pub fn with_kind(mut self, kind: ModelErrorKind) -> Self {
+        self.kind = kind;
+        self
+    }
+
+    pub fn with_status(mut self, status_code: u16) -> Self {
+        self.status_code = Some(status_code);
+        self
+    }
+
+    pub fn with_context_window(mut self, context_window: u64) -> Self {
+        self.context_window = Some(context_window);
+        self
+    }
+
+    pub fn with_output_started(mut self, output_started: bool) -> Self {
+        self.output_started = output_started;
+        self
     }
 
     pub fn cancelled() -> Self {
@@ -179,6 +225,7 @@ impl ModelError {
             "model request cancelled",
             Retryability::Never,
         )
+        .with_kind(ModelErrorKind::Cancelled)
     }
 }
 

@@ -5,6 +5,7 @@ use crate::{
     http_client_for_url, stream_http_request_with_tool_choice_fallback_with_report,
 };
 use async_trait::async_trait;
+use lato_core::{ModelError, ModelErrorKind, Retryability};
 use std::path::Path;
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -202,7 +203,7 @@ impl ModelStream for CustomHttpModelStream {
         prompt_bytes: usize,
         context: serde_json::Value,
         tx: tokio::sync::mpsc::Sender<StreamPiece>,
-    ) -> Result<(), String> {
+    ) -> Result<(), ModelError> {
         self.stream_with_report(prompt_bytes, context, tx)
             .await
             .map(|_| ())
@@ -213,9 +214,14 @@ impl ModelStream for CustomHttpModelStream {
         prompt_bytes: usize,
         context: serde_json::Value,
         tx: tokio::sync::mpsc::Sender<StreamPiece>,
-    ) -> Result<ModelCallReport, String> {
+    ) -> Result<ModelCallReport, ModelError> {
         if prompt_bytes > CONTEXT_HARD_LIMIT_BYTES {
-            return Err("context exceeds hard limit; compact required".into());
+            return Err(ModelError::new(
+                "model.context_overflow",
+                "context exceeds hard limit; compact required",
+                Retryability::Never,
+            )
+            .with_kind(ModelErrorKind::ContextOverflow));
         }
         if self.model.api == ModelApi::OpenaiCodexResponses {
             let request = crate::codex::build_codex_request_for_model(
@@ -223,12 +229,25 @@ impl ModelStream for CustomHttpModelStream {
                 Some(&self.model.base_url),
                 &self.auth,
                 &context,
-            )?;
-            return crate::codex::stream_codex_with_report(&self.client, &request, tx).await;
+            )
+            .map_err(legacy_model_error)?;
+            return crate::codex::stream_codex_with_report(&self.client, &request, tx)
+                .await
+                .map_err(legacy_model_error);
         }
-        let request = build_custom_request(&self.model, &self.auth, context)?;
+        let request =
+            build_custom_request(&self.model, &self.auth, context).map_err(legacy_model_error)?;
         stream_http_request_with_tool_choice_fallback_with_report(&self.client, request, tx).await
     }
+}
+
+fn legacy_model_error(error: impl std::fmt::Display) -> ModelError {
+    ModelError::new(
+        "model.stream_interrupted",
+        error.to_string(),
+        Retryability::AfterBackoff,
+    )
+    .with_kind(ModelErrorKind::Transport)
 }
 
 fn bearer(auth: &Auth) -> Vec<(String, String)> {

@@ -3,6 +3,7 @@ use crate::{
     send_request_response,
 };
 use async_trait::async_trait;
+use lato_core::{ModelError, ModelErrorKind, Retryability};
 use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};
 
@@ -39,14 +40,14 @@ pub trait ModelStream: Send + Sync {
         prompt_bytes: usize,
         context: serde_json::Value,
         tx: mpsc::Sender<StreamPiece>,
-    ) -> Result<(), String>;
+    ) -> Result<(), ModelError>;
 
     async fn stream_with_report(
         &self,
         prompt_bytes: usize,
         context: serde_json::Value,
         tx: mpsc::Sender<StreamPiece>,
-    ) -> Result<ModelCallReport, String> {
+    ) -> Result<ModelCallReport, ModelError> {
         self.stream(prompt_bytes, context, tx).await?;
         Ok(ModelCallReport::default())
     }
@@ -136,7 +137,7 @@ impl ModelStream for SwitchableModelStream {
         prompt_bytes: usize,
         context: serde_json::Value,
         tx: mpsc::Sender<StreamPiece>,
-    ) -> Result<(), String> {
+    ) -> Result<(), ModelError> {
         let stream = self
             .inner
             .read()
@@ -151,7 +152,7 @@ impl ModelStream for SwitchableModelStream {
         prompt_bytes: usize,
         context: serde_json::Value,
         tx: mpsc::Sender<StreamPiece>,
-    ) -> Result<ModelCallReport, String> {
+    ) -> Result<ModelCallReport, ModelError> {
         let endpoint = self
             .inner
             .read()
@@ -184,9 +185,11 @@ impl ModelStream for FakeModelStream {
         prompt_bytes: usize,
         _context: serde_json::Value,
         tx: mpsc::Sender<StreamPiece>,
-    ) -> Result<(), String> {
+    ) -> Result<(), ModelError> {
         if prompt_bytes > CONTEXT_HARD_LIMIT_BYTES {
-            return Err("context exceeds hard limit; compact not implemented".into());
+            return Err(context_overflow_error(
+                "context exceeds hard limit; compact not implemented",
+            ));
         }
         let next = {
             let mut s = self.script.lock().await;
@@ -234,7 +237,7 @@ impl ModelStream for HttpModelStream {
         prompt_bytes: usize,
         context: serde_json::Value,
         tx: mpsc::Sender<StreamPiece>,
-    ) -> Result<(), String> {
+    ) -> Result<(), ModelError> {
         self.stream_with_report(prompt_bytes, context, tx)
             .await
             .map(|_| ())
@@ -245,15 +248,21 @@ impl ModelStream for HttpModelStream {
         prompt_bytes: usize,
         context: serde_json::Value,
         tx: mpsc::Sender<StreamPiece>,
-    ) -> Result<ModelCallReport, String> {
+    ) -> Result<ModelCallReport, ModelError> {
         if prompt_bytes > CONTEXT_HARD_LIMIT_BYTES {
-            return Err("context exceeds hard limit; compact required".into());
+            return Err(context_overflow_error(
+                "context exceeds hard limit; compact required",
+            ));
         }
         if self.model.api == ModelApi::OpenaiCodexResponses {
-            let request = crate::codex::build_codex_request(&self.model, &self.auth, &context)?;
-            crate::codex::stream_codex_with_report(&self.client, &request, tx).await
+            let request = crate::codex::build_codex_request(&self.model, &self.auth, &context)
+                .map_err(legacy_model_error)?;
+            crate::codex::stream_codex_with_report(&self.client, &request, tx)
+                .await
+                .map_err(legacy_model_error)
         } else {
-            let request = build_request(&self.model, &self.auth, context)?;
+            let request =
+                build_request(&self.model, &self.auth, context).map_err(legacy_model_error)?;
             stream_http_request_with_tool_choice_fallback_with_report(&self.client, request, tx)
                 .await
         }
@@ -264,7 +273,7 @@ pub async fn stream_http_request_with_tool_choice_fallback(
     client: &reqwest::Client,
     request: crate::HttpRequestSpec,
     tx: mpsc::Sender<StreamPiece>,
-) -> Result<(), String> {
+) -> Result<(), ModelError> {
     stream_http_request_with_tool_choice_fallback_with_report(client, request, tx)
         .await
         .map(|_| ())
@@ -274,7 +283,7 @@ pub(crate) async fn stream_http_request_with_tool_choice_fallback_with_report(
     client: &reqwest::Client,
     mut request: crate::HttpRequestSpec,
     tx: mpsc::Sender<StreamPiece>,
-) -> Result<ModelCallReport, String> {
+) -> Result<ModelCallReport, ModelError> {
     match stream_http_request_with_report(client, &request, tx.clone()).await {
         Ok(report) => Ok(report),
         Err(error) if tool_choice_required_rejected(&error, &request) => {
@@ -285,8 +294,8 @@ pub(crate) async fn stream_http_request_with_tool_choice_fallback_with_report(
     }
 }
 
-fn tool_choice_required_rejected(error: &str, request: &crate::HttpRequestSpec) -> bool {
-    let lower = error.to_ascii_lowercase();
+fn tool_choice_required_rejected(error: &ModelError, request: &crate::HttpRequestSpec) -> bool {
+    let lower = error.message.to_ascii_lowercase();
     request.body.get("tool_choice").and_then(|v| v.as_str()) == Some("required")
         && lower.contains("http 400")
         && (lower.contains("tool_choice") || lower.contains("tool choice"))
@@ -296,7 +305,7 @@ pub async fn stream_http_request(
     client: &reqwest::Client,
     request: &crate::HttpRequestSpec,
     tx: mpsc::Sender<StreamPiece>,
-) -> Result<(), String> {
+) -> Result<(), ModelError> {
     stream_http_request_with_report(client, request, tx)
         .await
         .map(|_| ())
@@ -306,15 +315,17 @@ pub async fn stream_http_request_with_report(
     client: &reqwest::Client,
     request: &crate::HttpRequestSpec,
     tx: mpsc::Sender<StreamPiece>,
-) -> Result<ModelCallReport, String> {
-    let mut response = send_request_response(client, request).await?;
+) -> Result<ModelCallReport, ModelError> {
+    let mut response = send_request_response(client, request)
+        .await
+        .map_err(legacy_model_error)?;
     let mut buffered = Vec::<u8>::new();
     let mut decoder = WireDecoder::default();
     let mut parser = ModelEventParser::default();
     'read: loop {
         let chunk = tokio::select! {
-            _ = tx.closed() => return Err("stream receiver closed".into()),
-            chunk = response.chunk() => chunk.map_err(|error| error.to_string())?,
+            _ = tx.closed() => return Err(legacy_model_error("stream receiver closed")),
+            chunk = response.chunk() => chunk.map_err(legacy_model_error)?,
         };
         let Some(chunk) = chunk else {
             break;
@@ -324,9 +335,9 @@ pub async fn stream_http_request_with_report(
         while let Some(end) = buffered[start..].iter().position(|byte| *byte == b'\n') {
             let end = start + end;
             let line = std::str::from_utf8(&buffered[start..end])
-                .map_err(|_| "model response was not valid UTF-8".to_string())?;
-            if let Some(value) = decoder.line(line)? {
-                send_pieces(&tx, parser.accept(value)?).await?;
+                .map_err(|_| legacy_model_error("model response was not valid UTF-8"))?;
+            if let Some(value) = decoder.line(line).map_err(legacy_model_error)? {
+                send_pieces(&tx, parser.accept(value).map_err(legacy_model_error)?).await?;
             }
             start = end + 1;
             if decoder.terminal || parser.terminal {
@@ -338,15 +349,15 @@ pub async fn stream_http_request_with_report(
     }
     if !buffered.is_empty() {
         let line = std::str::from_utf8(&buffered)
-            .map_err(|_| "model response was not valid UTF-8".to_string())?;
-        if let Some(value) = decoder.line(line)? {
-            send_pieces(&tx, parser.accept(value)?).await?;
+            .map_err(|_| legacy_model_error("model response was not valid UTF-8"))?;
+        if let Some(value) = decoder.line(line).map_err(legacy_model_error)? {
+            send_pieces(&tx, parser.accept(value).map_err(legacy_model_error)?).await?;
         }
     }
-    if let Some(value) = decoder.finish()? {
-        send_pieces(&tx, parser.accept(value)?).await?;
+    if let Some(value) = decoder.finish().map_err(legacy_model_error)? {
+        send_pieces(&tx, parser.accept(value).map_err(legacy_model_error)?).await?;
     }
-    send_pieces(&tx, parser.finish()?).await?;
+    send_pieces(&tx, parser.finish().map_err(legacy_model_error)?).await?;
     Ok(ModelCallReport {
         usage: parser.usage,
         generation: 0,
@@ -356,13 +367,27 @@ pub async fn stream_http_request_with_report(
 async fn send_pieces(
     tx: &mpsc::Sender<StreamPiece>,
     pieces: Vec<StreamPiece>,
-) -> Result<(), String> {
+) -> Result<(), ModelError> {
     for piece in pieces {
         tx.send(piece)
             .await
-            .map_err(|_| "stream receiver closed".to_string())?;
+            .map_err(|_| legacy_model_error("stream receiver closed"))?;
     }
     Ok(())
+}
+
+fn legacy_model_error(error: impl std::fmt::Display) -> ModelError {
+    ModelError::new(
+        "model.stream_interrupted",
+        error.to_string(),
+        Retryability::AfterBackoff,
+    )
+    .with_kind(ModelErrorKind::Transport)
+}
+
+fn context_overflow_error(message: impl Into<String>) -> ModelError {
+    ModelError::new("model.context_overflow", message, Retryability::Never)
+        .with_kind(ModelErrorKind::ContextOverflow)
 }
 
 #[derive(Default)]
@@ -1051,7 +1076,7 @@ data: [DONE]
             .stream(CONTEXT_HARD_LIMIT_BYTES + 1, serde_json::json!([]), tx)
             .await
             .unwrap_err();
-        assert!(err.contains("compact"));
+        assert!(err.message.contains("compact"));
     }
 
     #[test]
@@ -1167,11 +1192,11 @@ data: [DONE]
             body: serde_json::json!({"tool_choice":"required"}),
         };
         assert!(tool_choice_required_rejected(
-            "http 400: invalid tool_choice",
+            &legacy_model_error("http 400: invalid tool_choice"),
             &request
         ));
         assert!(!tool_choice_required_rejected(
-            "http 401: unauthorized",
+            &legacy_model_error("http 401: unauthorized"),
             &request
         ));
     }
@@ -1185,11 +1210,11 @@ data: [DONE]
             body: serde_json::json!({"tool_choice":"required"}),
         };
         assert!(!tool_choice_required_rejected(
-            "http 400: invalid model",
+            &legacy_model_error("http 400: invalid model"),
             &request
         ));
         assert!(tool_choice_required_rejected(
-            "http 400: unsupported tool_choice required",
+            &legacy_model_error("http 400: unsupported tool_choice required"),
             &request
         ));
     }

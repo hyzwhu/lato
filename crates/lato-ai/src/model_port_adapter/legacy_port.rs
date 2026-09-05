@@ -118,22 +118,24 @@ async fn run_legacy_bridge(
     tokio::pin!(provider);
     let mut next_tool_index = 0_u32;
     let mut saw_tool_call = false;
+    let mut output_started = false;
 
     let provider_result = loop {
         tokio::select! {
             _ = cancellation.cancelled() => return,
             result = &mut provider => break result,
             piece = legacy_rx.recv() => {
-                if let Some(piece) = piece
-                    && !forward_piece(
+                if let Some(piece) = piece {
+                    output_started = true;
+                    if !forward_piece(
                         piece,
                         &event_tx,
                         &cancellation,
                         &mut next_tool_index,
                         &mut saw_tool_call,
-                    ).await
-                {
-                    return;
+                    ).await {
+                        return;
+                    }
                 }
             }
         }
@@ -144,6 +146,7 @@ async fn run_legacy_bridge(
             _ = cancellation.cancelled() => return,
             piece = legacy_rx.recv() => match piece {
                 Some(piece) => {
+                    output_started = true;
                     if !forward_piece(
                         piece,
                         &event_tx,
@@ -175,11 +178,10 @@ async fn run_legacy_bridge(
                 },
             })
         }
-        Err(message) => Err(ModelError::new(
-            "model.stream_interrupted",
-            message,
-            Retryability::AfterBackoff,
-        )),
+        Err(error) => {
+            let observed = error.output_started || output_started;
+            Err(error.with_output_started(observed))
+        }
     };
     let _ = send_event(&event_tx, &cancellation, final_event).await;
 }
@@ -277,7 +279,8 @@ mod tests {
     #[derive(Clone)]
     enum Behavior {
         Pieces(Vec<StreamPiece>),
-        Fail(String),
+        Fail(ModelError),
+        PiecesThenFail(Vec<StreamPiece>, ModelError),
         Block(Arc<AtomicBool>),
     }
 
@@ -293,16 +296,34 @@ mod tests {
             _prompt_bytes: usize,
             _context: serde_json::Value,
             tx: mpsc::Sender<StreamPiece>,
-        ) -> Result<(), String> {
+        ) -> Result<(), ModelError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             match &self.behavior {
                 Behavior::Pieces(pieces) => {
                     for piece in pieces.clone() {
-                        tx.send(piece).await.map_err(|error| error.to_string())?;
+                        tx.send(piece).await.map_err(|_| {
+                            ModelError::new(
+                                "model.receiver_closed",
+                                "model stream receiver closed",
+                                Retryability::Never,
+                            )
+                        })?;
                     }
                     Ok(())
                 }
-                Behavior::Fail(message) => Err(message.clone()),
+                Behavior::Fail(error) => Err(error.clone()),
+                Behavior::PiecesThenFail(pieces, error) => {
+                    for piece in pieces.clone() {
+                        tx.send(piece).await.map_err(|_| {
+                            ModelError::new(
+                                "model.receiver_closed",
+                                "model stream receiver closed",
+                                Retryability::Never,
+                            )
+                        })?;
+                    }
+                    Err(error.clone())
+                }
                 Behavior::Block(dropped) => {
                     struct DropMarker(Arc<AtomicBool>);
                     impl Drop for DropMarker {
@@ -436,7 +457,11 @@ mod tests {
     #[tokio::test]
     async fn provider_failure_is_a_typed_stream_item() {
         let port = port(
-            Behavior::Fail("wire broke".into()),
+            Behavior::Fail(ModelError::new(
+                "model.stream_interrupted",
+                "wire broke",
+                Retryability::AfterBackoff,
+            )),
             Arc::new(AtomicUsize::new(0)),
         );
 
@@ -451,6 +476,55 @@ mod tests {
         let error = events[0].as_ref().unwrap_err();
         assert_eq!(error.code, "model.stream_interrupted");
         assert!(error.message.contains("wire broke"));
+    }
+
+    #[tokio::test]
+    async fn provider_failure_preserves_metadata_and_observed_output() {
+        use lato_core::ModelErrorKind;
+
+        let overflow = ModelError::new(
+            "model.context_overflow",
+            "maximum context length is 128000 tokens",
+            Retryability::Never,
+        )
+        .with_kind(ModelErrorKind::ContextOverflow)
+        .with_status(400)
+        .with_context_window(128_000);
+        let before_output = port(
+            Behavior::Fail(overflow.clone()),
+            Arc::new(AtomicUsize::new(0)),
+        );
+        let error = before_output
+            .stream(request(selection()), CancellationToken::new())
+            .await
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await
+            .pop()
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.kind, ModelErrorKind::ContextOverflow);
+        assert_eq!(error.status_code, Some(400));
+        assert_eq!(error.context_window, Some(128_000));
+        assert!(!error.output_started);
+
+        let after_output = port(
+            Behavior::PiecesThenFail(vec![StreamPiece::Text("partial".into())], overflow),
+            Arc::new(AtomicUsize::new(0)),
+        );
+        let events = after_output
+            .stream(request(selection()), CancellationToken::new())
+            .await
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await;
+        assert!(matches!(
+            events.first(),
+            Some(Ok(ModelStreamEvent::TextDelta { .. }))
+        ));
+        let error = events.last().unwrap().as_ref().unwrap_err();
+        assert_eq!(error.kind, ModelErrorKind::ContextOverflow);
+        assert!(error.output_started);
     }
 
     #[tokio::test]

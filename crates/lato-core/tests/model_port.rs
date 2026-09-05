@@ -1,9 +1,9 @@
 use async_trait::async_trait;
 use futures_util::{StreamExt, stream};
 use lato_core::{
-    AgentError, ErrorCategory, ModelCapabilities, ModelContent, ModelError, ModelEventStream,
-    ModelMessage, ModelPort, ModelRequest, ModelRole, ModelSelection, ModelStopReason,
-    ModelStreamEvent, ModelUsage, Retryability, SamplingParameters, ToolChoice,
+    AgentError, ErrorCategory, ModelCapabilities, ModelContent, ModelError, ModelErrorKind,
+    ModelEventStream, ModelMessage, ModelPort, ModelRequest, ModelRole, ModelSelection,
+    ModelStopReason, ModelStreamEvent, ModelUsage, Retryability, SamplingParameters, ToolChoice,
 };
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
@@ -153,4 +153,21 @@ fn provider_specific_stop_reasons_remain_explicit() {
 fn selection_rejects_empty_parts() {
     assert!(ModelSelection::new("", "model").is_err());
     assert!(ModelSelection::new("provider", " ").is_err());
+}
+
+#[test]
+fn model_error_metadata_is_optional_and_round_trips() {
+    let old = ModelError::new("model.failed", "failed", Retryability::Never);
+    assert_eq!(old.kind, ModelErrorKind::Other);
+    assert_eq!(old.status_code, None);
+    assert_eq!(old.context_window, None);
+    assert!(!old.output_started);
+
+    let typed = old
+        .with_kind(ModelErrorKind::ContextOverflow)
+        .with_status(400)
+        .with_context_window(128_000)
+        .with_output_started(true);
+    let json = serde_json::to_value(&typed).unwrap();
+    assert_eq!(serde_json::from_value::<ModelError>(json).unwrap(), typed);
 }

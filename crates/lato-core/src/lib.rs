@@ -24,8 +24,8 @@ pub use journal::{
     journal_request_hash, project_journal, projection_message, validate_journal,
 };
 pub use model::{
-    ModelCapabilities, ModelContent, ModelError, ModelEventStream, ModelMessage, ModelPort,
-    ModelRequest, ModelRole, ModelSelection, ModelSelectionError, ModelStopReason,
+    ModelCapabilities, ModelContent, ModelError, ModelErrorKind, ModelEventStream, ModelMessage,
+    ModelPort, ModelRequest, ModelRole, ModelSelection, ModelSelectionError, ModelStopReason,
     ModelStreamEvent, ModelUsage, SamplingParameters, ToolCallDelta, ToolChoice,
 };
 pub use policy::{

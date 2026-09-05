@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use lato_agent::{AcpHost, REQUIRED_SECTIONS};
 use lato_ai::{ModelMetadata, ModelStream, StreamPiece, adapt_model_endpoint};
+use lato_core::{ModelError, Retryability};
 use lato_protocol::JsonRpcReq;
 use lato_workspace::SessionTrust;
 use std::sync::{Arc, Mutex};
@@ -18,11 +19,17 @@ impl ModelStream for RecordingStream {
         _prompt_bytes: usize,
         context: serde_json::Value,
         tx: mpsc::Sender<StreamPiece>,
-    ) -> Result<(), String> {
+    ) -> Result<(), ModelError> {
         self.contexts.lock().unwrap().push(context);
         let script = self.scripts.lock().await.remove(0);
         for piece in script {
-            tx.send(piece).await.map_err(|error| error.to_string())?;
+            tx.send(piece).await.map_err(|_| {
+                ModelError::new(
+                    "model.receiver_closed",
+                    "model stream receiver closed",
+                    Retryability::Never,
+                )
+            })?;
         }
         Ok(())
     }

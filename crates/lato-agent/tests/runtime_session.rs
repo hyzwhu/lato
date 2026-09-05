@@ -4,7 +4,7 @@ use lato_agent::{
     default_fake_stream,
 };
 use lato_ai::{FakeModelStream, ModelMetadata, ModelStream, StreamPiece, adapt_model_endpoint};
-use lato_core::CancelReason;
+use lato_core::{CancelReason, ModelError};
 use lato_workspace::{FileLocks, SessionTrust};
 use std::sync::Arc;
 use tokio::sync::{Notify, mpsc};
@@ -93,7 +93,7 @@ impl ModelStream for BlockingStream {
         _prompt_bytes: usize,
         _context: serde_json::Value,
         tx: mpsc::Sender<StreamPiece>,
-    ) -> Result<(), String> {
+    ) -> Result<(), ModelError> {
         self.started.notify_one();
         tx.closed().await;
         Ok(())

@@ -2,8 +2,8 @@ use async_trait::async_trait;
 use lato_agent::{HistoryItem, LegacyTurnDriver, default_fake_stream};
 use lato_ai::{FakeModelStream, ModelStream, StreamPiece};
 use lato_core::{
-    Command, EventPayload, PolicyMode, SandboxProfile, SessionId, StartBehavior, StartTurn,
-    ToolCallId, TurnId, UserInput,
+    Command, EventPayload, ModelError, PolicyMode, Retryability, SandboxProfile, SessionId,
+    StartBehavior, StartTurn, ToolCallId, TurnId, UserInput,
 };
 use lato_policy::{ApprovalLedger, PolicyEngine};
 use lato_runtime::spawn_session;
@@ -18,6 +18,14 @@ use std::{
 };
 use tokio::sync::{Mutex, Notify, mpsc};
 use tokio::time::timeout;
+
+fn receiver_closed() -> ModelError {
+    ModelError::new(
+        "model.receiver_closed",
+        "model stream receiver closed",
+        Retryability::Never,
+    )
+}
 
 fn driver_with_stream(
     stream: Arc<dyn ModelStream>,
@@ -202,7 +210,7 @@ impl ModelStream for GatedToolCallStream {
         _prompt_bytes: usize,
         _context: serde_json::Value,
         tx: mpsc::Sender<StreamPiece>,
-    ) -> Result<(), String> {
+    ) -> Result<(), ModelError> {
         self.release.notified().await;
         tx.send(StreamPiece::ToolCall {
             id: "cancelled-record-call".into(),
@@ -210,7 +218,7 @@ impl ModelStream for GatedToolCallStream {
             arguments: serde_json::json!({}),
         })
         .await
-        .map_err(|_| "stream receiver closed".to_string())
+        .map_err(|_| receiver_closed())
     }
 }
 
@@ -381,7 +389,7 @@ impl ModelStream for SteeringRecordingStream {
         _prompt_bytes: usize,
         _context: serde_json::Value,
         tx: mpsc::Sender<StreamPiece>,
-    ) -> Result<(), String> {
+    ) -> Result<(), ModelError> {
         match self.calls.fetch_add(1, Ordering::SeqCst) {
             0 => {
                 self.first_started.notify_one();
@@ -395,12 +403,12 @@ impl ModelStream for SteeringRecordingStream {
                     arguments: serde_json::json!({}),
                 })
                 .await
-                .map_err(|_| "stream receiver closed".to_string())?;
+                .map_err(|_| receiver_closed())?;
             }
             _ => {
                 tx.send(StreamPiece::Text("steered done".into()))
                     .await
-                    .map_err(|_| "stream receiver closed".to_string())?;
+                    .map_err(|_| receiver_closed())?;
             }
         }
         Ok(())
@@ -425,7 +433,7 @@ impl ModelStream for InterruptibleStream {
         _prompt_bytes: usize,
         context: serde_json::Value,
         tx: mpsc::Sender<StreamPiece>,
-    ) -> Result<(), String> {
+    ) -> Result<(), ModelError> {
         self.contexts.lock().await.push(context);
         if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
             self.first_started.notify_one();
@@ -434,7 +442,7 @@ impl ModelStream for InterruptibleStream {
         } else {
             tx.send(StreamPiece::Text("new answer".into()))
                 .await
-                .map_err(|_| "stream receiver closed".to_string())?;
+                .map_err(|_| receiver_closed())?;
         }
         Ok(())
     }

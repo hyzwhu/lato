@@ -768,11 +768,17 @@ mod tests {
                 _: usize,
                 context: serde_json::Value,
                 tx: tokio::sync::mpsc::Sender<StreamPiece>,
-            ) -> Result<(), String> {
+            ) -> Result<(), lato_core::ModelError> {
                 self.contexts.lock().unwrap().push(context);
                 tx.send(StreamPiece::Text(self.text.into()))
                     .await
-                    .map_err(|e| e.to_string())
+                    .map_err(|_| {
+                        lato_core::ModelError::new(
+                            "model.receiver_closed",
+                            "model stream receiver closed",
+                            lato_core::Retryability::Never,
+                        )
+                    })
             }
         }
         let workspace = tempfile::tempdir().unwrap();

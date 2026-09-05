@@ -240,7 +240,10 @@ impl SessionActor {
                     }
                 }
             }
-            let report = stream_task.await.map_err(|error| error.to_string())??;
+            let report = stream_task
+                .await
+                .map_err(|error| error.to_string())?
+                .map_err(|error| error.to_string())?;
             self.commit_assistant_text(&uncommitted_text).await?;
             if let Some(active) = active_model.as_ref()
                 && self
