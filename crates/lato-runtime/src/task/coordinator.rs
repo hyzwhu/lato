@@ -4,8 +4,8 @@
 
 use crate::task::state::{CoordinatorState, RuntimeTaskRecord};
 use crate::task::{
-    CoordinatorConfig, RunnerEvent, TaskCommand, TaskEventEnvelope, TaskEventPayload,
-    TaskEventSink, TaskHandle, TaskRunner, root_node,
+    CoordinatorConfig, InspectCaller, RunnerEvent, SinkShutdown, TaskCommand, TaskEventEnvelope,
+    TaskEventPayload, TaskEventSink, TaskHandle, TaskRunner, root_node,
 };
 use lato_core::{BudgetAccount, TaskError, TaskErrorCode, TaskId};
 use lato_workspace::WorkspaceAllocator;
@@ -23,7 +23,9 @@ pub struct TaskCoordinator<R: TaskRunner, A: WorkspaceAllocator> {
     _internal_tx: mpsc::Sender<RunnerEvent<R::Control>>,
     internal_rx: mpsc::Receiver<RunnerEvent<R::Control>>,
     event_tx: broadcast::Sender<TaskEventEnvelope>,
-    sink_tx: mpsc::Sender<TaskEventEnvelope>,
+    sink_tx: Option<mpsc::Sender<TaskEventEnvelope>>,
+    sink_drained: Option<tokio::sync::oneshot::Receiver<()>>,
+    sink_worker: Option<std::thread::JoinHandle<()>>,
     dropped_sink_events: u64,
     state: CoordinatorState,
     sequence: u64,
@@ -44,7 +46,8 @@ where
     let (internal_tx, internal_rx) = mpsc::channel(config.command_capacity);
     let (event_tx, _) = broadcast::channel(config.event_capacity);
     let (sink_tx, sink_rx) = mpsc::channel(config.event_capacity);
-    spawn_sink_dispatcher(event_sink, sink_rx);
+    let (sink_drained_tx, sink_drained) = tokio::sync::oneshot::channel();
+    let sink_worker = spawn_sink_dispatcher(event_sink, sink_rx, sink_drained_tx);
     let handle = TaskHandle {
         command_tx,
         event_tx: event_tx.clone(),
@@ -57,7 +60,9 @@ where
         _internal_tx: internal_tx,
         internal_rx,
         event_tx,
-        sink_tx,
+        sink_tx: Some(sink_tx),
+        sink_drained: Some(sink_drained),
+        sink_worker: Some(sink_worker),
         dropped_sink_events: 0,
         state: CoordinatorState::default(),
         sequence: 0,
@@ -72,7 +77,7 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
             tokio::select! {
                 command = self.command_rx.recv() => {
                     let Some(command) = command else { break };
-                    if self.handle_command(command) { break; }
+                    if self.handle_command(command).await { break; }
                 }
                 event = self.internal_rx.recv() => {
                     if let Some(event) = event {
@@ -83,25 +88,31 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
         }
     }
 
-    fn handle_command(&mut self, command: TaskCommand) -> bool {
+    async fn handle_command(&mut self, command: TaskCommand) -> bool {
         match command {
             TaskCommand::RegisterRoot { request, reply } => {
                 let result = self.register_root(*request);
                 let _ = reply.send(result);
             }
             TaskCommand::Inspect {
-                task_id,
-                requester_root,
+                task_id: target_task_id,
+                caller,
                 reply,
             } => {
-                let result = self
-                    .state
-                    .inspection(&task_id)
-                    .filter(|snapshot| {
-                        requester_root
-                            .as_ref()
-                            .is_none_or(|root_id| &snapshot.node.root_id == root_id)
-                    })
+                let authorized = match caller {
+                    InspectCaller::Admin => true,
+                    InspectCaller::Scoped {
+                        root_id,
+                        task_id: requester_task_id,
+                    } => self.state.is_self_or_descendant(
+                        &root_id,
+                        &requester_task_id,
+                        &target_task_id,
+                    ),
+                };
+                let result = authorized
+                    .then(|| self.state.inspection(&target_task_id))
+                    .flatten()
                     .ok_or_else(not_found);
                 let _ = reply.send(result);
             }
@@ -113,7 +124,8 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
                 let _ = reply.send(result);
             }
             TaskCommand::Shutdown { reply } => {
-                let _ = reply.send(());
+                let outcome = self.shutdown_sink().await;
+                let _ = reply.send(outcome);
                 return true;
             }
         }
@@ -211,17 +223,40 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
         record.last_event_sequence = self.sequence;
         let envelope = TaskEventEnvelope::new(self.sequence, &record.node, payload);
         let _ = self.event_tx.send(envelope.clone());
-        if self.sink_tx.try_send(envelope.clone()).is_err() {
+        if self
+            .sink_tx
+            .as_ref()
+            .is_none_or(|sink_tx| sink_tx.try_send(envelope.clone()).is_err())
+        {
             self.dropped_sink_events = self.dropped_sink_events.saturating_add(1);
         }
         envelope
+    }
+
+    async fn shutdown_sink(&mut self) -> SinkShutdown {
+        self.sink_tx.take();
+        let Some(drained) = self.sink_drained.take() else {
+            return SinkShutdown::Drained;
+        };
+        if !matches!(
+            tokio::time::timeout(self._config.teardown_drain_timeout, drained).await,
+            Ok(Ok(()))
+        ) {
+            self.sink_worker.take();
+            return SinkShutdown::TimedOutDetached;
+        }
+        if let Some(worker) = self.sink_worker.take() {
+            let _ = worker.join();
+        }
+        SinkShutdown::Drained
     }
 }
 
 fn spawn_sink_dispatcher(
     event_sink: Arc<dyn TaskEventSink>,
     mut sink_rx: mpsc::Receiver<TaskEventEnvelope>,
-) {
+    drained: tokio::sync::oneshot::Sender<()>,
+) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("lato-task-event-sink".into())
         .spawn(move || {
@@ -230,8 +265,9 @@ fn spawn_sink_dispatcher(
                     event_sink.on_event(event);
                 }));
             }
+            let _ = drained.send(());
         })
-        .expect("task event sink dispatcher thread must start");
+        .expect("task event sink dispatcher thread must start")
 }
 
 fn not_found() -> TaskError {

@@ -4,14 +4,14 @@ use lato_core::{
     AgentProfile, BudgetLimits, SessionId, TaskErrorCode, TaskId, TaskOwner, ToolCapability, TurnId,
 };
 use lato_runtime::{
-    CoordinatorConfig, MemoryTaskEventSink, TaskEventEnvelope, TaskEventPayload, TaskEventSink,
-    TaskRootRequest, spawn_task_coordinator,
+    CoordinatorConfig, MemoryTaskEventSink, SinkShutdown, TaskEventEnvelope, TaskEventPayload,
+    TaskEventSink, TaskRootRequest, spawn_task_coordinator,
 };
 use lato_workspace::MemoryWorkspaceAllocator;
 use std::{
     sync::{
         Arc, Condvar, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -31,7 +31,7 @@ async fn root_registration_is_actor_owned_and_evented() {
 
     let inspection = harness
         .handle
-        .inspect(TaskId::from("root-1"))
+        .inspect_admin(TaskId::from("root-1"))
         .await
         .unwrap();
     assert_eq!(inspection.node.id, TaskId::from("root-1"));
@@ -196,6 +196,7 @@ async fn panicking_sink_does_not_kill_the_actor_or_change_acknowledgements() {
 
 struct BlockingSink {
     entered: AtomicBool,
+    delivered: AtomicUsize,
     gate: Mutex<bool>,
     released: Condvar,
 }
@@ -204,6 +205,7 @@ impl BlockingSink {
     fn new() -> Self {
         Self {
             entered: AtomicBool::new(false),
+            delivered: AtomicUsize::new(0),
             gate: Mutex::new(false),
             released: Condvar::new(),
         }
@@ -222,6 +224,7 @@ impl TaskEventSink for BlockingSink {
         while !*released {
             released = self.released.wait(released).unwrap();
         }
+        self.delivered.fetch_add(1, Ordering::Release);
     }
 }
 
@@ -231,6 +234,7 @@ async fn blocking_sink_never_blocks_commands_and_saturation_is_counted() {
     let sink = Arc::new(BlockingSink::new());
     let config = CoordinatorConfig {
         event_capacity: 1,
+        teardown_drain_timeout: Duration::from_millis(20),
         ..CoordinatorConfig::default()
     };
     let (handle, actor) = spawn_task_coordinator(
@@ -267,9 +271,57 @@ async fn blocking_sink_never_blocks_commands_and_saturation_is_counted() {
     assert_eq!(counts.roots, 3);
     assert!(counts.dropped_sink_events >= 1);
 
-    handle.shutdown().await.unwrap();
+    assert_eq!(
+        handle.shutdown().await.unwrap(),
+        SinkShutdown::TimedOutDetached
+    );
     actor.await.unwrap();
     sink.release();
+}
+
+#[tokio::test]
+async fn normal_shutdown_waits_for_every_accepted_sink_event_to_drain() {
+    let workspace = tempfile::tempdir().unwrap();
+    let sink = Arc::new(BlockingSink::new());
+    let config = CoordinatorConfig {
+        teardown_drain_timeout: Duration::from_secs(1),
+        ..CoordinatorConfig::default()
+    };
+    let (handle, actor) = spawn_task_coordinator(
+        config,
+        Arc::new(task_support::ControlledTaskRunner),
+        Arc::new(MemoryWorkspaceAllocator::new(workspace.path()).unwrap()),
+        sink.clone(),
+    );
+    handle
+        .register_root(TaskRootRequest {
+            task_id: TaskId::from("root"),
+            owner: TaskOwner::Interactive {
+                session_id: SessionId::from("session"),
+                turn_id: TurnId::from("turn"),
+            },
+            profile: AgentProfile::worker(),
+            permissions: vec![ToolCapability::FileRead],
+            budget: BudgetLimits::unlimited(),
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !sink.entered.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+
+    let shutdown_handle = handle.clone();
+    let shutdown = tokio::spawn(async move { shutdown_handle.shutdown().await });
+    tokio::task::yield_now().await;
+    assert!(!shutdown.is_finished());
+    sink.release();
+    assert_eq!(shutdown.await.unwrap().unwrap(), SinkShutdown::Drained);
+    assert_eq!(sink.delivered.load(Ordering::Acquire), 1);
+    actor.await.unwrap();
 }
 
 #[tokio::test]
@@ -289,7 +341,7 @@ async fn root_shutdown_commits_terminal_state_before_publishing() {
     assert!(
         harness
             .handle
-            .inspect(TaskId::from("root-1"))
+            .inspect_admin(TaskId::from("root-1"))
             .await
             .unwrap()
             .node

@@ -127,6 +127,16 @@ pub struct RegistryCounts {
     pub dropped_sink_events: u64,
 }
 
+/// Result of shutting down the observational event-sink dispatcher.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SinkShutdown {
+    /// The dispatcher delivered every event it had accepted and exited.
+    Drained,
+    /// The bounded wait expired. The worker was detached because safe Rust
+    /// cannot force-stop arbitrary callback code that is currently blocked.
+    TimedOutDetached,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct TaskEventEnvelope {
     pub schema_version: u32,
@@ -240,7 +250,7 @@ pub(crate) enum TaskCommand {
     },
     Inspect {
         task_id: TaskId,
-        requester_root: Option<TaskId>,
+        caller: InspectCaller,
         reply: oneshot::Sender<Result<TaskSnapshot, TaskError>>,
     },
     RegistryCounts {
@@ -251,8 +261,13 @@ pub(crate) enum TaskCommand {
         reply: oneshot::Sender<Result<(), TaskError>>,
     },
     Shutdown {
-        reply: oneshot::Sender<()>,
+        reply: oneshot::Sender<SinkShutdown>,
     },
+}
+
+pub(crate) enum InspectCaller {
+    Admin,
+    Scoped { root_id: TaskId, task_id: TaskId },
 }
 
 #[derive(Clone)]
@@ -285,11 +300,12 @@ impl TaskHandle {
         ))
     }
 
-    pub async fn inspect(&self, task_id: TaskId) -> Result<TaskSnapshot, TaskError> {
+    /// Performs an unrestricted coordinator-administration lookup.
+    pub async fn inspect_admin(&self, task_id: TaskId) -> Result<TaskSnapshot, TaskError> {
         let (reply, response) = oneshot::channel();
         self.send(TaskCommand::Inspect {
             task_id,
-            requester_root: None,
+            caller: InspectCaller::Admin,
             reply,
         })
         .await?;
@@ -309,7 +325,7 @@ impl TaskHandle {
         response.await.map_err(|_| coordinator_closed())?
     }
 
-    pub async fn shutdown(&self) -> Result<(), TaskError> {
+    pub async fn shutdown(&self) -> Result<SinkShutdown, TaskError> {
         let (reply, response) = oneshot::channel();
         self.send(TaskCommand::Shutdown { reply }).await?;
         response.await.map_err(|_| coordinator_closed())
@@ -346,15 +362,15 @@ impl TaskHandle {
 /// ```
 pub struct ScopedTaskHandle {
     root_id: TaskId,
-    parent_id: TaskId,
+    task_id: TaskId,
     inner: TaskHandle,
 }
 
 impl ScopedTaskHandle {
-    pub(crate) fn new(root_id: TaskId, parent_id: TaskId, inner: TaskHandle) -> Self {
+    pub(crate) fn new(root_id: TaskId, task_id: TaskId, inner: TaskHandle) -> Self {
         Self {
             root_id,
-            parent_id,
+            task_id,
             inner,
         }
     }
@@ -364,7 +380,11 @@ impl ScopedTaskHandle {
     }
 
     pub fn parent_id(&self) -> &TaskId {
-        &self.parent_id
+        &self.task_id
+    }
+
+    pub fn task_id(&self) -> &TaskId {
+        &self.task_id
     }
 
     pub async fn inspect(&self, task_id: TaskId) -> Result<TaskSnapshot, TaskError> {
@@ -372,7 +392,10 @@ impl ScopedTaskHandle {
         self.inner
             .send(TaskCommand::Inspect {
                 task_id,
-                requester_root: Some(self.root_id.clone()),
+                caller: InspectCaller::Scoped {
+                    root_id: self.root_id.clone(),
+                    task_id: self.task_id.clone(),
+                },
                 reply,
             })
             .await?;
