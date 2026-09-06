@@ -182,6 +182,10 @@ impl SessionActor {
         let mut repeated_calls: HashMap<String, usize> = HashMap::new();
         let mut recovery_budget = SamplingRecoveryBudget::default();
         loop {
+            if self.cancelled || self.turn_cancellation.is_cancelled() {
+                self.active = false;
+                return Ok(TurnOutcome::Cancelled);
+            }
             sampling_steps += 1;
             if sampling_steps > 50 {
                 self.active = false;

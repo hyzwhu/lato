@@ -1,9 +1,9 @@
 use async_trait::async_trait;
-use lato_agent::{AcpHost, REQUIRED_SECTIONS};
+use lato_agent::{AcpHost, PromptKind, REQUIRED_SECTIONS, SessionActor, TurnOutcome};
 use lato_ai::{ModelMetadata, ModelStream, StreamPiece, adapt_model_endpoint};
-use lato_core::{ModelError, ModelErrorKind, Retryability};
+use lato_core::{ModelError, ModelErrorKind, Retryability, TurnId};
 use lato_protocol::JsonRpcReq;
-use lato_workspace::SessionTrust;
+use lato_workspace::{FileLocks, SessionTrust};
 use std::{
     collections::VecDeque,
     sync::{
@@ -12,6 +12,8 @@ use std::{
     },
 };
 use tokio::sync::mpsc;
+use tokio::time::{Duration, timeout};
+use tokio_util::sync::CancellationToken;
 
 #[derive(Clone)]
 struct FaultStep {
@@ -372,4 +374,51 @@ async fn fatal_recovery_appends_context_without_replacing_the_provider_failure()
         "{message}"
     );
     assert_eq!(stream.calls(), 3);
+}
+
+#[tokio::test]
+async fn cancellation_at_sampling_boundary_never_submits() {
+    let workspace = tempfile::tempdir().unwrap();
+    let stream = Arc::new(FaultStream::new(vec![success(vec![StreamPiece::Text(
+        "must not be sampled".into(),
+    )])]));
+    let raw: Arc<dyn ModelStream> = stream.clone();
+    let endpoint = adapt_model_endpoint(
+        "fixture",
+        "context-recovery-faults",
+        ModelMetadata {
+            context_window: Some(1_000_000),
+            model_family: Some("fixture".into()),
+        },
+        raw,
+    )
+    .unwrap();
+    let mut actor = SessionActor::new(
+        endpoint.stream,
+        Arc::new(FileLocks::new()),
+        SessionTrust::for_headless_prompt(workspace.path()),
+        workspace.path().to_path_buf(),
+    );
+    let cancellation = CancellationToken::new();
+    cancellation.cancel();
+
+    let outcome = timeout(
+        Duration::from_secs(1),
+        actor.prompt_with_context(
+            PromptKind::Start,
+            "continue after committed checkpoint".into(),
+            TurnId::from("cancelled-sampling-boundary"),
+            cancellation,
+        ),
+    )
+    .await
+    .expect("cancelled sampling boundary did not terminate")
+    .unwrap();
+
+    assert_eq!(outcome, TurnOutcome::Cancelled);
+    assert_eq!(
+        stream.calls(),
+        0,
+        "cancelled turns must not reach the model"
+    );
 }
