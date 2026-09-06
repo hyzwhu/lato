@@ -298,7 +298,7 @@ fn amount(tokens: u64, tools: u64, children: u64) -> BudgetAmount {
 fn failed_multi_dimension_reservation_is_atomic() {
     let mut account = BudgetAccount::new(BudgetLimits::limited(amount(100, 2, 1)));
     let error = account.reserve(TaskId::from("child"), amount(50, 3, 1)).unwrap_err();
-    assert_eq!(error.dimension(), BudgetDimension::ToolCalls);
+    assert_eq!(error.dimension(), Some(BudgetDimension::ToolCalls));
     assert_eq!(account.reserved(), BudgetAmount::ZERO);
 }
 
@@ -308,7 +308,9 @@ fn settlement_returns_unused_reservation() {
     let reservation = account.reserve(TaskId::from("child"), amount(80, 4, 1)).unwrap();
     account.settle(reservation, amount(30, 2, 1)).unwrap();
     assert_eq!(account.spent(), amount(30, 2, 1));
-    assert_eq!(account.remaining().unwrap(), amount(70, 8, 1));
+    assert_eq!(account.remaining().total_tokens, Some(70));
+    assert_eq!(account.remaining().tool_calls, Some(8));
+    assert_eq!(account.remaining().child_tasks, Some(1));
 }
 
 #[test]
@@ -321,7 +323,7 @@ fn duplicate_settlement_cannot_charge_twice() {
 }
 ```
 
-Also test release, unlimited dimensions, checked overflow, usage regression, actual usage above reservation, nested child roll-up, and reservation ID uniqueness.
+Also test release, mixed limited/unlimited dimensions, checked overflow, usage regression, actual usage above reservation, nested child roll-up, reservation ID uniqueness, and rejection of a reservation presented to a different account.
 
 - [ ] **Step 2: Run the budget tests and verify they fail**
 
@@ -355,12 +357,28 @@ impl BudgetAmount {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
-pub struct BudgetLimits { pub maximum: Option<BudgetAmount> }
+pub struct BudgetLimits {
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
+    pub tool_calls: Option<u64>,
+    pub cost_micros: Option<u64>,
+    pub wall_time_ms: Option<u64>,
+    pub retries: Option<u64>,
+    pub child_tasks: Option<u64>,
+    pub worktrees: Option<u64>,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct BudgetReservation { pub task_id: TaskId, pub amount: BudgetAmount, generation: u64 }
+pub struct BudgetReservation {
+    pub task_id: TaskId,
+    pub amount: BudgetAmount,
+    account_id: u64,
+    generation: u64,
+}
 
 pub struct BudgetAccount {
+    account_id: u64,
     limits: BudgetLimits,
     spent: BudgetAmount,
     reserved: BudgetAmount,
@@ -375,6 +393,16 @@ impl BudgetAccount {
     pub fn apply_cumulative_usage(&mut self, previous: BudgetAmount, next: BudgetAmount) -> Result<BudgetAmount, BudgetError>;
 }
 ```
+
+`BudgetLimits::unlimited()` sets every field to `None`, while
+`BudgetLimits::limited(amount)` sets every field to `Some`. Callers may mix the
+fields to limit only selected dimensions. `BudgetAccount::remaining()` returns
+the same per-dimension `BudgetLimits` shape. Assign every account a private,
+process-unique `account_id`; both account ID and generation must match before a
+reservation can be released or settled. `BudgetError::dimension()` returns
+`None` for reservation identity and generation faults. Limit violations,
+arithmetic overflow/underflow, and cumulative-usage regression retain
+`Some(dimension)` because the affected resource dimension is known.
 
 Perform the full candidate calculation before mutating any field. Use `checked_add`/`checked_sub`; never map arithmetic overflow to unlimited.
 
