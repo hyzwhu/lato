@@ -600,6 +600,7 @@ pub struct CoordinatorConfig {
     pub max_completed: usize,
     pub foreground_budget: std::time::Duration,
     pub waiter_timeout_cap: std::time::Duration,
+    pub profile_validation_timeout: std::time::Duration,
     pub cancel_grace: std::time::Duration,
     pub teardown_drain_timeout: std::time::Duration,
     pub queued_reap_interval: std::time::Duration,
@@ -636,6 +637,11 @@ child scope cannot inspect siblings, cousins, or ancestors.
 `TaskEventSink` receives cloned events after the state commit through a bounded
 dispatcher, never on the coordinator actor itself. The default sink is no-op;
 the test sink stores events.
+
+The coordinator stores only a weak command sender for minting scoped handles;
+it must not keep its own command channel alive. Dropping the last external
+`TaskHandle` or scoped handle closes ingress and triggers the same bounded
+cancel/drain cleanup as explicit shutdown.
 
 - [ ] **Step 4: Implement the actor skeleton and one transition path**
 
@@ -755,7 +761,27 @@ impl SpawnQueue {
 
 - [ ] **Step 4: Implement spawn validation and promotion acknowledgement**
 
-`SpawnTaskRequest` must contain task ID, objective/scope, profile, requested capabilities, budget envelope, result contract, mode, parent/root-bound identity, and cancellation token. Validate in the exact order from the spec, reserve budget before node visibility, and allocate workspace only after `Preparing` begins.
+The synchronous spawn preflight has observable error precedence and must remain
+ordered: authenticate caller and parent lineage/liveness; reject duplicate IDs;
+check depth, per-parent, total, and concurrency admission bounds; then run
+profile validation and capability narrowing; reserve budget; finally make the
+node visible. Mutable predicates are revalidated after asynchronous profile
+validation, but their original precedence must not be inverted.
+
+`SpawnTaskRequest` must contain task ID, objective/scope, profile, requested
+capabilities, one requested budget envelope, result contract, mode,
+parent/root-bound identity, and cancellation token. It must not accept an
+independent caller-authored reservation amount. Normalize every requested child
+limit against the parent's remaining limit: `None` under a finite parent
+inherits at most that finite remainder, while `None` under an unlimited parent
+remains unlimited. Derive the parent reservation from the resulting effective
+envelope and add checked fixed costs of one `child_tasks` unit plus one
+`worktrees` unit for `IsolatedWorktree`. Construct the child's `BudgetAccount`
+from exactly that effective envelope. Validate in the exact order from the
+spec, reserve budget before node visibility, and allocate workspace only after
+`Preparing` begins. Profile validation runs as an actor-owned asynchronous
+future with `profile_validation_timeout`; a slow validator cannot block other
+commands, cancellation, completion, or shutdown.
 
 The runner reports:
 
@@ -764,6 +790,23 @@ pub async fn started(&self, started: StartedTask<C>) -> bool
 ```
 
 If the actor no longer has a live preparing record, return `false`; the runner must cancel its control and the coordinator must release any allocated lease and open reservation.
+
+The coordinator owns every preparation/run future and its abort handle.
+Allocator futures are panic-contained; an allocation panic returns a structured
+startup failure without killing the actor or leaking the reservation.
+Cancellation of running work retains its physical concurrency slot, workspace
+lease, and budget reservation until runner exit is observed; after
+`cancel_grace`, abort and await the owned future before cleanup and queue
+promotion. Shutdown closes admission, cancels all roots, drains or aborts all
+owned work within a bound, and only then shuts down the event sink. Terminal
+state and cleanup are committed before `TaskRunner::on_completed`, whose panic
+is contained. Neither `TaskRunner::on_completed` nor `TaskChildControl::cancel`
+runs synchronously on the actor. Both use one coordinator-owned bounded callback
+dispatcher with nonblocking actor enqueue, panic isolation, saturation
+reporting, and bounded drain/explicit detachment at shutdown. The cancellation
+token remains authoritative, so cancel grace and abort continue even if a
+callback blocks. Workspace release failure emits a failure event and retains the
+lease/reservation for inspection; it must never emit a false release event.
 
 - [ ] **Step 5: Run admission tests and all runtime tests**
 
