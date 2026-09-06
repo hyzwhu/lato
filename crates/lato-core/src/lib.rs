@@ -1,3 +1,4 @@
+mod budget;
 mod command;
 mod compaction;
 mod error;
@@ -11,6 +12,7 @@ mod state;
 mod task;
 mod tool;
 
+pub use budget::*;
 pub use command::{Command, StartBehavior, StartTurn, UserInput};
 pub use compaction::*;
 pub use error::{AgentError, ErrorCategory, Retryability};
