@@ -311,9 +311,9 @@ AgentDojo 把“完成用户任务”与“攻击是否成功”分开评分。�
 | Provider 错误在输出前、文本后和工具增量后均保留 kind/status/context window/output-started 元数据；普通 HTTP 400 不误判为溢出 | `crates/lato-ai/src/model_port_adapter/{legacy_port,stream_adapter}.rs`、`crates/lato-ai/tests/provider_error.rs` |
 | 可见文本或工具输出之后不重放；拒绝的采样步骤只有一次自动恢复额度，第二次溢出直接终止 | `crates/lato-agent/tests/context_recovery_faults.rs`、`tests/session_compaction_cli.rs` |
 | 压缩检查点完成后、重新提交前响应取消；已知超限的预检输入要么先压缩，要么以 `context.preflight_recovery_failed` 失败，不发往模型 | `crates/lato-agent/tests/context_recovery_faults.rs` |
-| Session/Auth/Permanent 抑制按各自生命周期清除，所有自动入口受阻，手动压缩仍可用 | `crates/lato-agent/tests/context_recovery.rs`、`crates/lato-agent/tests/context_recovery_faults.rs` |
+| Turn/Sticky/UntilSuccess/Auth 抑制按各自生命周期清除，所有自动入口受阻，手动压缩仍可用 | `crates/lato-agent/tests/context_recovery.rs`、`crates/lato-agent/tests/context_recovery_faults.rs` |
 | 75/85% 预触发边界固定；NOTE1 缓存只在前缀和模型代次匹配时单次复用，前缀变化、代次变化或长度不匹配立即失效 | `crates/lato-agent/src/actor.rs` 单元测试 |
 | 两阶段压缩与 Prepared/Fitted/Lossy 降级共享全局三次模型调用上限，不会进入第四次 | `crates/lato-agent/tests/legacy_driver.rs` |
 | 投机 NOTE1 不安装、不写 journal、不作为 assistant delta 发送，重启后也不可回放 | `crates/lato-runtime/tests/session_runtime.rs`、`tests/session_compaction_cli.rs` |
-| 检查点 marker 后写入故障按已提交历史协调；ACP 只返回一个答案或错误，无重复 delta/工具输出 | `crates/lato-runtime/tests/session_runtime.rs`、`tests/session_compaction_cli.rs` |
+| 检查点 marker 后写入故障按已提交历史协调；ACP 只返回一个答案或错误，无重复 assistant delta；工具调用后不重放 | `crates/lato-runtime/tests/session_runtime.rs`、`tests/session_compaction_cli.rs` |
 | 重启只加载已提交的压缩历史，不恢复投机态；缺少 Phase 4C3 元数据的旧 journal 仍能回放并继续新 turn | `crates/lato-runtime/tests/session_runtime.rs`、`tests/session_compaction_cli.rs` |
