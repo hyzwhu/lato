@@ -15,6 +15,7 @@ pub(crate) struct RuntimeTaskRecord {
     pub(crate) reservation: Option<BudgetReservation>,
     pub(crate) reservation_parent_id: Option<TaskId>,
     pub(crate) cancellation: CancellationToken,
+    pub(crate) spawn_admission_closed: bool,
     pub(crate) depth: u32,
     pub(crate) cleanup_error: Option<lato_core::TaskError>,
     pub(crate) last_event_sequence: u64,
@@ -116,12 +117,14 @@ impl CoordinatorState {
         &self,
         dropped_sink_events: u64,
         dropped_callback_work: u64,
+        callback_execution_failures: u64,
     ) -> RegistryCounts {
         let mut counts = RegistryCounts {
             roots: self.roots.len(),
             total: self.tasks.len(),
             dropped_sink_events,
             dropped_callback_work,
+            callback_execution_failures,
             ..RegistryCounts::default()
         };
         for record in self.tasks.values() {
@@ -173,6 +176,7 @@ mod tests {
             reservation: None,
             reservation_parent_id: None,
             cancellation: CancellationToken::new(),
+            spawn_admission_closed: false,
             depth: if parent_id.is_some() { 1 } else { 0 },
             cleanup_error: None,
             last_event_sequence: 0,

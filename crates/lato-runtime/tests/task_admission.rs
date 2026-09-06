@@ -2,7 +2,7 @@ mod task_support;
 
 use lato_core::{
     AgentProfile, BudgetAmount, BudgetLimits, ResultContract, TaskError, TaskErrorCode, TaskId,
-    TaskScope, ToolCapability,
+    TaskScope, ToolCapability, VerificationPolicy, WorkspaceIntent,
 };
 use lato_runtime::{
     CoordinatorConfig, LimitBehavior, MemoryTaskEventSink, SinkShutdown, SpawnMode,
@@ -42,6 +42,30 @@ fn request(id: &str) -> SpawnTaskRequest {
         mode: SpawnMode::Background,
         cancellation: CancellationToken::new(),
     }
+}
+
+async fn register_root_with_profile(
+    handle: &lato_runtime::TaskHandle,
+    id: &str,
+    profile: AgentProfile,
+) -> lato_runtime::ScopedTaskHandle {
+    handle
+        .register_root(TaskRootRequest {
+            task_id: TaskId::from(id),
+            owner: lato_core::TaskOwner::Interactive {
+                session_id: lato_core::SessionId::from("session"),
+                turn_id: lato_core::TurnId::from("turn"),
+            },
+            profile,
+            permissions: vec![
+                ToolCapability::FileRead,
+                ToolCapability::FileWrite,
+                ToolCapability::NetworkRead,
+            ],
+            budget: BudgetLimits::unlimited(),
+        })
+        .await
+        .unwrap()
 }
 
 #[tokio::test]
@@ -331,6 +355,174 @@ async fn compound_spawn_errors_follow_the_specified_precedence() {
         "admission rejection must precede capability narrowing"
     );
     assert!(!reject_harness.runner.validation_entered());
+}
+
+#[tokio::test]
+async fn cancelling_parent_closes_direct_child_admission_during_grace() {
+    let runner = Arc::new(GatedTaskRunner::with_options(false, true, false, false));
+    let harness = Harness::with_runner(
+        CoordinatorConfig {
+            max_global_running: 1,
+            max_running_per_root: 1,
+            admission_behavior: LimitBehavior::Reject,
+            cancel_grace: Duration::from_millis(100),
+            queued_reap_interval: Duration::from_millis(1),
+            ..CoordinatorConfig::default()
+        },
+        runner.clone(),
+    )
+    .await;
+    let root = harness.register_root_scoped("root", "s", "t").await;
+    let cancellation = CancellationToken::new();
+    let mut parent = request("parent");
+    parent.cancellation = cancellation.clone();
+    let parent = root.spawn(parent).await.unwrap();
+    harness
+        .wait_for_status("parent", lato_core::TaskStatus::Running)
+        .await;
+    let validation_calls = runner.validation_calls();
+    cancellation.cancel();
+
+    let mut escaping = request("escaping-child");
+    escaping.profile.name = "invalid-profile-must-not-run".into();
+    escaping.requested_capabilities = Some(vec![ToolCapability::NetworkWrite]);
+    assert_eq!(
+        parent.handle.spawn(escaping).await.unwrap_err().code,
+        TaskErrorCode::SpawnAdmissionClosed
+    );
+    assert_eq!(runner.validation_calls(), validation_calls);
+}
+
+#[tokio::test]
+async fn cancelling_or_terminal_ancestor_closes_descendant_spawn_admission() {
+    let runner = Arc::new(GatedTaskRunner::with_options(false, true, false, false));
+    let harness = Harness::with_runner(
+        CoordinatorConfig {
+            max_global_running: 2,
+            max_running_per_root: 2,
+            admission_behavior: LimitBehavior::Reject,
+            cancel_grace: Duration::from_millis(20),
+            queued_reap_interval: Duration::from_millis(1),
+            ..CoordinatorConfig::default()
+        },
+        runner.clone(),
+    )
+    .await;
+    let root = harness.register_root_scoped("root", "s", "t").await;
+    let cancellation = CancellationToken::new();
+    let mut ancestor = request("ancestor");
+    ancestor.cancellation = cancellation.clone();
+    let ancestor = root.spawn(ancestor).await.unwrap();
+    harness
+        .wait_for_status("ancestor", lato_core::TaskStatus::Running)
+        .await;
+    let descendant = ancestor.handle.spawn(request("descendant")).await.unwrap();
+    harness
+        .wait_for_status("descendant", lato_core::TaskStatus::Running)
+        .await;
+    cancellation.cancel();
+
+    let mut escaping = request("during-cancel");
+    escaping.requested_capabilities = Some(vec![ToolCapability::NetworkWrite]);
+    assert_eq!(
+        descendant.handle.spawn(escaping).await.unwrap_err().code,
+        TaskErrorCode::SpawnAdmissionClosed,
+        "dying ancestor must beat saturated admission and capability validation"
+    );
+    harness
+        .wait_for_status("ancestor", lato_core::TaskStatus::Cancelled)
+        .await;
+    assert_eq!(
+        descendant
+            .handle
+            .spawn(request("after-terminal"))
+            .await
+            .unwrap_err()
+            .code,
+        TaskErrorCode::SpawnAdmissionClosed
+    );
+}
+
+#[tokio::test]
+async fn profile_workspace_and_verification_authority_are_monotone() {
+    for (index, widened_workspace) in [
+        WorkspaceIntent::SharedSerializedWrite,
+        WorkspaceIntent::IsolatedWorktree,
+        WorkspaceIntent::ExternalLease,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let harness = Harness::new(CoordinatorConfig::default()).await;
+        let mut parent_profile = AgentProfile::explorer();
+        parent_profile.verification = VerificationPolicy::Accept;
+        let root = register_root_with_profile(
+            &harness.handle,
+            &format!("readonly-root-{index}"),
+            parent_profile,
+        )
+        .await;
+        let mut child = request(&format!("workspace-widen-{index}"));
+        child.profile.workspace = widened_workspace;
+        child.profile.verification = VerificationPolicy::Accept;
+        assert_eq!(
+            root.spawn(child).await.unwrap_err().code,
+            TaskErrorCode::InvalidProfile
+        );
+    }
+
+    for (index, parent_workspace) in [
+        WorkspaceIntent::SharedSerializedWrite,
+        WorkspaceIntent::IsolatedWorktree,
+        WorkspaceIntent::ExternalLease,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let harness = Harness::new(CoordinatorConfig::default()).await;
+        let mut parent_profile = AgentProfile::worker();
+        parent_profile.workspace = parent_workspace;
+        parent_profile.verification = VerificationPolicy::Accept;
+        parent_profile.definition_background = true;
+        let root = register_root_with_profile(
+            &harness.handle,
+            &format!("write-root-{index}"),
+            parent_profile,
+        )
+        .await;
+        let mut child = request(&format!("narrow-child-{index}"));
+        child.profile.workspace = WorkspaceIntent::SharedReadOnly;
+        child.profile.verification = VerificationPolicy::HumanGate;
+        child.profile.definition_background = false;
+        assert!(root.spawn(child).await.is_ok());
+    }
+
+    let harness = Harness::new(CoordinatorConfig::default()).await;
+    let mut parent_profile = AgentProfile::worker();
+    parent_profile.workspace = WorkspaceIntent::SharedReadOnly;
+    parent_profile.verification = VerificationPolicy::Programmatic;
+    let root =
+        register_root_with_profile(&harness.handle, "verification-root", parent_profile).await;
+    for (id, weaker) in [
+        ("accept", VerificationPolicy::Accept),
+        ("schema", VerificationPolicy::Schema),
+    ] {
+        let mut child = request(id);
+        child.profile.workspace = WorkspaceIntent::SharedReadOnly;
+        child.profile.verification = weaker;
+        assert_eq!(
+            root.spawn(child).await.unwrap_err().code,
+            TaskErrorCode::InvalidProfile
+        );
+    }
+    let mut background = request("background-widen");
+    background.profile.workspace = WorkspaceIntent::SharedReadOnly;
+    background.profile.verification = VerificationPolicy::Programmatic;
+    background.profile.definition_background = true;
+    assert_eq!(
+        root.spawn(background).await.unwrap_err().code,
+        TaskErrorCode::InvalidProfile
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -1106,7 +1298,7 @@ async fn panicking_completion_callback_cannot_block_cleanup_or_queue_promotion()
                 .registry_counts()
                 .await
                 .unwrap()
-                .dropped_callback_work
+                .callback_execution_failures
                 >= 1
             {
                 break;
@@ -1116,6 +1308,15 @@ async fn panicking_completion_callback_cannot_block_cleanup_or_queue_promotion()
     })
     .await
     .unwrap();
+    assert_eq!(
+        harness
+            .handle
+            .registry_counts()
+            .await
+            .unwrap()
+            .dropped_callback_work,
+        0
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -1228,6 +1429,15 @@ async fn callback_dispatch_saturation_is_bounded_and_observable() {
     })
     .await
     .unwrap();
+    assert_eq!(
+        harness
+            .handle
+            .registry_counts()
+            .await
+            .unwrap()
+            .callback_execution_failures,
+        0
+    );
     assert_eq!(
         harness.handle.shutdown().await.unwrap(),
         SinkShutdown::TimedOutDetached

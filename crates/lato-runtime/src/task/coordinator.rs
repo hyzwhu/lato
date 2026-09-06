@@ -4,7 +4,9 @@
 
 use crate::task::admission::{AdmissionDecision, decide};
 use crate::task::queue::{QueuedTask, SpawnQueue};
-use crate::task::spawn::{PendingSpawnOccupancy, reserve, validate_structure};
+use crate::task::spawn::{
+    PendingSpawnOccupancy, reserve, validate_profile_authority, validate_structure,
+};
 use crate::task::state::{CoordinatorState, RuntimeTaskRecord};
 use crate::task::{
     CoordinatorConfig, InspectCaller, RunnerEvent, ScopedTaskHandle, SinkShutdown,
@@ -128,6 +130,7 @@ pub struct TaskCoordinator<R: TaskRunner, A: WorkspaceAllocator> {
     callback_drained: Option<oneshot::Receiver<()>>,
     callback_worker: Option<std::thread::JoinHandle<()>>,
     dropped_callback_work: u64,
+    callback_execution_failures: u64,
     state: CoordinatorState,
     queue: SpawnQueue,
     controls: HashMap<TaskId, crate::task::TaskControl<R::Control>>,
@@ -196,6 +199,7 @@ where
         callback_drained: Some(callback_drained),
         callback_worker: Some(callback_worker),
         dropped_callback_work: 0,
+        callback_execution_failures: 0,
         state: CoordinatorState::default(),
         controls: HashMap::new(),
         jobs: FuturesUnordered::new(),
@@ -330,10 +334,11 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
                 let _ = reply.send(result);
             }
             TaskCommand::RegistryCounts { reply } => {
-                let _ = reply.send(
-                    self.state
-                        .counts(self.dropped_sink_events, self.dropped_callback_work),
-                );
+                let _ = reply.send(self.state.counts(
+                    self.dropped_sink_events,
+                    self.dropped_callback_work,
+                    self.callback_execution_failures,
+                ));
             }
             TaskCommand::ShutdownRoot { root_id, reply } => {
                 let result = self.shutdown_root(&root_id);
@@ -369,6 +374,7 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
                 reservation: None,
                 reservation_parent_id: None,
                 cancellation: tokio_util::sync::CancellationToken::new(),
+                spawn_admission_closed: false,
                 depth: 0,
                 cleanup_error: None,
                 last_event_sequence: 0,
@@ -394,12 +400,13 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
             ));
         }
         self.state.roots.remove(root_id);
-        self.state
+        let root = self
+            .state
             .tasks
             .get_mut(root_id)
-            .expect("registered root must have a runtime record")
-            .node
-            .status = lato_core::TaskStatus::Cancelled;
+            .expect("registered root must have a runtime record");
+        root.spawn_admission_closed = true;
+        root.node.status = lato_core::TaskStatus::Cancelled;
         self.commit_transition(root_id.clone(), TaskEventPayload::RootClosed);
         Ok(())
     }
@@ -551,6 +558,7 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
             return self.retain_admission_rejection(parent_id, request, structure, error.clone());
         }
         profile_validation?;
+        validate_profile_authority(&self.state.tasks[&parent_id].node.profile, &request.profile)?;
         let (permissions, effective_budget, reservation) =
             reserve(&mut self.state, &parent_id, &request)?;
         let task_id = request.task_id.clone();
@@ -580,6 +588,7 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
                 reservation: Some(reservation),
                 reservation_parent_id: Some(parent_id),
                 cancellation: request.cancellation,
+                spawn_admission_closed: false,
                 depth: structure.depth,
                 cleanup_error: None,
                 last_event_sequence: 0,
@@ -640,6 +649,7 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
                 reservation: None,
                 reservation_parent_id: None,
                 cancellation: request.cancellation,
+                spawn_admission_closed: true,
                 depth: structure.depth,
                 cleanup_error: None,
                 last_event_sequence: 0,
@@ -770,6 +780,9 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
             .transition(status)
             .expect("coordinator only commits valid task transitions");
         record.node.status = status;
+        if status == TaskStatus::Verifying || status.is_terminal() {
+            record.spawn_admission_closed = true;
+        }
     }
 
     async fn complete_task(&mut self, task_id: TaskId, output: crate::task::TaskRunOutput) {
@@ -1010,6 +1023,13 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
 
     async fn request_cancel(&mut self, task_id: TaskId) {
         let status = self.state.tasks[&task_id].node.status;
+        let record = self
+            .state
+            .tasks
+            .get_mut(&task_id)
+            .expect("cancel target remains registered");
+        record.spawn_admission_closed = true;
+        record.cancellation.cancel();
         if status == TaskStatus::Queued {
             self.queue
                 .remove_matching(|queued| queued.task_id == task_id);
@@ -1018,7 +1038,6 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
             self.cleanup_terminal(&task_id).await;
             return;
         }
-        self.state.tasks[&task_id].cancellation.cancel();
         if let Some(control) = self.controls.get(&task_id) {
             self.dispatch_callback(CallbackWork::Cancel {
                 task_id: task_id.clone(),
@@ -1289,7 +1308,7 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
                     "task callback dispatcher is closed"
                 }
             };
-            self.record_callback_failure(
+            self.record_callback_dispatch_failure(
                 task_id,
                 kind,
                 TaskError::new(TaskErrorCode::RunnerProtocolViolation, reason),
@@ -1299,11 +1318,20 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
 
     fn handle_callback_outcome(&mut self, outcome: CallbackOutcome) {
         if let Some(error) = outcome.error {
-            self.record_callback_failure(outcome.task_id, outcome.kind, error);
+            self.callback_execution_failures = self.callback_execution_failures.saturating_add(1);
+            if self.state.tasks.contains_key(&outcome.task_id) {
+                self.commit_transition(
+                    outcome.task_id,
+                    TaskEventPayload::CallbackExecutionFailed {
+                        callback: outcome.kind,
+                        error,
+                    },
+                );
+            }
         }
     }
 
-    fn record_callback_failure(
+    fn record_callback_dispatch_failure(
         &mut self,
         task_id: TaskId,
         callback: TaskCallbackKind,

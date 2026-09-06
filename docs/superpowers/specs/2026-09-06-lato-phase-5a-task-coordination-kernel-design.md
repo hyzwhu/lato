@@ -413,6 +413,19 @@ Workspace modes are:
 - `IsolatedWorktree`
 - `ExternalLease`
 
+Workspace authority uses a conservative partial order. A child may keep its
+parent's mode. Any write-capable parent mode may narrow to `SharedReadOnly`, but
+the three write-capable modes are otherwise incomparable: a shared writer,
+isolated worktree, or external lease cannot be exchanged for another mode down
+the tree. A `SharedReadOnly` parent therefore permits only `SharedReadOnly`.
+
+Verification must stay equal or strengthen in this explicit order:
+`Accept < Schema < Programmatic < IndependentReview < HumanGate`. Definition-
+background execution is also monotone: a foreground-only parent cannot grant a
+child definition-level background lifetime, while a background-capable parent
+may narrow its child to foreground-only. Root registration is the trust
+boundary that establishes these ceilings.
+
 Queued tasks reserve the applicable workspace budget. Allocation begins only in
 `Preparing`. The lease is stored on the node before runner promotion. Startup
 failure, cancellation, and terminal completion all invoke idempotent release.

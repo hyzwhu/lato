@@ -132,6 +132,11 @@ pub enum SpawnMode {
 pub struct SpawnTaskRequest {
     pub task_id: TaskId,
     pub scope: TaskScope,
+    /// Child policy envelope. The coordinator rejects authority widening:
+    /// workspace access may remain equal or narrow from a write-capable mode
+    /// to `SharedReadOnly`; verification may remain equal or strengthen along
+    /// `Accept < Schema < Programmatic < IndependentReview < HumanGate`; and a
+    /// foreground-only parent cannot create a definition-background child.
     pub profile: AgentProfile,
     pub requested_capabilities: Option<Vec<ToolCapability>>,
     pub budget: BudgetLimits,
@@ -190,6 +195,7 @@ pub struct RegistryCounts {
     pub total: usize,
     pub dropped_sink_events: u64,
     pub dropped_callback_work: u64,
+    pub callback_execution_failures: u64,
 }
 
 /// Result of draining coordinator-owned work, callbacks, and the event sink.
@@ -311,6 +317,10 @@ pub enum TaskEventPayload {
         error: TaskError,
     },
     CallbackDispatchFailed {
+        callback: TaskCallbackKind,
+        error: TaskError,
+    },
+    CallbackExecutionFailed {
         callback: TaskCallbackKind,
         error: TaskError,
     },

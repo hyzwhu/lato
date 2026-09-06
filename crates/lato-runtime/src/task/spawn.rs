@@ -6,7 +6,7 @@ use crate::task::state::CoordinatorState;
 use crate::task::{CoordinatorConfig, SpawnTaskRequest};
 use lato_core::{
     BudgetAmount, BudgetDimension, BudgetLimits, BudgetReservation, TaskError, TaskErrorCode,
-    TaskId, ToolCapability, WorkspaceIntent,
+    TaskId, ToolCapability, VerificationPolicy, WorkspaceIntent,
 };
 
 #[derive(Debug)]
@@ -43,6 +43,23 @@ pub(crate) fn validate_structure(
             TaskErrorCode::TerminalParent,
             "terminal tasks cannot spawn children",
         ));
+    }
+    if parent.spawn_admission_closed || parent.cancellation.is_cancelled() {
+        return Err(spawn_admission_closed());
+    }
+    let mut ancestor_id = parent.node.parent_id.as_ref();
+    while let Some(task_id) = ancestor_id {
+        let ancestor = state.tasks.get(task_id).ok_or_else(not_owned)?;
+        if &ancestor.node.root_id != caller_root {
+            return Err(not_owned());
+        }
+        if ancestor.node.status.is_terminal()
+            || ancestor.spawn_admission_closed
+            || ancestor.cancellation.is_cancelled()
+        {
+            return Err(spawn_admission_closed());
+        }
+        ancestor_id = ancestor.node.parent_id.as_ref();
     }
     if state.contains(&request.task_id) || pending.duplicate {
         return Err(TaskError::new(
@@ -115,6 +132,54 @@ pub(crate) fn reserve(
             )
         })?;
     Ok((permissions, effective, reservation))
+}
+
+pub(crate) fn validate_profile_authority(
+    parent: &lato_core::AgentProfile,
+    child: &lato_core::AgentProfile,
+) -> Result<(), TaskError> {
+    if !workspace_narrows(parent.workspace, child.workspace) {
+        return Err(TaskError::new(
+            TaskErrorCode::InvalidProfile,
+            "child workspace policy widens inherited authority",
+        ));
+    }
+    if verification_strength(child.verification) < verification_strength(parent.verification) {
+        return Err(TaskError::new(
+            TaskErrorCode::InvalidProfile,
+            "child verification policy weakens inherited verification",
+        ));
+    }
+    if child.definition_background && !parent.definition_background {
+        return Err(TaskError::new(
+            TaskErrorCode::InvalidProfile,
+            "child background policy widens inherited lifetime authority",
+        ));
+    }
+    Ok(())
+}
+
+fn workspace_narrows(parent: WorkspaceIntent, child: WorkspaceIntent) -> bool {
+    parent == child
+        || matches!(
+            (parent, child),
+            (
+                WorkspaceIntent::SharedSerializedWrite
+                    | WorkspaceIntent::IsolatedWorktree
+                    | WorkspaceIntent::ExternalLease,
+                WorkspaceIntent::SharedReadOnly
+            )
+        )
+}
+
+const fn verification_strength(policy: VerificationPolicy) -> u8 {
+    match policy {
+        VerificationPolicy::Accept => 0,
+        VerificationPolicy::Schema => 1,
+        VerificationPolicy::Programmatic => 2,
+        VerificationPolicy::IndependentReview => 3,
+        VerificationPolicy::HumanGate => 4,
+    }
 }
 
 fn normalize_budget(
@@ -252,6 +317,13 @@ fn not_owned() -> TaskError {
     )
 }
 
+fn spawn_admission_closed() -> TaskError {
+    TaskError::new(
+        TaskErrorCode::SpawnAdmissionClosed,
+        "task spawn admission is closed for a cancelling or terminal ancestor",
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -280,6 +352,7 @@ mod tests {
             reservation: None,
             reservation_parent_id: None,
             cancellation: CancellationToken::new(),
+            spawn_admission_closed: false,
             depth: 0,
             cleanup_error: None,
             last_event_sequence: 0,
