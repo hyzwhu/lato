@@ -105,6 +105,15 @@ pub struct TaskCompletion {
 }
 
 pub(crate) enum RunnerEvent<C: TaskChildControl> {
+    WorkspaceAllocated {
+        task_id: TaskId,
+        lease: WorkspaceLease,
+        acknowledgement: oneshot::Sender<bool>,
+    },
+    WorkspaceAllocationFailed {
+        task_id: TaskId,
+        error: TaskError,
+    },
     Started {
         task_id: TaskId,
         started: StartedTask<C>,
@@ -117,6 +126,10 @@ pub(crate) enum RunnerEvent<C: TaskChildControl> {
     Progress {
         task_id: TaskId,
         progress: TaskProgress,
+    },
+    Completed {
+        task_id: TaskId,
+        output: TaskRunOutput,
     },
 }
 

@@ -11,6 +11,7 @@ use lato_workspace::WorkspaceLease;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{sync::Arc, time::Duration};
 use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -92,6 +93,10 @@ impl CoordinatorConfig {
             self.max_completed > 0,
             "completion capacity must be positive"
         );
+        assert!(
+            !self.queued_reap_interval.is_zero(),
+            "queued cancellation reap interval must be positive"
+        );
     }
 }
 
@@ -102,6 +107,53 @@ pub struct TaskRootRequest {
     pub profile: AgentProfile,
     pub permissions: Vec<ToolCapability>,
     pub budget: BudgetLimits,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SpawnMode {
+    Foreground,
+    AwaitCompletion,
+    Background,
+}
+
+#[derive(Clone, Debug)]
+pub struct SpawnTaskRequest {
+    pub task_id: TaskId,
+    pub scope: TaskScope,
+    pub profile: AgentProfile,
+    pub requested_capabilities: Option<Vec<ToolCapability>>,
+    pub budget: BudgetLimits,
+    pub reservation: BudgetAmount,
+    pub result_contract: ResultContract,
+    pub mode: SpawnMode,
+    pub cancellation: CancellationToken,
+}
+
+#[derive(Clone)]
+pub struct SpawnDisposition {
+    pub task_id: TaskId,
+    pub status: TaskStatus,
+    pub handle: ScopedTaskHandle,
+}
+
+impl std::fmt::Debug for SpawnDisposition {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SpawnDisposition")
+            .field("task_id", &self.task_id)
+            .field("status", &self.status)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SpawnDisposition {
+    pub fn is_queued(&self) -> bool {
+        self.status == TaskStatus::Queued
+    }
+
+    pub fn is_started(&self) -> bool {
+        self.status == TaskStatus::Preparing || self.status.is_running()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -248,6 +300,12 @@ pub(crate) enum TaskCommand {
         request: Box<TaskRootRequest>,
         reply: oneshot::Sender<Result<(), TaskError>>,
     },
+    Spawn {
+        root_id: TaskId,
+        parent_id: TaskId,
+        request: Box<SpawnTaskRequest>,
+        reply: oneshot::Sender<Result<SpawnDisposition, TaskError>>,
+    },
     Inspect {
         task_id: TaskId,
         caller: InspectCaller,
@@ -385,6 +443,19 @@ impl ScopedTaskHandle {
 
     pub fn task_id(&self) -> &TaskId {
         &self.task_id
+    }
+
+    pub async fn spawn(&self, request: SpawnTaskRequest) -> Result<SpawnDisposition, TaskError> {
+        let (reply, response) = oneshot::channel();
+        self.inner
+            .send(TaskCommand::Spawn {
+                root_id: self.root_id.clone(),
+                parent_id: self.task_id.clone(),
+                request: Box::new(request),
+                reply,
+            })
+            .await?;
+        response.await.map_err(|_| coordinator_closed())?
     }
 
     pub async fn inspect(&self, task_id: TaskId) -> Result<TaskSnapshot, TaskError> {

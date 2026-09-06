@@ -6,12 +6,16 @@ use crate::task::{RegistryCounts, TaskSnapshot};
 use lato_core::{BudgetAccount, BudgetReservation, TaskId, TaskNode, TaskStatus};
 use lato_workspace::WorkspaceLease;
 use std::collections::{HashMap, HashSet};
+use tokio_util::sync::CancellationToken;
 
 pub(crate) struct RuntimeTaskRecord {
     pub(crate) node: TaskNode,
     pub(crate) budget: BudgetAccount,
     pub(crate) workspace_lease: Option<WorkspaceLease>,
     pub(crate) reservation: Option<BudgetReservation>,
+    pub(crate) reservation_parent_id: Option<TaskId>,
+    pub(crate) cancellation: CancellationToken,
+    pub(crate) depth: u32,
     pub(crate) last_event_sequence: u64,
 }
 
@@ -24,6 +28,40 @@ pub(crate) struct CoordinatorState {
 impl CoordinatorState {
     pub(crate) fn contains(&self, task_id: &TaskId) -> bool {
         self.tasks.contains_key(task_id)
+    }
+
+    pub(crate) fn child_count(&self, parent_id: &TaskId) -> usize {
+        self.tasks
+            .values()
+            .filter(|record| record.node.parent_id.as_ref() == Some(parent_id))
+            .count()
+    }
+
+    pub(crate) fn depth(&self, task_id: &TaskId) -> Option<u32> {
+        self.tasks.get(task_id).map(|record| record.depth)
+    }
+
+    pub(crate) fn running_count(&self) -> usize {
+        self.tasks
+            .values()
+            .filter(|record| {
+                record.node.parent_id.is_some()
+                    && (matches!(record.node.status, TaskStatus::Preparing)
+                        || record.node.status.is_running())
+            })
+            .count()
+    }
+
+    pub(crate) fn running_count_for_root(&self, root_id: &TaskId) -> usize {
+        self.tasks
+            .values()
+            .filter(|record| {
+                &record.node.root_id == root_id
+                    && record.node.parent_id.is_some()
+                    && (matches!(record.node.status, TaskStatus::Preparing)
+                        || record.node.status.is_running())
+            })
+            .count()
     }
 
     pub(crate) fn inspection(&self, task_id: &TaskId) -> Option<TaskSnapshot> {
@@ -126,6 +164,9 @@ mod tests {
             budget: BudgetAccount::new(BudgetLimits::unlimited()),
             workspace_lease: None,
             reservation: None,
+            reservation_parent_id: None,
+            cancellation: CancellationToken::new(),
+            depth: if parent_id.is_some() { 1 } else { 0 },
             last_event_sequence: 0,
         }
     }
