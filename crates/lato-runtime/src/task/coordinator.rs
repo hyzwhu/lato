@@ -23,7 +23,8 @@ pub struct TaskCoordinator<R: TaskRunner, A: WorkspaceAllocator> {
     _internal_tx: mpsc::Sender<RunnerEvent<R::Control>>,
     internal_rx: mpsc::Receiver<RunnerEvent<R::Control>>,
     event_tx: broadcast::Sender<TaskEventEnvelope>,
-    event_sink: Arc<dyn TaskEventSink>,
+    sink_tx: mpsc::Sender<TaskEventEnvelope>,
+    dropped_sink_events: u64,
     state: CoordinatorState,
     sequence: u64,
 }
@@ -42,6 +43,8 @@ where
     let (command_tx, command_rx) = mpsc::channel(config.command_capacity);
     let (internal_tx, internal_rx) = mpsc::channel(config.command_capacity);
     let (event_tx, _) = broadcast::channel(config.event_capacity);
+    let (sink_tx, sink_rx) = mpsc::channel(config.event_capacity);
+    spawn_sink_dispatcher(event_sink, sink_rx);
     let handle = TaskHandle {
         command_tx,
         event_tx: event_tx.clone(),
@@ -54,7 +57,8 @@ where
         _internal_tx: internal_tx,
         internal_rx,
         event_tx,
-        event_sink,
+        sink_tx,
+        dropped_sink_events: 0,
         state: CoordinatorState::default(),
         sequence: 0,
     };
@@ -85,12 +89,24 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
                 let result = self.register_root(*request);
                 let _ = reply.send(result);
             }
-            TaskCommand::Inspect { task_id, reply } => {
-                let result = self.state.inspection(&task_id).ok_or_else(not_found);
+            TaskCommand::Inspect {
+                task_id,
+                requester_root,
+                reply,
+            } => {
+                let result = self
+                    .state
+                    .inspection(&task_id)
+                    .filter(|snapshot| {
+                        requester_root
+                            .as_ref()
+                            .is_none_or(|root_id| &snapshot.node.root_id == root_id)
+                    })
+                    .ok_or_else(not_found);
                 let _ = reply.send(result);
             }
             TaskCommand::RegistryCounts { reply } => {
-                let _ = reply.send(self.state.counts());
+                let _ = reply.send(self.state.counts(self.dropped_sink_events));
             }
             TaskCommand::ShutdownRoot { root_id, reply } => {
                 let result = self.shutdown_root(&root_id);
@@ -195,9 +211,27 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
         record.last_event_sequence = self.sequence;
         let envelope = TaskEventEnvelope::new(self.sequence, &record.node, payload);
         let _ = self.event_tx.send(envelope.clone());
-        self.event_sink.on_event(envelope.clone());
+        if self.sink_tx.try_send(envelope.clone()).is_err() {
+            self.dropped_sink_events = self.dropped_sink_events.saturating_add(1);
+        }
         envelope
     }
+}
+
+fn spawn_sink_dispatcher(
+    event_sink: Arc<dyn TaskEventSink>,
+    mut sink_rx: mpsc::Receiver<TaskEventEnvelope>,
+) {
+    std::thread::Builder::new()
+        .name("lato-task-event-sink".into())
+        .spawn(move || {
+            while let Some(event) = sink_rx.blocking_recv() {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    event_sink.on_event(event);
+                }));
+            }
+        })
+        .expect("task event sink dispatcher thread must start");
 }
 
 fn not_found() -> TaskError {

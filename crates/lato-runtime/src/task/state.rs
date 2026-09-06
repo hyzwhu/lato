@@ -38,10 +38,11 @@ impl CoordinatorState {
         })
     }
 
-    pub(crate) fn counts(&self) -> RegistryCounts {
+    pub(crate) fn counts(&self, dropped_sink_events: u64) -> RegistryCounts {
         let mut counts = RegistryCounts {
             roots: self.roots.len(),
             total: self.tasks.len(),
+            dropped_sink_events,
             ..RegistryCounts::default()
         };
         for record in self.tasks.values() {

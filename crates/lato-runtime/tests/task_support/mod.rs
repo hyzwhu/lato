@@ -106,6 +106,7 @@ impl Harness {
                 budget: BudgetLimits::unlimited(),
             })
             .await
+            .map(|_| ())
     }
 
     pub async fn next_event(&mut self) -> TaskEventEnvelope {

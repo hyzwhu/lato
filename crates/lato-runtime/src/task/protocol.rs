@@ -124,6 +124,7 @@ pub struct RegistryCounts {
     pub finalizing: usize,
     pub completed: usize,
     pub total: usize,
+    pub dropped_sink_events: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -239,6 +240,7 @@ pub(crate) enum TaskCommand {
     },
     Inspect {
         task_id: TaskId,
+        requester_root: Option<TaskId>,
         reply: oneshot::Sender<Result<TaskSnapshot, TaskError>>,
     },
     RegistryCounts {
@@ -264,19 +266,33 @@ impl TaskHandle {
         self.event_tx.subscribe()
     }
 
-    pub async fn register_root(&self, request: TaskRootRequest) -> Result<(), TaskError> {
+    pub async fn register_root(
+        &self,
+        request: TaskRootRequest,
+    ) -> Result<ScopedTaskHandle, TaskError> {
+        let root_id = request.task_id.clone();
         let (reply, response) = oneshot::channel();
         self.send(TaskCommand::RegisterRoot {
             request: Box::new(request),
             reply,
         })
         .await?;
-        response.await.map_err(|_| coordinator_closed())?
+        response.await.map_err(|_| coordinator_closed())??;
+        Ok(ScopedTaskHandle::new(
+            root_id.clone(),
+            root_id,
+            self.clone(),
+        ))
     }
 
     pub async fn inspect(&self, task_id: TaskId) -> Result<TaskSnapshot, TaskError> {
         let (reply, response) = oneshot::channel();
-        self.send(TaskCommand::Inspect { task_id, reply }).await?;
+        self.send(TaskCommand::Inspect {
+            task_id,
+            requester_root: None,
+            reply,
+        })
+        .await?;
         response.await.map_err(|_| coordinator_closed())?
     }
 
@@ -308,6 +324,26 @@ impl TaskHandle {
 }
 
 #[derive(Clone)]
+/// A root- and parent-bound coordinator client.
+///
+/// Scoped handles can only be minted by a successful coordinator operation;
+/// callers cannot construct one or recover the unrestricted handle.
+///
+/// ```compile_fail
+/// use lato_core::TaskId;
+/// use lato_runtime::ScopedTaskHandle;
+/// let _ = ScopedTaskHandle::new(
+///     TaskId::from("root"),
+///     TaskId::from("parent"),
+///     unimplemented!(),
+/// );
+/// ```
+///
+/// ```compile_fail
+/// use lato_runtime::ScopedTaskHandle;
+/// let scoped: ScopedTaskHandle = unimplemented!();
+/// let _unrestricted = scoped.handle();
+/// ```
 pub struct ScopedTaskHandle {
     root_id: TaskId,
     parent_id: TaskId,
@@ -315,7 +351,7 @@ pub struct ScopedTaskHandle {
 }
 
 impl ScopedTaskHandle {
-    pub fn new(root_id: TaskId, parent_id: TaskId, inner: TaskHandle) -> Self {
+    pub(crate) fn new(root_id: TaskId, parent_id: TaskId, inner: TaskHandle) -> Self {
         Self {
             root_id,
             parent_id,
@@ -331,8 +367,16 @@ impl ScopedTaskHandle {
         &self.parent_id
     }
 
-    pub fn handle(&self) -> &TaskHandle {
-        &self.inner
+    pub async fn inspect(&self, task_id: TaskId) -> Result<TaskSnapshot, TaskError> {
+        let (reply, response) = oneshot::channel();
+        self.inner
+            .send(TaskCommand::Inspect {
+                task_id,
+                requester_root: Some(self.root_id.clone()),
+                reply,
+            })
+            .await?;
+        response.await.map_err(|_| coordinator_closed())?
     }
 }
 
