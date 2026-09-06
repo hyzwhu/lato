@@ -762,6 +762,9 @@ impl AcpHost {
                     }
                     _ => return Some(err(id, -32602, "unknown login method")),
                 }
+                for session in self.sessions.values() {
+                    session.auth_refreshed().await;
+                }
                 Some(ok(
                     id,
                     serde_json::json!({"ok": true,"provider":provider,"method":method}),
@@ -861,6 +864,25 @@ pub fn default_fake_stream() -> Arc<dyn ModelStream> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct AuthenticationFailureStream;
+
+    #[async_trait::async_trait]
+    impl ModelStream for AuthenticationFailureStream {
+        async fn stream(
+            &self,
+            _prompt_bytes: usize,
+            _context: serde_json::Value,
+            _tx: tokio::sync::mpsc::Sender<StreamPiece>,
+        ) -> Result<(), lato_core::ModelError> {
+            Err(lato_core::ModelError::new(
+                "model.auth",
+                "invalid api key for deterministic compaction failure",
+                lato_core::Retryability::Never,
+            )
+            .with_kind(lato_core::ModelErrorKind::Authentication))
+        }
+    }
 
     #[test]
     fn acp_model_constructors_cross_the_canonical_model_port_boundary() {
@@ -1102,6 +1124,98 @@ mod tests {
         .await
         .unwrap();
         assert!(h.credentials.as_ref().unwrap().get("openai").is_none());
+    }
+
+    #[tokio::test]
+    async fn successful_login_clears_auth_suppression_for_all_current_sessions() {
+        let home = tempfile::tempdir().unwrap();
+        let cwd = std::env::current_dir().unwrap();
+        let (updates, mut updates_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut h = AcpHost::new_with_home(
+            cwd.clone(),
+            SessionTrust::for_headless_prompt(&cwd),
+            updates.clone(),
+            default_fake_stream(),
+            home.path().to_path_buf(),
+        );
+        let created = h
+            .handle(req(1, "session/new", serde_json::json!({})))
+            .await
+            .unwrap();
+        let sid = created["result"]["sessionId"].as_str().unwrap().to_string();
+        let failing_endpoint = adapt_model_endpoint(
+            "fixture",
+            "auth-failure",
+            lato_ai::ModelMetadata {
+                context_window: Some(20_000),
+                model_family: Some("auth-fixture".into()),
+            },
+            Arc::new(AuthenticationFailureStream),
+        )
+        .unwrap();
+        let session = Arc::new(RuntimeSession::new_with_endpoint(
+            sid.clone(),
+            failing_endpoint,
+            h.locks.clone(),
+            h.trust.clone(),
+            cwd,
+            updates,
+            None,
+        ));
+        session
+            .replace_history(vec![
+                crate::HistoryItem::System("system".into()),
+                crate::HistoryItem::User("retain the objective".into()),
+                crate::HistoryItem::AssistantText("prior-work-".repeat(6_800)),
+            ])
+            .await;
+        h.sessions.insert(sid.clone(), session.clone());
+
+        let failed = h
+            .handle(req(
+                2,
+                "session/prompt",
+                serde_json::json!({"sessionId":sid,"text":"trigger auth suppression"}),
+            ))
+            .await
+            .unwrap();
+        assert!(failed.get("error").is_some(), "{failed}");
+        assert!(
+            std::iter::from_fn(|| updates_rx.try_recv().ok()).any(|update| {
+                update["method"] == "lato/session/recovery"
+                    && update["params"]["sessionId"] == sid
+                    && update["params"]["automaticCompactionSuppression"] == "auth"
+            }),
+            "auth failure must publish auth suppression"
+        );
+        assert!(
+            !session
+                .automatic_compaction_allowed(lato_core::CompactionTrigger::Threshold)
+                .await
+        );
+
+        let login = h
+            .handle(req(
+                3,
+                "lato/auth/login",
+                serde_json::json!({"provider":"openai","method":"api_key","key":"sk-refreshed"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(login["result"]["ok"], true);
+        assert!(
+            session
+                .automatic_compaction_allowed(lato_core::CompactionTrigger::Threshold)
+                .await
+        );
+        assert!(
+            std::iter::from_fn(|| updates_rx.try_recv().ok()).any(|update| {
+                update["method"] == "lato/session/recovery"
+                    && update["params"]["sessionId"] == sid
+                    && update["params"]["automaticCompactionSuppression"] == "none"
+            }),
+            "successful login must publish cleared recovery state"
+        );
     }
 
     #[tokio::test]

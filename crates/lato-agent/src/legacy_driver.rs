@@ -24,7 +24,13 @@ use lato_runtime::{
     TurnControl, TurnDriver, TurnEventEmitter, TurnRequest,
 };
 use lato_workspace::{FileLocks, SessionTrust};
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicU8, Ordering},
+    },
+};
 use tokio::sync::{Mutex, mpsc};
 
 /// Adapts the existing model/tool loop to the typed runtime turn contract.
@@ -33,6 +39,7 @@ pub struct LegacyTurnDriver {
     passthrough: mpsc::UnboundedSender<serde_json::Value>,
     model_port: Arc<SwitchableModelPort>,
     model_stream: Arc<SwitchableModelStream>,
+    prefire_model_attempts: AtomicU8,
 }
 
 struct LegacyState {
@@ -122,6 +129,7 @@ impl LegacyTurnDriver {
             passthrough,
             model_port,
             model_stream,
+            prefire_model_attempts: AtomicU8::new(0),
         }
     }
 
@@ -162,6 +170,18 @@ impl LegacyTurnDriver {
 
     pub async fn context_budget_changed(&self) {
         self.state.lock().await.actor.context_budget_changed();
+    }
+
+    pub async fn model_generation_changed(&self) {
+        self.state.lock().await.actor.model_generation_changed();
+    }
+
+    pub async fn auth_refreshed(&self) {
+        let mut state = self.state.lock().await;
+        state.actor.auth_refreshed();
+        while let Ok(actor_event) = state.actor_events.try_recv() {
+            let _ = self.passthrough.send(actor_event);
+        }
     }
 
     pub(crate) async fn automatic_compaction_allowed(
@@ -264,9 +284,12 @@ impl TurnDriver for LegacyTurnDriver {
 
     async fn compact(
         &self,
-        request: CompactionRequest,
+        mut request: CompactionRequest,
         control: CompactionControl,
     ) -> Result<CompactionCandidate, AgentError> {
+        request.prior_model_attempts = request
+            .prior_model_attempts
+            .max(self.prefire_model_attempts.swap(0, Ordering::AcqRel));
         let active = match self.model_stream.active_model_port() {
             Some(active) => active,
             None => self.model_port.snapshot().await,
@@ -284,6 +307,22 @@ impl TurnDriver for LegacyTurnDriver {
                 "compaction.invalid_prefire_prefix",
                 ErrorCategory::InvalidInput,
                 "prefire prefix is outside the history snapshot",
+                Retryability::Never,
+            ));
+        }
+        let max_attempts = request.policy.max_attempts.max(1);
+        let prefire_limit = max_attempts.saturating_sub(1);
+        if self
+            .prefire_model_attempts
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                (current < prefire_limit).then_some(current.saturating_add(1))
+            })
+            .is_err()
+        {
+            return Err(AgentError::new(
+                "compaction.prefire_attempt_budget_exhausted",
+                ErrorCategory::Task,
+                "prefire compaction reserved the remaining model submission for final compaction",
                 Retryability::Never,
             ));
         }
@@ -341,6 +380,15 @@ async fn run_compaction(
     let (system, latest_user) =
         find_compaction_anchors(&request.messages).map_err(AgentError::from)?;
     let max_attempts = request.policy.max_attempts.max(1);
+    let remaining_attempts = max_attempts.saturating_sub(request.prior_model_attempts);
+    if remaining_attempts == 0 {
+        return Err(AgentError::new(
+            "compaction.attempt_budget_exhausted",
+            ErrorCategory::Task,
+            "compaction model submission budget was exhausted before final compaction",
+            Retryability::Never,
+        ));
+    }
     let mut last_error = None;
     let mut stage = CompactionInputStage::Prepared;
     let mut context_window = active
@@ -353,7 +401,7 @@ async fn run_compaction(
         .div_ceil(4)
         .saturating_add(256);
     let mut two_pass = request.two_pass.clone();
-    for attempt in 1..=max_attempts {
+    for attempt in 1..=remaining_attempts {
         if control.cancellation.is_cancelled() {
             return Err(CompactionError::Cancelled.into());
         }
@@ -476,7 +524,7 @@ async fn run_compaction(
                 break;
             }
         }
-        if attempt < max_attempts {
+        if attempt < remaining_attempts {
             tokio::select! {
                 _ = control.cancellation.cancelled() => {
                     return Err(CompactionError::Cancelled.into());
@@ -748,6 +796,7 @@ mod compaction_tests {
             messages: source(),
             policy: CompactionPolicy::default(),
             two_pass: None,
+            prior_model_attempts: 0,
         }
     }
 

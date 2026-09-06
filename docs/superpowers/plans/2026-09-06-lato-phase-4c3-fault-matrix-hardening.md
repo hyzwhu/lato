@@ -18,7 +18,7 @@
 - Cancellation is checked before every ordinary provider request, including the request rebuilt after a successful compaction checkpoint.
 - A known preflight overflow must compact before sampling or fail as `context.preflight_recovery_failed`; it must never call the ordinary model with the oversized input.
 - The 75/85/95 percentages remain unchanged: prefire lead at 75%, final threshold at 85%, and pass-one split at 95% of estimated token weight.
-- Final compaction has one global three-attempt ceiling across pass two and the Prepared/Fitted/Lossy fallback ladder.
+- Prefire pass one, pass two, and the Prepared/Fitted/Lossy fallback ladder share one global three-submission ceiling.
 - Speculative NOTE1 is ephemeral: it is never installed, journaled, emitted as an assistant delta, or replayed after restart.
 - Manual compaction continues to bypass automatic-compaction suppression.
 - Preserve unrelated user-owned changes. Before each commit, inspect `git diff --cached --name-only` and stage only files named by that task.

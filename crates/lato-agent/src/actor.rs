@@ -42,6 +42,7 @@ enum PrefireSlot {
     Empty,
     Running(tokio::task::JoinHandle<Result<PrefireCache, AgentError>>),
     Ready(PrefireCache),
+    Failed,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -102,6 +103,8 @@ pub struct SessionActor {
     prefire: PrefireSlot,
     #[cfg(test)]
     pub(crate) on_after_persist: Option<Box<dyn Fn() + Send + Sync>>,
+    #[cfg(test)]
+    on_before_sample_spawn: Option<Box<dyn Fn() + Send + Sync>>,
 }
 
 impl SessionActor {
@@ -148,6 +151,8 @@ impl SessionActor {
             prefire: PrefireSlot::Empty,
             #[cfg(test)]
             on_after_persist: None,
+            #[cfg(test)]
+            on_before_sample_spawn: None,
         }
     }
     pub fn with_interactive_events(
@@ -267,6 +272,14 @@ impl SessionActor {
             }
             let stream = self.stream.clone();
             let prompt_bytes = self.encoded_len();
+            #[cfg(test)]
+            if let Some(hook) = &self.on_before_sample_spawn {
+                hook();
+            }
+            if self.cancelled || self.turn_cancellation.is_cancelled() {
+                self.active = false;
+                return Ok(TurnOutcome::Cancelled);
+            }
             let stream_task =
                 tokio::spawn(
                     async move { stream.stream_with_report(prompt_bytes, context, tx).await },
@@ -464,7 +477,16 @@ impl SessionActor {
         let previous_suppression = self.context_tracker.automatic_compaction_suppression();
         self.context_tracker.on_context_budget_changed();
         self.emit_suppression_if_changed(previous_suppression);
-        self.clear_prefire();
+    }
+
+    pub fn model_generation_changed(&mut self) {
+        self.invalidate_prefire();
+    }
+
+    pub fn auth_refreshed(&mut self) {
+        let previous_suppression = self.context_tracker.automatic_compaction_suppression();
+        self.context_tracker.on_auth_refreshed();
+        self.emit_suppression_if_changed(previous_suppression);
     }
 
     pub(crate) fn automatic_compaction_allowed(&self, trigger: CompactionTrigger) -> bool {
@@ -494,13 +516,14 @@ impl SessionActor {
         };
         let messages =
             crate::history_to_model_messages(&self.history).map_err(|error| error.to_string())?;
-        let two_pass = self.take_prefire(&messages, model_generation).await;
+        let (two_pass, prior_model_attempts) = self.take_prefire(&messages, model_generation).await;
         let outcome = events
             .compact(AutomaticCompactionRequest {
                 trigger,
                 usage,
                 messages,
                 two_pass,
+                prior_model_attempts,
             })
             .await;
         match outcome {
@@ -586,37 +609,58 @@ impl SessionActor {
         let PrefireSlot::Running(handle) = std::mem::take(&mut self.prefire) else {
             return;
         };
-        if let Ok(Ok(cache)) = handle.await {
-            self.prefire = PrefireSlot::Ready(cache);
-        }
+        self.prefire = match handle.await {
+            Ok(Ok(cache)) => PrefireSlot::Ready(cache),
+            _ => PrefireSlot::Failed,
+        };
     }
 
     async fn take_prefire(
         &mut self,
         messages: &[ModelMessage],
         model_generation: u64,
-    ) -> Option<TwoPassCompactionInput> {
+    ) -> (Option<TwoPassCompactionInput>, u8) {
         let slot = std::mem::take(&mut self.prefire);
         let cache = match slot {
-            PrefireSlot::Empty => return None,
+            PrefireSlot::Empty => return (None, 0),
+            PrefireSlot::Failed => return (None, 1),
             PrefireSlot::Ready(cache) => cache,
-            PrefireSlot::Running(handle) => handle.await.ok()?.ok()?,
+            PrefireSlot::Running(handle) => match handle.await {
+                Ok(Ok(cache)) => cache,
+                _ => return (None, 1),
+            },
         };
         if cache.model_generation != model_generation
             || cache.prefix_len > messages.len()
             || fingerprint_prefix(messages, cache.prefix_len) != cache.fingerprint
         {
-            return None;
+            return (None, 1);
         }
-        Some(TwoPassCompactionInput {
-            note1: cache.note1,
-            prefix_len: cache.prefix_len,
-        })
+        (
+            Some(TwoPassCompactionInput {
+                note1: cache.note1,
+                prefix_len: cache.prefix_len,
+            }),
+            1,
+        )
     }
 
     fn clear_prefire(&mut self) {
         if let PrefireSlot::Running(handle) = std::mem::take(&mut self.prefire) {
             handle.abort();
+        }
+    }
+
+    fn invalidate_prefire(&mut self) {
+        match std::mem::take(&mut self.prefire) {
+            PrefireSlot::Empty => {}
+            PrefireSlot::Running(handle) => {
+                handle.abort();
+                self.prefire = PrefireSlot::Failed;
+            }
+            PrefireSlot::Ready(_) | PrefireSlot::Failed => {
+                self.prefire = PrefireSlot::Failed;
+            }
         }
     }
 
@@ -1081,6 +1125,50 @@ mod tests {
         )
     }
 
+    struct CountingModelStream(Arc<AtomicUsize>);
+
+    #[async_trait]
+    impl ModelStream for CountingModelStream {
+        async fn stream(
+            &self,
+            _prompt_bytes: usize,
+            _context: serde_json::Value,
+            tx: mpsc::Sender<StreamPiece>,
+        ) -> Result<(), lato_core::ModelError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            let _ = tx.send(StreamPiece::Text("unexpected".into())).await;
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_at_final_sampling_boundary_prevents_provider_spawn() {
+        let directory = tempfile::tempdir().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let cancellation = CancellationToken::new();
+        let mut actor = SessionActor::new(
+            Arc::new(CountingModelStream(calls.clone())),
+            Arc::new(FileLocks::new()),
+            SessionTrust::for_headless_prompt(directory.path()),
+            directory.path().to_path_buf(),
+        );
+        let cancel_at_boundary = cancellation.clone();
+        actor.on_before_sample_spawn = Some(Box::new(move || cancel_at_boundary.cancel()));
+
+        let outcome = actor
+            .prompt_with_context(
+                PromptKind::Start,
+                "cancel before spawn".into(),
+                TurnId::from("turn-cancel-before-spawn"),
+                cancellation,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, TurnOutcome::Cancelled);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
     fn model_text(role: ModelRole, value: impl Into<String>) -> ModelMessage {
         ModelMessage {
             role,
@@ -1140,10 +1228,12 @@ mod tests {
         actor.prefire = ready_prefire(&messages, messages.len(), 7);
         messages.push(model_text(ModelRole::User, "appended tail"));
 
-        let pass = actor.take_prefire(&messages, 7).await.unwrap();
+        let (pass, attempts) = actor.take_prefire(&messages, 7).await;
+        let pass = pass.unwrap();
         assert_eq!(pass.note1, "cached note one");
         assert_eq!(pass.prefix_len, 2);
-        assert!(actor.take_prefire(&messages, 7).await.is_none());
+        assert_eq!(attempts, 1);
+        assert_eq!(actor.take_prefire(&messages, 7).await, (None, 0));
     }
 
     #[tokio::test]
@@ -1158,16 +1248,43 @@ mod tests {
         actor.prefire = ready_prefire(&original, original.len(), 7);
         let mut mutated = original.clone();
         mutated[1] = model_text(ModelRole::User, "mutated prefix");
-        assert!(actor.take_prefire(&mutated, 7).await.is_none());
-        assert!(actor.take_prefire(&original, 7).await.is_none());
+        assert_eq!(actor.take_prefire(&mutated, 7).await, (None, 1));
+        assert_eq!(actor.take_prefire(&original, 7).await, (None, 0));
 
         actor.prefire = ready_prefire(&original, original.len(), 7);
-        assert!(actor.take_prefire(&original, 8).await.is_none());
-        assert!(actor.take_prefire(&original, 7).await.is_none());
+        assert_eq!(actor.take_prefire(&original, 8).await, (None, 1));
+        assert_eq!(actor.take_prefire(&original, 7).await, (None, 0));
 
         actor.prefire = ready_prefire(&original, original.len(), 7);
-        assert!(actor.take_prefire(&original[..1], 7).await.is_none());
-        assert!(actor.take_prefire(&original, 7).await.is_none());
+        assert_eq!(actor.take_prefire(&original[..1], 7).await, (None, 1));
+        assert_eq!(actor.take_prefire(&original, 7).await, (None, 0));
+    }
+
+    #[tokio::test]
+    async fn failed_prefire_still_consumes_one_final_compaction_attempt() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut actor = actor(vec![], directory.path().to_path_buf());
+        actor.prefire = PrefireSlot::Failed;
+
+        let (two_pass, attempts) = actor.take_prefire(&[], 0).await;
+
+        assert!(two_pass.is_none());
+        assert_eq!(attempts, 1);
+        assert_eq!(actor.take_prefire(&[], 0).await, (None, 0));
+    }
+
+    #[tokio::test]
+    async fn model_generation_change_invalidates_prefire_without_refunding_its_attempt() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut actor = actor(vec![], directory.path().to_path_buf());
+        let messages = vec![model_text(ModelRole::User, "cached prefix")];
+        actor.prefire = ready_prefire(&messages, 1, 7);
+
+        actor.model_generation_changed();
+        let (two_pass, attempts) = actor.take_prefire(&messages, 8).await;
+
+        assert!(two_pass.is_none());
+        assert_eq!(attempts, 1);
     }
 
     struct AllowTool;

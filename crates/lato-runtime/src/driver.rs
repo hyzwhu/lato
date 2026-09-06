@@ -29,6 +29,7 @@ pub struct CompactionRequest {
     pub messages: Vec<ModelMessage>,
     pub policy: CompactionPolicy,
     pub two_pass: Option<TwoPassCompactionInput>,
+    pub prior_model_attempts: u8,
 }
 
 pub struct CompactionControl {
@@ -41,6 +42,7 @@ pub struct AutomaticCompactionRequest {
     pub usage: ContextUsage,
     pub messages: Vec<ModelMessage>,
     pub two_pass: Option<TwoPassCompactionInput>,
+    pub prior_model_attempts: u8,
 }
 
 #[derive(Clone, Debug)]
@@ -55,7 +57,7 @@ pub struct PrefireCompactionResult {
     pub note1: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TwoPassCompactionInput {
     pub note1: String,
     pub prefix_len: usize,

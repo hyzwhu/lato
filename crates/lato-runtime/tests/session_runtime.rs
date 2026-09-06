@@ -277,6 +277,7 @@ impl TurnDriver for AutomaticFailureDriver {
                     }],
                 }],
                 two_pass: None,
+                prior_model_attempts: 0,
             })
             .await?;
         *self.observed.lock().await = Some(outcome);
@@ -337,6 +338,7 @@ impl TurnDriver for AutomaticCompactionDriver {
                 },
                 messages: self.source.clone(),
                 two_pass: None,
+                prior_model_attempts: 0,
             })
             .await?;
         if let AutomaticCompactionOutcome::Compacted(messages) = outcome {

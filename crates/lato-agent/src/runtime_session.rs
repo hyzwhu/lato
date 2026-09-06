@@ -401,6 +401,15 @@ impl RuntimeSession {
         self.active_operation.lock().await.is_some()
     }
 
+    pub(crate) async fn auth_refreshed(&self) {
+        self.driver.auth_refreshed().await;
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn automatic_compaction_allowed(&self, trigger: CompactionTrigger) -> bool {
+        self.driver.automatic_compaction_allowed(trigger).await
+    }
+
     pub async fn switch_model(
         &self,
         prepared: PreparedModelSwitch,
@@ -438,6 +447,7 @@ impl RuntimeSession {
             self.driver.activate_model(previous).await;
             return Err(error);
         }
+        self.driver.model_generation_changed().await;
         if context_budget_changed {
             self.driver.context_budget_changed().await;
         }
@@ -701,8 +711,221 @@ fn journal_error(error: JournalError) -> AgentError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lato_core::{ToolCallId, UnresolvedToolCall};
+    use async_trait::async_trait;
+    use lato_ai::{ModelMetadata, StreamPiece};
+    use lato_core::{
+        ModelContent, ModelError, ModelMessage, ModelRole, ToolCallId, UnresolvedToolCall,
+    };
+    use lato_runtime::{CompactionControl, PrefireCompactionRequest};
     use lato_store::MemoryEventStore;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct InvalidThenSummaryStream {
+        calls: AtomicUsize,
+    }
+
+    struct TextStream {
+        text: String,
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ModelStream for TextStream {
+        async fn stream(
+            &self,
+            _prompt_bytes: usize,
+            _context: serde_json::Value,
+            tx: mpsc::Sender<StreamPiece>,
+        ) -> Result<(), ModelError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            tx.send(StreamPiece::Text(self.text.clone()))
+                .await
+                .map_err(|_| ModelError::cancelled())
+        }
+    }
+
+    fn prefire_request() -> PrefireCompactionRequest {
+        PrefireCompactionRequest {
+            messages: vec![
+                ModelMessage {
+                    role: ModelRole::System,
+                    content: vec![ModelContent::Text {
+                        text: "system".into(),
+                    }],
+                },
+                ModelMessage {
+                    role: ModelRole::User,
+                    content: vec![ModelContent::Text {
+                        text: "retain objective".into(),
+                    }],
+                },
+            ],
+            prefix_len: 2,
+            policy: CompactionPolicy::default(),
+        }
+    }
+
+    #[async_trait]
+    impl ModelStream for InvalidThenSummaryStream {
+        async fn stream(
+            &self,
+            _prompt_bytes: usize,
+            _context: serde_json::Value,
+            tx: mpsc::Sender<StreamPiece>,
+        ) -> Result<(), ModelError> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            let text = if call < 2 {
+                "invalid summary".to_string()
+            } else {
+                let detail = "preserve verified state and pending work ".repeat(3);
+                crate::REQUIRED_SECTIONS
+                    .iter()
+                    .enumerate()
+                    .map(|(index, heading)| format!("{}. {}: {detail}", index + 1, heading))
+                    .collect::<Vec<_>>()
+                    .join("\n\n")
+            };
+            tx.send(StreamPiece::Text(text))
+                .await
+                .map_err(|_| ModelError::cancelled())
+        }
+    }
+
+    #[tokio::test]
+    async fn repeated_same_window_model_switches_keep_prefire_and_final_within_budget() {
+        let directory = tempfile::tempdir().unwrap();
+        let (updates, _updates_rx) = mpsc::unbounded_channel();
+        let first_prefire = Arc::new(TextStream {
+            text: "first speculative note".into(),
+            calls: AtomicUsize::new(0),
+        });
+        let initial = adapt_model_endpoint(
+            "fixture",
+            "old",
+            ModelMetadata {
+                context_window: Some(120_000),
+                model_family: Some("family-a".into()),
+            },
+            first_prefire.clone(),
+        )
+        .unwrap();
+        let session = RuntimeSession::new_with_endpoint(
+            "same-window-prefire-budget".into(),
+            initial,
+            Arc::new(FileLocks::new()),
+            SessionTrust::for_headless_prompt(directory.path()),
+            directory.path().to_path_buf(),
+            updates,
+            None,
+        );
+        session
+            .replace_history(vec![
+                HistoryItem::System("system".into()),
+                HistoryItem::User("retain objective".into()),
+                HistoryItem::AssistantText("prior work ".repeat(30_000)),
+            ])
+            .await;
+        TurnDriver::prefire_compaction(
+            session.driver.as_ref(),
+            prefire_request(),
+            CompactionControl {
+                cancellation: tokio_util::sync::CancellationToken::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let second_prefire = Arc::new(TextStream {
+            text: "second speculative note".into(),
+            calls: AtomicUsize::new(0),
+        });
+        let active = adapt_model_endpoint(
+            "fixture",
+            "middle",
+            ModelMetadata {
+                context_window: Some(120_000),
+                model_family: Some("family-a".into()),
+            },
+            second_prefire.clone(),
+        )
+        .unwrap();
+        session
+            .switch_model(PreparedModelSwitch { active })
+            .await
+            .unwrap();
+        TurnDriver::prefire_compaction(
+            session.driver.as_ref(),
+            prefire_request(),
+            CompactionControl {
+                cancellation: tokio_util::sync::CancellationToken::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let rejected_prefire = Arc::new(TextStream {
+            text: "must not be submitted".into(),
+            calls: AtomicUsize::new(0),
+        });
+        let active = adapt_model_endpoint(
+            "fixture",
+            "third",
+            ModelMetadata {
+                context_window: Some(120_000),
+                model_family: Some("family-a".into()),
+            },
+            rejected_prefire.clone(),
+        )
+        .unwrap();
+        session
+            .switch_model(PreparedModelSwitch { active })
+            .await
+            .unwrap();
+        let error = TurnDriver::prefire_compaction(
+            session.driver.as_ref(),
+            prefire_request(),
+            CompactionControl {
+                cancellation: tokio_util::sync::CancellationToken::new(),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, "compaction.prefire_attempt_budget_exhausted");
+        assert_eq!(rejected_prefire.calls.load(Ordering::SeqCst), 0);
+
+        let final_stream = Arc::new(InvalidThenSummaryStream {
+            calls: AtomicUsize::new(0),
+        });
+        let active = adapt_model_endpoint(
+            "fixture",
+            "new",
+            ModelMetadata {
+                context_window: Some(120_000),
+                model_family: Some("family-b".into()),
+            },
+            final_stream.clone(),
+        )
+        .unwrap();
+
+        let switched = session
+            .switch_model(PreparedModelSwitch { active })
+            .await
+            .unwrap();
+        assert!(switched.compaction_warning.is_some());
+        assert_eq!(final_stream.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(first_prefire.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(second_prefire.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            first_prefire.calls.load(Ordering::SeqCst)
+                + second_prefire.calls.load(Ordering::SeqCst)
+                + final_stream.calls.load(Ordering::SeqCst),
+            usize::from(CompactionPolicy::default().max_attempts)
+        );
+
+        let manual = session.compact(None).await.unwrap();
+        assert!(matches!(manual, RuntimeCompactionOutcome::Complete { .. }));
+        assert_eq!(final_stream.calls.load(Ordering::SeqCst), 3);
+    }
 
     #[test]
     fn lagged_event_error_is_structured_and_reports_the_count() {

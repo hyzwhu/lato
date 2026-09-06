@@ -733,6 +733,7 @@ fn compaction_request(two_pass: bool) -> CompactionRequest {
             note1: NOTE1_SENTINEL.into(),
             prefix_len: messages.len() / 2,
         }),
+        prior_model_attempts: u8::from(two_pass),
         messages,
         policy: CompactionPolicy::default(),
     }
@@ -830,28 +831,18 @@ async fn compaction_two_pass_and_fallbacks_share_one_three_call_budget() {
         CompactionStep::Overflow {
             context_window: None,
         },
-        CompactionStep::Overflow {
-            context_window: Some(20_000),
-        },
         CompactionStep::Summary,
     ]));
 
     let candidate = compact_with_script(port.clone(), true).await.unwrap();
     assert_eq!(
-        port.calls.load(Ordering::SeqCst),
+        port.calls.load(Ordering::SeqCst) + 1,
         usize::from(CompactionPolicy::default().max_attempts)
     );
     let requests = port.requests.lock().await;
     assert!(request_contains(&requests[0], NOTE1_SENTINEL));
     assert!(!request_contains(&requests[1], NOTE1_SENTINEL));
-    assert!(!request_contains(&requests[2], NOTE1_SENTINEL));
     assert_request_stage(&requests[1], CompactionInputStage::Prepared, 30_000);
-    assert_request_stage(&requests[2], CompactionInputStage::Fitted, 20_000);
-    let fallback_sizes = requests[1..]
-        .iter()
-        .map(|request| serde_json::to_vec(&request.messages).unwrap().len())
-        .collect::<Vec<_>>();
-    assert!(fallback_sizes[0] > fallback_sizes[1], "{fallback_sizes:?}");
     assert!(
         !serde_json::to_string(&candidate.messages)
             .unwrap()
@@ -860,12 +851,9 @@ async fn compaction_two_pass_and_fallbacks_share_one_three_call_budget() {
 }
 
 #[tokio::test]
-async fn invalid_two_pass_and_two_fallback_overflows_never_make_a_fourth_call() {
+async fn invalid_two_pass_and_fallback_never_exceed_prefire_inclusive_budget() {
     let port = Arc::new(CanonicalCompactionPort::new([
         CompactionStep::InvalidSummary,
-        CompactionStep::Overflow {
-            context_window: Some(20_000),
-        },
         CompactionStep::Overflow {
             context_window: Some(20_000),
         },
@@ -880,7 +868,7 @@ async fn invalid_two_pass_and_two_fallback_overflows_never_make_a_fourth_call() 
         error.message
     );
     assert_eq!(
-        port.calls.load(Ordering::SeqCst),
+        port.calls.load(Ordering::SeqCst) + 1,
         usize::from(CompactionPolicy::default().max_attempts)
     );
     let requests = port.requests.lock().await;
@@ -891,7 +879,6 @@ async fn invalid_two_pass_and_two_fallback_overflows_never_make_a_fourth_call() 
             .all(|request| !request_contains(request, NOTE1_SENTINEL))
     );
     assert_request_stage(&requests[1], CompactionInputStage::Prepared, 30_000);
-    assert_request_stage(&requests[2], CompactionInputStage::Fitted, 20_000);
 }
 
 #[tokio::test]

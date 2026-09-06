@@ -328,6 +328,7 @@ impl SessionLoop {
             messages,
             policy: CompactionPolicy::default(),
             two_pass: None,
+            prior_model_attempts: 0,
         };
         let driver = self.driver.clone();
         let driver_tx = self.driver_tx.clone();
@@ -667,6 +668,7 @@ impl SessionLoop {
             messages: request.messages,
             policy: CompactionPolicy::default(),
             two_pass: request.two_pass,
+            prior_model_attempts: request.prior_model_attempts,
         };
         let driver = self.driver.clone();
         let driver_tx = self.driver_tx.clone();
