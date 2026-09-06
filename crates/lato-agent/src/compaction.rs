@@ -28,6 +28,15 @@ const TOOL_RESULT_CHARS: usize = 1_024;
 pub fn prepare_compaction_messages(
     source: &[ModelMessage],
 ) -> Result<Vec<ModelMessage>, CompactionError> {
+    Ok(prepare_compaction_messages_with_source_indices(source)?
+        .into_iter()
+        .map(|(_, message)| message)
+        .collect())
+}
+
+pub(crate) fn prepare_compaction_messages_with_source_indices(
+    source: &[ModelMessage],
+) -> Result<Vec<(usize, ModelMessage)>, CompactionError> {
     if source
         .first()
         .is_none_or(|message| message.role != ModelRole::System)
@@ -45,7 +54,7 @@ pub fn prepare_compaction_messages(
         })
         .collect::<BTreeSet<_>>();
     let mut prepared = Vec::new();
-    for message in source {
+    for (source_index, message) in source.iter().enumerate() {
         let mut parts = Vec::new();
         for content in &message.content {
             match content {
@@ -69,16 +78,19 @@ pub fn prepare_compaction_messages(
             }
         }
         if !parts.is_empty() {
-            prepared.push(ModelMessage {
-                role: if message.role == ModelRole::Tool {
-                    ModelRole::User
-                } else {
-                    message.role
+            prepared.push((
+                source_index,
+                ModelMessage {
+                    role: if message.role == ModelRole::Tool {
+                        ModelRole::User
+                    } else {
+                        message.role
+                    },
+                    content: vec![ModelContent::Text {
+                        text: parts.join("\n"),
+                    }],
                 },
-                content: vec![ModelContent::Text {
-                    text: parts.join("\n"),
-                }],
-            });
+            ));
         }
     }
     Ok(prepared)

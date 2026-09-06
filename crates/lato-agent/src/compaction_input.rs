@@ -2,7 +2,9 @@
 // License: Apache-2.0
 // Lato changes: provider-neutral, whole-unit compaction input fitting with a bounded lossy fallback
 
-use crate::{message_text, prepare_compaction_messages};
+use crate::{
+    message_text, prepare_compaction_messages, prepare_compaction_messages_with_source_indices,
+};
 use lato_core::{CompactionError, ModelContent, ModelMessage, ModelRole};
 use std::collections::BTreeSet;
 
@@ -98,13 +100,38 @@ fn fit_whole_units(
         }
     }
 
+    let selected_indices = selected_message_indices(&units, &selected);
+    let protected_source_index = selected_indices
+        .iter()
+        .position(|index| *index == latest_user)
+        .map(|index| index + 1)
+        .ok_or_else(|| CompactionError::InvalidSummary {
+            message: "latest user objective was not selected for fitting".into(),
+        })?;
     let mut selected_source = vec![system];
-    selected_source.extend(selected_messages(body, &units, &selected));
-    let mut prepared = prepare_compaction_messages(&selected_source)?;
+    selected_source.extend(selected_indices.iter().map(|index| body[*index].clone()));
+    let prepared_with_indices = prepare_compaction_messages_with_source_indices(&selected_source)?;
+    let protected_prepared_index = prepared_with_indices
+        .iter()
+        .position(|(source_index, _)| *source_index == protected_source_index)
+        .ok_or_else(|| CompactionError::InvalidSummary {
+            message: "latest user objective disappeared during preparation".into(),
+        })?;
+    let mut prepared = prepared_with_indices
+        .into_iter()
+        .map(|(_, message)| message)
+        .collect::<Vec<_>>();
     if serialized_bytes(&prepared[1..]) > body_budget_bytes {
         // Mandatory anchors may be larger than the window. Keep their identity and
-        // safely trim text on UTF-8 boundaries, newest first.
-        truncate_to_budget(&mut prepared[1..], body_budget_bytes)?;
+        // safely trim text on UTF-8 boundaries, protecting the latest objective
+        // until every older mandatory message has been reduced first.
+        let mut body = prepared.split_off(1);
+        truncate_to_budget(
+            &mut body,
+            body_budget_bytes,
+            protected_prepared_index.saturating_sub(1),
+        )?;
+        prepared.extend(body);
     }
     Ok(prepared)
 }
@@ -144,6 +171,16 @@ fn selected_messages(
         .collect()
 }
 
+fn selected_message_indices(
+    units: &[std::ops::Range<usize>],
+    selected: &BTreeSet<usize>,
+) -> Vec<usize> {
+    selected
+        .iter()
+        .flat_map(|index| units[*index].clone())
+        .collect()
+}
+
 fn prepared_units_bytes(
     system: &ModelMessage,
     body: &[ModelMessage],
@@ -162,29 +199,47 @@ fn serialized_bytes(messages: &[ModelMessage]) -> u64 {
         .unwrap_or(u64::MAX)
 }
 
-fn truncate_to_budget(messages: &mut [ModelMessage], budget: u64) -> Result<(), CompactionError> {
+fn truncate_to_budget(
+    messages: &mut Vec<ModelMessage>,
+    budget: u64,
+    mut protected_message: usize,
+) -> Result<(), CompactionError> {
     loop {
         let current_size = serialized_bytes(messages);
         if current_size <= budget {
             return Ok(());
         }
-        let Some((message_index, content_index, text_len)) = messages
-            .iter()
-            .enumerate()
-            .rev()
-            .find_map(|(message_index, message)| {
-                message
-                    .content
-                    .iter()
-                    .enumerate()
-                    .rev()
-                    .find_map(|(content_index, content)| match content {
-                        ModelContent::Text { text } if !text.is_empty() => {
-                            Some((message_index, content_index, text.len()))
-                        }
-                        _ => None,
+        let Some((message_index, content_index, text_len)) =
+            messages
+                .iter()
+                .enumerate()
+                .rev()
+                .filter(|(message_index, _)| *message_index != protected_message)
+                .find_map(|(message_index, message)| {
+                    message
+                        .content
+                        .iter()
+                        .enumerate()
+                        .rev()
+                        .find_map(|(content_index, content)| match content {
+                            ModelContent::Text { text } if !text.is_empty() => {
+                                Some((message_index, content_index, text.len()))
+                            }
+                            _ => None,
+                        })
+                })
+                .or_else(|| {
+                    messages.get(protected_message).and_then(|message| {
+                        message.content.iter().enumerate().rev().find_map(
+                            |(content_index, content)| match content {
+                                ModelContent::Text { text } if !text.is_empty() => {
+                                    Some((protected_message, content_index, text.len()))
+                                }
+                                _ => None,
+                            },
+                        )
                     })
-            })
+                })
         else {
             return Err(CompactionError::InputTooLarge);
         };
@@ -200,14 +255,34 @@ fn truncate_to_budget(messages: &mut [ModelMessage], budget: u64) -> Result<(), 
         };
         let boundary = floor_char_boundary(text, keep);
         let dropped = text.len().saturating_sub(boundary);
-        let marker = format!("\n[... truncated {dropped} bytes to fit the compaction window ...]");
-        if boundary == 0 && marker.len() >= text.len() {
+        let is_protected = message_index == protected_message;
+        let marker = if is_protected {
+            "[... latest objective truncated ...]".to_owned()
+        } else {
+            format!("\n[... truncated {dropped} bytes to fit the compaction window ...]")
+        };
+        if is_protected && boundary == 0 {
+            *text = marker;
+        } else if boundary == 0 && marker.len() >= text.len() {
             text.clear();
         } else {
             text.truncate(boundary);
             text.push_str(&marker);
         }
-        if serialized_bytes(messages) >= current_size {
+        if !is_protected
+            && messages[message_index]
+                .content
+                .iter()
+                .all(|content| matches!(content, ModelContent::Text { text } if text.is_empty()))
+        {
+            messages.remove(message_index);
+            if message_index < protected_message {
+                protected_message -= 1;
+            }
+        } else if serialized_bytes(messages) >= current_size {
+            if is_protected {
+                return Err(CompactionError::InputTooLarge);
+            }
             let ModelContent::Text { text } = &mut messages[message_index].content[content_index]
             else {
                 unreachable!();
@@ -343,5 +418,40 @@ mod tests {
             prepare_compaction_input(&source, CompactionInputStage::Fitted, budget).unwrap();
         assert_eq!(fitted.first().unwrap().role, ModelRole::System);
         assert!(serialized_bytes(&fitted[1..]) <= budget * 4);
+    }
+
+    #[test]
+    fn fitting_protects_latest_objective_until_older_summary_is_reduced() {
+        let source = vec![
+            text(ModelRole::System, "system"),
+            text(
+                ModelRole::User,
+                format!(
+                    "<conversation_summary version=\"1\">{}</conversation_summary>",
+                    "old-summary-".repeat(2_000)
+                ),
+            ),
+            text(
+                ModelRole::User,
+                "LATEST_OBJECTIVE preserve this intent ".repeat(500),
+            ),
+        ];
+
+        let budget = 200;
+        let fitted =
+            prepare_compaction_input(&source, CompactionInputStage::Fitted, budget).unwrap();
+        let latest = fitted.last().expect("latest objective must remain present");
+        let latest_text = message_text(latest);
+        assert_eq!(latest.role, ModelRole::User);
+        assert!(!latest_text.trim().is_empty());
+        assert!(
+            latest_text.contains("LATEST_OBJECTIVE")
+                || latest_text.contains("latest objective truncated")
+        );
+        assert!(serialized_bytes(&fitted[1..]) <= budget * 4);
+
+        let error = prepare_compaction_input(&source, CompactionInputStage::Fitted, 5)
+            .expect_err("an impossible budget must fail instead of erasing the objective");
+        assert_eq!(error.code(), "compaction.input_too_large");
     }
 }
