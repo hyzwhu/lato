@@ -3,9 +3,11 @@ pub mod locks;
 pub mod paths;
 pub mod sandbox;
 pub mod shell;
+pub mod task;
 
 pub use approval::*;
 pub use locks::*;
 pub use paths::*;
 pub use sandbox::*;
 pub use shell::*;
+pub use task::*;
