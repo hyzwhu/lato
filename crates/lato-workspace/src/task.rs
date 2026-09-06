@@ -132,21 +132,39 @@ pub struct MemoryWorkspaceAllocator {
 
 struct MemoryWorkspaceAllocatorInner {
     base_root: PathBuf,
+    shared_write_resource_key: PathBuf,
     issuer: Arc<AllocatorIssuer>,
     fail_next: AtomicBool,
     live: Mutex<HashMap<LeaseId, WorkspaceLease>>,
 }
 
 impl MemoryWorkspaceAllocator {
-    pub fn new(base_root: impl AsRef<Path>) -> Self {
-        Self {
+    pub fn new(base_root: impl AsRef<Path>) -> Result<Self, TaskError> {
+        let configured_root = base_root.as_ref();
+        let absolute_root = if configured_root.is_absolute() {
+            configured_root.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map_err(|error| {
+                    TaskError::new(
+                        TaskErrorCode::WorkspaceAllocation,
+                        format!("failed to resolve current workspace directory: {error}"),
+                    )
+                })?
+                .join(configured_root)
+        };
+        let frozen_root = std::fs::canonicalize(&absolute_root).unwrap_or(absolute_root);
+        let shared_write_resource_key = lock_key(&frozen_root);
+
+        Ok(Self {
             inner: Arc::new(MemoryWorkspaceAllocatorInner {
-                base_root: base_root.as_ref().to_path_buf(),
+                base_root: frozen_root,
+                shared_write_resource_key,
                 issuer: Arc::new(AllocatorIssuer),
                 fail_next: AtomicBool::new(false),
                 live: Mutex::new(HashMap::new()),
             }),
-        }
+        })
     }
 
     pub fn fail_next_allocation(&self) {
@@ -188,23 +206,6 @@ impl MemoryWorkspaceAllocator {
                 .join(lease_id.as_str()),
         }
     }
-
-    fn shared_resource_key(&self, root: &Path) -> Result<PathBuf, TaskError> {
-        let absolute = if root.is_absolute() {
-            root.to_path_buf()
-        } else {
-            std::env::current_dir()
-                .map_err(|error| {
-                    TaskError::new(
-                        TaskErrorCode::WorkspaceAllocation,
-                        format!("failed to resolve current workspace directory: {error}"),
-                    )
-                })?
-                .join(root)
-        };
-        let canonical = std::fs::canonicalize(&absolute).unwrap_or(absolute);
-        Ok(lock_key(canonical))
-    }
 }
 
 #[async_trait::async_trait]
@@ -221,7 +222,7 @@ impl WorkspaceAllocator for MemoryWorkspaceAllocator {
         let mode = WorkspaceMode::from(request.intent);
         let root = self.lease_root(mode, &id);
         let resource_key = if mode == WorkspaceMode::SharedSerializedWrite {
-            Some(self.shared_resource_key(&root)?)
+            Some(self.inner.shared_write_resource_key.clone())
         } else {
             None
         };
