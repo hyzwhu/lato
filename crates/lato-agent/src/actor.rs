@@ -1159,15 +1159,15 @@ mod tests {
         let mut mutated = original.clone();
         mutated[1] = model_text(ModelRole::User, "mutated prefix");
         assert!(actor.take_prefire(&mutated, 7).await.is_none());
-        assert!(actor.take_prefire(&mutated, 7).await.is_none());
+        assert!(actor.take_prefire(&original, 7).await.is_none());
 
         actor.prefire = ready_prefire(&original, original.len(), 7);
         assert!(actor.take_prefire(&original, 8).await.is_none());
-        assert!(actor.take_prefire(&original, 8).await.is_none());
+        assert!(actor.take_prefire(&original, 7).await.is_none());
 
         actor.prefire = ready_prefire(&original, original.len(), 7);
         assert!(actor.take_prefire(&original[..1], 7).await.is_none());
-        assert!(actor.take_prefire(&original[..1], 7).await.is_none());
+        assert!(actor.take_prefire(&original, 7).await.is_none());
     }
 
     struct AllowTool;
