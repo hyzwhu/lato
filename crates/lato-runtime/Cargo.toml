@@ -5,8 +5,11 @@ edition = "2024"
 
 [dependencies]
 async-trait = "0.1"
+futures-util = "0.3"
 lato-core = { path = "../lato-core" }
 lato-store = { path = "../lato-store" }
+lato-workspace = { path = "../lato-workspace" }
+serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 

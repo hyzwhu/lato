@@ -1125,8 +1125,11 @@ name = "lato-runtime"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "futures-util",
  "lato-core",
  "lato-store",
+ "lato-workspace",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",

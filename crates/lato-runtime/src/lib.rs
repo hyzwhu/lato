@@ -1,5 +1,6 @@
 mod driver;
 mod session;
+pub mod task;
 
 pub use driver::{
     AutomaticCompactionOutcome, AutomaticCompactionRequest, CompactionControl, CompactionRequest,
@@ -7,3 +8,4 @@ pub use driver::{
     TurnRequest, TwoPassCompactionInput,
 };
 pub use session::{SessionBootstrap, SessionHandle, spawn_session, spawn_session_with_store};
+pub use task::*;
