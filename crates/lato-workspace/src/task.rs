@@ -2,6 +2,7 @@
 // License: Apache-2.0
 // Lato changes: extracted a provider-neutral workspace lease boundary and deterministic memory allocator without filesystem effects
 
+use crate::lock_key;
 use lato_core::{LeaseId, TaskError, TaskErrorCode, TaskId, WorkspaceIntent};
 use std::{
     collections::HashMap,
@@ -12,6 +13,8 @@ use std::{
     },
 };
 use tokio::sync::Mutex;
+
+static NEXT_MEMORY_LEASE_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -39,8 +42,48 @@ pub struct WorkspaceLease {
     pub task_id: TaskId,
     pub mode: WorkspaceMode,
     pub root: PathBuf,
-    pub resource_key: Option<String>,
+    pub resource_key: Option<PathBuf>,
+    #[serde(skip)]
+    provenance: Option<LeaseProvenance>,
 }
+
+impl WorkspaceLease {
+    pub fn new(
+        id: LeaseId,
+        task_id: TaskId,
+        mode: WorkspaceMode,
+        root: PathBuf,
+        resource_key: Option<PathBuf>,
+    ) -> Self {
+        Self {
+            id,
+            task_id,
+            mode,
+            root,
+            resource_key,
+            provenance: None,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct LeaseProvenance(Arc<AllocatorIssuer>);
+
+impl std::fmt::Debug for LeaseProvenance {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("<opaque>")
+    }
+}
+
+impl PartialEq for LeaseProvenance {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for LeaseProvenance {}
+
+struct AllocatorIssuer;
 
 #[derive(Clone, Debug)]
 pub struct WorkspaceRequest {
@@ -67,7 +110,7 @@ pub struct MemoryWorkspaceAllocator {
 
 struct MemoryWorkspaceAllocatorInner {
     base_root: PathBuf,
-    next_id: AtomicU64,
+    issuer: Arc<AllocatorIssuer>,
     fail_next: AtomicBool,
     live: Mutex<HashMap<LeaseId, WorkspaceLease>>,
 }
@@ -77,7 +120,7 @@ impl MemoryWorkspaceAllocator {
         Self {
             inner: Arc::new(MemoryWorkspaceAllocatorInner {
                 base_root: base_root.as_ref().to_path_buf(),
-                next_id: AtomicU64::new(1),
+                issuer: Arc::new(AllocatorIssuer),
                 fail_next: AtomicBool::new(false),
                 live: Mutex::new(HashMap::new()),
             }),
@@ -93,9 +136,7 @@ impl MemoryWorkspaceAllocator {
     }
 
     fn next_lease_id(&self) -> Result<LeaseId, TaskError> {
-        let sequence = self
-            .inner
-            .next_id
+        let sequence = NEXT_MEMORY_LEASE_ID
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 current.checked_add(1)
             })
@@ -140,14 +181,14 @@ impl WorkspaceAllocator for MemoryWorkspaceAllocator {
         let id = self.next_lease_id()?;
         let mode = WorkspaceMode::from(request.intent);
         let root = self.lease_root(mode, &id);
-        let resource_key = (mode == WorkspaceMode::SharedSerializedWrite)
-            .then(|| format!("shared-workspace:{}", root.display()));
+        let resource_key = (mode == WorkspaceMode::SharedSerializedWrite).then(|| lock_key(&root));
         let lease = WorkspaceLease {
             id: id.clone(),
             task_id: request.task_id,
             mode,
             root,
             resource_key,
+            provenance: Some(LeaseProvenance(Arc::clone(&self.inner.issuer))),
         };
 
         self.inner.live.lock().await.insert(id, lease.clone());
@@ -155,7 +196,28 @@ impl WorkspaceAllocator for MemoryWorkspaceAllocator {
     }
 
     async fn release(&self, lease: &WorkspaceLease) -> Result<(), TaskError> {
-        self.inner.live.lock().await.remove(&lease.id);
+        let issued_here = lease
+            .provenance
+            .as_ref()
+            .is_some_and(|provenance| Arc::ptr_eq(&provenance.0, &self.inner.issuer));
+        if !issued_here {
+            return Err(TaskError::new(
+                TaskErrorCode::WorkspaceRelease,
+                "workspace lease was not issued by this allocator",
+            ));
+        }
+
+        let mut live = self.inner.live.lock().await;
+        if live
+            .get(&lease.id)
+            .is_some_and(|registered| registered != lease)
+        {
+            return Err(TaskError::new(
+                TaskErrorCode::WorkspaceRelease,
+                "workspace lease does not match the registered lease",
+            ));
+        }
+        live.remove(&lease.id);
         Ok(())
     }
 }
