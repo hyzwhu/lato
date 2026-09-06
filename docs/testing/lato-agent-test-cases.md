@@ -309,7 +309,7 @@ AgentDojo 把“完成用户任务”与“攻击是否成功”分开评分。�
 | 已验证保证 | 主要回归位置 |
 | --- | --- |
 | Provider 错误在输出前、文本后和工具增量后均保留 kind/status/context window/output-started 元数据；普通 HTTP 400 不误判为溢出 | `crates/lato-ai/src/model_port_adapter/{legacy_port,stream_adapter}.rs`、`crates/lato-ai/tests/provider_error.rs` |
-| 可见文本或工具输出之后不重放；拒绝的采样步骤只有一次自动恢复额度，第二次溢出直接终止 | `crates/lato-agent/tests/context_recovery_faults.rs`、`tests/session_compaction_cli.rs` |
+| 可见文本或工具调用增量开始后不重放；拒绝的采样步骤只有一次自动恢复额度，第二次溢出直接终止 | `crates/lato-agent/tests/context_recovery_faults.rs`、`tests/session_compaction_cli.rs` |
 | 压缩检查点完成后、重新提交前响应取消；已知超限的预检输入要么先压缩，要么以 `context.preflight_recovery_failed` 失败，不发往模型 | `crates/lato-agent/tests/context_recovery_faults.rs` |
 | Turn/Sticky/UntilSuccess/Auth 抑制按各自生命周期清除，所有自动入口受阻，手动压缩仍可用 | `crates/lato-agent/tests/context_recovery.rs`、`crates/lato-agent/tests/context_recovery_faults.rs` |
 | 75/85% 预触发边界固定；NOTE1 缓存只在前缀和模型代次匹配时单次复用，前缀变化、代次变化或长度不匹配立即失效 | `crates/lato-agent/src/actor.rs` 单元测试 |
