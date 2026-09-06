@@ -44,9 +44,24 @@ enum PrefireSlot {
     Ready(PrefireCache),
 }
 
-fn is_prefire_window(usage: &ContextUsage, threshold_percent: u8) -> bool {
-    usage.threshold_reached(threshold_percent.saturating_sub(PREFIRE_LEAD_PERCENT))
-        && !usage.threshold_reached(threshold_percent)
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ContextCompactionAction {
+    None,
+    Prefire,
+    Final,
+}
+
+fn context_compaction_action(
+    usage: &ContextUsage,
+    threshold_percent: u8,
+) -> ContextCompactionAction {
+    if usage.threshold_reached(threshold_percent) {
+        ContextCompactionAction::Final
+    } else if usage.threshold_reached(threshold_percent.saturating_sub(PREFIRE_LEAD_PERCENT)) {
+        ContextCompactionAction::Prefire
+    } else {
+        ContextCompactionAction::None
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -202,7 +217,8 @@ impl SessionActor {
                 let usage = self.context_tracker.measure(&self.history, active);
                 self.emit_context_usage(usage.clone())?;
                 let threshold = CompactionPolicy::default().threshold_percent;
-                if is_prefire_window(&usage, threshold) {
+                let threshold_action = context_compaction_action(&usage, threshold);
+                if threshold_action == ContextCompactionAction::Prefire {
                     self.start_prefire(active).await?;
                 }
                 let preflight_overflow =
@@ -214,8 +230,7 @@ impl SessionActor {
                         .threshold_reached(threshold)
                         .then_some(CompactionTrigger::ModelSwitch)
                 } else {
-                    usage
-                        .threshold_reached(threshold)
+                    (threshold_action == ContextCompactionAction::Final)
                         .then_some(CompactionTrigger::Threshold)
                 };
                 if let Some(trigger) = trigger {
@@ -1088,7 +1103,7 @@ mod tests {
     }
 
     #[test]
-    fn prefire_and_final_thresholds_have_exact_74_75_84_85_boundaries() {
+    fn compaction_action_has_exact_74_75_84_85_boundaries() {
         let usage = |percent| ContextUsage {
             estimated_input_tokens: percent,
             context_window: 100,
@@ -1096,14 +1111,22 @@ mod tests {
         };
         let threshold = CompactionPolicy::default().threshold_percent;
 
-        assert!(!is_prefire_window(&usage(74), threshold));
-        assert!(!usage(74).threshold_reached(threshold));
-        assert!(is_prefire_window(&usage(75), threshold));
-        assert!(!usage(75).threshold_reached(threshold));
-        assert!(is_prefire_window(&usage(84), threshold));
-        assert!(!usage(84).threshold_reached(threshold));
-        assert!(!is_prefire_window(&usage(85), threshold));
-        assert!(usage(85).threshold_reached(threshold));
+        assert_eq!(
+            context_compaction_action(&usage(74), threshold),
+            ContextCompactionAction::None
+        );
+        assert_eq!(
+            context_compaction_action(&usage(75), threshold),
+            ContextCompactionAction::Prefire
+        );
+        assert_eq!(
+            context_compaction_action(&usage(84), threshold),
+            ContextCompactionAction::Prefire
+        );
+        assert_eq!(
+            context_compaction_action(&usage(85), threshold),
+            ContextCompactionAction::Final
+        );
     }
 
     #[tokio::test]
@@ -1136,11 +1159,14 @@ mod tests {
         let mut mutated = original.clone();
         mutated[1] = model_text(ModelRole::User, "mutated prefix");
         assert!(actor.take_prefire(&mutated, 7).await.is_none());
+        assert!(actor.take_prefire(&mutated, 7).await.is_none());
 
         actor.prefire = ready_prefire(&original, original.len(), 7);
         assert!(actor.take_prefire(&original, 8).await.is_none());
+        assert!(actor.take_prefire(&original, 8).await.is_none());
 
         actor.prefire = ready_prefire(&original, original.len(), 7);
+        assert!(actor.take_prefire(&original[..1], 7).await.is_none());
         assert!(actor.take_prefire(&original[..1], 7).await.is_none());
     }
 

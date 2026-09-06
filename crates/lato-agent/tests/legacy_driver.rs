@@ -872,7 +872,13 @@ async fn invalid_two_pass_and_two_fallback_overflows_never_make_a_fourth_call() 
     ]));
 
     let error = compact_with_script(port.clone(), true).await.unwrap_err();
-    assert!(error.code.starts_with("compaction."), "{error:?}");
+    assert_eq!(error.code, "compaction.model_failed");
+    assert!(
+        error.message.contains("model.context_overflow")
+            && error.message.contains("scripted context overflow"),
+        "{}",
+        error.message
+    );
     assert_eq!(
         port.calls.load(Ordering::SeqCst),
         usize::from(CompactionPolicy::default().max_attempts)
@@ -901,7 +907,13 @@ async fn prepared_fitted_and_lossy_failures_stop_at_the_global_budget() {
     ]));
 
     let error = compact_with_script(port.clone(), false).await.unwrap_err();
-    assert!(error.code.starts_with("compaction."), "{error:?}");
+    assert_eq!(error.code, "compaction.model_failed");
+    assert!(
+        error.message.contains("model.script_exhausted")
+            && error.message.contains("compaction script exhausted"),
+        "{}",
+        error.message
+    );
     assert_eq!(
         port.calls.load(Ordering::SeqCst),
         usize::from(CompactionPolicy::default().max_attempts)

@@ -153,42 +153,54 @@ mod tests {
     }
 
     #[test]
-    fn split_is_exact_immediately_below_at_and_above_ninety_five_percent() {
-        let messages = (0..100)
-            .map(|_| text(ModelRole::User, "x".repeat(100)))
-            .collect::<Vec<_>>();
+    fn split_crosses_the_fixed_ninety_five_percent_target_by_token_weight() {
+        let lengths = [17, 61, 149, 337, 733, 1_601, 3_203, 127];
+        let messages = lengths
+            .map(|length| text(ModelRole::User, "x".repeat(length)))
+            .to_vec();
+        let weights = messages.iter().map(message_tokens).collect::<Vec<_>>();
+        assert!(weights.iter().max().unwrap() > &(weights.iter().min().unwrap() * 10));
 
-        for percent in [94, 95, 96] {
-            let split = split_for_two_pass(&messages, percent);
-            let target = split
-                .total_tokens
-                .saturating_mul(u64::from(percent))
-                .div_ceil(100);
-            assert!(split.index > 0 && split.index < messages.len());
-            assert!(split.prefix_tokens >= target);
-            let previous = split
-                .prefix_tokens
-                .saturating_sub(message_tokens(&messages[split.index - 1]));
-            assert!(previous < target, "percent={percent}, split={split:?}");
-        }
+        let split = split_for_two_pass(&messages, 95);
+        let target = split.total_tokens.saturating_mul(95).div_ceil(100);
+        let below = weights[..split.index - 1].iter().copied().sum::<u64>();
+        let at_or_above = weights[..split.index].iter().copied().sum::<u64>();
+
+        assert!(split.index > 0 && split.index < messages.len());
+        assert!(below < target, "prefix before boundary must be below 95%");
+        assert!(at_or_above >= target, "boundary message must reach 95%");
+        assert_eq!(split.prefix_tokens, at_or_above);
     }
 
     #[test]
-    fn split_never_severs_an_assistant_tool_call_and_result_pair() {
-        for pair_index in 1..40 {
-            let mut messages = (0..40)
-                .map(|_| text(ModelRole::User, "x".repeat(100)))
-                .collect::<Vec<_>>();
-            messages.insert(pair_index, tool_call("pair"));
-            messages.insert(pair_index + 1, tool_result("pair"));
+    fn split_extends_past_a_tool_result_when_the_pair_straddles_ninety_five_percent() {
+        let base = (0..60)
+            .map(|index| text(ModelRole::User, "x".repeat(40 + index * 3)))
+            .collect::<Vec<_>>();
+        let (messages, pair_index) = (1..base.len())
+            .find_map(|pair_index| {
+                let mut messages = base.clone();
+                messages.insert(pair_index, tool_call("pair"));
+                messages.insert(pair_index + 1, tool_result("pair"));
+                let weights = messages.iter().map(message_tokens).collect::<Vec<_>>();
+                let target = weights.iter().copied().sum::<u64>().saturating_mul(95);
+                let mut prefix = 0_u64;
+                let naive = weights
+                    .iter()
+                    .position(|weight| {
+                        prefix = prefix.saturating_add(*weight);
+                        prefix.saturating_mul(100) >= target
+                    })
+                    .map(|index| index + 1)
+                    .unwrap();
+                (naive == pair_index + 1).then_some((messages, pair_index))
+            })
+            .expect("fixture must place the assistant call across the 95% boundary");
 
-            let split = split_for_two_pass(&messages, 95);
-            assert_ne!(
-                split.index,
-                pair_index + 1,
-                "split severed tool pair inserted at {pair_index}"
-            );
-        }
+        let split = split_for_two_pass(&messages, 95);
+        assert_eq!(split.index, pair_index + 2);
+        assert_eq!(messages[pair_index].role, ModelRole::Assistant);
+        assert_eq!(messages[pair_index + 1].role, ModelRole::Tool);
     }
 
     #[test]
