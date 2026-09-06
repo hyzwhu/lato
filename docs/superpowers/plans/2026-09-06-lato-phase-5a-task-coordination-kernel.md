@@ -601,6 +601,7 @@ runtime resources without creating a crate cycle:
 ```rust
 struct RuntimeTaskRecord {
     node: TaskNode,
+    budget: BudgetAccount,
     workspace_lease: Option<WorkspaceLease>,
     reservation: Option<BudgetReservation>,
 }
