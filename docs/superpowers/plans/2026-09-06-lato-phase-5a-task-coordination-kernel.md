@@ -627,7 +627,15 @@ pub trait TaskChildControl: Send + Sync + 'static {
 }
 ```
 
-`TaskReporter::started` must use an acknowledgement. `TaskEventSink` receives cloned events after the state commit. The default sink is no-op; the test sink stores events.
+`ScopedTaskHandle` has a crate-private constructor and never exposes `inner` or
+an unrestricted `TaskHandle`; every public operation injects a `ScopedCaller`
+containing its stored root and task identity. Authorization permits the scoped
+task itself and its descendants only: a root scope can see its tree, while a
+child scope cannot inspect siblings, cousins, or ancestors.
+`TaskReporter::started` must use an acknowledgement.
+`TaskEventSink` receives cloned events after the state commit through a bounded
+dispatcher, never on the coordinator actor itself. The default sink is no-op;
+the test sink stores events.
 
 - [ ] **Step 4: Implement the actor skeleton and one transition path**
 
@@ -638,10 +646,26 @@ fn commit_transition(&mut self, task_id: TaskId, payload: TaskEventPayload) -> T
     self.sequence = self.sequence.checked_add(1).expect("task event sequence overflow");
     let envelope = TaskEventEnvelope::new(self.sequence, &self.state, task_id, payload);
     let _ = self.event_tx.send(envelope.clone());
-    self.event_sink.on_event(envelope.clone());
+    self.sink_dispatcher.try_send(envelope.clone());
     envelope
 }
 ```
+
+The sink dispatcher preserves accepted-event order on a dedicated bounded
+worker, catches sink panics, and never waits on the coordinator. Saturation is
+observable through a dropped-event counter; snapshots remain authoritative.
+The dispatcher owns a drained acknowledgement and sends it only after every
+accepted event was processed and all user-controlled sink captures were
+dropped. Shutdown closes dispatcher input, then waits only for a configured
+bound and returns `SinkShutdown::Drained`, or `SinkShutdown::TimedOutDetached`
+when arbitrary sink code remains blocked. Safe Rust cannot force-stop such a
+callback, so detachment is explicit and observable rather than silently
+reported as clean shutdown. Tests prove that panicking and blocked sinks do not
+change command acknowledgements or stop later coordinator commands, normal
+shutdown drains accepted events, and blocked shutdown returns the timeout
+outcome within its bound. A sink with a blocking `Drop` is covered by the same
+timeout regression; the actor never synchronously joins a worker until the
+post-drop acknowledgement proves joining is safe.
 
 Keep mutation immediately before this call and do not expose mutable state outside `CoordinatorState`.
 The actor-owned runtime record wraps the provider-neutral node and concrete
