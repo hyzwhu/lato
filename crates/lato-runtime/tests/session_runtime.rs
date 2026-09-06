@@ -613,20 +613,59 @@ async fn next_event(
 async fn events_through_turn_terminal(
     events: &mut tokio::sync::broadcast::Receiver<lato_core::EventEnvelope>,
 ) -> Vec<lato_core::EventEnvelope> {
-    let mut observed = Vec::new();
-    loop {
-        let event = next_event(events).await;
-        let terminal = matches!(
-            &event.payload,
-            EventPayload::TurnCompleted(_)
-                | EventPayload::TurnFailed { .. }
-                | EventPayload::TurnCancelled { .. }
-        );
-        observed.push(event);
-        if terminal {
-            return observed;
+    timeout(Duration::from_secs(1), async {
+        let mut observed = Vec::new();
+        loop {
+            let event = events
+                .recv()
+                .await
+                .expect("event channel closed before turn terminal");
+            let terminal = matches!(
+                &event.payload,
+                EventPayload::TurnCompleted(_)
+                    | EventPayload::TurnFailed { .. }
+                    | EventPayload::TurnCancelled { .. }
+            );
+            observed.push(event);
+            if terminal {
+                return observed;
+            }
         }
-    }
+    })
+    .await
+    .expect("turn event sequence exceeded its total deadline")
+}
+
+async fn shutdown_and_collect(
+    session: &lato_runtime::SessionHandle,
+    events: &mut tokio::sync::broadcast::Receiver<lato_core::EventEnvelope>,
+) -> Vec<lato_core::EventEnvelope> {
+    timeout(Duration::from_secs(1), session.submit(Command::Shutdown))
+        .await
+        .expect("shutdown command exceeded its deadline")
+        .unwrap();
+    let observed = timeout(Duration::from_secs(1), async {
+        let mut observed = Vec::new();
+        loop {
+            let event = events
+                .recv()
+                .await
+                .expect("event channel closed before session stop");
+            let stopped = matches!(&event.payload, EventPayload::SessionStopped);
+            observed.push(event);
+            if stopped {
+                return observed;
+            }
+        }
+    })
+    .await
+    .expect("shutdown event sequence exceeded its total deadline");
+    assert!(matches!(
+        events.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+            | Err(tokio::sync::broadcast::error::TryRecvError::Closed)
+    ));
+    observed
 }
 
 fn runtime_event_kind(payload: &EventPayload) -> &'static str {
@@ -855,15 +894,8 @@ async fn completed_prefire_is_never_emitted_installed_or_persisted() {
         .await
         .unwrap();
 
-    let mut observed = Vec::new();
-    loop {
-        let event = next_event(&mut events).await;
-        let terminal = matches!(event.payload, EventPayload::TurnCompleted(_));
-        observed.push(event);
-        if terminal {
-            break;
-        }
-    }
+    let mut observed = events_through_turn_terminal(&mut events).await;
+    observed.extend(shutdown_and_collect(&session, &mut events).await);
     assert_eq!(
         observed
             .iter()
@@ -1467,9 +1499,10 @@ async fn bootstrap_resumes_the_next_journal_sequence_without_duplicate_start() {
 
 #[tokio::test]
 async fn old_journal_without_phase_4c3_metadata_replays_and_runs_the_next_turn() {
+    let directory = tempfile::tempdir().unwrap();
     let sid = SessionId::from("session-old-journal");
     let old_turn = lato_core::TurnId::from("old-turn");
-    let store = Arc::new(MemoryEventStore::new());
+    let seed_store = FileEventStore::open(directory.path()).unwrap();
     let old_assistant = ModelMessage {
         role: ModelRole::Assistant,
         content: vec![ModelContent::Text {
@@ -1500,7 +1533,7 @@ async fn old_journal_without_phase_4c3_metadata_replays_and_runs_the_next_turn()
         ),
     ];
     for (sequence, (turn_id, record)) in old_records.into_iter().enumerate() {
-        store
+        seed_store
             .append(
                 JournalEnvelope {
                     schema_version: JOURNAL_SCHEMA_VERSION,
@@ -1516,7 +1549,10 @@ async fn old_journal_without_phase_4c3_metadata_replays_and_runs_the_next_turn()
             .await
             .unwrap();
     }
+    seed_store.shutdown(&sid).await.unwrap();
+    drop(seed_store);
 
+    let store = Arc::new(FileEventStore::open(directory.path()).unwrap());
     let bootstrap_replay = timeout(Duration::from_secs(1), store.replay(&sid))
         .await
         .expect("old journal replay timed out")
@@ -1554,7 +1590,8 @@ async fn old_journal_without_phase_4c3_metadata_replays_and_runs_the_next_turn()
         }))
         .await
         .unwrap();
-    let observed = events_through_turn_terminal(&mut events).await;
+    let mut observed = events_through_turn_terminal(&mut events).await;
+    observed.extend(shutdown_and_collect(&session, &mut events).await);
     assert_eq!(
         observed
             .iter()
@@ -1565,6 +1602,7 @@ async fn old_journal_without_phase_4c3_metadata_replays_and_runs_the_next_turn()
             "turn_started",
             "model_delta",
             "turn_completed",
+            "session_stopped",
         ]
     );
     assert_eq!(
@@ -1584,8 +1622,8 @@ async fn old_journal_without_phase_4c3_metadata_replays_and_runs_the_next_turn()
         .await
         .expect("continued old journal replay timed out")
         .expect("continued old journal replay failed");
-    assert_eq!(replay.envelopes.len(), 6);
-    assert_eq!(replay.projection.next_journal_sequence, 6);
+    assert_eq!(replay.envelopes.len(), 7);
+    assert_eq!(replay.projection.next_journal_sequence, 7);
     assert_eq!(
         replay
             .envelopes
@@ -1803,7 +1841,8 @@ async fn automatic_compaction_pre_marker_failure_retains_old_history() {
         .await
         .unwrap();
 
-    let observed = events_through_turn_terminal(&mut events).await;
+    let mut observed = events_through_turn_terminal(&mut events).await;
+    observed.extend(shutdown_and_collect(&session, &mut events).await);
     assert_eq!(
         observed
             .iter()
@@ -1815,7 +1854,29 @@ async fn automatic_compaction_pre_marker_failure_retains_old_history() {
             "compaction_started",
             "compaction_failed",
             "turn_failed",
+            "session_stopped",
         ]
+    );
+    assert_eq!(
+        observed
+            .iter()
+            .filter(|event| matches!(&event.payload, EventPayload::CompactionStarted { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        observed
+            .iter()
+            .filter(|event| matches!(&event.payload, EventPayload::CompactionFailed { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        observed
+            .iter()
+            .filter(|event| matches!(&event.payload, EventPayload::TurnFailed { .. }))
+            .count(),
+        1
     );
     let EventPayload::CompactionFailed { error, .. } = &observed[3].payload else {
         unreachable!("exact event ordering asserted above")
@@ -1847,6 +1908,14 @@ async fn automatic_compaction_pre_marker_failure_retains_old_history() {
                 &envelope.record,
                 JournalRecord::CompactionRequested { .. }
             ))
+            .count(),
+        1
+    );
+    assert_eq!(
+        replay
+            .envelopes
+            .iter()
+            .filter(|envelope| matches!(&envelope.record, JournalRecord::TurnFailed { .. }))
             .count(),
         1
     );
@@ -1900,7 +1969,8 @@ async fn automatic_compaction_post_marker_reconciliation_returns_committed_histo
         .await
         .unwrap();
 
-    let observed = events_through_turn_terminal(&mut events).await;
+    let mut observed = events_through_turn_terminal(&mut events).await;
+    observed.extend(shutdown_and_collect(&session, &mut events).await);
     assert_eq!(
         observed
             .iter()
@@ -1912,9 +1982,36 @@ async fn automatic_compaction_post_marker_reconciliation_returns_committed_histo
             "compaction_started",
             "compaction_completed",
             "turn_completed",
+            "session_stopped",
         ]
     );
-    let EventPayload::CompactionCompleted { warning, .. } = &observed[3].payload else {
+    assert_eq!(
+        observed
+            .iter()
+            .filter(|event| matches!(&event.payload, EventPayload::CompactionStarted { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        observed
+            .iter()
+            .filter(|event| matches!(&event.payload, EventPayload::CompactionCompleted { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        observed
+            .iter()
+            .filter(|event| matches!(&event.payload, EventPayload::TurnCompleted(_)))
+            .count(),
+        1
+    );
+    let EventPayload::CompactionCompleted {
+        checkpoint_id: event_checkpoint_id,
+        warning,
+        ..
+    } = &observed[3].payload
+    else {
         unreachable!("exact event ordering asserted above")
     };
     assert_eq!(
@@ -1931,16 +2028,23 @@ async fn automatic_compaction_post_marker_reconciliation_returns_committed_histo
         .expect("post-marker replay timed out")
         .expect("post-marker replay failed");
     assert_eq!(replay.projection.messages, replacement);
+    let replacement_checkpoint_ids = replay
+        .envelopes
+        .iter()
+        .filter_map(|envelope| match &envelope.record {
+            JournalRecord::HistoryProjectionReplaced { checkpoint_id, .. } => {
+                Some(checkpoint_id.as_str())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
     assert_eq!(
-        replay
-            .envelopes
-            .iter()
-            .filter(|envelope| matches!(
-                &envelope.record,
-                JournalRecord::HistoryProjectionReplaced { .. }
-            ))
-            .count(),
-        1
+        replacement_checkpoint_ids,
+        vec![event_checkpoint_id.as_str()]
+    );
+    assert_eq!(
+        replay.projection.active_checkpoint_id.as_deref(),
+        Some(event_checkpoint_id.as_str())
     );
     assert_eq!(
         replay
