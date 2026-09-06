@@ -439,7 +439,7 @@ use lato_workspace::{MemoryWorkspaceAllocator, WorkspaceAllocator, WorkspaceRequ
 
 #[tokio::test]
 async fn isolated_write_tasks_receive_distinct_leases() {
-    let allocator = MemoryWorkspaceAllocator::new("/workspace");
+    let allocator = MemoryWorkspaceAllocator::new("/workspace").unwrap();
     let first = allocator.allocate(WorkspaceRequest::new(TaskId::from("a"), WorkspaceIntent::IsolatedWorktree)).await.unwrap();
     let second = allocator.allocate(WorkspaceRequest::new(TaskId::from("b"), WorkspaceIntent::IsolatedWorktree)).await.unwrap();
     assert_ne!(first.id, second.id);
@@ -448,7 +448,7 @@ async fn isolated_write_tasks_receive_distinct_leases() {
 
 #[tokio::test]
 async fn release_is_idempotent() {
-    let allocator = MemoryWorkspaceAllocator::new("/workspace");
+    let allocator = MemoryWorkspaceAllocator::new("/workspace").unwrap();
     let lease = allocator.allocate(WorkspaceRequest::new(TaskId::from("a"), WorkspaceIntent::SharedReadOnly)).await.unwrap();
     allocator.release(&lease).await.unwrap();
     allocator.release(&lease).await.unwrap();
@@ -479,7 +479,8 @@ pub struct WorkspaceLease {
     pub task_id: TaskId,
     pub mode: WorkspaceMode,
     pub root: std::path::PathBuf,
-    pub resource_key: Option<String>,
+    pub resource_key: Option<std::path::PathBuf>,
+    provenance: Option<LeaseProvenance>,
 }
 
 #[derive(Clone, Debug)]
@@ -492,7 +493,27 @@ pub trait WorkspaceAllocator: Send + Sync + 'static {
 }
 ```
 
-The memory allocator must generate deterministic unique lease IDs with an atomic counter and track live leases under a Tokio mutex. It must not create directories or invoke Git.
+`MemoryWorkspaceAllocator::new(root) -> Result<Self, TaskError>` resolves and freezes the absolute
+root and shared-write resource key once. Construction returns `TaskError` when
+the process current directory cannot be read for a relative root. Later
+allocations reuse those frozen values and cannot drift when the process current
+directory or filesystem alias state changes.
+
+The memory allocator must generate process-unique lease IDs with an atomic
+counter and track live leases under a Tokio mutex. Authentic clones retain an
+allocator-scoped, per-lease opaque provenance token bound to the originally
+issued visible fields; serialization exposes only the lease metadata and
+deserialization sets provenance to `None`, so it does not recreate release
+authority. `release` first verifies issuer and every visible field against the
+per-lease provenance, even when the ID is already absent from the live map. It
+rejects a foreign, deserialized, or mutated/forged lease while remaining
+idempotent only for an unchanged authentic clone of the issued lease.
+Shared-write resource keys first absolutize relative roots, canonicalize when
+the target exists, and then use the crate's lossless `lock_key` platform
+normalization; they never use `Path::display()`.
+It must not create directories or invoke Git. Tests cover serde names and
+visible-field round trips, concurrent uniqueness, cross-allocator release,
+forged/deserialized release, and relative/absolute/symlink aliases.
 
 - [ ] **Step 4: Run workspace tests**
 
