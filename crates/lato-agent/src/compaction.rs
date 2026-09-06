@@ -340,13 +340,16 @@ mod tests {
         assert!(json.contains("read_file"));
         assert!(json.contains("call-1"));
         assert!(!json.contains(&"x".repeat(10_000)));
-        assert!(prepared.iter().all(|message| {
-            message.role != ModelRole::Tool
-                || matches!(
-                    message.content.as_slice(),
-                    [ModelContent::ToolResult { .. }]
-                )
-        }));
+        let bounded_result = prepared
+            .iter()
+            .find(|message| message_text(message).contains("[Tool result call-1:"))
+            .expect("bounded tool result text must be retained");
+        assert_eq!(bounded_result.role, ModelRole::User);
+        assert!(
+            prepared
+                .iter()
+                .all(|message| message.role != ModelRole::Tool)
+        );
     }
 
     #[test]

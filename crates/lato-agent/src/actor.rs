@@ -449,6 +449,10 @@ impl SessionActor {
         self.clear_prefire();
     }
 
+    pub(crate) fn automatic_compaction_allowed(&self, trigger: CompactionTrigger) -> bool {
+        self.context_tracker.automatic_compaction_allowed(trigger)
+    }
+
     fn emit_context_usage(&self, usage: ContextUsage) -> Result<(), String> {
         match &self.journal_events {
             Some(events) => events

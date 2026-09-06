@@ -1,12 +1,18 @@
 use async_trait::async_trait;
 use lato_agent::{
-    HistoryItem, PreparedModelSwitch, REQUIRED_SECTIONS, RuntimePromptOutcome, RuntimeSession,
-    default_fake_stream,
+    HistoryItem, PreparedModelSwitch, REQUIRED_SECTIONS, RuntimeCompactionOutcome,
+    RuntimePromptOutcome, RuntimeSession, default_fake_stream,
 };
 use lato_ai::{FakeModelStream, ModelMetadata, ModelStream, StreamPiece, adapt_model_endpoint};
-use lato_core::{CancelReason, ModelError};
+use lato_core::{CancelReason, ModelError, ModelErrorKind, Retryability};
 use lato_workspace::{FileLocks, SessionTrust};
-use std::sync::Arc;
+use std::{
+    collections::VecDeque,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 use tokio::sync::{Notify, mpsc};
 use tokio::time::{Duration, timeout};
 
@@ -152,6 +158,66 @@ fn endpoint(
         Arc::new(FakeModelStream::new(scripts)),
     )
     .unwrap()
+}
+
+struct CountingScriptStream {
+    scripts: Mutex<VecDeque<Vec<StreamPiece>>>,
+    calls: AtomicUsize,
+}
+
+impl CountingScriptStream {
+    fn new(scripts: Vec<Vec<StreamPiece>>) -> Self {
+        Self {
+            scripts: Mutex::new(scripts.into()),
+            calls: AtomicUsize::new(0),
+        }
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl ModelStream for CountingScriptStream {
+    async fn stream(
+        &self,
+        _prompt_bytes: usize,
+        _context: serde_json::Value,
+        tx: mpsc::Sender<StreamPiece>,
+    ) -> Result<(), ModelError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let script = self.scripts.lock().unwrap().pop_front().ok_or_else(|| {
+            ModelError::new(
+                "test.script_exhausted",
+                "unexpected model request",
+                Retryability::Never,
+            )
+        })?;
+        for piece in script {
+            tx.send(piece).await.map_err(|_| ModelError::cancelled())?;
+        }
+        Ok(())
+    }
+}
+
+struct AuthenticationFailureStream;
+
+#[async_trait]
+impl ModelStream for AuthenticationFailureStream {
+    async fn stream(
+        &self,
+        _prompt_bytes: usize,
+        _context: serde_json::Value,
+        _tx: mpsc::Sender<StreamPiece>,
+    ) -> Result<(), ModelError> {
+        Err(ModelError::new(
+            "model.auth",
+            "invalid api key for deterministic compaction failure",
+            Retryability::Never,
+        )
+        .with_kind(ModelErrorKind::Authentication))
+    }
 }
 
 fn healthy_summary() -> String {
@@ -306,6 +372,94 @@ async fn ordinary_cross_family_compaction_failure_keeps_the_new_model_with_a_war
 
     assert!(outcome.compaction_warning.is_some());
     assert_eq!(session.active_model().await.selection.model, "new");
+}
+
+#[tokio::test]
+async fn auth_suppression_blocks_immediate_model_switch_but_manual_compaction_still_runs() {
+    let cwd = std::env::current_dir().unwrap();
+    let (updates, mut updates_rx) = mpsc::unbounded_channel();
+    let initial = adapt_model_endpoint(
+        "fixture",
+        "old",
+        ModelMetadata {
+            context_window: Some(20_000),
+            model_family: Some("family-a".into()),
+        },
+        Arc::new(AuthenticationFailureStream),
+    )
+    .unwrap();
+    let session = RuntimeSession::new_with_endpoint(
+        "suppressed-switch".into(),
+        initial,
+        Arc::new(FileLocks::new()),
+        SessionTrust::for_headless_prompt(&cwd),
+        cwd.clone(),
+        updates,
+        None,
+    );
+    session
+        .replace_history(vec![
+            HistoryItem::System("system".into()),
+            HistoryItem::User("retain the objective".into()),
+            HistoryItem::AssistantText("prior-work-".repeat(6_800)),
+        ])
+        .await;
+
+    let error = timeout(
+        Duration::from_secs(2),
+        session.prompt("trigger deterministic automatic compaction failure".into()),
+    )
+    .await
+    .expect("automatic compaction failure path timed out")
+    .unwrap_err();
+    assert!(error.message.contains("model.auth"), "{error}");
+    assert!(
+        std::iter::from_fn(|| updates_rx.try_recv().ok()).any(|update| {
+            update["method"] == "lato/session/recovery"
+                && update["params"]["automaticCompactionSuppression"] == "auth"
+        })
+    );
+
+    let new_model = Arc::new(CountingScriptStream::new(vec![vec![StreamPiece::Text(
+        healthy_summary(),
+    )]]));
+    let active = adapt_model_endpoint(
+        "fixture",
+        "new",
+        ModelMetadata {
+            context_window: Some(32_000),
+            model_family: Some("family-b".into()),
+        },
+        new_model.clone(),
+    )
+    .unwrap();
+    let switched = timeout(
+        Duration::from_secs(2),
+        session.switch_model(PreparedModelSwitch { active }),
+    )
+    .await
+    .expect("suppressed model switch timed out")
+    .unwrap();
+    assert_eq!(switched.model, "new");
+    assert_eq!(
+        new_model.calls(),
+        0,
+        "suppressed immediate switch must not call the summary model"
+    );
+
+    let compacted = timeout(Duration::from_secs(2), session.compact(None))
+        .await
+        .expect("manual compaction timed out")
+        .unwrap();
+    assert!(matches!(
+        compacted,
+        RuntimeCompactionOutcome::Complete { .. }
+    ));
+    assert_eq!(
+        new_model.calls(),
+        1,
+        "manual compaction must bypass automatic suppression"
+    );
 }
 
 #[tokio::test]

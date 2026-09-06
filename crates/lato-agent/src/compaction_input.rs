@@ -28,16 +28,18 @@ pub fn prepare_compaction_input(
     stage: CompactionInputStage,
     input_budget_tokens: u64,
 ) -> Result<Vec<ModelMessage>, CompactionError> {
-    let prepared = match stage {
-        CompactionInputStage::Prepared | CompactionInputStage::Fitted => {
-            prepare_compaction_messages(source)?
+    match stage {
+        CompactionInputStage::Prepared => prepare_compaction_messages(source),
+        CompactionInputStage::Fitted => {
+            let fitted = fit_whole_units(source.to_vec(), input_budget_tokens.saturating_mul(4))?;
+            prepare_compaction_messages(&fitted)
         }
-        CompactionInputStage::Lossy => prepare_compaction_messages(&lossy_source(source))?,
-    };
-    if stage == CompactionInputStage::Prepared {
-        return Ok(prepared);
+        CompactionInputStage::Lossy => {
+            let fitted =
+                fit_whole_units(lossy_source(source), input_budget_tokens.saturating_mul(4))?;
+            prepare_compaction_messages(&fitted)
+        }
     }
-    fit_whole_units(prepared, input_budget_tokens.saturating_mul(4))
 }
 
 fn lossy_source(source: &[ModelMessage]) -> Vec<ModelMessage> {
@@ -256,8 +258,21 @@ mod tests {
         ];
         let fitted = prepare_compaction_input(&source, CompactionInputStage::Fitted, 250).unwrap();
         assert_eq!(fitted.first().unwrap().role, ModelRole::System);
-        assert!(message_text(fitted.last().unwrap()).contains("latest objective"));
-        assert!(!matches!(fitted.get(1), Some(message) if message.role == ModelRole::Tool));
+        assert!(
+            fitted
+                .iter()
+                .any(|message| message_text(message).contains("latest objective"))
+        );
+        let all = fitted
+            .iter()
+            .map(message_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            all.contains("[Tool call c1:"),
+            all.contains("[Tool result c1:")
+        );
+        assert!(!fitted.iter().any(|message| message.role == ModelRole::Tool));
     }
 
     #[test]

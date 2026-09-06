@@ -445,16 +445,22 @@ impl RuntimeSession {
         let mut compaction_warning = None;
         match switch {
             SwitchCompaction::Immediate => {
-                match self
-                    .compact_with_gate_held(CompactionTrigger::ModelSwitch, None, false, gate)
+                if self
+                    .driver
+                    .automatic_compaction_allowed(CompactionTrigger::ModelSwitch)
                     .await
                 {
-                    Ok(RuntimeCompactionOutcome::Complete { warning, .. }) => {
-                        compaction_warning = warning;
+                    match self
+                        .compact_with_gate_held(CompactionTrigger::ModelSwitch, None, false, gate)
+                        .await
+                    {
+                        Ok(RuntimeCompactionOutcome::Complete { warning, .. }) => {
+                            compaction_warning = warning;
+                        }
+                        Ok(RuntimeCompactionOutcome::Cancelled) => {}
+                        Err(error) if is_auth_failure(&error) => return Err(error),
+                        Err(error) => compaction_warning = Some(error),
                     }
-                    Ok(RuntimeCompactionOutcome::Cancelled) => {}
-                    Err(error) if is_auth_failure(&error) => return Err(error),
-                    Err(error) => compaction_warning = Some(error),
                 }
             }
             SwitchCompaction::BeforeNextSample => {

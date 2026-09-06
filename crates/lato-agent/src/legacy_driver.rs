@@ -163,6 +163,17 @@ impl LegacyTurnDriver {
     pub async fn context_budget_changed(&self) {
         self.state.lock().await.actor.context_budget_changed();
     }
+
+    pub(crate) async fn automatic_compaction_allowed(
+        &self,
+        trigger: lato_core::CompactionTrigger,
+    ) -> bool {
+        self.state
+            .lock()
+            .await
+            .actor
+            .automatic_compaction_allowed(trigger)
+    }
 }
 
 #[async_trait]
