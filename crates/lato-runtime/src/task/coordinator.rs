@@ -3,16 +3,18 @@
 // Lato changes: bounded Tokio actor with a single committed root transition path
 
 use crate::task::admission::{AdmissionDecision, decide};
+use crate::task::query::{BlockingWaiter, ForegroundWaiter, caller_owns, inspection};
 use crate::task::queue::{QueuedTask, SpawnQueue};
 use crate::task::spawn::{
     PendingSpawnOccupancy, reserve, validate_profile_authority, validate_structure,
 };
 use crate::task::state::{CoordinatorState, RuntimeTaskRecord};
 use crate::task::{
-    CoordinatorConfig, InspectCaller, RunnerEvent, ScopedTaskHandle, SinkShutdown,
-    SpawnDisposition, SpawnTaskRequest, TaskCallbackKind, TaskChildControl, TaskCommand,
-    TaskCommandSender, TaskCompletion, TaskEventEnvelope, TaskEventPayload, TaskEventSink,
-    TaskHandle, TaskReporter, TaskRunRequest, TaskRunner, coordinator_closed, root_node,
+    CompletionDisposition, CoordinatorConfig, InspectCaller, RunnerEvent, ScopedTaskHandle,
+    SinkShutdown, SpawnDisposition, SpawnMode, SpawnTaskRequest, TaskCallbackKind,
+    TaskChildControl, TaskCommand, TaskCommandSender, TaskCompletion, TaskEventEnvelope,
+    TaskEventPayload, TaskEventSink, TaskHandle, TaskReporter, TaskRunRequest, TaskRunner,
+    WaitOutcome, coordinator_closed, root_node,
 };
 use futures_util::{
     FutureExt, StreamExt,
@@ -38,6 +40,7 @@ struct PendingSpawn {
     parent_id: TaskId,
     request: SpawnTaskRequest,
     reply: oneshot::Sender<Result<SpawnDisposition, TaskError>>,
+    enqueued_at: Instant,
 }
 
 struct ProfileValidation {
@@ -144,6 +147,11 @@ pub struct TaskCoordinator<R: TaskRunner, A: WorkspaceAllocator> {
     validation_results: HashMap<TaskId, Result<(), TaskError>>,
     cleanup_inflight: HashSet<TaskId>,
     pending_completions: HashMap<TaskId, TaskCompletion>,
+    waiters: HashMap<TaskId, Vec<BlockingWaiter>>,
+    foreground_waiters: HashMap<TaskId, ForegroundWaiter>,
+    completed_order: VecDeque<TaskId>,
+    next_queue_reap: Instant,
+    inspection_loads: FuturesUnordered<BoxFuture<'static, ()>>,
     shutdown: Option<ShutdownState>,
     weak_handle: TaskHandle,
     sequence: u64,
@@ -180,6 +188,7 @@ where
         callback_result_tx,
         callback_drained_tx,
     );
+    let next_queue_reap = Instant::now() + config.queued_reap_interval;
     let coordinator = TaskCoordinator {
         queue: SpawnQueue::new(config.max_queue),
         config,
@@ -212,6 +221,11 @@ where
         validation_results: HashMap::new(),
         cleanup_inflight: HashSet::new(),
         pending_completions: HashMap::new(),
+        waiters: HashMap::new(),
+        foreground_waiters: HashMap::new(),
+        completed_order: VecDeque::new(),
+        next_queue_reap,
+        inspection_loads: FuturesUnordered::new(),
         shutdown: None,
         weak_handle,
         sequence: 0,
@@ -221,11 +235,387 @@ where
 }
 
 impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
-    pub async fn run(mut self) {
-        let mut reap = tokio::time::interval(self.config.queued_reap_interval);
-        reap.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    fn next_deadline(&self) -> Instant {
+        let mut deadline = self.next_queue_reap;
+        for candidate in self.cancel_deadlines.values().copied() {
+            deadline = deadline.min(candidate);
+        }
+        if let Some(shutdown) = &self.shutdown {
+            deadline = deadline.min(shutdown.deadline);
+        }
+        for waiter in self.waiters.values().flatten() {
+            deadline = deadline.min(waiter.deadline);
+        }
+        for candidate in self
+            .foreground_waiters
+            .values()
+            .filter_map(|waiter| waiter.deadline)
+        {
+            deadline = deadline.min(candidate);
+        }
+        deadline
+    }
+
+    async fn process_deadlines(&mut self) {
+        let now = Instant::now();
+        if self.next_queue_reap <= now {
+            self.next_queue_reap = now + self.config.queued_reap_interval;
+        }
+        self.reap_cancelled().await;
+        self.expire_waiters(now);
+        self.expire_foreground(now);
+        if self
+            .shutdown
+            .as_ref()
+            .is_some_and(|shutdown| shutdown.deadline <= now)
+        {
+            self.inspection_loads = FuturesUnordered::new();
+        }
+    }
+
+    fn register_waiter(
+        &mut self,
+        task_id: TaskId,
+        caller: InspectCaller,
+        timeout: std::time::Duration,
+        reply: oneshot::Sender<Result<WaitOutcome, TaskError>>,
+    ) {
+        if !caller_owns(&self.state, &caller, &task_id) {
+            let _ = reply.send(Ok(WaitOutcome::NotFoundOrNotOwned));
+            return;
+        }
+        let snapshot = self
+            .state
+            .inspection(&task_id)
+            .expect("authorized wait target remains registered");
+        if snapshot.node.status.is_terminal() {
+            let mut disposition = self.state.tasks[&task_id]
+                .completion_disposition
+                .unwrap_or_default();
+            disposition.waiter_delivered = true;
+            disposition.should_surface = false;
+            let mut snapshot = self
+                .state
+                .inspection(&task_id)
+                .expect("terminal waiter target remains registered");
+            snapshot.completion_disposition = Some(disposition);
+            if reply.send(Ok(WaitOutcome::Finished(snapshot))).is_ok() {
+                self.state
+                    .tasks
+                    .get_mut(&task_id)
+                    .expect("terminal waiter target remains registered")
+                    .completion_disposition = Some(disposition);
+            }
+            return;
+        }
+        let total_waiters: usize =
+            self.waiters.values().map(Vec::len).sum::<usize>() + self.foreground_waiters.len();
+        let per_task = self.waiters.get(&task_id).map_or(0, Vec::len);
+        if total_waiters >= self.config.max_waiters || per_task >= self.config.max_waiters_per_task
+        {
+            let _ = reply.send(Err(TaskError::new(
+                TaskErrorCode::RetentionLimit,
+                "task waiter capacity is exhausted",
+            )));
+            return;
+        }
+        let timeout = timeout.min(self.config.waiter_timeout_cap);
+        if timeout.is_zero() {
+            let _ = reply.send(Ok(WaitOutcome::TimedOut(snapshot)));
+            return;
+        }
+        self.waiters
+            .entry(task_id)
+            .or_default()
+            .push(BlockingWaiter {
+                deadline: Instant::now() + timeout,
+                reply,
+            });
+    }
+
+    fn register_foreground_waiter(
+        &mut self,
+        task_id: TaskId,
+        caller: InspectCaller,
+        reply: oneshot::Sender<Result<CompletionDisposition, TaskError>>,
+    ) {
+        if !caller_owns(&self.state, &caller, &task_id) {
+            let _ = reply.send(Err(not_found()));
+            return;
+        }
+        let record = self
+            .state
+            .tasks
+            .get(&task_id)
+            .expect("authorized foreground target remains registered");
+        if record.node.status.is_terminal() {
+            let mut disposition = record.completion_disposition.unwrap_or_default();
+            disposition.foreground_delivered = true;
+            disposition.should_surface = false;
+            if reply.send(Ok(disposition)).is_ok() {
+                self.state
+                    .tasks
+                    .get_mut(&task_id)
+                    .expect("terminal foreground target remains registered")
+                    .completion_disposition = Some(disposition);
+            }
+            return;
+        }
+        let mode = record.spawn_mode.unwrap_or(SpawnMode::Background);
+        if mode == SpawnMode::Background {
+            let disposition = CompletionDisposition {
+                backgrounded: true,
+                ..record.completion_disposition.unwrap_or_default()
+            };
+            let _ = reply.send(Ok(disposition));
+            return;
+        }
+        let waiter_count =
+            self.foreground_waiters.len() + self.waiters.values().map(Vec::len).sum::<usize>();
+        if self.foreground_waiters.contains_key(&task_id) || waiter_count >= self.config.max_waiters
+        {
+            let _ = reply.send(Err(TaskError::new(
+                TaskErrorCode::RetentionLimit,
+                "foreground waiter capacity is exhausted",
+            )));
+            return;
+        }
+        let deadline = (mode == SpawnMode::Foreground)
+            .then(|| record.enqueued_at + self.config.foreground_budget);
+        self.foreground_waiters
+            .insert(task_id.clone(), ForegroundWaiter { deadline, reply });
+        if deadline.is_some_and(|deadline| deadline <= Instant::now()) {
+            self.expire_foreground(Instant::now());
+        }
+    }
+
+    fn expire_waiters(&mut self, now: Instant) {
+        let task_ids: Vec<_> = self.waiters.keys().cloned().collect();
+        for task_id in task_ids {
+            let snapshot = self.state.inspection(&task_id);
+            let Some(waiters) = self.waiters.remove(&task_id) else {
+                continue;
+            };
+            let mut retained = Vec::with_capacity(waiters.len());
+            for waiter in waiters {
+                if waiter.reply.is_closed() {
+                    continue;
+                }
+                if waiter.deadline <= now {
+                    if let Some(snapshot) = snapshot.clone() {
+                        let _ = waiter.reply.send(Ok(WaitOutcome::TimedOut(snapshot)));
+                    }
+                } else {
+                    retained.push(waiter);
+                }
+            }
+            if !retained.is_empty() {
+                self.waiters.insert(task_id, retained);
+            }
+        }
+    }
+
+    fn expire_foreground(&mut self, now: Instant) {
+        let expired: Vec<_> = self
+            .foreground_waiters
+            .iter()
+            .filter(|(_, waiter)| {
+                waiter.reply.is_closed() || waiter.deadline.is_some_and(|d| d <= now)
+            })
+            .map(|(task_id, _)| task_id.clone())
+            .collect();
+        for task_id in expired {
+            let waiter = self
+                .foreground_waiters
+                .remove(&task_id)
+                .expect("selected foreground waiter exists");
+            let workflow_owned = matches!(
+                &self.state.tasks[&task_id].node.owner,
+                lato_core::TaskOwner::Workflow { .. }
+            );
+            let mut disposition = self.state.tasks[&task_id]
+                .completion_disposition
+                .unwrap_or_default();
+            disposition.backgrounded = true;
+            let delivered = waiter.reply.send(Ok(disposition)).is_ok();
+            let workflow_drop = !delivered && workflow_owned;
+            disposition.backgrounded = delivered || !workflow_drop;
+            self.state
+                .tasks
+                .get_mut(&task_id)
+                .expect("foreground task remains registered")
+                .completion_disposition = Some(disposition);
+            if workflow_drop {
+                self.state.tasks[&task_id].cancellation.cancel();
+            }
+            if delivered {
+                self.commit_transition(task_id, TaskEventPayload::Backgrounded);
+            } else {
+                self.commit_transition(task_id, TaskEventPayload::ForegroundReleased);
+            }
+        }
+    }
+
+    fn resolve_terminal_observers(&mut self, task_id: &TaskId) {
+        let mut disposition = self.state.tasks[task_id]
+            .completion_disposition
+            .unwrap_or_default();
+        if let Some(waiter) = self.foreground_waiters.remove(task_id)
+            && waiter
+                .reply
+                .send(Ok(CompletionDisposition {
+                    foreground_delivered: true,
+                    should_surface: false,
+                    ..disposition
+                }))
+                .is_ok()
+        {
+            disposition.foreground_delivered = true;
+        }
+
+        let mut waiter_delivered = false;
+        if let Some(waiters) = self.waiters.remove(task_id) {
+            let snapshot = self
+                .state
+                .inspection(task_id)
+                .expect("terminal waiter target remains registered");
+            for waiter in waiters {
+                if waiter
+                    .reply
+                    .send(Ok(WaitOutcome::Finished(snapshot.clone())))
+                    .is_ok()
+                {
+                    waiter_delivered = true;
+                }
+            }
+        }
+        disposition.waiter_delivered |= waiter_delivered;
+        disposition.should_surface = !disposition.foreground_delivered
+            && !disposition.waiter_delivered
+            && !disposition.explicitly_killed;
+        self.state
+            .tasks
+            .get_mut(task_id)
+            .expect("terminal observer target remains registered")
+            .completion_disposition = Some(disposition);
+    }
+
+    fn retain_completed(&mut self, _task_id: TaskId) {
         loop {
-            if self.shutdown.is_some() && self.jobs.is_empty() && self.validations.is_empty() {
+            let mut eligible: Vec<_> =
+                self.state
+                    .tasks
+                    .iter()
+                    .filter(|(task_id, record)| {
+                        record.node.parent_id.is_some()
+                            && record.node.status.is_terminal()
+                            && record.workspace_lease.is_none()
+                            && record.reservation.is_none()
+                            && record.cleanup_error.is_none()
+                            && !self.completed_order.contains(task_id)
+                            && !self.state.tasks.values().any(|candidate| {
+                                candidate.node.parent_id.as_ref() == Some(*task_id)
+                            })
+                    })
+                    .map(|(task_id, record)| (record.last_event_sequence, task_id.clone()))
+                    .collect();
+            eligible.sort_by_key(|(sequence, _)| *sequence);
+            for (_, task_id) in eligible {
+                self.completed_order.push_back(task_id);
+            }
+            let retained_completed = self
+                .state
+                .tasks
+                .values()
+                .filter(|record| {
+                    record.node.parent_id.is_some()
+                        && record.node.status.is_terminal()
+                        && record.workspace_lease.is_none()
+                        && record.reservation.is_none()
+                        && record.cleanup_error.is_none()
+                })
+                .count();
+            if retained_completed <= self.config.max_completed {
+                break;
+            }
+            let Some(evicted) = self.completed_order.pop_front() else {
+                // Terminal ancestors remain live authority/budget anchors until
+                // their descendants leave the registry. `max_total_tasks`
+                // bounds these non-evictable anchors independently.
+                break;
+            };
+            self.commit_transition(evicted.clone(), TaskEventPayload::CompletedRecordEvicted);
+            self.waiters.remove(&evicted);
+            self.foreground_waiters.remove(&evicted);
+            self.state.tasks.remove(&evicted);
+        }
+    }
+
+    fn reply_with_loaded_inspection(
+        &mut self,
+        result: Result<crate::task::TaskInspection, TaskError>,
+        reply: oneshot::Sender<Result<crate::task::TaskInspection, TaskError>>,
+    ) {
+        let Ok(mut result) = result else {
+            let _ = reply.send(result);
+            return;
+        };
+        let Some(output_ref) = result
+            .snapshot
+            .result
+            .as_ref()
+            .and_then(|task_result| task_result.output_ref.clone())
+        else {
+            let _ = reply.send(Ok(result));
+            return;
+        };
+        let runner = Arc::clone(&self.runner);
+        let timeout = self.config.output_load_timeout;
+        if self.inspection_loads.len() >= self.config.max_output_loads {
+            let _ = reply.send(Err(TaskError::new(
+                TaskErrorCode::RetentionLimit,
+                "persisted output load capacity is exhausted",
+            )));
+            return;
+        }
+        self.inspection_loads.push(Box::pin(async move {
+            let load = std::panic::AssertUnwindSafe(runner.load_persisted_output(&output_ref))
+                .catch_unwind();
+            let loaded = match tokio::time::timeout(timeout, load).await {
+                Ok(Ok(value)) => value,
+                Ok(Err(_)) => Err(TaskError::new(
+                    TaskErrorCode::RunnerPanic,
+                    "task runner panicked while loading persisted output",
+                )),
+                Err(_) => Err(TaskError::new(
+                    TaskErrorCode::RunnerProtocolViolation,
+                    "persisted task output load timed out",
+                )),
+            };
+            match loaded {
+                Ok(Some(output)) => {
+                    if let Some(task_result) = result.snapshot.result.as_mut() {
+                        task_result.output = output;
+                    }
+                    let _ = reply.send(Ok(result));
+                }
+                Ok(None) => {
+                    let _ = reply.send(Ok(result));
+                }
+                Err(error) => {
+                    let _ = reply.send(Err(error));
+                }
+            }
+        }));
+    }
+
+    pub async fn run(mut self) {
+        loop {
+            if self.shutdown.is_some()
+                && self.jobs.is_empty()
+                && self.validations.is_empty()
+                && self.inspection_loads.is_empty()
+            {
                 let callbacks_drained = self.shutdown_callbacks().await;
                 while let Ok(outcome) = self.callback_rx.try_recv() {
                     self.handle_callback_outcome(outcome);
@@ -257,6 +647,7 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
                 }
                 break;
             }
+            let deadline = self.next_deadline();
             tokio::select! {
                 command = self.command_rx.recv(), if !self.command_channel_closed => {
                     if let Some(command) = command {
@@ -288,7 +679,8 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
                         self.handle_callback_outcome(callback);
                     }
                 }
-                _ = reap.tick() => self.reap_cancelled().await,
+                _ = self.inspection_loads.next(), if !self.inspection_loads.is_empty() => {}
+                _ = tokio::time::sleep_until(deadline) => self.process_deadlines().await,
             }
         }
     }
@@ -307,32 +699,60 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
                 root_id,
                 parent_id,
                 request,
+                enqueued_at,
                 reply,
             } => {
-                self.begin_spawn(root_id, parent_id, *request, reply);
+                self.begin_spawn(root_id, parent_id, *request, enqueued_at, reply);
             }
             TaskCommand::Inspect {
                 task_id: target_task_id,
                 caller,
                 reply,
             } => {
-                let authorized = match caller {
-                    InspectCaller::Admin => true,
-                    InspectCaller::Scoped {
-                        root_id,
-                        task_id: requester_task_id,
-                    } => self.state.is_self_or_descendant(
-                        &root_id,
-                        &requester_task_id,
-                        &target_task_id,
-                    ),
-                };
-                let result = authorized
+                let result = caller_owns(&self.state, &caller, &target_task_id)
                     .then(|| self.state.inspection(&target_task_id))
                     .flatten()
                     .ok_or_else(not_found);
                 let _ = reply.send(result);
             }
+            TaskCommand::InspectDetailed {
+                task_id: target_task_id,
+                caller,
+                reply,
+            } => {
+                let result = caller_owns(&self.state, &caller, &target_task_id)
+                    .then(|| self.state.inspection(&target_task_id))
+                    .flatten()
+                    .map(inspection)
+                    .ok_or_else(not_found);
+                self.reply_with_loaded_inspection(result, reply);
+            }
+            TaskCommand::ListRunning { caller, reply } => {
+                let snapshots = self
+                    .state
+                    .tasks
+                    .keys()
+                    .filter(|task_id| caller_owns(&self.state, &caller, task_id))
+                    .filter_map(|task_id| self.state.inspection(task_id))
+                    .filter(|snapshot| {
+                        snapshot.node.parent_id.is_some()
+                            && (matches!(snapshot.node.status, TaskStatus::Preparing)
+                                || snapshot.node.status.is_running())
+                    })
+                    .collect();
+                let _ = reply.send(snapshots);
+            }
+            TaskCommand::Wait {
+                task_id,
+                caller,
+                timeout,
+                reply,
+            } => self.register_waiter(task_id, caller, timeout, reply),
+            TaskCommand::ForegroundWait {
+                task_id,
+                caller,
+                reply,
+            } => self.register_foreground_waiter(task_id, caller, reply),
             TaskCommand::RegistryCounts { reply } => {
                 let _ = reply.send(self.state.counts(
                     self.dropped_sink_events,
@@ -378,6 +798,12 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
                 depth: 0,
                 cleanup_error: None,
                 last_event_sequence: 0,
+                progress: Default::default(),
+                usage: Default::default(),
+                result: None,
+                completion_disposition: None,
+                spawn_mode: None,
+                enqueued_at: Instant::now(),
             },
         );
         self.commit_transition(task_id, TaskEventPayload::RootRegistered);
@@ -416,6 +842,7 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
         root_id: TaskId,
         parent_id: TaskId,
         request: SpawnTaskRequest,
+        enqueued_at: Instant,
         reply: oneshot::Sender<Result<SpawnDisposition, TaskError>>,
     ) {
         if self.shutdown.is_some() {
@@ -467,6 +894,7 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
                 parent_id,
                 request,
                 reply,
+                enqueued_at,
             },
         );
         self.validation_order.push_back(task_id.clone());
@@ -519,13 +947,29 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
             let Some(pending) = self.pending_spawns.remove(&task_id) else {
                 continue;
             };
+            let workflow_owned = self
+                .state
+                .tasks
+                .get(&pending.parent_id)
+                .is_some_and(|parent| {
+                    matches!(&parent.node.owner, lato_core::TaskOwner::Workflow { .. })
+                });
+            if workflow_owned && pending.reply.is_closed() {
+                continue;
+            }
             let result = self.finish_spawn(
                 pending.root_id,
                 pending.parent_id,
                 pending.request,
+                pending.enqueued_at,
                 validation,
             );
-            let _ = pending.reply.send(result);
+            if let Err(Ok(disposition)) = pending.reply.send(result)
+                && workflow_owned
+                && let Some(record) = self.state.tasks.get(&disposition.task_id)
+            {
+                record.cancellation.cancel();
+            }
         }
     }
 
@@ -534,6 +978,7 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
         root_id: TaskId,
         parent_id: TaskId,
         request: SpawnTaskRequest,
+        enqueued_at: Instant,
         profile_validation: Result<(), TaskError>,
     ) -> Result<SpawnDisposition, TaskError> {
         if self.shutdown.is_some() {
@@ -592,9 +1037,30 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
                 depth: structure.depth,
                 cleanup_error: None,
                 last_event_sequence: 0,
+                progress: Default::default(),
+                usage: Default::default(),
+                result: None,
+                completion_disposition: None,
+                spawn_mode: Some(if request.profile.definition_background {
+                    SpawnMode::Background
+                } else {
+                    request.mode
+                }),
+                enqueued_at,
             },
         );
         self.commit_transition(task_id.clone(), TaskEventPayload::SpawnAccepted);
+        if request.profile.definition_background || request.mode == SpawnMode::Background {
+            self.state
+                .tasks
+                .get_mut(&task_id)
+                .expect("accepted task remains registered")
+                .completion_disposition = Some(CompletionDisposition {
+                backgrounded: true,
+                ..CompletionDisposition::default()
+            });
+            self.commit_transition(task_id.clone(), TaskEventPayload::Backgrounded);
+        }
 
         match admission {
             AdmissionDecision::Start => {
@@ -653,14 +1119,32 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
                 depth: structure.depth,
                 cleanup_error: None,
                 last_event_sequence: 0,
+                progress: Default::default(),
+                usage: Default::default(),
+                result: Some(lato_core::TaskResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(error.clone()),
+                    usage: Default::default(),
+                    duration_ms: 0,
+                    output_ref: None,
+                }),
+                completion_disposition: Some(CompletionDisposition {
+                    should_surface: true,
+                    ..CompletionDisposition::default()
+                }),
+                spawn_mode: Some(request.mode),
+                enqueued_at: Instant::now(),
             },
         );
         self.commit_transition(
-            task_id,
+            task_id.clone(),
             TaskEventPayload::AdmissionRejected {
                 error: error.clone(),
             },
         );
+        self.resolve_terminal_observers(&task_id);
+        self.retain_completed(task_id.clone());
         Err(error)
     }
 
@@ -785,7 +1269,7 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
         }
     }
 
-    async fn complete_task(&mut self, task_id: TaskId, output: crate::task::TaskRunOutput) {
+    async fn complete_task(&mut self, task_id: TaskId, mut output: crate::task::TaskRunOutput) {
         let Some(status) = self
             .state
             .tasks
@@ -810,6 +1294,26 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
         }
         self.set_status(&task_id, TaskStatus::Verifying);
         self.commit_transition(task_id.clone(), TaskEventPayload::VerificationStarted);
+        if output.result.output_ref.is_none() {
+            output.result.output_ref = output.external_snapshot_ref.take();
+        }
+        if output.result.output_ref.is_some() {
+            let cap = self.state.tasks[&task_id]
+                .node
+                .result_contract
+                .max_output_bytes;
+            truncate_utf8(&mut output.result.output, cap);
+        }
+        self.state
+            .tasks
+            .get_mut(&task_id)
+            .expect("completed task remains registered")
+            .result = Some(output.result.clone());
+        self.state
+            .tasks
+            .get_mut(&task_id)
+            .expect("completed task remains registered")
+            .usage = output.result.usage.clone();
         if output.result.success {
             self.set_status(&task_id, TaskStatus::Completed);
             self.commit_transition(
@@ -833,6 +1337,7 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
             result: output.result,
         };
         self.pending_completions.insert(task_id.clone(), completion);
+        self.resolve_terminal_observers(&task_id);
         self.cleanup_terminal(&task_id).await;
     }
 
@@ -849,7 +1354,20 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
             return;
         }
         self.set_status(&task_id, TaskStatus::Failed);
+        self.state
+            .tasks
+            .get_mut(&task_id)
+            .expect("failed task remains registered")
+            .result = Some(lato_core::TaskResult {
+            success: false,
+            output: String::new(),
+            error: Some(error.clone()),
+            usage: Default::default(),
+            duration_ms: 0,
+            output_ref: None,
+        });
         self.commit_transition(task_id.clone(), TaskEventPayload::Failed { error });
+        self.resolve_terminal_observers(&task_id);
         self.cleanup_terminal(&task_id).await;
     }
 
@@ -916,6 +1434,7 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
                 completion,
             });
         }
+        self.retain_completed(task_id.clone());
         if self.shutdown.is_none() {
             self.promote_queue();
         }
@@ -1034,7 +1553,9 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
             self.queue
                 .remove_matching(|queued| queued.task_id == task_id);
             self.set_status(&task_id, TaskStatus::Cancelled);
+            self.record_cancelled_result(&task_id);
             self.commit_transition(task_id.clone(), TaskEventPayload::Cancelled);
+            self.resolve_terminal_observers(&task_id);
             self.cleanup_terminal(&task_id).await;
             return;
         }
@@ -1123,7 +1644,9 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
             );
             if cancellation_requested {
                 self.set_status(&task_id, TaskStatus::Cancelled);
+                self.record_cancelled_result(&task_id);
                 self.commit_transition(task_id.clone(), TaskEventPayload::Cancelled);
+                self.resolve_terminal_observers(&task_id);
                 self.cleanup_terminal(&task_id).await;
             } else {
                 self.launch_runner(task_id);
@@ -1132,7 +1655,9 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
         }
         if cancellation_requested {
             self.set_status(&task_id, TaskStatus::Cancelled);
+            self.record_cancelled_result(&task_id);
             self.commit_transition(task_id.clone(), TaskEventPayload::Cancelled);
+            self.resolve_terminal_observers(&task_id);
             self.cleanup_terminal(&task_id).await;
         } else {
             match exit {
@@ -1156,6 +1681,29 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
                 }
             }
         }
+    }
+
+    fn record_cancelled_result(&mut self, task_id: &TaskId) {
+        let record = self
+            .state
+            .tasks
+            .get_mut(task_id)
+            .expect("cancelled task remains registered");
+        record.result = Some(lato_core::TaskResult {
+            success: false,
+            output: String::new(),
+            error: Some(TaskError::new(
+                TaskErrorCode::Cancelled,
+                "task was cancelled",
+            )),
+            usage: Default::default(),
+            duration_ms: 0,
+            output_ref: None,
+        });
+        let mut disposition = record.completion_disposition.unwrap_or_default();
+        disposition.explicitly_killed = true;
+        disposition.should_surface = false;
+        record.completion_disposition = Some(disposition);
     }
 
     fn finish_failed_lease_cleanup(&mut self, task_id: &TaskId, error: TaskError) {
@@ -1257,10 +1805,22 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
                 let _ = acknowledgement.send(accepted);
             }
             RunnerEvent::Usage { task_id, usage } => {
-                let _ = (task_id, usage);
+                if let Some(record) = self.state.tasks.get_mut(&task_id)
+                    && !record.node.status.is_terminal()
+                    && usage.total_tokens >= record.usage.total_tokens
+                    && usage.tool_calls >= record.usage.tool_calls
+                {
+                    record.usage = usage.clone();
+                    self.commit_transition(task_id, TaskEventPayload::UsageUpdated { usage });
+                }
             }
             RunnerEvent::Progress { task_id, progress } => {
-                let _ = (task_id, progress);
+                if let Some(record) = self.state.tasks.get_mut(&task_id)
+                    && !record.node.status.is_terminal()
+                    && progress.completed_units >= record.progress.completed_units
+                {
+                    record.progress = progress;
+                }
             }
         }
     }
@@ -1443,4 +2003,15 @@ fn not_found() -> TaskError {
         TaskErrorCode::NotFoundOrNotOwned,
         "task was not found in the requested scope",
     )
+}
+
+fn truncate_utf8(value: &mut String, max_bytes: usize) {
+    if value.len() <= max_bytes {
+        return;
+    }
+    let mut boundary = max_bytes;
+    while boundary > 0 && !value.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    value.truncate(boundary);
 }

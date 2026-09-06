@@ -356,6 +356,12 @@ mod tests {
             depth: 0,
             cleanup_error: None,
             last_event_sequence: 0,
+            progress: Default::default(),
+            usage: Default::default(),
+            result: None,
+            completion_disposition: None,
+            spawn_mode: None,
+            enqueued_at: tokio::time::Instant::now(),
         }
     }
 

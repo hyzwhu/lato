@@ -193,6 +193,14 @@ pub trait TaskRunner: Send + Sync + 'static {
     /// an implementation-owned bounded worker that it can join.
     async fn validate_profile(&self, profile: &AgentProfile) -> Result<(), TaskError>;
 
+    /// Loads runner-owned output referenced by a retained result.
+    ///
+    /// The coordinator invokes this outside its actor loop. Returning `None`
+    /// leaves the capped inline output unchanged.
+    async fn load_persisted_output(&self, _output_ref: &str) -> Result<Option<String>, TaskError> {
+        Ok(None)
+    }
+
     /// Observes a completion after terminal state and resource cleanup commit.
     ///
     /// This callback runs on the coordinator's bounded, panic-contained

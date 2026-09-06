@@ -34,6 +34,10 @@ pub struct CoordinatorConfig {
     pub max_children_per_parent: usize,
     pub max_total_tasks: usize,
     pub max_completed: usize,
+    pub max_waiters: usize,
+    pub max_waiters_per_task: usize,
+    pub max_output_loads: usize,
+    pub output_load_timeout: Duration,
     pub foreground_budget: Duration,
     pub waiter_timeout_cap: Duration,
     pub cancel_grace: Duration,
@@ -58,6 +62,10 @@ impl Default for CoordinatorConfig {
             max_children_per_parent: 16,
             max_total_tasks: 1_024,
             max_completed: 256,
+            max_waiters: 1_024,
+            max_waiters_per_task: 64,
+            max_output_loads: 64,
+            output_load_timeout: Duration::from_secs(5),
             foreground_budget: Duration::from_secs(45),
             waiter_timeout_cap: Duration::from_secs(3_600),
             cancel_grace: Duration::from_secs(5),
@@ -101,9 +109,26 @@ impl CoordinatorConfig {
             self.max_completed > 0,
             "completion capacity must be positive"
         );
+        assert!(self.max_waiters > 0, "waiter capacity must be positive");
+        assert!(
+            self.max_waiters_per_task > 0,
+            "per-task waiter capacity must be positive"
+        );
+        assert!(
+            self.max_output_loads > 0,
+            "output-load capacity must be positive"
+        );
+        assert!(
+            !self.output_load_timeout.is_zero(),
+            "output-load timeout must be positive"
+        );
         assert!(
             !self.queued_reap_interval.is_zero(),
             "queued cancellation reap interval must be positive"
+        );
+        assert!(
+            !self.waiter_timeout_cap.is_zero(),
+            "waiter timeout cap must be positive"
         );
         assert!(
             !self.profile_validation_timeout.is_zero(),
@@ -182,6 +207,43 @@ pub struct TaskSnapshot {
     pub has_parent_reservation: bool,
     pub event_sequence: u64,
     pub cleanup_error: Option<TaskError>,
+    pub elapsed_ms: u64,
+    pub progress: lato_core::TaskProgress,
+    pub usage: TaskUsage,
+    pub result: Option<TaskResult>,
+    pub completion_disposition: Option<CompletionDisposition>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TaskInspection {
+    pub snapshot: TaskSnapshot,
+    pub owner: TaskOwner,
+    pub parent_id: Option<TaskId>,
+    pub root_id: TaskId,
+}
+
+impl std::ops::Deref for TaskInspection {
+    type Target = TaskSnapshot;
+
+    fn deref(&self) -> &Self::Target {
+        &self.snapshot
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum WaitOutcome {
+    Finished(TaskSnapshot),
+    TimedOut(TaskSnapshot),
+    NotFoundOrNotOwned,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct CompletionDisposition {
+    pub foreground_delivered: bool,
+    pub waiter_delivered: bool,
+    pub backgrounded: bool,
+    pub explicitly_killed: bool,
+    pub should_surface: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -372,12 +434,33 @@ pub(crate) enum TaskCommand {
         root_id: TaskId,
         parent_id: TaskId,
         request: Box<SpawnTaskRequest>,
+        enqueued_at: tokio::time::Instant,
         reply: oneshot::Sender<Result<SpawnDisposition, TaskError>>,
     },
     Inspect {
         task_id: TaskId,
         caller: InspectCaller,
         reply: oneshot::Sender<Result<TaskSnapshot, TaskError>>,
+    },
+    InspectDetailed {
+        task_id: TaskId,
+        caller: InspectCaller,
+        reply: oneshot::Sender<Result<TaskInspection, TaskError>>,
+    },
+    ListRunning {
+        caller: InspectCaller,
+        reply: oneshot::Sender<Vec<TaskSnapshot>>,
+    },
+    Wait {
+        task_id: TaskId,
+        caller: InspectCaller,
+        timeout: Duration,
+        reply: oneshot::Sender<Result<WaitOutcome, TaskError>>,
+    },
+    ForegroundWait {
+        task_id: TaskId,
+        caller: InspectCaller,
+        reply: oneshot::Sender<Result<CompletionDisposition, TaskError>>,
     },
     RegistryCounts {
         reply: oneshot::Sender<RegistryCounts>,
@@ -438,6 +521,46 @@ impl TaskHandle {
         self.send(TaskCommand::Inspect {
             task_id,
             caller: InspectCaller::Admin,
+            reply,
+        })
+        .await?;
+        response.await.map_err(|_| coordinator_closed())?
+    }
+
+    pub async fn inspect_detailed_admin(
+        &self,
+        task_id: TaskId,
+    ) -> Result<TaskInspection, TaskError> {
+        let (reply, response) = oneshot::channel();
+        self.send(TaskCommand::InspectDetailed {
+            task_id,
+            caller: InspectCaller::Admin,
+            reply,
+        })
+        .await?;
+        response.await.map_err(|_| coordinator_closed())?
+    }
+
+    pub async fn list_running_admin(&self) -> Result<Vec<TaskSnapshot>, TaskError> {
+        let (reply, response) = oneshot::channel();
+        self.send(TaskCommand::ListRunning {
+            caller: InspectCaller::Admin,
+            reply,
+        })
+        .await?;
+        response.await.map_err(|_| coordinator_closed())
+    }
+
+    pub async fn wait_admin(
+        &self,
+        task_id: TaskId,
+        timeout: Duration,
+    ) -> Result<WaitOutcome, TaskError> {
+        let (reply, response) = oneshot::channel();
+        self.send(TaskCommand::Wait {
+            task_id,
+            caller: InspectCaller::Admin,
+            timeout,
             reply,
         })
         .await?;
@@ -554,10 +677,19 @@ impl ScopedTaskHandle {
                 root_id: self.root_id.clone(),
                 parent_id: self.task_id.clone(),
                 request: Box::new(request),
+                enqueued_at: tokio::time::Instant::now(),
                 reply,
             })
             .await?;
         response.await.map_err(|_| coordinator_closed())?
+    }
+
+    pub async fn spawn_and_wait(
+        &self,
+        request: SpawnTaskRequest,
+    ) -> Result<CompletionDisposition, TaskError> {
+        let disposition = self.spawn(request).await?;
+        disposition.handle.wait_foreground().await
     }
 
     pub async fn inspect(&self, task_id: TaskId) -> Result<TaskSnapshot, TaskError> {
@@ -565,6 +697,66 @@ impl ScopedTaskHandle {
         self.inner
             .send(TaskCommand::Inspect {
                 task_id,
+                caller: InspectCaller::Scoped {
+                    root_id: self.root_id.clone(),
+                    task_id: self.task_id.clone(),
+                },
+                reply,
+            })
+            .await?;
+        response.await.map_err(|_| coordinator_closed())?
+    }
+
+    pub async fn inspect_detailed(&self, task_id: TaskId) -> Result<TaskInspection, TaskError> {
+        let (reply, response) = oneshot::channel();
+        self.inner
+            .send(TaskCommand::InspectDetailed {
+                task_id,
+                caller: InspectCaller::Scoped {
+                    root_id: self.root_id.clone(),
+                    task_id: self.task_id.clone(),
+                },
+                reply,
+            })
+            .await?;
+        response.await.map_err(|_| coordinator_closed())?
+    }
+
+    pub async fn list_running(&self) -> Result<Vec<TaskSnapshot>, TaskError> {
+        let (reply, response) = oneshot::channel();
+        self.inner
+            .send(TaskCommand::ListRunning {
+                caller: InspectCaller::Scoped {
+                    root_id: self.root_id.clone(),
+                    task_id: self.task_id.clone(),
+                },
+                reply,
+            })
+            .await?;
+        response.await.map_err(|_| coordinator_closed())
+    }
+
+    pub async fn wait(&self, task_id: TaskId, timeout: Duration) -> Result<WaitOutcome, TaskError> {
+        let (reply, response) = oneshot::channel();
+        self.inner
+            .send(TaskCommand::Wait {
+                task_id,
+                caller: InspectCaller::Scoped {
+                    root_id: self.root_id.clone(),
+                    task_id: self.task_id.clone(),
+                },
+                timeout,
+                reply,
+            })
+            .await?;
+        response.await.map_err(|_| coordinator_closed())?
+    }
+
+    pub async fn wait_foreground(&self) -> Result<CompletionDisposition, TaskError> {
+        let (reply, response) = oneshot::channel();
+        self.inner
+            .send(TaskCommand::ForegroundWait {
+                task_id: self.task_id.clone(),
                 caller: InspectCaller::Scoped {
                     root_id: self.root_id.clone(),
                     task_id: self.task_id.clone(),

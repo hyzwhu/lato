@@ -5,6 +5,7 @@
 mod admission;
 mod coordinator;
 mod protocol;
+mod query;
 mod queue;
 mod runner;
 mod spawn;

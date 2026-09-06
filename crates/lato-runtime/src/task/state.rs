@@ -2,8 +2,10 @@
 // License: Apache-2.0
 // Lato changes: real task-tree records own hierarchical budgets and workspace leases
 
-use crate::task::{RegistryCounts, TaskSnapshot};
-use lato_core::{BudgetAccount, BudgetReservation, TaskId, TaskNode, TaskStatus};
+use crate::task::{CompletionDisposition, RegistryCounts, SpawnMode, TaskSnapshot};
+use lato_core::{
+    BudgetAccount, BudgetReservation, TaskId, TaskNode, TaskProgress, TaskResult, TaskStatus,
+};
 use lato_workspace::WorkspaceLease;
 use std::collections::{HashMap, HashSet};
 use tokio_util::sync::CancellationToken;
@@ -19,6 +21,12 @@ pub(crate) struct RuntimeTaskRecord {
     pub(crate) depth: u32,
     pub(crate) cleanup_error: Option<lato_core::TaskError>,
     pub(crate) last_event_sequence: u64,
+    pub(crate) progress: TaskProgress,
+    pub(crate) usage: lato_core::TaskUsage,
+    pub(crate) result: Option<TaskResult>,
+    pub(crate) completion_disposition: Option<CompletionDisposition>,
+    pub(crate) spawn_mode: Option<SpawnMode>,
+    pub(crate) enqueued_at: tokio::time::Instant,
 }
 
 #[derive(Default)]
@@ -76,6 +84,16 @@ impl CoordinatorState {
             has_parent_reservation: record.reservation.is_some(),
             event_sequence: record.last_event_sequence,
             cleanup_error: record.cleanup_error.clone(),
+            elapsed_ms: record
+                .enqueued_at
+                .elapsed()
+                .as_millis()
+                .try_into()
+                .unwrap_or(u64::MAX),
+            progress: record.progress.clone(),
+            usage: record.usage.clone(),
+            result: record.result.clone(),
+            completion_disposition: record.completion_disposition,
         })
     }
 
@@ -180,6 +198,12 @@ mod tests {
             depth: if parent_id.is_some() { 1 } else { 0 },
             cleanup_error: None,
             last_event_sequence: 0,
+            progress: TaskProgress::default(),
+            usage: Default::default(),
+            result: None,
+            completion_disposition: None,
+            spawn_mode: None,
+            enqueued_at: tokio::time::Instant::now(),
         }
     }
 
