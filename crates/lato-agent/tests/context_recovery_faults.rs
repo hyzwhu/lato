@@ -1,8 +1,22 @@
 use async_trait::async_trait;
-use lato_agent::{AcpHost, PromptKind, REQUIRED_SECTIONS, SessionActor, TurnOutcome};
+use lato_agent::{
+    AcpHost, LegacyTurnDriver, PromptKind, REQUIRED_SECTIONS, SessionActor, TurnOutcome,
+    history_to_model_messages,
+};
 use lato_ai::{ModelMetadata, ModelStream, StreamPiece, adapt_model_endpoint};
-use lato_core::{ModelError, ModelErrorKind, Retryability, TurnId};
+use lato_core::{
+    AgentError, CancelReason, Command, ErrorCategory, EventPayload, EventStore,
+    HistoryProjectionMetadata, HistoryProjectionStore, HistoryReplacementReason, JournalDurability,
+    JournalEnvelope, JournalError, JournalReplay, ModelError, ModelErrorKind, ModelMessage,
+    ProjectionError, Retryability, SessionId, StartBehavior, StartTurn, TurnId, TurnOutput,
+    UserInput,
+};
 use lato_protocol::JsonRpcReq;
+use lato_runtime::{
+    CompactionControl, CompactionRequest, SessionBootstrap, TurnControl, TurnDriver,
+    TurnEventEmitter, TurnRequest, spawn_session_with_store,
+};
+use lato_store::MemoryEventStore;
 use lato_workspace::{FileLocks, SessionTrust};
 use std::{
     collections::VecDeque,
@@ -11,7 +25,7 @@ use std::{
         atomic::{AtomicUsize, Ordering},
     },
 };
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex as AsyncMutex, Notify, mpsc};
 use tokio::time::{Duration, timeout};
 use tokio_util::sync::CancellationToken;
 
@@ -376,6 +390,130 @@ async fn fatal_recovery_appends_context_without_replacing_the_provider_failure()
     assert_eq!(stream.calls(), 3);
 }
 
+struct CheckpointCancellingStore {
+    inner: MemoryEventStore,
+    turn_cancellation: Arc<AsyncMutex<Option<CancellationToken>>>,
+    checkpoint_committed: Notify,
+}
+
+#[async_trait]
+impl EventStore for CheckpointCancellingStore {
+    async fn append(
+        &self,
+        envelope: JournalEnvelope,
+        durability: JournalDurability,
+    ) -> Result<(), JournalError> {
+        self.inner.append(envelope, durability).await
+    }
+
+    async fn replay(&self, session_id: &SessionId) -> Result<JournalReplay, JournalError> {
+        self.inner.replay(session_id).await
+    }
+
+    async fn import_if_absent(
+        &self,
+        session_id: &SessionId,
+        envelopes: Vec<JournalEnvelope>,
+    ) -> Result<JournalReplay, JournalError> {
+        self.inner.import_if_absent(session_id, envelopes).await
+    }
+
+    async fn list_sessions(&self) -> Result<Vec<SessionId>, JournalError> {
+        self.inner.list_sessions().await
+    }
+
+    async fn shutdown(&self, session_id: &SessionId) -> Result<(), JournalError> {
+        self.inner.shutdown(session_id).await
+    }
+}
+
+#[async_trait]
+impl HistoryProjectionStore for CheckpointCancellingStore {
+    async fn replace_history(
+        &self,
+        session_id: &SessionId,
+        messages: Vec<ModelMessage>,
+        reason: HistoryReplacementReason,
+    ) -> Result<HistoryProjectionMetadata, ProjectionError> {
+        let metadata = self
+            .inner
+            .replace_history(session_id, messages, reason)
+            .await?;
+        self.turn_cancellation
+            .lock()
+            .await
+            .as_ref()
+            .expect("active turn cancellation was not captured")
+            .cancel();
+        self.checkpoint_committed.notify_one();
+        Ok(metadata)
+    }
+}
+
+struct RuntimeActorDriver {
+    actor: AsyncMutex<SessionActor>,
+    compactor: Arc<LegacyTurnDriver>,
+    turn_cancellation: Arc<AsyncMutex<Option<CancellationToken>>>,
+    actor_observed_cancellation: Notify,
+    release_finished: Notify,
+}
+
+#[async_trait]
+impl TurnDriver for RuntimeActorDriver {
+    async fn run(
+        &self,
+        request: TurnRequest,
+        control: TurnControl,
+        events: TurnEventEmitter,
+    ) -> Result<TurnOutput, AgentError> {
+        *self.turn_cancellation.lock().await = Some(control.cancellation.clone());
+        let mut actor = self.actor.lock().await;
+        actor.set_journal_events(Some(events));
+        let result = actor
+            .prompt_with_context(
+                PromptKind::Start,
+                request.input.text,
+                request.turn_id,
+                control.cancellation,
+            )
+            .await
+            .map_err(|message| {
+                AgentError::new(
+                    "test.turn_failed",
+                    ErrorCategory::Task,
+                    message,
+                    Retryability::Never,
+                )
+            })?;
+        if result == TurnOutcome::Cancelled {
+            self.actor_observed_cancellation.notify_one();
+            self.release_finished.notified().await;
+        }
+        Ok(TurnOutput {
+            final_text: actor.latest_assistant_text(),
+        })
+    }
+
+    async fn history_snapshot(&self) -> Result<Vec<ModelMessage>, AgentError> {
+        history_to_model_messages(self.actor.lock().await.history()).map_err(|error| {
+            AgentError::new(
+                "test.history_projection_failed",
+                ErrorCategory::Task,
+                error.to_string(),
+                Retryability::Never,
+            )
+        })
+    }
+
+    async fn compact(
+        &self,
+        request: CompactionRequest,
+        control: CompactionControl,
+    ) -> Result<lato_core::CompactionCandidate, AgentError> {
+        TurnDriver::compact(self.compactor.as_ref(), request, control).await
+    }
+}
+
 #[tokio::test]
 async fn cancellation_at_sampling_boundary_never_submits() {
     let workspace = tempfile::tempdir().unwrap();
@@ -420,5 +558,185 @@ async fn cancellation_at_sampling_boundary_never_submits() {
         stream.calls(),
         0,
         "cancelled turns must not reach the model"
+    );
+}
+
+#[tokio::test]
+async fn cancellation_after_compaction_never_resubmits() {
+    let workspace = tempfile::tempdir().unwrap();
+    let stream = Arc::new(FaultStream::new(vec![
+        success(vec![StreamPiece::Text("seed history ".repeat(2_000))]),
+        failure(Vec::new(), overflow("overflow before cancellation")),
+        success(vec![StreamPiece::Text(summary())]),
+        success(vec![StreamPiece::Text("must not be sampled".into())]),
+    ]));
+    let raw: Arc<dyn ModelStream> = stream.clone();
+    let endpoint = adapt_model_endpoint(
+        "fixture",
+        "context-recovery-faults",
+        ModelMetadata {
+            context_window: Some(1_000_000),
+            model_family: Some("fixture".into()),
+        },
+        raw,
+    )
+    .unwrap();
+    let sid = SessionId::from("cancellation-after-compaction");
+    let actor = SessionActor::new(
+        endpoint.stream.clone(),
+        Arc::new(FileLocks::new()),
+        SessionTrust::for_headless_prompt(workspace.path()),
+        workspace.path().to_path_buf(),
+    );
+    let (updates, _updates_rx) = mpsc::unbounded_channel();
+    let compactor = Arc::new(LegacyTurnDriver::new_with_endpoint(
+        sid.to_string(),
+        endpoint,
+        Arc::new(FileLocks::new()),
+        SessionTrust::for_headless_prompt(workspace.path()),
+        workspace.path().to_path_buf(),
+        updates,
+        None,
+    ));
+    let turn_cancellation = Arc::new(AsyncMutex::new(None));
+    let driver = Arc::new(RuntimeActorDriver {
+        actor: AsyncMutex::new(actor),
+        compactor,
+        turn_cancellation: turn_cancellation.clone(),
+        actor_observed_cancellation: Notify::new(),
+        release_finished: Notify::new(),
+    });
+    let store = Arc::new(CheckpointCancellingStore {
+        inner: MemoryEventStore::new(),
+        turn_cancellation,
+        checkpoint_committed: Notify::new(),
+    });
+    let session = spawn_session_with_store(
+        sid.clone(),
+        driver.clone(),
+        store.clone(),
+        SessionBootstrap {
+            replay: JournalReplay::empty(sid.clone()),
+        },
+    );
+    let mut events = session.subscribe();
+
+    timeout(
+        Duration::from_secs(1),
+        session.submit(Command::StartTurn(StartTurn {
+            input: UserInput::text("seed"),
+            behavior: StartBehavior::Reject,
+        })),
+    )
+    .await
+    .expect("runtime did not accept seed turn")
+    .unwrap();
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if matches!(
+                events.recv().await.unwrap().payload,
+                EventPayload::TurnCompleted(_)
+            ) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("seed turn did not complete");
+
+    timeout(
+        Duration::from_secs(1),
+        session.submit(Command::StartTurn(StartTurn {
+            input: UserInput::text("continue"),
+            behavior: StartBehavior::Reject,
+        })),
+    )
+    .await
+    .expect("runtime did not accept recovery turn")
+    .unwrap();
+    let turn_id = timeout(Duration::from_secs(1), async {
+        loop {
+            let event = events.recv().await.unwrap();
+            if matches!(event.payload, EventPayload::TurnStarted) {
+                break event.turn_id.expect("turn start must carry an id");
+            }
+        }
+    })
+    .await
+    .expect("recovery turn did not start");
+
+    timeout(
+        Duration::from_secs(1),
+        store.checkpoint_committed.notified(),
+    )
+    .await
+    .expect("automatic compaction checkpoint was not committed");
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if matches!(
+                events.recv().await.unwrap().payload,
+                EventPayload::CompactionCompleted { .. }
+            ) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("compaction completion was not published");
+    timeout(
+        Duration::from_secs(1),
+        driver.actor_observed_cancellation.notified(),
+    )
+    .await
+    .expect("actor did not observe cancellation at the recovery boundary");
+
+    timeout(
+        Duration::from_secs(1),
+        session.submit(Command::CancelTurn {
+            turn_id: turn_id.clone(),
+        }),
+    )
+    .await
+    .expect("runtime did not accept turn cancellation")
+    .unwrap();
+    driver.release_finished.notify_one();
+
+    let terminal = timeout(Duration::from_secs(1), async {
+        loop {
+            let event = events.recv().await.unwrap();
+            if matches!(
+                event.payload,
+                EventPayload::TurnCancelled { .. }
+                    | EventPayload::TurnCompleted(_)
+                    | EventPayload::TurnFailed { .. }
+            ) {
+                break event;
+            }
+        }
+    })
+    .await
+    .expect("recovery turn did not terminate");
+
+    assert!(matches!(
+        terminal.payload,
+        EventPayload::TurnCancelled {
+            reason: CancelReason::User
+        }
+    ));
+    assert_eq!(
+        stream.calls(),
+        3,
+        "seed, rejected request, and compaction only; no recovery resubmit"
+    );
+    let replay = timeout(Duration::from_secs(1), store.replay(&sid))
+        .await
+        .expect("committed checkpoint replay timed out")
+        .unwrap();
+    assert!(replay.projection.active_checkpoint_id.is_some());
+    assert!(
+        serde_json::to_string(&replay.projection.messages)
+            .unwrap()
+            .contains("conversation_summary"),
+        "the committed compacted history must remain authoritative"
     );
 }
