@@ -117,14 +117,15 @@ async fn relative_and_absolute_shared_roots_have_the_same_resource_key() {
     );
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn symlinked_shared_roots_have_the_same_resource_key() {
     let temp = tempfile::tempdir().unwrap();
     let real = temp.path().join("real");
     let alias = temp.path().join("alias");
     std::fs::create_dir(&real).unwrap();
-    std::os::unix::fs::symlink(&real, &alias).unwrap();
+    if create_directory_symlink(&real, &alias).is_err() {
+        return;
+    }
 
     let direct = MemoryWorkspaceAllocator::new(&real)
         .allocate(WorkspaceRequest::new(
@@ -142,7 +143,26 @@ async fn symlinked_shared_roots_have_the_same_resource_key() {
         .unwrap();
 
     assert_eq!(direct.resource_key, linked.resource_key);
-    assert_eq!(direct.resource_key, Some(real.canonicalize().unwrap()));
+    assert_eq!(
+        direct.resource_key,
+        Some(lato_workspace::lock_key(real.canonicalize().unwrap()))
+    );
+}
+
+#[cfg(unix)]
+fn create_directory_symlink(
+    original: &std::path::Path,
+    link: &std::path::Path,
+) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(original, link)
+}
+
+#[cfg(windows)]
+fn create_directory_symlink(
+    original: &std::path::Path,
+    link: &std::path::Path,
+) -> std::io::Result<()> {
+    std::os::windows::fs::symlink_dir(original, link)
 }
 
 #[tokio::test]
@@ -226,6 +246,65 @@ async fn authentic_provenance_cannot_authorize_tampered_lease_fields() {
     assert_eq!(error.code, TaskErrorCode::WorkspaceRelease);
     assert_eq!(allocator.live_count().await, 1);
     allocator.release(&authentic).await.unwrap();
+}
+
+#[tokio::test]
+async fn authentic_clone_with_a_nonexistent_id_is_never_idempotent() {
+    let allocator = MemoryWorkspaceAllocator::new("/workspace");
+    let authentic = allocator
+        .allocate(WorkspaceRequest::new(
+            TaskId::from("owned"),
+            WorkspaceIntent::SharedReadOnly,
+        ))
+        .await
+        .unwrap();
+    let mut tampered = authentic.clone();
+    tampered.id = lato_core::LeaseId::from("never-issued");
+
+    assert_eq!(
+        allocator.release(&tampered).await.unwrap_err().code,
+        TaskErrorCode::WorkspaceRelease
+    );
+    assert_eq!(allocator.live_count().await, 1);
+
+    allocator.release(&authentic).await.unwrap();
+    assert_eq!(
+        allocator.release(&tampered).await.unwrap_err().code,
+        TaskErrorCode::WorkspaceRelease
+    );
+    assert_eq!(allocator.live_count().await, 0);
+}
+
+#[tokio::test]
+async fn retired_lease_only_accepts_an_unchanged_authentic_clone() {
+    let allocator = MemoryWorkspaceAllocator::new("/workspace");
+    let authentic = allocator
+        .allocate(WorkspaceRequest::new(
+            TaskId::from("owned"),
+            WorkspaceIntent::SharedSerializedWrite,
+        ))
+        .await
+        .unwrap();
+    let unchanged = authentic.clone();
+    allocator.release(&authentic).await.unwrap();
+
+    let mut changed_task = unchanged.clone();
+    changed_task.task_id = TaskId::from("changed");
+    let mut changed_mode = unchanged.clone();
+    changed_mode.mode = WorkspaceMode::SharedReadOnly;
+    let mut changed_root = unchanged.clone();
+    changed_root.root = PathBuf::from("/different");
+    let mut changed_key = unchanged.clone();
+    changed_key.resource_key = Some(PathBuf::from("/different"));
+
+    for tampered in [changed_task, changed_mode, changed_root, changed_key] {
+        assert_eq!(
+            allocator.release(&tampered).await.unwrap_err().code,
+            TaskErrorCode::WorkspaceRelease
+        );
+    }
+    allocator.release(&unchanged).await.unwrap();
+    assert_eq!(allocator.live_count().await, 0);
 }
 
 #[tokio::test]

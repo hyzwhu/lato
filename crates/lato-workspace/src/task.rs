@@ -67,7 +67,29 @@ impl WorkspaceLease {
 }
 
 #[derive(Clone)]
-struct LeaseProvenance(Arc<AllocatorIssuer>);
+struct LeaseProvenance {
+    issuer: Arc<AllocatorIssuer>,
+    original: LeaseMetadata,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LeaseMetadata {
+    id: LeaseId,
+    task_id: TaskId,
+    mode: WorkspaceMode,
+    root: PathBuf,
+    resource_key: Option<PathBuf>,
+}
+
+impl LeaseMetadata {
+    fn matches(&self, lease: &WorkspaceLease) -> bool {
+        self.id == lease.id
+            && self.task_id == lease.task_id
+            && self.mode == lease.mode
+            && self.root == lease.root
+            && self.resource_key == lease.resource_key
+    }
+}
 
 impl std::fmt::Debug for LeaseProvenance {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -77,7 +99,7 @@ impl std::fmt::Debug for LeaseProvenance {
 
 impl PartialEq for LeaseProvenance {
     fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
+        Arc::ptr_eq(&self.issuer, &other.issuer) && self.original == other.original
     }
 }
 
@@ -166,6 +188,23 @@ impl MemoryWorkspaceAllocator {
                 .join(lease_id.as_str()),
         }
     }
+
+    fn shared_resource_key(&self, root: &Path) -> Result<PathBuf, TaskError> {
+        let absolute = if root.is_absolute() {
+            root.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map_err(|error| {
+                    TaskError::new(
+                        TaskErrorCode::WorkspaceAllocation,
+                        format!("failed to resolve current workspace directory: {error}"),
+                    )
+                })?
+                .join(root)
+        };
+        let canonical = std::fs::canonicalize(&absolute).unwrap_or(absolute);
+        Ok(lock_key(canonical))
+    }
 }
 
 #[async_trait::async_trait]
@@ -181,14 +220,28 @@ impl WorkspaceAllocator for MemoryWorkspaceAllocator {
         let id = self.next_lease_id()?;
         let mode = WorkspaceMode::from(request.intent);
         let root = self.lease_root(mode, &id);
-        let resource_key = (mode == WorkspaceMode::SharedSerializedWrite).then(|| lock_key(&root));
+        let resource_key = if mode == WorkspaceMode::SharedSerializedWrite {
+            Some(self.shared_resource_key(&root)?)
+        } else {
+            None
+        };
+        let original = LeaseMetadata {
+            id: id.clone(),
+            task_id: request.task_id.clone(),
+            mode,
+            root: root.clone(),
+            resource_key: resource_key.clone(),
+        };
         let lease = WorkspaceLease {
             id: id.clone(),
             task_id: request.task_id,
             mode,
             root,
             resource_key,
-            provenance: Some(LeaseProvenance(Arc::clone(&self.inner.issuer))),
+            provenance: Some(LeaseProvenance {
+                issuer: Arc::clone(&self.inner.issuer),
+                original,
+            }),
         };
 
         self.inner.live.lock().await.insert(id, lease.clone());
@@ -196,14 +249,22 @@ impl WorkspaceAllocator for MemoryWorkspaceAllocator {
     }
 
     async fn release(&self, lease: &WorkspaceLease) -> Result<(), TaskError> {
-        let issued_here = lease
-            .provenance
-            .as_ref()
-            .is_some_and(|provenance| Arc::ptr_eq(&provenance.0, &self.inner.issuer));
-        if !issued_here {
+        let Some(provenance) = lease.provenance.as_ref() else {
             return Err(TaskError::new(
                 TaskErrorCode::WorkspaceRelease,
                 "workspace lease was not issued by this allocator",
+            ));
+        };
+        if !Arc::ptr_eq(&provenance.issuer, &self.inner.issuer) {
+            return Err(TaskError::new(
+                TaskErrorCode::WorkspaceRelease,
+                "workspace lease was not issued by this allocator",
+            ));
+        }
+        if !provenance.original.matches(lease) {
+            return Err(TaskError::new(
+                TaskErrorCode::WorkspaceRelease,
+                "workspace lease metadata differs from the issued lease",
             ));
         }
 
