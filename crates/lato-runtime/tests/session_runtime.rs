@@ -23,6 +23,8 @@ use std::{
 use tokio::sync::{Notify, oneshot};
 use tokio::time::{Duration, timeout};
 
+const PREFIRE_NOTE1_SENTINEL: &str = "NOTE1-SPECULATIVE-SENTINEL";
+
 struct EchoDriver;
 
 struct ControlledStore {
@@ -608,8 +610,50 @@ async fn next_event(
         .expect("event channel closed")
 }
 
+async fn events_through_turn_terminal(
+    events: &mut tokio::sync::broadcast::Receiver<lato_core::EventEnvelope>,
+) -> Vec<lato_core::EventEnvelope> {
+    let mut observed = Vec::new();
+    loop {
+        let event = next_event(events).await;
+        let terminal = matches!(
+            &event.payload,
+            EventPayload::TurnCompleted(_)
+                | EventPayload::TurnFailed { .. }
+                | EventPayload::TurnCancelled { .. }
+        );
+        observed.push(event);
+        if terminal {
+            return observed;
+        }
+    }
+}
+
+fn runtime_event_kind(payload: &EventPayload) -> &'static str {
+    match payload {
+        EventPayload::SessionStarted => "session_started",
+        EventPayload::TurnStarted => "turn_started",
+        EventPayload::ModelDelta { .. } => "model_delta",
+        EventPayload::ReasoningDelta { .. } => "reasoning_delta",
+        EventPayload::TurnCompleted(_) => "turn_completed",
+        EventPayload::TurnFailed { .. } => "turn_failed",
+        EventPayload::TurnCancelled { .. } => "turn_cancelled",
+        EventPayload::ContextUsageUpdated { .. } => "context_usage_updated",
+        EventPayload::CompactionStarted { .. } => "compaction_started",
+        EventPayload::CompactionCompleted { .. } => "compaction_completed",
+        EventPayload::CompactionFailed { .. } => "compaction_failed",
+        EventPayload::CompactionCancelled { .. } => "compaction_cancelled",
+        EventPayload::SessionStopped => "session_stopped",
+    }
+}
+
 struct BlockingPrefireDriver {
     started: Notify,
+    install_called: AtomicBool,
+}
+
+struct CompletedPrefireDriver {
+    observed_note1: tokio::sync::Mutex<Option<String>>,
     install_called: AtomicBool,
 }
 
@@ -658,13 +702,83 @@ impl TurnDriver for BlockingPrefireDriver {
     }
 }
 
+#[async_trait]
+impl TurnDriver for CompletedPrefireDriver {
+    async fn run(
+        &self,
+        request: TurnRequest,
+        _control: TurnControl,
+        events: TurnEventEmitter,
+    ) -> Result<TurnOutput, lato_core::AgentError> {
+        let result = events
+            .prefire_compaction(PrefireCompactionRequest {
+                messages: vec![ModelMessage {
+                    role: ModelRole::User,
+                    content: vec![ModelContent::Text {
+                        text: request.input.text,
+                    }],
+                }],
+                prefix_len: 1,
+                policy: lato_core::CompactionPolicy::default(),
+            })
+            .await?;
+        *self.observed_note1.lock().await = Some(result.note1);
+        events.model_delta("ordinary delta")?;
+        Ok(TurnOutput {
+            final_text: "done".into(),
+        })
+    }
+
+    async fn prefire_compaction(
+        &self,
+        _request: PrefireCompactionRequest,
+        _control: CompactionControl,
+    ) -> Result<PrefireCompactionResult, lato_core::AgentError> {
+        Ok(PrefireCompactionResult {
+            note1: PREFIRE_NOTE1_SENTINEL.into(),
+        })
+    }
+
+    async fn install_history(
+        &self,
+        _messages: Vec<ModelMessage>,
+    ) -> Result<(), lato_core::AgentError> {
+        self.install_called.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+fn journal_contains_assistant_text(record: &JournalRecord, needle: &str) -> bool {
+    let JournalRecord::ConversationItemCommitted { message } = record else {
+        return false;
+    };
+    message.role == ModelRole::Assistant
+        && message
+            .content
+            .iter()
+            .any(|content| matches!(content, ModelContent::Text { text } if text.contains(needle)))
+}
+
+fn is_compaction_lifecycle(payload: &EventPayload) -> bool {
+    matches!(
+        payload,
+        EventPayload::CompactionStarted { .. }
+            | EventPayload::CompactionCompleted { .. }
+            | EventPayload::CompactionFailed { .. }
+            | EventPayload::CompactionCancelled { .. }
+    )
+}
+
 #[tokio::test]
 async fn prefire_is_non_installing_and_cancellable_without_compaction_events() {
+    let sid = SessionId::from("session-prefire");
     let driver = Arc::new(BlockingPrefireDriver {
         started: Notify::new(),
         install_called: AtomicBool::new(false),
     });
-    let session = spawn_session("session-prefire".into(), driver.clone());
+    let store = Arc::new(MemoryEventStore::new());
+    let session =
+        spawn_session_with_store(sid.clone(), driver.clone(), store.clone(), bootstrap(&sid));
     let mut events = session.subscribe();
     session
         .submit(Command::StartTurn(StartTurn {
@@ -686,23 +800,119 @@ async fn prefire_is_non_installing_and_cancellable_without_compaction_events() {
             text: "ordinary delta".into()
         }
     );
-    driver.started.notified().await;
-    assert!(
-        timeout(Duration::from_millis(25), events.recv())
-            .await
-            .is_err()
-    );
+    timeout(Duration::from_secs(1), driver.started.notified())
+        .await
+        .expect("prefire did not start");
+    assert!(matches!(
+        events.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    ));
     assert!(!driver.install_called.load(Ordering::SeqCst));
     session
         .submit(Command::CancelTurn { turn_id })
         .await
         .unwrap();
+    let cancelled = next_event(&mut events).await;
     assert!(matches!(
-        next_event(&mut events).await.payload,
+        &cancelled.payload,
         EventPayload::TurnCancelled {
             reason: CancelReason::User
         }
     ));
+    assert!(!is_compaction_lifecycle(&cancelled.payload));
+
+    let replay = timeout(Duration::from_secs(1), store.replay(&sid))
+        .await
+        .expect("prefire replay timed out")
+        .expect("prefire replay failed");
+    assert!(!replay.envelopes.iter().any(|envelope| matches!(
+        &envelope.record,
+        JournalRecord::CompactionRequested { .. } | JournalRecord::HistoryProjectionReplaced { .. }
+    )));
+    assert!(!replay.envelopes.iter().any(|envelope| {
+        journal_contains_assistant_text(&envelope.record, PREFIRE_NOTE1_SENTINEL)
+    }));
+    assert!(!driver.install_called.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn completed_prefire_is_never_emitted_installed_or_persisted() {
+    let sid = SessionId::from("session-prefire-completed");
+    let driver = Arc::new(CompletedPrefireDriver {
+        observed_note1: tokio::sync::Mutex::new(None),
+        install_called: AtomicBool::new(false),
+    });
+    let store = Arc::new(MemoryEventStore::new());
+    let session =
+        spawn_session_with_store(sid.clone(), driver.clone(), store.clone(), bootstrap(&sid));
+    let mut events = session.subscribe();
+
+    session
+        .submit(Command::StartTurn(StartTurn {
+            input: UserInput::text("large history"),
+            behavior: StartBehavior::Reject,
+        }))
+        .await
+        .unwrap();
+
+    let mut observed = Vec::new();
+    loop {
+        let event = next_event(&mut events).await;
+        let terminal = matches!(event.payload, EventPayload::TurnCompleted(_));
+        observed.push(event);
+        if terminal {
+            break;
+        }
+    }
+    assert_eq!(
+        observed
+            .iter()
+            .filter(|event| matches!(event.payload, EventPayload::TurnCompleted(_)))
+            .count(),
+        1
+    );
+    assert!(
+        observed
+            .iter()
+            .all(|event| !is_compaction_lifecycle(&event.payload))
+    );
+    assert!(observed.iter().all(|event| {
+        !matches!(
+            &event.payload,
+            EventPayload::ModelDelta { text } if text.contains(PREFIRE_NOTE1_SENTINEL)
+        )
+    }));
+    assert_eq!(
+        observed
+            .iter()
+            .filter_map(|event| match &event.payload {
+                EventPayload::ModelDelta { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+        vec!["ordinary delta"]
+    );
+    assert_eq!(
+        driver.observed_note1.lock().await.as_deref(),
+        Some(PREFIRE_NOTE1_SENTINEL)
+    );
+    assert!(!driver.install_called.load(Ordering::SeqCst));
+    assert!(matches!(
+        events.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    ));
+
+    let replay = timeout(Duration::from_secs(1), store.replay(&sid))
+        .await
+        .expect("completed prefire replay timed out")
+        .expect("completed prefire replay failed");
+    assert!(!replay.envelopes.iter().any(|envelope| matches!(
+        &envelope.record,
+        JournalRecord::CompactionRequested { .. } | JournalRecord::HistoryProjectionReplaced { .. }
+    )));
+    assert!(!replay.envelopes.iter().any(|envelope| {
+        journal_contains_assistant_text(&envelope.record, PREFIRE_NOTE1_SENTINEL)
+    }));
 }
 
 #[tokio::test]
@@ -1255,6 +1465,145 @@ async fn bootstrap_resumes_the_next_journal_sequence_without_duplicate_start() {
     assert_eq!(replay.envelopes[1].journal_sequence, 1);
 }
 
+#[tokio::test]
+async fn old_journal_without_phase_4c3_metadata_replays_and_runs_the_next_turn() {
+    let sid = SessionId::from("session-old-journal");
+    let old_turn = lato_core::TurnId::from("old-turn");
+    let store = Arc::new(MemoryEventStore::new());
+    let old_assistant = ModelMessage {
+        role: ModelRole::Assistant,
+        content: vec![ModelContent::Text {
+            text: "old answer".into(),
+        }],
+    };
+    let old_records = vec![
+        (None, JournalRecord::SessionStarted),
+        (
+            Some(old_turn.clone()),
+            JournalRecord::TurnInputAccepted {
+                input: UserInput::text("old question"),
+            },
+        ),
+        (
+            Some(old_turn.clone()),
+            JournalRecord::ConversationItemCommitted {
+                message: old_assistant.clone(),
+            },
+        ),
+        (
+            Some(old_turn),
+            JournalRecord::TurnCompleted {
+                output: TurnOutput {
+                    final_text: "old answer".into(),
+                },
+            },
+        ),
+    ];
+    for (sequence, (turn_id, record)) in old_records.into_iter().enumerate() {
+        store
+            .append(
+                JournalEnvelope {
+                    schema_version: JOURNAL_SCHEMA_VERSION,
+                    record_id: JournalRecordId::from(format!("old-journal-{sequence}")),
+                    session_id: sid.clone(),
+                    turn_id,
+                    journal_sequence: sequence as u64,
+                    timestamp_ms: sequence as u64,
+                    record,
+                },
+                JournalDurability::SyncData,
+            )
+            .await
+            .unwrap();
+    }
+
+    let bootstrap_replay = timeout(Duration::from_secs(1), store.replay(&sid))
+        .await
+        .expect("old journal replay timed out")
+        .expect("old journal replay failed");
+    assert_eq!(
+        bootstrap_replay.projection.messages,
+        vec![
+            ModelMessage {
+                role: ModelRole::User,
+                content: vec![ModelContent::Text {
+                    text: "old question".into(),
+                }],
+            },
+            old_assistant,
+        ]
+    );
+    assert!(bootstrap_replay.projection.active_checkpoint_id.is_none());
+    assert!(bootstrap_replay.projection.model_selection.is_none());
+    assert!(bootstrap_replay.projection.model_family.is_none());
+    assert!(bootstrap_replay.projection.model_context_window.is_none());
+
+    let session = spawn_session_with_store(
+        sid.clone(),
+        Arc::new(EchoDriver),
+        store.clone(),
+        SessionBootstrap {
+            replay: bootstrap_replay,
+        },
+    );
+    let mut events = session.subscribe();
+    session
+        .submit(Command::StartTurn(StartTurn {
+            input: UserInput::text("next question"),
+            behavior: StartBehavior::Reject,
+        }))
+        .await
+        .unwrap();
+    let observed = events_through_turn_terminal(&mut events).await;
+    assert_eq!(
+        observed
+            .iter()
+            .map(|event| runtime_event_kind(&event.payload))
+            .collect::<Vec<_>>(),
+        vec![
+            "session_started",
+            "turn_started",
+            "model_delta",
+            "turn_completed",
+        ]
+    );
+    assert_eq!(
+        observed[2].payload,
+        EventPayload::ModelDelta {
+            text: "next question".into(),
+        }
+    );
+    assert_eq!(
+        observed[3].payload,
+        EventPayload::TurnCompleted(TurnOutput {
+            final_text: "next question".into(),
+        })
+    );
+
+    let replay = timeout(Duration::from_secs(1), store.replay(&sid))
+        .await
+        .expect("continued old journal replay timed out")
+        .expect("continued old journal replay failed");
+    assert_eq!(replay.envelopes.len(), 6);
+    assert_eq!(replay.projection.next_journal_sequence, 6);
+    assert_eq!(
+        replay
+            .envelopes
+            .iter()
+            .filter(|envelope| matches!(&envelope.record, JournalRecord::SessionStarted))
+            .count(),
+        1
+    );
+    assert!(!replay.envelopes.iter().any(|envelope| matches!(
+        &envelope.record,
+        JournalRecord::CompactionRequested { .. }
+            | JournalRecord::CompactionFailed { .. }
+            | JournalRecord::CompactionCancelled { .. }
+            | JournalRecord::HistoryProjectionReplaced { .. }
+            | JournalRecord::ModelSelected { .. }
+    )));
+}
+
 fn manual_compaction() -> Command {
     Command::CompactSession(CompactSession {
         user_context: None,
@@ -1425,7 +1774,12 @@ async fn automatic_compaction_is_cancelled_with_its_turn_and_rejects_manual_over
 async fn automatic_compaction_pre_marker_failure_retains_old_history() {
     let directory = tempfile::tempdir().unwrap();
     let sid = SessionId::from("automatic-pre-marker-failure");
-    let replay = seeded_file_store(directory.path(), &sid).await;
+    let driver = Arc::new(AutomaticCompactionDriver::new(
+        CompactionTrigger::Threshold,
+        false,
+    ));
+    let old_history = driver.source.clone();
+    let replay = seeded_file_store_with_messages(directory.path(), &sid, &old_history).await;
     let store = Arc::new(
         FileEventStore::open_with_fault_injector(
             directory.path(),
@@ -1433,10 +1787,6 @@ async fn automatic_compaction_pre_marker_failure_retains_old_history() {
         )
         .unwrap(),
     );
-    let driver = Arc::new(AutomaticCompactionDriver::new(
-        CompactionTrigger::Threshold,
-        false,
-    ));
     let session = spawn_session_with_store(
         sid.clone(),
         driver.clone(),
@@ -1453,28 +1803,65 @@ async fn automatic_compaction_pre_marker_failure_retains_old_history() {
         .await
         .unwrap();
 
-    let mut saw_storage_failure = false;
-    loop {
-        let event = next_event(&mut events).await;
-        match event.payload {
-            EventPayload::CompactionFailed { error, .. } => {
-                assert_eq!(error.category, lato_core::ErrorCategory::Storage);
-                saw_storage_failure = true;
-            }
-            EventPayload::TurnFailed { .. } => break,
-            _ => {}
-        }
-    }
-    assert!(saw_storage_failure);
-    assert!(
-        store
-            .replay(&sid)
-            .await
-            .unwrap()
-            .projection
-            .active_checkpoint_id
-            .is_none()
+    let observed = events_through_turn_terminal(&mut events).await;
+    assert_eq!(
+        observed
+            .iter()
+            .map(|event| runtime_event_kind(&event.payload))
+            .collect::<Vec<_>>(),
+        vec![
+            "session_started",
+            "turn_started",
+            "compaction_started",
+            "compaction_failed",
+            "turn_failed",
+        ]
     );
+    let EventPayload::CompactionFailed { error, .. } = &observed[3].payload else {
+        unreachable!("exact event ordering asserted above")
+    };
+    assert_eq!(error.category, lato_core::ErrorCategory::Storage);
+    let EventPayload::TurnFailed { error } = &observed[4].payload else {
+        unreachable!("exact event ordering asserted above")
+    };
+    assert_eq!(error.code, "projection.write_failed");
+
+    let replay = timeout(Duration::from_secs(1), store.replay(&sid))
+        .await
+        .expect("pre-checkpoint replay timed out")
+        .expect("pre-checkpoint replay failed");
+    assert!(replay.projection.active_checkpoint_id.is_none());
+    let mut expected_history = old_history;
+    expected_history.push(ModelMessage {
+        role: ModelRole::User,
+        content: vec![ModelContent::Text {
+            text: "continue".into(),
+        }],
+    });
+    assert_eq!(replay.projection.messages, expected_history);
+    assert_eq!(
+        replay
+            .envelopes
+            .iter()
+            .filter(|envelope| matches!(
+                &envelope.record,
+                JournalRecord::CompactionRequested { .. }
+            ))
+            .count(),
+        1
+    );
+    assert_eq!(
+        replay
+            .envelopes
+            .iter()
+            .filter(|envelope| matches!(&envelope.record, JournalRecord::CompactionFailed { .. }))
+            .count(),
+        1
+    );
+    assert!(!replay.envelopes.iter().any(|envelope| matches!(
+        &envelope.record,
+        JournalRecord::HistoryProjectionReplaced { .. }
+    )));
     assert!(driver.installed_inside_turn.lock().await.is_empty());
     assert!(!driver.install_history_called.load(Ordering::SeqCst));
 }
@@ -1483,7 +1870,12 @@ async fn automatic_compaction_pre_marker_failure_retains_old_history() {
 async fn automatic_compaction_post_marker_reconciliation_returns_committed_history() {
     let directory = tempfile::tempdir().unwrap();
     let sid = SessionId::from("automatic-post-marker-failure");
-    let replay = seeded_file_store(directory.path(), &sid).await;
+    let driver = Arc::new(AutomaticCompactionDriver::new(
+        CompactionTrigger::Threshold,
+        false,
+    ));
+    let old_history = driver.source.clone();
+    let replay = seeded_file_store_with_messages(directory.path(), &sid, &old_history).await;
     let store = Arc::new(
         FileEventStore::open_with_fault_injector(
             directory.path(),
@@ -1491,10 +1883,6 @@ async fn automatic_compaction_post_marker_reconciliation_returns_committed_histo
         )
         .unwrap(),
     );
-    let driver = Arc::new(AutomaticCompactionDriver::new(
-        CompactionTrigger::Threshold,
-        false,
-    ));
     let replacement = driver.replacement.clone();
     let session = spawn_session_with_store(
         sid.clone(),
@@ -1512,24 +1900,60 @@ async fn automatic_compaction_post_marker_reconciliation_returns_committed_histo
         .await
         .unwrap();
 
-    let mut saw_warning = false;
-    loop {
-        let event = next_event(&mut events).await;
-        match event.payload {
-            EventPayload::CompactionCompleted { warning, .. } => {
-                assert_eq!(warning.unwrap().code, "projection.write_failed");
-                saw_warning = true;
-            }
-            EventPayload::TurnCompleted(_) => break,
-            _ => {}
-        }
-    }
-    assert!(saw_warning);
-    assert_eq!(*driver.installed_inside_turn.lock().await, replacement);
+    let observed = events_through_turn_terminal(&mut events).await;
     assert_eq!(
-        store.replay(&sid).await.unwrap().projection.messages,
-        replacement
+        observed
+            .iter()
+            .map(|event| runtime_event_kind(&event.payload))
+            .collect::<Vec<_>>(),
+        vec![
+            "session_started",
+            "turn_started",
+            "compaction_started",
+            "compaction_completed",
+            "turn_completed",
+        ]
     );
+    let EventPayload::CompactionCompleted { warning, .. } = &observed[3].payload else {
+        unreachable!("exact event ordering asserted above")
+    };
+    assert_eq!(
+        warning.as_ref().map(|warning| warning.code.as_str()),
+        Some("projection.write_failed")
+    );
+    let EventPayload::TurnCompleted(output) = &observed[4].payload else {
+        unreachable!("exact event ordering asserted above")
+    };
+    assert_eq!(output.final_text, "continue");
+    assert_eq!(*driver.installed_inside_turn.lock().await, replacement);
+    let replay = timeout(Duration::from_secs(1), store.replay(&sid))
+        .await
+        .expect("post-marker replay timed out")
+        .expect("post-marker replay failed");
+    assert_eq!(replay.projection.messages, replacement);
+    assert_eq!(
+        replay
+            .envelopes
+            .iter()
+            .filter(|envelope| matches!(
+                &envelope.record,
+                JournalRecord::HistoryProjectionReplaced { .. }
+            ))
+            .count(),
+        1
+    );
+    assert_eq!(
+        replay
+            .envelopes
+            .iter()
+            .filter(|envelope| matches!(&envelope.record, JournalRecord::TurnCompleted { .. }))
+            .count(),
+        1
+    );
+    assert!(!replay.envelopes.iter().any(|envelope| matches!(
+        &envelope.record,
+        JournalRecord::CompactionFailed { .. } | JournalRecord::TurnFailed { .. }
+    )));
     assert!(!driver.install_history_called.load(Ordering::SeqCst));
 }
 
@@ -1786,6 +2210,14 @@ async fn compaction_persistence_installs_checkpoint_and_resynchronizes_sequence(
 }
 
 async fn seeded_file_store(directory: &std::path::Path, sid: &SessionId) -> JournalReplay {
+    seeded_file_store_with_messages(directory, sid, &[]).await
+}
+
+async fn seeded_file_store_with_messages(
+    directory: &std::path::Path,
+    sid: &SessionId,
+    messages: &[ModelMessage],
+) -> JournalReplay {
     let store = FileEventStore::open(directory).unwrap();
     store
         .append(
@@ -1802,6 +2234,26 @@ async fn seeded_file_store(directory: &std::path::Path, sid: &SessionId) -> Jour
         )
         .await
         .unwrap();
+    for (index, message) in messages.iter().enumerate() {
+        let sequence = index as u64 + 1;
+        store
+            .append(
+                JournalEnvelope {
+                    schema_version: JOURNAL_SCHEMA_VERSION,
+                    record_id: JournalRecordId::from(format!("{sid}-journal-{sequence}")),
+                    session_id: sid.clone(),
+                    turn_id: None,
+                    journal_sequence: sequence,
+                    timestamp_ms: sequence,
+                    record: JournalRecord::ConversationItemCommitted {
+                        message: message.clone(),
+                    },
+                },
+                JournalDurability::SyncData,
+            )
+            .await
+            .unwrap();
+    }
     let replay = store.replay(sid).await.unwrap();
     store.shutdown(sid).await.unwrap();
     replay
