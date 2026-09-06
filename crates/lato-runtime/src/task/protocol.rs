@@ -38,6 +38,7 @@ pub struct CoordinatorConfig {
     pub cancel_grace: Duration,
     pub teardown_drain_timeout: Duration,
     pub queued_reap_interval: Duration,
+    pub profile_validation_timeout: Duration,
     pub admission_behavior: LimitBehavior,
 }
 
@@ -60,6 +61,7 @@ impl Default for CoordinatorConfig {
             cancel_grace: Duration::from_secs(5),
             teardown_drain_timeout: Duration::from_secs(30),
             queued_reap_interval: Duration::from_millis(250),
+            profile_validation_timeout: Duration::from_secs(5),
             admission_behavior: LimitBehavior::Queue,
         }
     }
@@ -97,6 +99,10 @@ impl CoordinatorConfig {
             !self.queued_reap_interval.is_zero(),
             "queued cancellation reap interval must be positive"
         );
+        assert!(
+            !self.profile_validation_timeout.is_zero(),
+            "profile validation timeout must be positive"
+        );
     }
 }
 
@@ -123,7 +129,6 @@ pub struct SpawnTaskRequest {
     pub profile: AgentProfile,
     pub requested_capabilities: Option<Vec<ToolCapability>>,
     pub budget: BudgetLimits,
-    pub reservation: BudgetAmount,
     pub result_contract: ResultContract,
     pub mode: SpawnMode,
     pub cancellation: CancellationToken,
@@ -165,6 +170,7 @@ pub struct TaskSnapshot {
     pub workspace_lease: Option<WorkspaceLease>,
     pub has_parent_reservation: bool,
     pub event_sequence: u64,
+    pub cleanup_error: Option<TaskError>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -179,7 +185,7 @@ pub struct RegistryCounts {
     pub dropped_sink_events: u64,
 }
 
-/// Result of shutting down the observational event-sink dispatcher.
+/// Result of draining coordinator-owned work and the observational event sink.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SinkShutdown {
     /// The dispatcher delivered every event it had accepted and exited.
@@ -187,6 +193,12 @@ pub enum SinkShutdown {
     /// The bounded wait expired. The worker was detached because safe Rust
     /// cannot force-stop arbitrary callback code that is currently blocked.
     TimedOutDetached,
+    /// Runner work is joined, but one or more allocator leases could not be
+    /// released. `sink_drained` independently preserves the sink outcome.
+    CleanupIncomplete {
+        unreleased_leases: usize,
+        sink_drained: bool,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -236,26 +248,53 @@ pub enum TaskEventPayload {
     RootClosed,
     SpawnAccepted,
     Queued,
-    AdmissionRejected { error: TaskError },
+    AdmissionRejected {
+        error: TaskError,
+    },
     Preparing,
     Started,
-    PhaseChanged { status: TaskStatus },
-    UsageUpdated { usage: TaskUsage },
-    BudgetExhausted { error: TaskError },
-    ActiveMessageAccepted { message_id: u64 },
-    ActiveMessageRejected { message_id: u64, error: TaskError },
-    ActiveMessageUncertain { message_id: u64 },
+    PhaseChanged {
+        status: TaskStatus,
+    },
+    UsageUpdated {
+        usage: TaskUsage,
+    },
+    BudgetExhausted {
+        error: TaskError,
+    },
+    ActiveMessageAccepted {
+        message_id: u64,
+    },
+    ActiveMessageRejected {
+        message_id: u64,
+        error: TaskError,
+    },
+    ActiveMessageUncertain {
+        message_id: u64,
+    },
     ForegroundReleased,
     Backgrounded,
     CancellationRequested,
     Finalizing,
     VerificationStarted,
-    Completed { result: TaskResult },
-    Failed { error: TaskError },
+    Completed {
+        result: TaskResult,
+    },
+    Failed {
+        error: TaskError,
+    },
     Cancelled,
     TimedOut,
-    WorkspaceLeaseAllocated { lease_id: lato_core::LeaseId },
-    WorkspaceLeaseReleased { lease_id: lato_core::LeaseId },
+    WorkspaceLeaseAllocated {
+        lease_id: lato_core::LeaseId,
+    },
+    WorkspaceLeaseReleased {
+        lease_id: lato_core::LeaseId,
+    },
+    WorkspaceLeaseReleaseFailed {
+        lease_id: lato_core::LeaseId,
+        error: TaskError,
+    },
     SpawnAdmissionClosed,
     SpawnAdmissionOpened,
     CompletedRecordEvicted,

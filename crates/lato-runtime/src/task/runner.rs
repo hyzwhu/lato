@@ -105,15 +105,6 @@ pub struct TaskCompletion {
 }
 
 pub(crate) enum RunnerEvent<C: TaskChildControl> {
-    WorkspaceAllocated {
-        task_id: TaskId,
-        lease: WorkspaceLease,
-        acknowledgement: oneshot::Sender<bool>,
-    },
-    WorkspaceAllocationFailed {
-        task_id: TaskId,
-        error: TaskError,
-    },
     Started {
         task_id: TaskId,
         started: StartedTask<C>,
@@ -126,10 +117,6 @@ pub(crate) enum RunnerEvent<C: TaskChildControl> {
     Progress {
         task_id: TaskId,
         progress: TaskProgress,
-    },
-    Completed {
-        task_id: TaskId,
-        output: TaskRunOutput,
     },
 }
 
@@ -193,6 +180,12 @@ pub trait TaskRunner: Send + Sync + 'static {
         reporter: TaskReporter<Self::Control>,
     ) -> TaskRunOutput;
 
+    /// Validates a profile without blocking the executor thread.
+    ///
+    /// The coordinator runs this in an owned Tokio task and enforces a
+    /// deadline by aborting and joining that task. Implementations must keep
+    /// the async cancellation contract: CPU-heavy or blocking work belongs in
+    /// an implementation-owned bounded worker that it can join.
     async fn validate_profile(&self, profile: &AgentProfile) -> Result<(), TaskError>;
 
     fn on_completed(&self, completion: TaskCompletion);

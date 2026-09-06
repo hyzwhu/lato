@@ -10,18 +10,73 @@ use crate::task::{
     CoordinatorConfig, InspectCaller, RunnerEvent, ScopedTaskHandle, SinkShutdown,
     SpawnDisposition, SpawnTaskRequest, TaskChildControl, TaskCommand, TaskCompletion,
     TaskEventEnvelope, TaskEventPayload, TaskEventSink, TaskHandle, TaskReporter, TaskRunRequest,
-    TaskRunner, root_node,
+    TaskRunner, coordinator_closed, root_node,
 };
-use futures_util::FutureExt;
+use futures_util::{
+    FutureExt, StreamExt,
+    future::{AbortHandle as FutureAbortHandle, Abortable, BoxFuture},
+    stream::FuturesUnordered,
+};
 use lato_core::{
     BudgetAccount, TaskError, TaskErrorCode, TaskId, TaskMachine, TaskNode, TaskStatus,
 };
 use lato_workspace::{WorkspaceAllocator, WorkspaceRequest};
-use std::{collections::HashMap, sync::Arc};
-use tokio::{
-    sync::{broadcast, mpsc},
-    task::JoinHandle,
+use std::{
+    collections::{HashMap, HashSet, VecDeque},
+    sync::Arc,
 };
+use tokio::{
+    sync::{broadcast, mpsc, oneshot},
+    task::JoinHandle,
+    time::Instant,
+};
+
+struct PendingSpawn {
+    root_id: TaskId,
+    parent_id: TaskId,
+    request: SpawnTaskRequest,
+    reply: oneshot::Sender<Result<SpawnDisposition, TaskError>>,
+}
+
+struct ProfileValidation {
+    task_id: TaskId,
+    result: Result<(), TaskError>,
+}
+
+enum TaskJobExit {
+    WorkspaceAllocated(TaskId, lato_workspace::WorkspaceLease),
+    Completed(TaskId, crate::task::TaskRunOutput),
+    WorkspaceAllocationFailed(TaskId, TaskError),
+    LeaseReleased(TaskId, lato_core::LeaseId),
+    LeaseReleaseFailed(TaskId, TaskError),
+    Aborted(TaskId, JobPhase),
+}
+
+#[derive(Clone, Copy)]
+enum JobPhase {
+    Preparing,
+    Running,
+    Cleanup,
+}
+
+enum OwnedAbortHandle {
+    Future(FutureAbortHandle),
+    Tokio(tokio::task::AbortHandle),
+}
+
+impl OwnedAbortHandle {
+    fn abort(&self) {
+        match self {
+            Self::Future(handle) => handle.abort(),
+            Self::Tokio(handle) => handle.abort(),
+        }
+    }
+}
+
+struct ShutdownState {
+    replies: Vec<oneshot::Sender<SinkShutdown>>,
+    deadline: Instant,
+}
 
 pub struct TaskCoordinator<R: TaskRunner, A: WorkspaceAllocator> {
     config: CoordinatorConfig,
@@ -38,6 +93,17 @@ pub struct TaskCoordinator<R: TaskRunner, A: WorkspaceAllocator> {
     state: CoordinatorState,
     queue: SpawnQueue,
     controls: HashMap<TaskId, crate::task::TaskControl<R::Control>>,
+    jobs: FuturesUnordered<BoxFuture<'static, TaskJobExit>>,
+    job_aborts: HashMap<TaskId, OwnedAbortHandle>,
+    cancel_deadlines: HashMap<TaskId, Instant>,
+    validations: FuturesUnordered<BoxFuture<'static, ProfileValidation>>,
+    validation_aborts: HashMap<TaskId, tokio::task::AbortHandle>,
+    pending_spawns: HashMap<TaskId, PendingSpawn>,
+    validation_order: VecDeque<TaskId>,
+    validation_results: HashMap<TaskId, Result<(), TaskError>>,
+    cleanup_inflight: HashSet<TaskId>,
+    pending_completions: HashMap<TaskId, TaskCompletion>,
+    shutdown: Option<ShutdownState>,
     handle: TaskHandle,
     sequence: u64,
 }
@@ -78,6 +144,17 @@ where
         dropped_sink_events: 0,
         state: CoordinatorState::default(),
         controls: HashMap::new(),
+        jobs: FuturesUnordered::new(),
+        job_aborts: HashMap::new(),
+        cancel_deadlines: HashMap::new(),
+        validations: FuturesUnordered::new(),
+        validation_aborts: HashMap::new(),
+        pending_spawns: HashMap::new(),
+        validation_order: VecDeque::new(),
+        validation_results: HashMap::new(),
+        cleanup_inflight: HashSet::new(),
+        pending_completions: HashMap::new(),
+        shutdown: None,
         handle: handle.clone(),
         sequence: 0,
     };
@@ -90,14 +167,50 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
         let mut reap = tokio::time::interval(self.config.queued_reap_interval);
         reap.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
+            if self.shutdown.is_some() && self.jobs.is_empty() && self.validations.is_empty() {
+                let sink_outcome = self.shutdown_sink().await;
+                let unreleased_leases = self
+                    .state
+                    .tasks
+                    .values()
+                    .filter(|record| record.workspace_lease.is_some())
+                    .count();
+                let outcome = if unreleased_leases == 0 {
+                    sink_outcome
+                } else {
+                    SinkShutdown::CleanupIncomplete {
+                        unreleased_leases,
+                        sink_drained: sink_outcome == SinkShutdown::Drained,
+                    }
+                };
+                if let Some(shutdown) = self.shutdown.take() {
+                    for reply in shutdown.replies {
+                        let _ = reply.send(outcome);
+                    }
+                }
+                break;
+            }
             tokio::select! {
                 command = self.command_rx.recv() => {
-                    let Some(command) = command else { break };
-                    if self.handle_command(command).await { break; }
+                    if let Some(command) = command {
+                        self.handle_command(command).await;
+                    } else if self.shutdown.is_none() {
+                        self.begin_shutdown(None).await;
+                    }
                 }
                 event = self.internal_rx.recv() => {
                     if let Some(event) = event {
                         self.handle_runner_event(event).await;
+                    }
+                }
+                validation = self.validations.next(), if !self.validations.is_empty() => {
+                    if let Some(validation) = validation {
+                        self.finish_profile_validation(validation);
+                    }
+                }
+                job = self.jobs.next(), if !self.jobs.is_empty() => {
+                    if let Some(job) = job {
+                        self.finish_job(job).await;
                     }
                 }
                 _ = reap.tick() => self.reap_cancelled().await,
@@ -105,10 +218,14 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
         }
     }
 
-    async fn handle_command(&mut self, command: TaskCommand) -> bool {
+    async fn handle_command(&mut self, command: TaskCommand) {
         match command {
             TaskCommand::RegisterRoot { request, reply } => {
-                let result = self.register_root(*request);
+                let result = if self.shutdown.is_some() {
+                    Err(coordinator_closed())
+                } else {
+                    self.register_root(*request)
+                };
                 let _ = reply.send(result);
             }
             TaskCommand::Spawn {
@@ -117,8 +234,7 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
                 request,
                 reply,
             } => {
-                let result = self.spawn(root_id, parent_id, *request).await;
-                let _ = reply.send(result);
+                self.begin_spawn(root_id, parent_id, *request, reply);
             }
             TaskCommand::Inspect {
                 task_id: target_task_id,
@@ -150,12 +266,9 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
                 let _ = reply.send(result);
             }
             TaskCommand::Shutdown { reply } => {
-                let outcome = self.shutdown_sink().await;
-                let _ = reply.send(outcome);
-                return true;
+                self.begin_shutdown(Some(reply)).await;
             }
         }
-        false
     }
 
     fn register_root(&mut self, request: crate::task::TaskRootRequest) -> Result<(), TaskError> {
@@ -183,6 +296,7 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
                 reservation_parent_id: None,
                 cancellation: tokio_util::sync::CancellationToken::new(),
                 depth: 0,
+                cleanup_error: None,
                 last_event_sequence: 0,
             },
         );
@@ -216,12 +330,129 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
         Ok(())
     }
 
-    async fn spawn(
+    fn begin_spawn(
+        &mut self,
+        root_id: TaskId,
+        parent_id: TaskId,
+        request: SpawnTaskRequest,
+        reply: oneshot::Sender<Result<SpawnDisposition, TaskError>>,
+    ) {
+        if self.shutdown.is_some() {
+            let _ = reply.send(Err(coordinator_closed()));
+            return;
+        }
+        if self.pending_spawns.contains_key(&request.task_id) {
+            let _ = reply.send(Err(TaskError::new(
+                TaskErrorCode::DuplicateTask,
+                "task identifier is already pending profile validation",
+            )));
+            return;
+        }
+        if self
+            .state
+            .tasks
+            .len()
+            .saturating_add(self.pending_spawns.len())
+            >= self.config.max_total_tasks
+        {
+            let _ = reply.send(Err(TaskError::new(
+                TaskErrorCode::RetentionLimit,
+                "pending task validation capacity is exhausted",
+            )));
+            return;
+        }
+        if let Err(error) =
+            validate_structure(&self.state, &self.config, &root_id, &parent_id, &request)
+        {
+            let _ = reply.send(Err(error));
+            return;
+        }
+        if let Err(error) = request.profile.effective_capabilities(
+            &self.state.tasks[&parent_id].node.permissions,
+            request.requested_capabilities.as_deref(),
+        ) {
+            let _ = reply.send(Err(error));
+            return;
+        }
+        let task_id = request.task_id.clone();
+        let profile = request.profile.clone();
+        let runner = Arc::clone(&self.runner);
+        let timeout = self.config.profile_validation_timeout;
+        self.pending_spawns.insert(
+            task_id.clone(),
+            PendingSpawn {
+                root_id,
+                parent_id,
+                request,
+                reply,
+            },
+        );
+        self.validation_order.push_back(task_id.clone());
+        let validation_task = tokio::spawn(async move {
+            let validation =
+                std::panic::AssertUnwindSafe(runner.validate_profile(&profile)).catch_unwind();
+            match tokio::time::timeout(timeout, validation).await {
+                Ok(Ok(Ok(()))) => Ok(()),
+                Ok(Ok(Err(error))) => Err(TaskError::new(
+                    TaskErrorCode::InvalidProfile,
+                    format!("task profile validation failed: {error}"),
+                )),
+                Ok(Err(_)) => Err(TaskError::new(
+                    TaskErrorCode::RunnerPanic,
+                    "task runner panicked during profile validation",
+                )),
+                Err(_) => Err(TaskError::new(
+                    TaskErrorCode::InvalidProfile,
+                    "task profile validation timed out",
+                )),
+            }
+        });
+        self.validation_aborts
+            .insert(task_id.clone(), validation_task.abort_handle());
+        self.validations.push(Box::pin(async move {
+            let result = match validation_task.await {
+                Ok(result) => result,
+                Err(error) if error.is_cancelled() => Err(coordinator_closed()),
+                Err(_) => Err(TaskError::new(
+                    TaskErrorCode::RunnerPanic,
+                    "task profile validation task terminated unexpectedly",
+                )),
+            };
+            ProfileValidation { task_id, result }
+        }));
+    }
+
+    fn finish_profile_validation(&mut self, validation: ProfileValidation) {
+        self.validation_aborts.remove(&validation.task_id);
+        self.validation_results
+            .insert(validation.task_id, validation.result);
+        while let Some(task_id) = self.validation_order.front() {
+            let Some(validation) = self.validation_results.remove(task_id) else {
+                break;
+            };
+            let task_id = self
+                .validation_order
+                .pop_front()
+                .expect("validation order front exists");
+            let Some(pending) = self.pending_spawns.remove(&task_id) else {
+                continue;
+            };
+            let result = validation.and_then(|()| {
+                self.finish_spawn(pending.root_id, pending.parent_id, pending.request)
+            });
+            let _ = pending.reply.send(result);
+        }
+    }
+
+    fn finish_spawn(
         &mut self,
         root_id: TaskId,
         parent_id: TaskId,
         request: SpawnTaskRequest,
     ) -> Result<SpawnDisposition, TaskError> {
+        if self.shutdown.is_some() {
+            return Err(coordinator_closed());
+        }
         let structure =
             validate_structure(&self.state, &self.config, &root_id, &parent_id, &request)?;
         let admission = decide(
@@ -230,25 +461,8 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
             self.state.running_count_for_root(&root_id),
             self.queue.len(),
         );
-        match std::panic::AssertUnwindSafe(self.runner.validate_profile(&request.profile))
-            .catch_unwind()
-            .await
-        {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                return Err(TaskError::new(
-                    TaskErrorCode::InvalidProfile,
-                    format!("task profile validation failed: {error}"),
-                ));
-            }
-            Err(_) => {
-                return Err(TaskError::new(
-                    TaskErrorCode::RunnerPanic,
-                    "task runner panicked during profile validation",
-                ));
-            }
-        }
-        let (permissions, reservation) = reserve(&mut self.state, &parent_id, &request)?;
+        let (permissions, effective_budget, reservation) =
+            reserve(&mut self.state, &parent_id, &request)?;
         let task_id = request.task_id.clone();
         let initial_status = match admission {
             AdmissionDecision::Start => TaskStatus::Preparing,
@@ -271,12 +485,13 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
             task_id.clone(),
             RuntimeTaskRecord {
                 node,
-                budget: BudgetAccount::new(request.budget),
+                budget: BudgetAccount::new(effective_budget),
                 workspace_lease: None,
                 reservation: Some(reservation),
                 reservation_parent_id: Some(parent_id),
                 cancellation: request.cancellation,
                 depth: structure.depth,
+                cleanup_error: None,
                 last_event_sequence: 0,
             },
         );
@@ -313,49 +528,48 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
         })
     }
 
-    fn launch_preparation(&self, task_id: TaskId) {
+    fn launch_preparation(&mut self, task_id: TaskId) {
         let record = self
             .state
             .tasks
             .get(&task_id)
             .expect("preparing task remains registered");
         let node = record.node.clone();
-        let cancellation = record.cancellation.clone();
         let allocator = Arc::clone(&self.workspace_allocator);
-        let runner = Arc::clone(&self.runner);
-        let event_tx = self._internal_tx.clone();
-        let scoped_handle =
-            ScopedTaskHandle::new(node.root_id.clone(), task_id.clone(), self.handle.clone());
-        tokio::spawn(async move {
-            let lease = match allocator
+        let job_task_id = task_id.clone();
+        let future = async move {
+            match allocator
                 .allocate(WorkspaceRequest::new(
                     task_id.clone(),
                     node.workspace_intent,
                 ))
                 .await
             {
-                Ok(lease) => lease,
-                Err(error) => {
-                    let _ = event_tx
-                        .send(RunnerEvent::WorkspaceAllocationFailed { task_id, error })
-                        .await;
-                    return;
-                }
-            };
-            let (acknowledgement, response) = tokio::sync::oneshot::channel();
-            if event_tx
-                .send(RunnerEvent::WorkspaceAllocated {
-                    task_id: task_id.clone(),
-                    lease: lease.clone(),
-                    acknowledgement,
-                })
-                .await
-                .is_err()
-                || !response.await.unwrap_or(false)
-            {
-                let _ = allocator.release(&lease).await;
-                return;
+                Ok(lease) => TaskJobExit::WorkspaceAllocated(task_id, lease),
+                Err(error) => TaskJobExit::WorkspaceAllocationFailed(task_id, error),
             }
+        };
+        self.push_job(job_task_id, JobPhase::Preparing, future);
+    }
+
+    fn launch_runner(&mut self, task_id: TaskId) {
+        let record = self
+            .state
+            .tasks
+            .get(&task_id)
+            .expect("prepared task remains registered");
+        let node = record.node.clone();
+        let cancellation = record.cancellation.clone();
+        let lease = record
+            .workspace_lease
+            .clone()
+            .expect("runner starts only after actor accepts a workspace lease");
+        let runner = Arc::clone(&self.runner);
+        let event_tx = self._internal_tx.clone();
+        let scoped_handle =
+            ScopedTaskHandle::new(node.root_id.clone(), task_id.clone(), self.handle.clone());
+        let job_task_id = task_id.clone();
+        let future = async move {
             let reporter = TaskReporter::new(task_id.clone(), event_tx.clone());
             let run = runner.run(
                 TaskRunRequest {
@@ -380,10 +594,26 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
                     output_ref: None,
                 }),
             };
-            let _ = event_tx
-                .send(RunnerEvent::Completed { task_id, output })
-                .await;
-        });
+            TaskJobExit::Completed(task_id, output)
+        };
+        self.push_job(job_task_id, JobPhase::Running, future);
+    }
+
+    fn push_job(
+        &mut self,
+        task_id: TaskId,
+        phase: JobPhase,
+        future: impl std::future::Future<Output = TaskJobExit> + Send + 'static,
+    ) {
+        let (abort, registration) = FutureAbortHandle::new_pair();
+        self.job_aborts
+            .insert(task_id.clone(), OwnedAbortHandle::Future(abort));
+        self.jobs.push(Box::pin(async move {
+            match Abortable::new(future, registration).await {
+                Ok(exit) => exit,
+                Err(_) => TaskJobExit::Aborted(task_id, phase),
+            }
+        }));
     }
 
     fn is_live_preparing(&self, task_id: &TaskId) -> bool {
@@ -448,12 +678,12 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
             });
             self.commit_transition(task_id.clone(), TaskEventPayload::Failed { error });
         }
-        self.runner.on_completed(TaskCompletion {
+        let completion = TaskCompletion {
             task_id: task_id.clone(),
             result: output.result,
-        });
+        };
+        self.pending_completions.insert(task_id.clone(), completion);
         self.cleanup_terminal(&task_id).await;
-        self.promote_queue();
     }
 
     async fn fail_task(&mut self, task_id: TaskId, error: TaskError) {
@@ -471,25 +701,67 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
         self.set_status(&task_id, TaskStatus::Failed);
         self.commit_transition(task_id.clone(), TaskEventPayload::Failed { error });
         self.cleanup_terminal(&task_id).await;
-        self.promote_queue();
     }
 
     async fn cleanup_terminal(&mut self, task_id: &TaskId) {
         self.controls.remove(task_id);
+        if self.cleanup_inflight.contains(task_id) {
+            return;
+        }
         let lease = self
             .state
             .tasks
-            .get_mut(task_id)
-            .and_then(|record| record.workspace_lease.take());
+            .get(task_id)
+            .and_then(|record| record.workspace_lease.clone());
         if let Some(lease) = lease {
-            let lease_id = lease.id.clone();
-            let _ = self.workspace_allocator.release(&lease).await;
-            self.commit_transition(
-                task_id.clone(),
-                TaskEventPayload::WorkspaceLeaseReleased { lease_id },
-            );
+            self.launch_lease_cleanup(task_id.clone(), lease);
+            return;
         }
         self.release_reservation(task_id);
+        self.finish_terminal_cleanup(task_id);
+    }
+
+    fn launch_lease_cleanup(&mut self, task_id: TaskId, lease: lato_workspace::WorkspaceLease) {
+        self.cleanup_inflight.insert(task_id.clone());
+        let allocator = Arc::clone(&self.workspace_allocator);
+        let lease_id = lease.id.clone();
+        let timeout = self.config.teardown_drain_timeout;
+        let cleanup_task_id = task_id.clone();
+        let cleanup_task = tokio::spawn(async move {
+            match tokio::time::timeout(timeout, allocator.release(&lease)).await {
+                Ok(Ok(())) => TaskJobExit::LeaseReleased(cleanup_task_id, lease_id),
+                Ok(Err(error)) => TaskJobExit::LeaseReleaseFailed(cleanup_task_id, error),
+                Err(_) => TaskJobExit::LeaseReleaseFailed(
+                    cleanup_task_id,
+                    TaskError::new(
+                        TaskErrorCode::WorkspaceRelease,
+                        "workspace release timed out",
+                    ),
+                ),
+            }
+        });
+        self.job_aborts.insert(
+            task_id.clone(),
+            OwnedAbortHandle::Tokio(cleanup_task.abort_handle()),
+        );
+        self.jobs.push(Box::pin(async move {
+            match cleanup_task.await {
+                Ok(exit) => exit,
+                Err(_) => TaskJobExit::Aborted(task_id, JobPhase::Cleanup),
+            }
+        }));
+    }
+
+    fn finish_terminal_cleanup(&mut self, task_id: &TaskId) {
+        if let Some(completion) = self.pending_completions.remove(task_id) {
+            let runner = Arc::clone(&self.runner);
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                runner.on_completed(completion);
+            }));
+        }
+        if self.shutdown.is_none() {
+            self.promote_queue();
+        }
     }
 
     fn release_reservation(&mut self, task_id: &TaskId) {
@@ -515,6 +787,20 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
     }
 
     fn promote_queue(&mut self) {
+        let cancelled = self.queue.remove_matching(|queued| {
+            self.state.tasks.get(&queued.task_id).is_none_or(|record| {
+                record.node.status != TaskStatus::Queued || record.cancellation.is_cancelled()
+            })
+        });
+        for queued in cancelled {
+            if self.state.tasks.get(&queued.task_id).is_some_and(|record| {
+                record.node.status == TaskStatus::Queued && record.cancellation.is_cancelled()
+            }) {
+                self.set_status(&queued.task_id, TaskStatus::Cancelled);
+                self.commit_transition(queued.task_id.clone(), TaskEventPayload::Cancelled);
+                self.release_reservation(&queued.task_id);
+            }
+        }
         let mut global = self.state.running_count();
         let mut roots = HashMap::<TaskId, usize>::new();
         for root_id in &self.state.roots {
@@ -543,68 +829,249 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
     }
 
     async fn reap_cancelled(&mut self) {
-        let cancelled: Vec<_> = self
+        let newly_cancelled: Vec<_> = self
+            .state
+            .tasks
+            .iter()
+            .filter(|(task_id, record)| {
+                !record.node.status.is_terminal()
+                    && record.cancellation.is_cancelled()
+                    && !self.cancel_deadlines.contains_key(*task_id)
+            })
+            .map(|(task_id, _)| task_id.clone())
+            .collect();
+        for task_id in newly_cancelled {
+            self.request_cancel(task_id).await;
+        }
+        let now = Instant::now();
+        let expired: Vec<_> = self
+            .cancel_deadlines
+            .iter()
+            .filter(|(_, deadline)| **deadline <= now)
+            .map(|(task_id, _)| task_id.clone())
+            .collect();
+        for task_id in expired {
+            if let Some(abort) = self.job_aborts.get(&task_id) {
+                abort.abort();
+            }
+        }
+        if let Some(shutdown) = &self.shutdown
+            && shutdown.deadline <= now
+        {
+            for abort in self.job_aborts.values() {
+                abort.abort();
+            }
+        }
+    }
+
+    async fn request_cancel(&mut self, task_id: TaskId) {
+        let status = self.state.tasks[&task_id].node.status;
+        if status == TaskStatus::Queued {
+            self.queue
+                .remove_matching(|queued| queued.task_id == task_id);
+            self.set_status(&task_id, TaskStatus::Cancelled);
+            self.commit_transition(task_id.clone(), TaskEventPayload::Cancelled);
+            self.cleanup_terminal(&task_id).await;
+            return;
+        }
+        self.state.tasks[&task_id].cancellation.cancel();
+        if let Some(control) = self.controls.get(&task_id) {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                control.child().cancel();
+            }));
+        }
+        self.commit_transition(task_id.clone(), TaskEventPayload::CancellationRequested);
+        self.cancel_deadlines
+            .insert(task_id, Instant::now() + self.config.cancel_grace);
+    }
+
+    async fn finish_job(&mut self, exit: TaskJobExit) {
+        let task_id = match &exit {
+            TaskJobExit::WorkspaceAllocated(task_id, _)
+            | TaskJobExit::Completed(task_id, _)
+            | TaskJobExit::WorkspaceAllocationFailed(task_id, _)
+            | TaskJobExit::LeaseReleased(task_id, _)
+            | TaskJobExit::LeaseReleaseFailed(task_id, _)
+            | TaskJobExit::Aborted(task_id, _) => task_id.clone(),
+        };
+        self.job_aborts.remove(&task_id);
+        match &exit {
+            TaskJobExit::LeaseReleased(_, lease_id) => {
+                self.cleanup_inflight.remove(&task_id);
+                let record = self
+                    .state
+                    .tasks
+                    .get_mut(&task_id)
+                    .expect("cleanup completion references retained task");
+                record.workspace_lease = None;
+                record.cleanup_error = None;
+                self.commit_transition(
+                    task_id.clone(),
+                    TaskEventPayload::WorkspaceLeaseReleased {
+                        lease_id: lease_id.clone(),
+                    },
+                );
+                self.release_reservation(&task_id);
+                self.finish_terminal_cleanup(&task_id);
+                return;
+            }
+            TaskJobExit::LeaseReleaseFailed(_, error) => {
+                self.finish_failed_lease_cleanup(&task_id, error.clone());
+                return;
+            }
+            TaskJobExit::Aborted(_, JobPhase::Cleanup) => {
+                self.finish_failed_lease_cleanup(
+                    &task_id,
+                    TaskError::new(
+                        TaskErrorCode::WorkspaceRelease,
+                        "workspace release was aborted at the shutdown deadline",
+                    ),
+                );
+                return;
+            }
+            _ => {}
+        }
+        let cancellation_requested = self.cancel_deadlines.remove(&task_id).is_some()
+            || self
+                .state
+                .tasks
+                .get(&task_id)
+                .is_some_and(|record| record.cancellation.is_cancelled());
+        if self
+            .state
+            .tasks
+            .get(&task_id)
+            .is_none_or(|record| record.node.status.is_terminal())
+        {
+            return;
+        }
+        if let TaskJobExit::WorkspaceAllocated(_, lease) = &exit {
+            let lease_id = lease.id.clone();
+            let record = self
+                .state
+                .tasks
+                .get_mut(&task_id)
+                .expect("allocated lease remains actor-owned");
+            record.workspace_lease = Some(lease.clone());
+            self.commit_transition(
+                task_id.clone(),
+                TaskEventPayload::WorkspaceLeaseAllocated { lease_id },
+            );
+            if cancellation_requested {
+                self.set_status(&task_id, TaskStatus::Cancelled);
+                self.commit_transition(task_id.clone(), TaskEventPayload::Cancelled);
+                self.cleanup_terminal(&task_id).await;
+            } else {
+                self.launch_runner(task_id);
+            }
+            return;
+        }
+        if cancellation_requested {
+            self.set_status(&task_id, TaskStatus::Cancelled);
+            self.commit_transition(task_id.clone(), TaskEventPayload::Cancelled);
+            self.cleanup_terminal(&task_id).await;
+        } else {
+            match exit {
+                TaskJobExit::WorkspaceAllocated(_, _) => unreachable!("handled above"),
+                TaskJobExit::Completed(_, output) => self.complete_task(task_id, output).await,
+                TaskJobExit::WorkspaceAllocationFailed(_, error) => {
+                    self.fail_task(task_id, error).await;
+                }
+                TaskJobExit::LeaseReleased(_, _) | TaskJobExit::LeaseReleaseFailed(_, _) => {
+                    unreachable!("cleanup exits handled above")
+                }
+                TaskJobExit::Aborted(_, _) => {
+                    self.fail_task(
+                        task_id,
+                        TaskError::new(
+                            TaskErrorCode::RunnerInitialization,
+                            "task execution ended without a completion result",
+                        ),
+                    )
+                    .await;
+                }
+            }
+        }
+    }
+
+    fn finish_failed_lease_cleanup(&mut self, task_id: &TaskId, error: TaskError) {
+        self.cleanup_inflight.remove(task_id);
+        let lease_id = self
+            .state
+            .tasks
+            .get(task_id)
+            .and_then(|record| record.workspace_lease.as_ref())
+            .map(|lease| lease.id.clone())
+            .expect("failed cleanup retains its lease authority");
+        self.state
+            .tasks
+            .get_mut(task_id)
+            .expect("cleanup failure references retained task")
+            .cleanup_error = Some(error.clone());
+        self.commit_transition(
+            task_id.clone(),
+            TaskEventPayload::WorkspaceLeaseReleaseFailed { lease_id, error },
+        );
+        self.finish_terminal_cleanup(task_id);
+    }
+
+    async fn begin_shutdown(&mut self, reply: Option<oneshot::Sender<SinkShutdown>>) {
+        if let Some(shutdown) = &mut self.shutdown {
+            if let Some(reply) = reply {
+                shutdown.replies.push(reply);
+            }
+            return;
+        }
+        let mut replies = Vec::new();
+        if let Some(reply) = reply {
+            replies.push(reply);
+        }
+        self.shutdown = Some(ShutdownState {
+            replies,
+            deadline: Instant::now() + self.config.teardown_drain_timeout,
+        });
+
+        for abort in self.validation_aborts.values() {
+            abort.abort();
+        }
+        for (_, pending) in self.pending_spawns.drain() {
+            let _ = pending.reply.send(Err(coordinator_closed()));
+        }
+        self.validation_order.clear();
+        self.validation_results.clear();
+
+        let live: Vec<_> = self
             .state
             .tasks
             .iter()
             .filter(|(_, record)| {
-                !record.node.status.is_terminal() && record.cancellation.is_cancelled()
+                record.node.parent_id.is_some() && !record.node.status.is_terminal()
             })
             .map(|(task_id, _)| task_id.clone())
             .collect();
-        if cancelled.is_empty() {
-            return;
+        for task_id in live {
+            self.request_cancel(task_id).await;
         }
-        self.queue
-            .remove_matching(|queued| cancelled.contains(&queued.task_id));
-        for task_id in cancelled {
-            self.cancel_one(task_id).await;
-        }
-        self.promote_queue();
+        self.retry_terminal_cleanup().await;
     }
 
-    async fn cancel_one(&mut self, task_id: TaskId) {
-        let status = self.state.tasks[&task_id].node.status;
-        if status == TaskStatus::Running
-            && let Some(control) = self.controls.remove(&task_id)
-        {
-            control.child().cancel();
+    async fn retry_terminal_cleanup(&mut self) {
+        let retry_cleanup: Vec<_> = self
+            .state
+            .tasks
+            .iter()
+            .filter(|(_, record)| {
+                record.node.status.is_terminal() && record.workspace_lease.is_some()
+            })
+            .map(|(task_id, _)| task_id.clone())
+            .collect();
+        for task_id in retry_cleanup {
+            self.cleanup_terminal(&task_id).await;
         }
-        self.set_status(&task_id, TaskStatus::Cancelled);
-        self.commit_transition(task_id.clone(), TaskEventPayload::Cancelled);
-        self.cleanup_terminal(&task_id).await;
     }
 
     async fn handle_runner_event(&mut self, event: RunnerEvent<R::Control>) {
         match event {
-            RunnerEvent::WorkspaceAllocated {
-                task_id,
-                lease,
-                acknowledgement,
-            } => {
-                let accepted = self.state.tasks.get(&task_id).is_some_and(|record| {
-                    record.node.status == TaskStatus::Preparing
-                        && !record.cancellation.is_cancelled()
-                });
-                if accepted {
-                    let lease_id = lease.id.clone();
-                    self.state
-                        .tasks
-                        .get_mut(&task_id)
-                        .expect("checked record")
-                        .workspace_lease = Some(lease);
-                    self.commit_transition(
-                        task_id,
-                        TaskEventPayload::WorkspaceLeaseAllocated { lease_id },
-                    );
-                }
-                let _ = acknowledgement.send(accepted);
-            }
-            RunnerEvent::WorkspaceAllocationFailed { task_id, error } => {
-                if self.is_live_preparing(&task_id) {
-                    self.fail_task(task_id, error).await;
-                }
-            }
             RunnerEvent::Started {
                 task_id,
                 started,
@@ -616,7 +1083,9 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
                     self.set_status(&task_id, TaskStatus::Running);
                     self.commit_transition(task_id, TaskEventPayload::Started);
                 } else {
-                    started.control.child().cancel();
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        started.control.child().cancel();
+                    }));
                 }
                 let _ = acknowledgement.send(accepted);
             }
@@ -625,16 +1094,6 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
             }
             RunnerEvent::Progress { task_id, progress } => {
                 let _ = (task_id, progress);
-            }
-            RunnerEvent::Completed { task_id, output } => {
-                if self.state.tasks.get(&task_id).is_some_and(|record| {
-                    !record.node.status.is_terminal() && record.cancellation.is_cancelled()
-                }) {
-                    self.cancel_one(task_id).await;
-                    self.promote_queue();
-                } else {
-                    self.complete_task(task_id, output).await;
-                }
             }
         }
     }

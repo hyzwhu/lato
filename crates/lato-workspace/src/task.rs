@@ -121,7 +121,22 @@ impl WorkspaceRequest {
 
 #[async_trait::async_trait]
 pub trait WorkspaceAllocator: Send + Sync + 'static {
+    /// Acquires a workspace lease transactionally.
+    ///
+    /// The returned future must be cancellation-safe: dropping it at any await
+    /// point must roll back every external resource created before a
+    /// `WorkspaceLease` is returned. Once the lease is returned, the caller
+    /// owns cleanup authority and will call [`WorkspaceAllocator::release`].
     async fn allocate(&self, request: WorkspaceRequest) -> Result<WorkspaceLease, TaskError>;
+
+    /// Releases all external resources represented by `lease`.
+    ///
+    /// This operation must be cancellation-safe and retryable: returning an
+    /// error or dropping the future at any await point must leave `lease` usable
+    /// as cleanup authority. Implementations must either roll back partial
+    /// cleanup before suspension or make every cleanup step idempotent so a
+    /// later call can safely finish it. Callers may bound and cancel this future,
+    /// retain the lease, and report incomplete cleanup without claiming success.
     async fn release(&self, lease: &WorkspaceLease) -> Result<(), TaskError>;
 }
 

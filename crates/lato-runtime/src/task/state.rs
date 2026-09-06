@@ -16,6 +16,7 @@ pub(crate) struct RuntimeTaskRecord {
     pub(crate) reservation_parent_id: Option<TaskId>,
     pub(crate) cancellation: CancellationToken,
     pub(crate) depth: u32,
+    pub(crate) cleanup_error: Option<lato_core::TaskError>,
     pub(crate) last_event_sequence: u64,
 }
 
@@ -73,6 +74,7 @@ impl CoordinatorState {
             workspace_lease: record.workspace_lease.clone(),
             has_parent_reservation: record.reservation.is_some(),
             event_sequence: record.last_event_sequence,
+            cleanup_error: record.cleanup_error.clone(),
         })
     }
 
@@ -167,6 +169,7 @@ mod tests {
             reservation_parent_id: None,
             cancellation: CancellationToken::new(),
             depth: if parent_id.is_some() { 1 } else { 0 },
+            cleanup_error: None,
             last_event_sequence: 0,
         }
     }
