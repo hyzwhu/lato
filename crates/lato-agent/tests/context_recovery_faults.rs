@@ -1,22 +1,26 @@
 use async_trait::async_trait;
 use lato_agent::{
-    AcpHost, LegacyTurnDriver, PromptKind, REQUIRED_SECTIONS, SessionActor, TurnOutcome,
-    history_to_model_messages,
+    AcpHost, HistoryItem, LegacyTurnDriver, PromptKind, REQUIRED_SECTIONS, SessionActor,
+    TurnOutcome, history_to_model_messages,
 };
 use lato_ai::{ModelMetadata, ModelStream, StreamPiece, adapt_model_endpoint};
 use lato_core::{
     AgentError, CancelReason, Command, ErrorCategory, EventPayload, EventStore,
     HistoryProjectionMetadata, HistoryProjectionStore, HistoryReplacementReason, JournalDurability,
     JournalEnvelope, JournalError, JournalReplay, ModelError, ModelErrorKind, ModelMessage,
-    ProjectionError, Retryability, SessionId, StartBehavior, StartTurn, TurnId, TurnOutput,
-    UserInput,
+    PolicyMode, ProjectionError, Retryability, SandboxProfile, SessionId, SideEffect,
+    StartBehavior, StartTurn, ToolCancellation, ToolCapability, ToolConcurrency, ToolContext,
+    ToolDescriptor, ToolError, ToolIdempotency, ToolLayer, ToolOutput, ToolSource, TurnId,
+    TurnOutput, UserInput,
 };
+use lato_policy::{ApprovalLedger, PolicyEngine};
 use lato_protocol::JsonRpcReq;
 use lato_runtime::{
     CompactionControl, CompactionRequest, SessionBootstrap, TurnControl, TurnDriver,
-    TurnEventEmitter, TurnRequest, spawn_session_with_store,
+    TurnEventEmitter, TurnRequest, spawn_session, spawn_session_with_store,
 };
 use lato_store::MemoryEventStore;
+use lato_tools::{PolicyScope, ToolRuntimeBuilder};
 use lato_workspace::{FileLocks, SessionTrust};
 use std::{
     collections::VecDeque,
@@ -388,6 +392,244 @@ async fn fatal_recovery_appends_context_without_replacing_the_provider_failure()
         "{message}"
     );
     assert_eq!(stream.calls(), 3);
+}
+
+struct OversizedOutputTool;
+
+#[async_trait]
+impl lato_core::Tool for OversizedOutputTool {
+    fn descriptor(&self) -> ToolDescriptor {
+        ToolDescriptor {
+            name: lato_core::ToolName::parse("test:oversized_output").unwrap(),
+            version: semver::Version::new(1, 0, 0),
+            description: "return deterministic output large enough to cross preflight".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+            capabilities: vec![ToolCapability::ExtensionInvoke],
+            side_effect: SideEffect::None,
+            concurrency: ToolConcurrency::Serial,
+            idempotency: ToolIdempotency::Idempotent,
+            timeout_ms: 1_000,
+            max_output_bytes: 40_000,
+            cancellation: ToolCancellation::Cooperative,
+            source: ToolSource {
+                layer: ToolLayer::SessionOverride,
+                id: "test.oversized-output".into(),
+                replacement: None,
+            },
+        }
+    }
+
+    async fn invoke(
+        &self,
+        _context: ToolContext,
+        _arguments: serde_json::Value,
+    ) -> Result<ToolOutput, ToolError> {
+        Ok(ToolOutput {
+            content: "oversized-tool-output".repeat(1_500),
+            metadata: serde_json::json!({}),
+            truncated: false,
+            artifact_path: None,
+        })
+    }
+}
+
+async fn preflight_driver(
+    workspace: &tempfile::TempDir,
+    stream: Arc<FaultStream>,
+) -> (
+    Arc<LegacyTurnDriver>,
+    mpsc::UnboundedReceiver<serde_json::Value>,
+) {
+    let raw: Arc<dyn ModelStream> = stream;
+    let endpoint = adapt_model_endpoint(
+        "fixture",
+        "preflight-faults",
+        ModelMetadata {
+            context_window: Some(10_000),
+            model_family: Some("fixture".into()),
+        },
+        raw,
+    )
+    .unwrap();
+    let policy = Arc::new(PolicyEngine::new(Arc::new(ApprovalLedger::new(
+        Duration::from_secs(60),
+    ))));
+    let mut tools = ToolRuntimeBuilder::new(
+        policy,
+        PolicyScope {
+            workspace_root: workspace.path().to_path_buf(),
+            mode: PolicyMode::Always,
+            project_trusted: true,
+            sandbox_profile: SandboxProfile::Off,
+        },
+    );
+    tools.register(Arc::new(OversizedOutputTool)).unwrap();
+    let (updates, updates_rx) = mpsc::unbounded_channel();
+    let driver = Arc::new(LegacyTurnDriver::new_with_tool_runtime(
+        "preflight-faults".into(),
+        endpoint.stream,
+        Arc::new(FileLocks::new()),
+        SessionTrust::for_headless_prompt(workspace.path()),
+        workspace.path().to_path_buf(),
+        updates,
+        None,
+        Arc::new(tools.build().unwrap()),
+    ));
+    driver
+        .replace_history(vec![
+            HistoryItem::System("deterministic test system".into()),
+            HistoryItem::AssistantText("prior-context".repeat(1_800)),
+        ])
+        .await;
+    (driver, updates_rx)
+}
+
+async fn run_preflight_turn(driver: Arc<LegacyTurnDriver>) -> Vec<lato_core::EventEnvelope> {
+    let session = spawn_session(SessionId::from("preflight-faults"), driver);
+    let mut events = session.subscribe();
+    timeout(
+        Duration::from_secs(2),
+        session.submit(Command::StartTurn(StartTurn {
+            input: UserInput::text("produce a deterministic oversized tool result"),
+            behavior: StartBehavior::Reject,
+        })),
+    )
+    .await
+    .expect("runtime did not accept the preflight turn")
+    .unwrap();
+
+    timeout(Duration::from_secs(2), async {
+        let mut observed = Vec::new();
+        loop {
+            let event = events.recv().await.unwrap();
+            let terminal = matches!(
+                event.payload,
+                EventPayload::TurnCompleted(_)
+                    | EventPayload::TurnFailed { .. }
+                    | EventPayload::TurnCancelled { .. }
+            );
+            observed.push(event);
+            if terminal {
+                break observed;
+            }
+        }
+    })
+    .await
+    .expect("preflight turn did not terminate")
+}
+
+fn oversized_tool_call_step() -> FaultStep {
+    success(vec![StreamPiece::ToolCall {
+        id: "oversized-output-call".into(),
+        name: "oversized_output".into(),
+        arguments: serde_json::json!({}),
+    }])
+}
+
+#[tokio::test]
+async fn preflight_overflow_compacts_before_rebuilt_ordinary_request() {
+    let workspace = tempfile::tempdir().unwrap();
+    let stream = Arc::new(FaultStream::new(vec![
+        oversized_tool_call_step(),
+        success(vec![StreamPiece::Text(summary())]),
+        success(vec![StreamPiece::Text("recovered after preflight".into())]),
+    ]));
+    let (driver, _updates) = preflight_driver(&workspace, stream.clone()).await;
+    let events = run_preflight_turn(driver).await;
+
+    assert!(
+        matches!(
+            events.last().unwrap().payload,
+            EventPayload::TurnCompleted(_)
+        ),
+        "unexpected terminal event: {:?}",
+        events.last().unwrap()
+    );
+    assert!(events.iter().any(|event| matches!(
+        event.payload,
+        EventPayload::CompactionStarted {
+            trigger: lato_core::CompactionTrigger::PreflightOverflow,
+            ..
+        }
+    )));
+    let contexts = stream.contexts();
+    assert_eq!(contexts.len(), 3, "ordinary, compaction, rebuilt ordinary");
+    assert!(!contexts[0]["tools"].as_array().unwrap().is_empty());
+    assert!(contexts[1]["tools"].as_array().unwrap().is_empty());
+    assert!(!contexts[2]["tools"].as_array().unwrap().is_empty());
+    assert!(contexts[2].to_string().contains("conversation_summary"));
+}
+
+#[tokio::test]
+async fn preflight_recovery_failure_never_submits_known_oversized_ordinary_request() {
+    let workspace = tempfile::tempdir().unwrap();
+    let stream = Arc::new(FaultStream::new(vec![
+        oversized_tool_call_step(),
+        success(vec![StreamPiece::Text("invalid summary one".into())]),
+        success(vec![StreamPiece::Text("invalid summary two".into())]),
+    ]));
+    let (driver, mut updates) = preflight_driver(&workspace, stream.clone()).await;
+    let events = run_preflight_turn(driver).await;
+
+    let EventPayload::TurnFailed { error } = &events.last().unwrap().payload else {
+        panic!(
+            "preflight failure did not terminate the turn: {:?}",
+            events.last()
+        );
+    };
+    assert!(
+        error.message.contains("context.preflight_recovery_failed"),
+        "{error}"
+    );
+    let contexts = stream.contexts();
+    assert_eq!(contexts.len(), 3, "events: {events:#?}");
+    assert!(!contexts[0]["tools"].as_array().unwrap().is_empty());
+    assert!(
+        contexts[1..]
+            .iter()
+            .all(|context| context["tools"].as_array().unwrap().is_empty()),
+        "no oversized ordinary request may follow the tool result"
+    );
+    let recovery_updates = std::iter::from_fn(|| updates.try_recv().ok())
+        .filter(|update| update["method"] == "lato/session/recovery")
+        .collect::<Vec<_>>();
+    assert_eq!(recovery_updates.len(), 1);
+    assert_eq!(
+        recovery_updates[0]["params"]["automaticCompactionSuppression"],
+        "sticky"
+    );
+}
+
+#[tokio::test]
+async fn suppression_policy_manual_bypass_has_a_real_acp_compaction_entry_point() {
+    let workspace = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let stream = Arc::new(FaultStream::new(vec![
+        success(vec![StreamPiece::Text(
+            "manual compaction source ".repeat(2_000),
+        )]),
+        success(vec![StreamPiece::Text(summary())]),
+    ]));
+    let (mut host, _) = make_host(&workspace, &home, stream.clone());
+    let sid = new_session(&mut host).await;
+    seed(&mut host, &sid).await;
+
+    let response = timeout(
+        Duration::from_secs(2),
+        host.handle(req(
+            3,
+            "lato/session/compact",
+            serde_json::json!({"sessionId": sid}),
+        )),
+    )
+    .await
+    .expect("manual ACP compaction timed out")
+    .unwrap();
+
+    assert_eq!(response["result"]["status"], "complete", "{response}");
+    let contexts = stream.contexts();
+    assert_eq!(contexts.len(), 2, "ordinary seed and manual compaction");
+    assert!(contexts[1]["tools"].as_array().unwrap().is_empty());
 }
 
 struct CheckpointCancellingStore {

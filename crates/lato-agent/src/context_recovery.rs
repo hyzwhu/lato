@@ -75,21 +75,11 @@ impl AutomaticRecoveryState {
     }
 
     pub fn on_context_budget_changed(&mut self) {
-        if matches!(
-            self.suppression,
-            AutoCompactionSuppression::Turn | AutoCompactionSuppression::Sticky
-        ) {
-            self.suppression = AutoCompactionSuppression::None;
-        }
+        self.clear_if(AutoCompactionSuppression::Sticky);
     }
 
     pub fn on_compaction_success(&mut self) {
-        if matches!(
-            self.suppression,
-            AutoCompactionSuppression::Turn | AutoCompactionSuppression::Sticky
-        ) {
-            self.suppression = AutoCompactionSuppression::None;
-        }
+        self.clear_if(AutoCompactionSuppression::Sticky);
     }
 
     pub fn on_provider_success(&mut self) {

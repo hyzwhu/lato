@@ -4,40 +4,94 @@ use lato_agent::{
 };
 use lato_core::{CompactionTrigger, ModelError, ModelErrorKind, Retryability};
 
-#[test]
-fn suppression_clear_conditions_match_grok_build() {
-    let mut state = AutomaticRecoveryState::default();
-    state.suppress(SuppressionReason::Size);
-    state.on_new_turn();
-    assert_eq!(state.suppression(), AutoCompactionSuppression::Sticky);
-    state.on_context_budget_changed();
-    assert_eq!(state.suppression(), AutoCompactionSuppression::None);
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LifecycleEvent {
+    NewTurn,
+    ContextBudgetChanged,
+    CompactionSuccess,
+    ProviderSuccess,
+    AuthRefreshed,
+}
 
-    state.suppress(SuppressionReason::Credit);
-    state.on_context_budget_changed();
-    assert_eq!(state.suppression(), AutoCompactionSuppression::UntilSuccess);
-    state.on_provider_success();
-    assert_eq!(state.suppression(), AutoCompactionSuppression::None);
-
-    state.suppress(SuppressionReason::Auth);
-    state.on_provider_success();
-    assert_eq!(state.suppression(), AutoCompactionSuppression::Auth);
-    state.on_auth_refreshed();
-    assert_eq!(state.suppression(), AutoCompactionSuppression::None);
+fn apply(state: &mut AutomaticRecoveryState, event: LifecycleEvent) {
+    match event {
+        LifecycleEvent::NewTurn => state.on_new_turn(),
+        LifecycleEvent::ContextBudgetChanged => state.on_context_budget_changed(),
+        LifecycleEvent::CompactionSuccess => state.on_compaction_success(),
+        LifecycleEvent::ProviderSuccess => state.on_provider_success(),
+        LifecycleEvent::AuthRefreshed => state.on_auth_refreshed(),
+    }
 }
 
 #[test]
-fn manual_compaction_bypasses_suppression() {
-    let mut state = AutomaticRecoveryState::default();
-    state.suppress(SuppressionReason::Other);
-    assert!(state.allows(CompactionTrigger::Manual));
-    for trigger in [
-        CompactionTrigger::Threshold,
-        CompactionTrigger::ModelSwitch,
-        CompactionTrigger::PreflightOverflow,
-        CompactionTrigger::ProviderOverflow,
+fn suppression_lifetimes_clear_only_on_their_documented_events() {
+    let cases = [
+        (
+            SuppressionReason::Other,
+            AutoCompactionSuppression::Turn,
+            &[LifecycleEvent::NewTurn][..],
+        ),
+        (
+            SuppressionReason::Size,
+            AutoCompactionSuppression::Sticky,
+            &[
+                LifecycleEvent::ContextBudgetChanged,
+                LifecycleEvent::CompactionSuccess,
+            ][..],
+        ),
+        (
+            SuppressionReason::Credit,
+            AutoCompactionSuppression::UntilSuccess,
+            &[LifecycleEvent::ProviderSuccess][..],
+        ),
+        (
+            SuppressionReason::Auth,
+            AutoCompactionSuppression::Auth,
+            &[LifecycleEvent::AuthRefreshed][..],
+        ),
+    ];
+    let all_events = [
+        LifecycleEvent::NewTurn,
+        LifecycleEvent::ContextBudgetChanged,
+        LifecycleEvent::CompactionSuccess,
+        LifecycleEvent::ProviderSuccess,
+        LifecycleEvent::AuthRefreshed,
+    ];
+
+    for (reason, scope, clearing_events) in cases {
+        for event in all_events {
+            let mut state = AutomaticRecoveryState::default();
+            assert!(state.suppress(reason));
+            apply(&mut state, event);
+            let expected = if clearing_events.contains(&event) {
+                AutoCompactionSuppression::None
+            } else {
+                scope
+            };
+            assert_eq!(state.suppression(), expected, "{scope:?} after {event:?}");
+        }
+    }
+}
+
+#[test]
+fn every_suppression_scope_blocks_automatic_triggers_but_manual_bypasses_policy() {
+    for reason in [
+        SuppressionReason::Other,
+        SuppressionReason::Size,
+        SuppressionReason::Credit,
+        SuppressionReason::Auth,
     ] {
-        assert!(!state.allows(trigger));
+        let mut state = AutomaticRecoveryState::default();
+        assert!(state.suppress(reason));
+        assert!(state.allows(CompactionTrigger::Manual), "{reason:?}");
+        for trigger in [
+            CompactionTrigger::Threshold,
+            CompactionTrigger::ModelSwitch,
+            CompactionTrigger::PreflightOverflow,
+            CompactionTrigger::ProviderOverflow,
+        ] {
+            assert!(!state.allows(trigger), "{reason:?} allowed {trigger:?}");
+        }
     }
 }
 

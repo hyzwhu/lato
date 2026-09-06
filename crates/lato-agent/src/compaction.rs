@@ -70,7 +70,11 @@ pub fn prepare_compaction_messages(
         }
         if !parts.is_empty() {
             prepared.push(ModelMessage {
-                role: message.role,
+                role: if message.role == ModelRole::Tool {
+                    ModelRole::User
+                } else {
+                    message.role
+                },
                 content: vec![ModelContent::Text {
                     text: parts.join("\n"),
                 }],
@@ -336,6 +340,13 @@ mod tests {
         assert!(json.contains("read_file"));
         assert!(json.contains("call-1"));
         assert!(!json.contains(&"x".repeat(10_000)));
+        assert!(prepared.iter().all(|message| {
+            message.role != ModelRole::Tool
+                || matches!(
+                    message.content.as_slice(),
+                    [ModelContent::ToolResult { .. }]
+                )
+        }));
     }
 
     #[test]
