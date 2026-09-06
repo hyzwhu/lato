@@ -63,3 +63,6 @@ string_id!(ToolCallId);
 string_id!(ModelCallId);
 string_id!(JournalRecordId);
 string_id!(CompactionId);
+string_id!(TaskId);
+string_id!(AgentId);
+string_id!(LeaseId);

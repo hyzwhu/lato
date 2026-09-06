@@ -8,6 +8,7 @@ mod model;
 mod policy;
 mod projection;
 mod state;
+mod task;
 mod tool;
 
 pub use command::{Command, StartBehavior, StartTurn, UserInput};
@@ -15,7 +16,8 @@ pub use compaction::*;
 pub use error::{AgentError, ErrorCategory, Retryability};
 pub use event::{CancelReason, EVENT_SCHEMA_VERSION, EventEnvelope, EventPayload, TurnOutput};
 pub use id::{
-    CompactionId, EventId, IdError, JournalRecordId, ModelCallId, SessionId, ToolCallId, TurnId,
+    AgentId, CompactionId, EventId, IdError, JournalRecordId, LeaseId, ModelCallId, SessionId,
+    TaskId, ToolCallId, TurnId,
 };
 pub use journal::{
     EventStore, JOURNAL_SCHEMA_VERSION, JournalDurability, JournalEnvelope, JournalError,
@@ -41,6 +43,7 @@ pub use projection::{
 pub use state::{
     ActiveCompaction, ActiveTurn, SessionMachine, SessionPhase, StartDecision, TransitionError,
 };
+pub use task::*;
 pub use tool::{
     DescriptorError, SideEffect, Tool, ToolCancellation, ToolCapability, ToolConcurrency,
     ToolContext, ToolDescriptor, ToolError, ToolIdempotency, ToolLayer, ToolName, ToolNameError,
