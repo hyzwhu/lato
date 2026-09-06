@@ -2,9 +2,7 @@ use std::{fmt, str::FromStr};
 
 macro_rules! string_id {
     ($name:ident) => {
-        #[derive(
-            Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
-        )]
+        #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, serde::Serialize)]
         #[serde(transparent)]
         pub struct $name(String);
 
@@ -45,6 +43,16 @@ macro_rules! string_id {
 
             fn from_str(value: &str) -> Result<Self, Self::Err> {
                 Self::parse(value)
+            }
+        }
+
+        impl<'de> serde::Deserialize<'de> for $name {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                let value = <String as serde::Deserialize>::deserialize(deserializer)?;
+                Self::parse(value).map_err(serde::de::Error::custom)
             }
         }
     };

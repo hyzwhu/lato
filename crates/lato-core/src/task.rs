@@ -387,7 +387,6 @@ impl PartialEq<&str> for TaskErrorCode {
 pub struct TaskError {
     pub code: TaskErrorCode,
     pub message: String,
-    pub retryability: Retryability,
 }
 
 impl TaskError {
@@ -395,7 +394,6 @@ impl TaskError {
         Self {
             code,
             message: message.into(),
-            retryability: code.retryability(),
         }
     }
 
@@ -404,7 +402,7 @@ impl TaskError {
             self.code.as_str(),
             ErrorCategory::Task,
             self.message.clone(),
-            self.retryability.clone(),
+            self.code.retryability(),
         )
     }
 }
