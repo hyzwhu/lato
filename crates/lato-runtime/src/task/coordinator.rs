@@ -265,6 +265,11 @@ fn spawn_sink_dispatcher(
                     event_sink.on_event(event);
                 }));
             }
+            drop(sink_rx);
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(event_sink))).is_err()
+            {
+                return;
+            }
             let _ = drained.send(());
         })
         .expect("task event sink dispatcher thread must start")

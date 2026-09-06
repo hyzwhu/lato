@@ -324,6 +324,94 @@ async fn normal_shutdown_waits_for_every_accepted_sink_event_to_drain() {
     actor.await.unwrap();
 }
 
+struct DropGate {
+    started: AtomicBool,
+    finished: AtomicBool,
+    open: Mutex<bool>,
+    released: Condvar,
+}
+
+impl DropGate {
+    fn new() -> Self {
+        Self {
+            started: AtomicBool::new(false),
+            finished: AtomicBool::new(false),
+            open: Mutex::new(false),
+            released: Condvar::new(),
+        }
+    }
+
+    fn release(&self) {
+        *self.open.lock().unwrap() = true;
+        self.released.notify_all();
+    }
+}
+
+struct DropBlockingSink {
+    gate: Arc<DropGate>,
+}
+
+impl TaskEventSink for DropBlockingSink {
+    fn on_event(&self, _event: TaskEventEnvelope) {}
+}
+
+impl Drop for DropBlockingSink {
+    fn drop(&mut self) {
+        self.gate.started.store(true, Ordering::Release);
+        let mut open = self.gate.open.lock().unwrap();
+        while !*open {
+            open = self.gate.released.wait(open).unwrap();
+        }
+        self.gate.finished.store(true, Ordering::Release);
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn sink_drop_that_blocks_times_out_without_hanging_the_runtime() {
+    let workspace = tempfile::tempdir().unwrap();
+    let gate = Arc::new(DropGate::new());
+    let config = CoordinatorConfig {
+        teardown_drain_timeout: Duration::from_millis(20),
+        ..CoordinatorConfig::default()
+    };
+    let (handle, actor) = spawn_task_coordinator(
+        config,
+        Arc::new(task_support::ControlledTaskRunner),
+        Arc::new(MemoryWorkspaceAllocator::new(workspace.path()).unwrap()),
+        Arc::new(DropBlockingSink { gate: gate.clone() }),
+    );
+    handle
+        .register_root(TaskRootRequest {
+            task_id: TaskId::from("root"),
+            owner: TaskOwner::Interactive {
+                session_id: SessionId::from("session"),
+                turn_id: TurnId::from("turn"),
+            },
+            profile: AgentProfile::worker(),
+            permissions: vec![ToolCapability::FileRead],
+            budget: BudgetLimits::unlimited(),
+        })
+        .await
+        .unwrap();
+
+    let outcome = tokio::time::timeout(Duration::from_secs(1), handle.shutdown())
+        .await
+        .expect("sink destruction must not block the current-thread runtime")
+        .unwrap();
+    assert_eq!(outcome, SinkShutdown::TimedOutDetached);
+    assert!(gate.started.load(Ordering::Acquire));
+    actor.await.unwrap();
+
+    gate.release();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !gate.finished.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("detached sink worker should finish after test cleanup release");
+}
+
 #[tokio::test]
 async fn root_shutdown_commits_terminal_state_before_publishing() {
     let mut harness = Harness::new(CoordinatorConfig::default()).await;
