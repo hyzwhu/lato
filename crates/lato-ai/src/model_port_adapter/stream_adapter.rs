@@ -373,6 +373,17 @@ mod tests {
         })
     }
 
+    fn overflow() -> ModelError {
+        ModelError::new(
+            "model.context_overflow",
+            "maximum context length is 128000 tokens",
+            Retryability::Never,
+        )
+        .with_kind(lato_core::ModelErrorKind::ContextOverflow)
+        .with_status(400)
+        .with_context_window(128_000)
+    }
+
     #[tokio::test]
     async fn streams_text_and_reassembles_indexed_tool_deltas() {
         let request = Arc::new(Mutex::new(None));
@@ -485,6 +496,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn canonical_stream_error_preserves_metadata_before_output() {
+        use lato_core::ModelErrorKind;
+
+        let port = Arc::new(ScriptedPort {
+            request: Arc::new(Mutex::new(None)),
+            events: vec![Err(overflow())],
+        });
+        let adapter = ModelPortStreamAdapter::new(active(port));
+        let (tx, mut rx) = mpsc::channel(16);
+
+        let error = adapter.stream(1, context(), tx).await.unwrap_err();
+
+        assert!(rx.recv().await.is_none());
+        assert_eq!(error.code, "model.context_overflow");
+        assert_eq!(error.kind, ModelErrorKind::ContextOverflow);
+        assert_eq!(error.status_code, Some(400));
+        assert_eq!(error.context_window, Some(128_000));
+        assert!(!error.output_started);
+    }
+
+    #[tokio::test]
     async fn canonical_stream_error_records_prior_output_without_losing_metadata() {
         use lato_core::ModelErrorKind;
 
@@ -494,14 +526,7 @@ mod tests {
                 Ok(ModelStreamEvent::TextDelta {
                     text: "partial".into(),
                 }),
-                Err(ModelError::new(
-                    "model.context_overflow",
-                    "context too long",
-                    Retryability::Never,
-                )
-                .with_kind(ModelErrorKind::ContextOverflow)
-                .with_status(400)
-                .with_context_window(128_000)),
+                Err(overflow()),
             ],
         });
         let adapter = ModelPortStreamAdapter::new(active(port));
@@ -514,6 +539,70 @@ mod tests {
         assert_eq!(error.status_code, Some(400));
         assert_eq!(error.context_window, Some(128_000));
         assert!(error.output_started);
+    }
+
+    #[tokio::test]
+    async fn partial_tool_delta_marks_output_started_without_flushing_a_tool_call() {
+        use lato_core::ModelErrorKind;
+
+        let port = Arc::new(ScriptedPort {
+            request: Arc::new(Mutex::new(None)),
+            events: vec![
+                Ok(ModelStreamEvent::ToolCallDelta(ToolCallDelta {
+                    index: 0,
+                    call_id: Some(ToolCallId::from("tool-partial")),
+                    name: Some(ToolName::parse("legacy:read_file").unwrap()),
+                    arguments_delta: "{\"path\":".into(),
+                })),
+                Err(overflow()),
+            ],
+        });
+        let adapter = ModelPortStreamAdapter::new(active(port));
+        let (tx, mut rx) = mpsc::channel(16);
+
+        let error = adapter.stream(1, context(), tx).await.unwrap_err();
+
+        assert!(rx.recv().await.is_none());
+        assert_eq!(error.code, "model.context_overflow");
+        assert_eq!(error.kind, ModelErrorKind::ContextOverflow);
+        assert_eq!(error.status_code, Some(400));
+        assert_eq!(error.context_window, Some(128_000));
+        assert!(error.output_started);
+    }
+
+    #[tokio::test]
+    async fn interrupted_stream_tracks_whether_output_started() {
+        for (events, expected_output_started) in [
+            (Vec::new(), false),
+            (
+                vec![Ok(ModelStreamEvent::ReasoningDelta {
+                    text: "working".into(),
+                })],
+                true,
+            ),
+            (
+                vec![Ok(ModelStreamEvent::Usage(ModelUsage {
+                    input_tokens: Some(10),
+                    output_tokens: None,
+                    reasoning_tokens: None,
+                    cached_input_tokens: None,
+                }))],
+                true,
+            ),
+        ] {
+            let port = Arc::new(ScriptedPort {
+                request: Arc::new(Mutex::new(None)),
+                events,
+            });
+            let adapter = ModelPortStreamAdapter::new(active(port));
+            let (tx, mut rx) = mpsc::channel(16);
+
+            let error = adapter.stream(1, context(), tx).await.unwrap_err();
+
+            assert!(rx.recv().await.is_none());
+            assert_eq!(error.code, "model.stream_interrupted");
+            assert_eq!(error.output_started, expected_output_started);
+        }
     }
 
     #[tokio::test]

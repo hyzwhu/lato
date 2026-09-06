@@ -365,6 +365,17 @@ mod tests {
         )
     }
 
+    fn overflow() -> ModelError {
+        ModelError::new(
+            "model.context_overflow",
+            "maximum context length is 128000 tokens",
+            Retryability::Never,
+        )
+        .with_kind(lato_core::ModelErrorKind::ContextOverflow)
+        .with_status(400)
+        .with_context_window(128_000)
+    }
+
     #[tokio::test]
     async fn preserves_text_tool_order_and_completes_once() {
         let calls = Arc::new(AtomicUsize::new(0));
@@ -482,34 +493,23 @@ mod tests {
     async fn provider_failure_preserves_metadata_and_observed_output() {
         use lato_core::ModelErrorKind;
 
-        let overflow = ModelError::new(
-            "model.context_overflow",
-            "maximum context length is 128000 tokens",
-            Retryability::Never,
-        )
-        .with_kind(ModelErrorKind::ContextOverflow)
-        .with_status(400)
-        .with_context_window(128_000);
-        let before_output = port(
-            Behavior::Fail(overflow.clone()),
-            Arc::new(AtomicUsize::new(0)),
-        );
-        let error = before_output
+        let before_output = port(Behavior::Fail(overflow()), Arc::new(AtomicUsize::new(0)));
+        let events = before_output
             .stream(request(selection()), CancellationToken::new())
             .await
             .unwrap()
             .collect::<Vec<_>>()
-            .await
-            .pop()
-            .unwrap()
-            .unwrap_err();
+            .await;
+        assert_eq!(events.len(), 1);
+        let error = events[0].as_ref().unwrap_err();
+        assert_eq!(error.code, "model.context_overflow");
         assert_eq!(error.kind, ModelErrorKind::ContextOverflow);
         assert_eq!(error.status_code, Some(400));
         assert_eq!(error.context_window, Some(128_000));
         assert!(!error.output_started);
 
         let after_output = port(
-            Behavior::PiecesThenFail(vec![StreamPiece::Text("partial".into())], overflow),
+            Behavior::PiecesThenFail(vec![StreamPiece::Text("partial".into())], overflow()),
             Arc::new(AtomicUsize::new(0)),
         );
         let events = after_output
@@ -522,8 +522,42 @@ mod tests {
             events.first(),
             Some(Ok(ModelStreamEvent::TextDelta { .. }))
         ));
+        assert_eq!(events.len(), 2);
         let error = events.last().unwrap().as_ref().unwrap_err();
+        assert_eq!(error.code, "model.context_overflow");
         assert_eq!(error.kind, ModelErrorKind::ContextOverflow);
+        assert_eq!(error.status_code, Some(400));
+        assert_eq!(error.context_window, Some(128_000));
+        assert!(error.output_started);
+
+        let after_tool_call = port(
+            Behavior::PiecesThenFail(
+                vec![StreamPiece::ToolCall {
+                    id: "tool-8".into(),
+                    name: "read_file".into(),
+                    arguments: json!({"path": "b.rs"}),
+                }],
+                overflow(),
+            ),
+            Arc::new(AtomicUsize::new(0)),
+        );
+        let events = after_tool_call
+            .stream(request(selection()), CancellationToken::new())
+            .await
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await;
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            events.first(),
+            Some(Ok(ModelStreamEvent::ToolCallDelta(delta)))
+                if delta.call_id == Some(ToolCallId::from("tool-8"))
+        ));
+        let error = events.last().unwrap().as_ref().unwrap_err();
+        assert_eq!(error.code, "model.context_overflow");
+        assert_eq!(error.kind, ModelErrorKind::ContextOverflow);
+        assert_eq!(error.status_code, Some(400));
+        assert_eq!(error.context_window, Some(128_000));
         assert!(error.output_started);
     }
 

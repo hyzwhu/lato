@@ -24,14 +24,14 @@ fn structured_context_window_takes_priority() {
 
 #[test]
 fn generic_bad_request_is_not_context_overflow() {
-    let error = classify_provider_failure(400, r#"{"error":{"message":"invalid tool schema"}}"#);
-    assert_eq!(error.kind, ModelErrorKind::InvalidRequest);
-
-    let output_limit = classify_provider_failure(
-        400,
-        r#"{"error":{"message":"max_output_tokens exceeds the maximum value"}}"#,
-    );
-    assert_eq!(output_limit.kind, ModelErrorKind::InvalidRequest);
+    for body in [
+        r#"{"error":{"message":"invalid tool schema"}}"#,
+        r#"{"error":{"message":"max_output_tokens must be positive"}}"#,
+        r#"{"error":{"code":"bad_request","message":"invalid request"}}"#,
+    ] {
+        let error = classify_provider_failure(400, body);
+        assert_eq!(error.kind, ModelErrorKind::InvalidRequest, "{body}");
+    }
 }
 
 #[test]
