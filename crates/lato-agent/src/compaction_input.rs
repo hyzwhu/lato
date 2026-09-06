@@ -31,13 +31,10 @@ pub fn prepare_compaction_input(
     match stage {
         CompactionInputStage::Prepared => prepare_compaction_messages(source),
         CompactionInputStage::Fitted => {
-            let fitted = fit_whole_units(source.to_vec(), input_budget_tokens.saturating_mul(4))?;
-            prepare_compaction_messages(&fitted)
+            fit_whole_units(source.to_vec(), input_budget_tokens.saturating_mul(4))
         }
         CompactionInputStage::Lossy => {
-            let fitted =
-                fit_whole_units(lossy_source(source), input_budget_tokens.saturating_mul(4))?;
-            prepare_compaction_messages(&fitted)
+            fit_whole_units(lossy_source(source), input_budget_tokens.saturating_mul(4))
         }
     }
 }
@@ -63,17 +60,17 @@ fn lossy_source(source: &[ModelMessage]) -> Vec<ModelMessage> {
 }
 
 fn fit_whole_units(
-    prepared: Vec<ModelMessage>,
+    source: Vec<ModelMessage>,
     body_budget_bytes: u64,
 ) -> Result<Vec<ModelMessage>, CompactionError> {
-    let Some(system) = prepared.first().cloned() else {
+    let Some(system) = source.first().cloned() else {
         return Err(CompactionError::InvalidSummary {
             message: "history must begin with a system message".into(),
         });
     };
-    let body = &prepared[1..];
+    let body = &source[1..];
     if body.is_empty() {
-        return Ok(vec![system]);
+        return prepare_compaction_messages(&[system]);
     }
 
     let units = complete_units(body);
@@ -96,20 +93,20 @@ fn fit_whole_units(
     for unit_index in (0..units.len()).rev() {
         let mut candidate = selected.clone();
         candidate.insert(unit_index);
-        if units_bytes(body, &units, &candidate) <= body_budget_bytes {
+        if prepared_units_bytes(&system, body, &units, &candidate)? <= body_budget_bytes {
             selected = candidate;
         }
     }
 
-    let mut fitted = selected_messages(body, &units, &selected);
-    if serialized_bytes(&fitted) > body_budget_bytes {
+    let mut selected_source = vec![system];
+    selected_source.extend(selected_messages(body, &units, &selected));
+    let mut prepared = prepare_compaction_messages(&selected_source)?;
+    if serialized_bytes(&prepared[1..]) > body_budget_bytes {
         // Mandatory anchors may be larger than the window. Keep their identity and
         // safely trim text on UTF-8 boundaries, newest first.
-        truncate_to_budget(&mut fitted, body_budget_bytes);
+        truncate_to_budget(&mut prepared[1..], body_budget_bytes)?;
     }
-    let mut result = vec![system];
-    result.extend(fitted);
-    Ok(result)
+    Ok(prepared)
 }
 
 fn complete_units(body: &[ModelMessage]) -> Vec<std::ops::Range<usize>> {
@@ -147,12 +144,16 @@ fn selected_messages(
         .collect()
 }
 
-fn units_bytes(
+fn prepared_units_bytes(
+    system: &ModelMessage,
     body: &[ModelMessage],
     units: &[std::ops::Range<usize>],
     selected: &BTreeSet<usize>,
-) -> u64 {
-    serialized_bytes(&selected_messages(body, units, selected))
+) -> Result<u64, CompactionError> {
+    let mut candidate = vec![system.clone()];
+    candidate.extend(selected_messages(body, units, selected));
+    let prepared = prepare_compaction_messages(&candidate)?;
+    Ok(serialized_bytes(&prepared[1..]))
 }
 
 fn serialized_bytes(messages: &[ModelMessage]) -> u64 {
@@ -161,8 +162,12 @@ fn serialized_bytes(messages: &[ModelMessage]) -> u64 {
         .unwrap_or(u64::MAX)
 }
 
-fn truncate_to_budget(messages: &mut [ModelMessage], budget: u64) {
-    while serialized_bytes(messages) > budget {
+fn truncate_to_budget(messages: &mut [ModelMessage], budget: u64) -> Result<(), CompactionError> {
+    loop {
+        let current_size = serialized_bytes(messages);
+        if current_size <= budget {
+            return Ok(());
+        }
         let Some((message_index, content_index, text_len)) = messages
             .iter()
             .enumerate()
@@ -181,10 +186,14 @@ fn truncate_to_budget(messages: &mut [ModelMessage], budget: u64) {
                     })
             })
         else {
-            break;
+            return Err(CompactionError::InputTooLarge);
         };
-        let excess = serialized_bytes(messages).saturating_sub(budget);
-        let keep = text_len.saturating_sub(usize::try_from(excess.max(1)).unwrap_or(usize::MAX));
+        let excess = current_size.saturating_sub(budget);
+        // Reserve enough room for the truncation marker and its JSON escaping. If
+        // the estimate is ever insufficient, the strict-progress check below
+        // clears this field instead of looping on an unchanged serialized size.
+        let keep = text_len
+            .saturating_sub(usize::try_from(excess.saturating_add(128)).unwrap_or(usize::MAX));
         let ModelContent::Text { text } = &mut messages[message_index].content[content_index]
         else {
             unreachable!();
@@ -197,6 +206,13 @@ fn truncate_to_budget(messages: &mut [ModelMessage], budget: u64) {
         } else {
             text.truncate(boundary);
             text.push_str(&marker);
+        }
+        if serialized_bytes(messages) >= current_size {
+            let ModelContent::Text { text } = &mut messages[message_index].content[content_index]
+            else {
+                unreachable!();
+            };
+            text.clear();
         }
     }
 }
@@ -251,28 +267,30 @@ mod tests {
                 role: ModelRole::Tool,
                 content: vec![ModelContent::ToolResult {
                     call_id: ToolCallId::from("c1"),
-                    output: "你".repeat(8_000),
+                    output: "x".repeat(100_000),
                 }],
             },
             text(ModelRole::User, "latest objective"),
         ];
-        let fitted = prepare_compaction_input(&source, CompactionInputStage::Fitted, 250).unwrap();
-        assert_eq!(fitted.first().unwrap().role, ModelRole::System);
-        assert!(
-            fitted
+        for (budget, expect_pair) in [(500, true), (100, false)] {
+            let fitted =
+                prepare_compaction_input(&source, CompactionInputStage::Fitted, budget).unwrap();
+            assert_eq!(fitted.first().unwrap().role, ModelRole::System);
+            assert!(
+                fitted
+                    .iter()
+                    .any(|message| message_text(message).contains("latest objective"))
+            );
+            let all = fitted
                 .iter()
-                .any(|message| message_text(message).contains("latest objective"))
-        );
-        let all = fitted
-            .iter()
-            .map(message_text)
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert_eq!(
-            all.contains("[Tool call c1:"),
-            all.contains("[Tool result c1:")
-        );
-        assert!(!fitted.iter().any(|message| message.role == ModelRole::Tool));
+                .map(message_text)
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert_eq!(all.contains("[Tool call c1:"), expect_pair, "{budget}");
+            assert_eq!(all.contains("[Tool result c1:"), expect_pair, "{budget}");
+            assert!(!fitted.iter().any(|message| message.role == ModelRole::Tool));
+            assert!(serialized_bytes(&fitted[1..]) <= budget * 4);
+        }
     }
 
     #[test]
@@ -303,10 +321,27 @@ mod tests {
             text(ModelRole::User, "目标".repeat(100)),
         ];
         for budget in [0, 1, 8] {
-            let fitted =
-                prepare_compaction_input(&source, CompactionInputStage::Fitted, budget).unwrap();
-            assert_eq!(fitted[0].role, ModelRole::System);
-            assert!(serde_json::to_string(&fitted).is_ok());
+            match prepare_compaction_input(&source, CompactionInputStage::Fitted, budget) {
+                Ok(fitted) => {
+                    assert_eq!(fitted[0].role, ModelRole::System);
+                    assert!(serde_json::to_string(&fitted).is_ok());
+                    assert!(serialized_bytes(&fitted[1..]) <= budget * 4);
+                }
+                Err(error) => assert_eq!(error.code(), "compaction.input_too_large"),
+            }
         }
+    }
+
+    #[test]
+    fn moderate_budget_truncation_terminates_and_respects_the_body_limit() {
+        let source = vec![
+            text(ModelRole::System, "system"),
+            text(ModelRole::User, "mandatory-ascii-anchor".repeat(1_000)),
+        ];
+        let budget = 300;
+        let fitted =
+            prepare_compaction_input(&source, CompactionInputStage::Fitted, budget).unwrap();
+        assert_eq!(fitted.first().unwrap().role, ModelRole::System);
+        assert!(serialized_bytes(&fitted[1..]) <= budget * 4);
     }
 }
