@@ -14,7 +14,7 @@ use std::{
     collections::{HashMap, HashSet},
     future::ready,
     sync::{
-        Arc,
+        Arc, Condvar, Mutex as StdMutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
@@ -27,7 +27,21 @@ use tokio::{
 #[derive(Default)]
 pub struct ControlledTaskRunner;
 
-pub struct ControlledTaskControl;
+pub struct ControlledTaskControl {
+    cancel_blocker: Option<Arc<CallbackBlocker>>,
+}
+
+impl ControlledTaskControl {
+    pub fn new() -> Self {
+        Self {
+            cancel_blocker: None,
+        }
+    }
+
+    fn with_cancel_blocker(cancel_blocker: Option<Arc<CallbackBlocker>>) -> Self {
+        Self { cancel_blocker }
+    }
+}
 
 impl TaskChildControl for ControlledTaskControl {
     fn progress(&self) -> TaskProgress {
@@ -41,7 +55,11 @@ impl TaskChildControl for ControlledTaskControl {
         Box::pin(ready(lato_runtime::ActiveMessageAdmission::Rejected))
     }
 
-    fn cancel(&self) {}
+    fn cancel(&self) {
+        if let Some(blocker) = &self.cancel_blocker {
+            blocker.block();
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -77,6 +95,7 @@ pub struct GatedTaskRunner {
     pause_validation: bool,
     validation_error: bool,
     validation_panic: bool,
+    validation_calls: AtomicUsize,
     validation_entered: AtomicBool,
     validation_gate: Notify,
     entered: Mutex<HashSet<TaskId>>,
@@ -86,6 +105,8 @@ pub struct GatedTaskRunner {
     changed: Notify,
     active_runs: Arc<AtomicUsize>,
     completion_callbacks: AtomicUsize,
+    cancel_blocker: Option<Arc<CallbackBlocker>>,
+    completion_blocker: Option<Arc<CallbackBlocker>>,
 }
 
 impl GatedTaskRunner {
@@ -106,6 +127,7 @@ impl GatedTaskRunner {
             pause_validation,
             validation_error: false,
             validation_panic: false,
+            validation_calls: AtomicUsize::new(0),
             validation_entered: AtomicBool::new(false),
             validation_gate: Notify::new(),
             entered: Mutex::new(HashSet::new()),
@@ -115,11 +137,61 @@ impl GatedTaskRunner {
             changed: Notify::new(),
             active_runs: Arc::new(AtomicUsize::new(0)),
             completion_callbacks: AtomicUsize::new(0),
+            cancel_blocker: None,
+            completion_blocker: None,
         }
+    }
+
+    pub fn blocking_cancel() -> Self {
+        let mut runner = Self::with_options(false, true, false, false);
+        runner.cancel_blocker = Some(Arc::new(CallbackBlocker::default()));
+        runner
+    }
+
+    pub fn blocking_completion() -> Self {
+        let mut runner = Self::new(false);
+        runner.completion_blocker = Some(Arc::new(CallbackBlocker::default()));
+        runner
+    }
+
+    pub async fn wait_until_cancel_callback_entered(&self) {
+        self.cancel_blocker
+            .as_ref()
+            .expect("blocking cancel runner configured")
+            .wait_until_entered()
+            .await;
+    }
+
+    pub fn release_cancel_callback(&self) {
+        self.cancel_blocker
+            .as_ref()
+            .expect("blocking cancel runner configured")
+            .release();
+    }
+
+    pub async fn wait_until_completion_callback_entered(&self) {
+        self.completion_blocker
+            .as_ref()
+            .expect("blocking completion runner configured")
+            .wait_until_entered()
+            .await;
+    }
+
+    pub fn release_completion_callback(&self) {
+        self.completion_blocker
+            .as_ref()
+            .expect("blocking completion runner configured")
+            .release();
     }
 
     pub fn failing_validator() -> Self {
         let mut runner = Self::new(false);
+        runner.validation_error = true;
+        runner
+    }
+
+    pub fn failing_paused_validator() -> Self {
+        let mut runner = Self::with_options(false, false, false, true);
         runner.validation_error = true;
         runner
     }
@@ -173,12 +245,44 @@ impl GatedTaskRunner {
         self.validation_entered.load(Ordering::Acquire)
     }
 
+    pub fn validation_calls(&self) -> usize {
+        self.validation_calls.load(Ordering::Acquire)
+    }
+
     pub fn allow_validation(&self) {
         self.validation_gate.notify_one();
     }
 }
 
 struct ActiveRunGuard(Arc<AtomicUsize>);
+
+#[derive(Default)]
+struct CallbackBlocker {
+    entered: AtomicBool,
+    gate: StdMutex<bool>,
+    wake: Condvar,
+}
+
+impl CallbackBlocker {
+    fn block(&self) {
+        self.entered.store(true, Ordering::Release);
+        let mut released = self.gate.lock().expect("callback gate poisoned");
+        while !*released {
+            released = self.wake.wait(released).expect("callback gate poisoned");
+        }
+    }
+
+    async fn wait_until_entered(&self) {
+        while !self.entered.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    fn release(&self) {
+        *self.gate.lock().expect("callback gate poisoned") = true;
+        self.wake.notify_all();
+    }
+}
 
 impl Drop for ActiveRunGuard {
     fn drop(&mut self) {
@@ -215,7 +319,9 @@ impl TaskRunner for GatedTaskRunner {
         }
         if reporter
             .started(lato_runtime::StartedTask::new(
-                Arc::new(ControlledTaskControl),
+                Arc::new(ControlledTaskControl::with_cancel_blocker(
+                    self.cancel_blocker.clone(),
+                )),
                 request.cancellation.clone(),
             ))
             .await
@@ -241,6 +347,7 @@ impl TaskRunner for GatedTaskRunner {
     }
 
     async fn validate_profile(&self, _profile: &AgentProfile) -> Result<(), TaskError> {
+        self.validation_calls.fetch_add(1, Ordering::AcqRel);
         if self.pause_validation {
             self.validation_entered.store(true, Ordering::Release);
             self.validation_gate.notified().await;
@@ -256,6 +363,9 @@ impl TaskRunner for GatedTaskRunner {
     }
 
     fn on_completed(&self, _completion: lato_runtime::TaskCompletion) {
+        if let Some(blocker) = &self.completion_blocker {
+            blocker.block();
+        }
         assert!(
             !self.panic_on_completed,
             "injected completion callback panic"

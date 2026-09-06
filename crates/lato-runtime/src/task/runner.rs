@@ -37,6 +37,11 @@ pub trait TaskChildControl: Send + Sync + 'static {
         &self,
         delivery: ActiveMessageDelivery,
     ) -> BoxFuture<'static, ActiveMessageAdmission>;
+    /// Requests runner-specific cancellation.
+    ///
+    /// The cancellation token is authoritative. The coordinator invokes this
+    /// advisory callback on a bounded, panic-contained dispatcher, never on
+    /// the actor or async executor thread.
     fn cancel(&self);
 }
 
@@ -188,5 +193,9 @@ pub trait TaskRunner: Send + Sync + 'static {
     /// an implementation-owned bounded worker that it can join.
     async fn validate_profile(&self, profile: &AgentProfile) -> Result<(), TaskError>;
 
+    /// Observes a completion after terminal state and resource cleanup commit.
+    ///
+    /// This callback runs on the coordinator's bounded, panic-contained
+    /// callback dispatcher rather than on the actor or async executor thread.
     fn on_completed(&self, completion: TaskCompletion);
 }

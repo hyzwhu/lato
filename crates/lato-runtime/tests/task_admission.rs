@@ -6,7 +6,8 @@ use lato_core::{
 };
 use lato_runtime::{
     CoordinatorConfig, LimitBehavior, MemoryTaskEventSink, SinkShutdown, SpawnMode,
-    SpawnTaskRequest, TaskEventEnvelope, TaskEventPayload, TaskEventSink, TaskRootRequest,
+    SpawnTaskRequest, StartedTask, TaskEventEnvelope, TaskEventPayload, TaskEventSink,
+    TaskReporter, TaskRootRequest, TaskRunOutput, TaskRunRequest, TaskRunner,
     spawn_task_coordinator,
 };
 use lato_workspace::{
@@ -20,7 +21,7 @@ use std::{
     },
     time::Duration,
 };
-use task_support::{GatedTaskRunner, Harness};
+use task_support::{ControlledTaskControl, GatedTaskRunner, Harness};
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
@@ -263,6 +264,132 @@ async fn total_task_bound_is_independent_of_child_and_queue_bounds() {
 }
 
 #[tokio::test]
+async fn compound_spawn_errors_follow_the_specified_precedence() {
+    let terminal_runner = Arc::new(GatedTaskRunner::new(false));
+    let terminal_harness = Harness::with_runner(
+        CoordinatorConfig {
+            max_total_tasks: 2,
+            ..CoordinatorConfig::default()
+        },
+        terminal_runner.clone(),
+    )
+    .await;
+    let terminal_root = terminal_harness
+        .register_root_scoped("terminal-root", "s", "t")
+        .await;
+    let terminal_child = terminal_root
+        .spawn(request("terminal-child"))
+        .await
+        .unwrap();
+    terminal_harness
+        .wait_for_status("terminal-child", lato_core::TaskStatus::Running)
+        .await;
+    terminal_runner.finish("terminal-child").await;
+    terminal_harness
+        .wait_for_status("terminal-child", lato_core::TaskStatus::Completed)
+        .await;
+    assert_eq!(
+        terminal_child
+            .handle
+            .spawn(request("terminal-root"))
+            .await
+            .unwrap_err()
+            .code,
+        TaskErrorCode::TerminalParent,
+        "terminal parent must beat duplicate and retention errors"
+    );
+
+    assert_eq!(
+        terminal_root
+            .spawn(request("terminal-child"))
+            .await
+            .unwrap_err()
+            .code,
+        TaskErrorCode::DuplicateTask,
+        "duplicate must beat retention exhaustion"
+    );
+
+    let reject_harness = Harness::new(CoordinatorConfig {
+        max_global_running: 1,
+        max_running_per_root: 1,
+        admission_behavior: LimitBehavior::Reject,
+        ..CoordinatorConfig::default()
+    })
+    .await;
+    let reject_root = reject_harness
+        .register_root_scoped("reject-root", "s", "t")
+        .await;
+    reject_root.spawn(request("blocker")).await.unwrap();
+    reject_harness
+        .wait_for_status("blocker", lato_core::TaskStatus::Running)
+        .await;
+    let mut expanded = request("expanded");
+    expanded.requested_capabilities = Some(vec![ToolCapability::NetworkWrite]);
+    assert_eq!(
+        reject_root.spawn(expanded).await.unwrap_err().code,
+        TaskErrorCode::ConcurrencyLimit,
+        "admission rejection must precede capability narrowing"
+    );
+    assert!(!reject_harness.runner.validation_entered());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn dropping_every_external_handle_performs_bounded_shutdown_and_cleanup() {
+    let workspace = tempfile::tempdir().unwrap();
+    let allocator = Arc::new(MemoryWorkspaceAllocator::new(workspace.path()).unwrap());
+    let runner = Arc::new(GatedTaskRunner::new(false));
+    let (handle, actor) = spawn_task_coordinator(
+        CoordinatorConfig {
+            cancel_grace: Duration::from_millis(10),
+            queued_reap_interval: Duration::from_millis(1),
+            teardown_drain_timeout: Duration::from_millis(100),
+            ..CoordinatorConfig::default()
+        },
+        runner.clone(),
+        allocator.clone(),
+        Arc::new(MemoryTaskEventSink::default()),
+    );
+    let root = handle
+        .register_root(TaskRootRequest {
+            task_id: TaskId::from("root"),
+            owner: lato_core::TaskOwner::Interactive {
+                session_id: lato_core::SessionId::from("s"),
+                turn_id: lato_core::TurnId::from("t"),
+            },
+            profile: AgentProfile::worker(),
+            permissions: vec![ToolCapability::FileRead, ToolCapability::FileWrite],
+            budget: BudgetLimits::unlimited(),
+        })
+        .await
+        .unwrap();
+    let child = root.spawn(request("child")).await.unwrap();
+    loop {
+        if handle
+            .inspect_admin(TaskId::from("child"))
+            .await
+            .unwrap()
+            .node
+            .status
+            == lato_core::TaskStatus::Running
+        {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(allocator.live_count().await, 1);
+    drop(child);
+    drop(root);
+    drop(handle);
+
+    tokio::time::timeout(Duration::from_secs(1), actor)
+        .await
+        .expect("last external handle drop must close and drain the coordinator")
+        .unwrap();
+    assert_eq!(runner.active_runs(), 0);
+    assert_eq!(allocator.live_count().await, 0);
+}
+
+#[tokio::test]
 async fn queue_promotes_in_fifo_order_when_capacity_returns() {
     let harness = Harness::new(CoordinatorConfig {
         max_global_running: 1,
@@ -323,6 +450,83 @@ async fn workspace_allocation_failure_never_starts_runner_and_releases_reservati
             .budget_reserved,
         BudgetAmount::ZERO
     );
+}
+
+#[derive(Clone)]
+struct PanickingWorkspaceAllocator;
+
+#[async_trait::async_trait]
+impl WorkspaceAllocator for PanickingWorkspaceAllocator {
+    async fn allocate(&self, _request: WorkspaceRequest) -> Result<WorkspaceLease, TaskError> {
+        panic!("injected workspace allocation panic")
+    }
+
+    async fn release(&self, _lease: &WorkspaceLease) -> Result<(), TaskError> {
+        unreachable!("a panicking allocation cannot return a lease")
+    }
+}
+
+#[tokio::test]
+async fn workspace_allocator_panic_is_a_structured_failure_and_actor_survives() {
+    let runner = Arc::new(GatedTaskRunner::new(false));
+    let sink = Arc::new(MemoryTaskEventSink::default());
+    let (handle, _actor) = spawn_task_coordinator(
+        CoordinatorConfig::default(),
+        runner.clone(),
+        Arc::new(PanickingWorkspaceAllocator),
+        sink.clone(),
+    );
+    let root = handle
+        .register_root(TaskRootRequest {
+            task_id: TaskId::from("root"),
+            owner: lato_core::TaskOwner::Interactive {
+                session_id: lato_core::SessionId::from("s"),
+                turn_id: lato_core::TurnId::from("t"),
+            },
+            profile: AgentProfile::worker(),
+            permissions: vec![ToolCapability::FileRead, ToolCapability::FileWrite],
+            budget: BudgetLimits::unlimited(),
+        })
+        .await
+        .unwrap();
+    root.spawn(request("child")).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let snapshot = handle.inspect_admin(TaskId::from("child")).await.unwrap();
+            if snapshot.node.status == lato_core::TaskStatus::Failed {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(handle.registry_counts().await.unwrap().completed, 1);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if sink.events().iter().any(|event| {
+                matches!(
+                    &event.payload,
+                    TaskEventPayload::Failed { error }
+                        if error.code == TaskErrorCode::WorkspaceAllocation
+                )
+            }) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        handle
+            .inspect_admin(TaskId::from("root"))
+            .await
+            .unwrap()
+            .budget_reserved,
+        BudgetAmount::ZERO
+    );
+    assert!(runner.started_ids().await.is_empty());
 }
 
 #[tokio::test]
@@ -479,8 +683,8 @@ async fn budget_amplification_and_fixed_cost_overflow_are_atomic() {
 }
 
 #[tokio::test]
-async fn capability_expansion_is_rejected_before_visibility_reservation_or_validation() {
-    let runner = Arc::new(GatedTaskRunner::with_options(false, false, false, true));
+async fn capability_expansion_is_rejected_after_profile_validation_but_before_visibility() {
+    let runner = Arc::new(GatedTaskRunner::new(false));
     let harness = Harness::with_runner(CoordinatorConfig::default(), runner.clone()).await;
     let root = harness.register_root_scoped("root", "s", "t").await;
     let mut child = request("child");
@@ -489,7 +693,7 @@ async fn capability_expansion_is_rejected_before_visibility_reservation_or_valid
         root.spawn(child).await.unwrap_err().code,
         TaskErrorCode::CapabilityExpansion
     );
-    assert!(!runner.validation_entered());
+    assert_eq!(runner.validation_calls(), 1);
     assert!(
         harness
             .handle
@@ -598,6 +802,178 @@ async fn profile_validation_error_and_panic_are_structured_and_atomic() {
             BudgetAmount::ZERO
         );
     }
+}
+
+#[tokio::test]
+async fn profile_validation_failure_precedes_later_capability_narrowing_failure() {
+    let runner = Arc::new(GatedTaskRunner::failing_validator());
+    let harness = Harness::with_runner(CoordinatorConfig::default(), runner.clone()).await;
+    let root = harness.register_root_scoped("root", "s", "t").await;
+    let mut child = request("child");
+    child.requested_capabilities = Some(vec![ToolCapability::NetworkWrite]);
+    assert_eq!(
+        root.spawn(child).await.unwrap_err().code,
+        TaskErrorCode::InvalidProfile
+    );
+    assert_eq!(runner.validation_calls(), 1);
+}
+
+#[tokio::test]
+async fn terminal_parent_revalidation_precedes_async_profile_failure() {
+    let runner = Arc::new(GatedTaskRunner::failing_paused_validator());
+    let harness = Harness::with_runner(CoordinatorConfig::default(), runner.clone()).await;
+    let root = harness.register_root_scoped("root", "s", "t").await;
+    let spawning_root = root.clone();
+    let spawn = tokio::spawn(async move { spawning_root.spawn(request("child")).await });
+    runner.wait_until_validation_entered().await;
+    harness
+        .handle
+        .shutdown_root(TaskId::from("root"))
+        .await
+        .unwrap();
+    runner.allow_validation();
+    assert_eq!(
+        spawn.await.unwrap().unwrap_err().code,
+        TaskErrorCode::TerminalParent
+    );
+}
+
+struct AdmissionRaceRunner {
+    first_entered: AtomicBool,
+    second_entered: AtomicBool,
+    first_gate: Notify,
+    second_gate: Notify,
+}
+
+impl AdmissionRaceRunner {
+    fn new() -> Self {
+        Self {
+            first_entered: AtomicBool::new(false),
+            second_entered: AtomicBool::new(false),
+            first_gate: Notify::new(),
+            second_gate: Notify::new(),
+        }
+    }
+
+    async fn wait_entered(&self, first: bool) {
+        let entered = if first {
+            &self.first_entered
+        } else {
+            &self.second_entered
+        };
+        while !entered.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl TaskRunner for AdmissionRaceRunner {
+    type Control = ControlledTaskControl;
+
+    async fn run(
+        &self,
+        request: TaskRunRequest,
+        reporter: TaskReporter<Self::Control>,
+    ) -> TaskRunOutput {
+        if reporter
+            .started(StartedTask::new(
+                Arc::new(ControlledTaskControl::new()),
+                request.cancellation.clone(),
+            ))
+            .await
+        {
+            request.cancellation.cancelled().await;
+        }
+        TaskRunOutput::from(lato_core::TaskResult {
+            success: true,
+            output: String::new(),
+            error: None,
+            usage: Default::default(),
+            duration_ms: 0,
+            output_ref: None,
+        })
+    }
+
+    async fn validate_profile(&self, profile: &AgentProfile) -> Result<(), TaskError> {
+        if profile.name == "first" {
+            self.first_entered.store(true, Ordering::Release);
+            self.first_gate.notified().await;
+            Ok(())
+        } else {
+            self.second_entered.store(true, Ordering::Release);
+            self.second_gate.notified().await;
+            Err(TaskError::new(
+                TaskErrorCode::InvalidProfile,
+                "injected second validation failure",
+            ))
+        }
+    }
+
+    fn on_completed(&self, _completion: lato_runtime::TaskCompletion) {}
+}
+
+#[tokio::test]
+async fn newly_saturated_reject_admission_precedes_async_profile_failure() {
+    let workspace = tempfile::tempdir().unwrap();
+    let allocator = Arc::new(MemoryWorkspaceAllocator::new(workspace.path()).unwrap());
+    let runner = Arc::new(AdmissionRaceRunner::new());
+    let (handle, _actor) = spawn_task_coordinator(
+        CoordinatorConfig {
+            max_global_running: 1,
+            max_running_per_root: 1,
+            admission_behavior: LimitBehavior::Reject,
+            ..CoordinatorConfig::default()
+        },
+        runner.clone(),
+        allocator,
+        Arc::new(MemoryTaskEventSink::default()),
+    );
+    let root = handle
+        .register_root(TaskRootRequest {
+            task_id: TaskId::from("root"),
+            owner: lato_core::TaskOwner::Interactive {
+                session_id: lato_core::SessionId::from("s"),
+                turn_id: lato_core::TurnId::from("t"),
+            },
+            profile: AgentProfile::worker(),
+            permissions: vec![ToolCapability::FileRead, ToolCapability::FileWrite],
+            budget: BudgetLimits::unlimited(),
+        })
+        .await
+        .unwrap();
+    let mut first = request("first");
+    first.profile.name = "first".into();
+    let first_root = root.clone();
+    let first_spawn = tokio::spawn(async move { first_root.spawn(first).await });
+    runner.wait_entered(true).await;
+
+    let mut second = request("second");
+    second.profile.name = "second".into();
+    let second_root = root.clone();
+    let second_spawn = tokio::spawn(async move { second_root.spawn(second).await });
+    runner.wait_entered(false).await;
+
+    runner.first_gate.notify_one();
+    first_spawn.await.unwrap().unwrap();
+    loop {
+        if handle
+            .inspect_admin(TaskId::from("first"))
+            .await
+            .unwrap()
+            .node
+            .status
+            == lato_core::TaskStatus::Running
+        {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    runner.second_gate.notify_one();
+    assert_eq!(
+        second_spawn.await.unwrap().unwrap_err().code,
+        TaskErrorCode::ConcurrencyLimit
+    );
 }
 
 #[tokio::test]
@@ -723,6 +1099,140 @@ async fn panicking_completion_callback_cannot_block_cleanup_or_queue_promotion()
         .wait_for_status("second", lato_core::TaskStatus::Running)
         .await;
     assert_eq!(harness.allocator.live_count().await, 1);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if harness
+                .handle
+                .registry_counts()
+                .await
+                .unwrap()
+                .dropped_callback_work
+                >= 1
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn blocking_cancel_callback_never_stalls_actor_or_cancel_grace() {
+    let runner = Arc::new(GatedTaskRunner::blocking_cancel());
+    let harness = Harness::with_runner(
+        CoordinatorConfig {
+            cancel_grace: Duration::from_millis(10),
+            queued_reap_interval: Duration::from_millis(1),
+            teardown_drain_timeout: Duration::from_millis(20),
+            ..CoordinatorConfig::default()
+        },
+        runner.clone(),
+    )
+    .await;
+    let root = harness.register_root_scoped("root", "s", "t").await;
+    let cancellation = CancellationToken::new();
+    let mut child = request("child");
+    child.cancellation = cancellation.clone();
+    root.spawn(child).await.unwrap();
+    harness
+        .wait_for_status("child", lato_core::TaskStatus::Running)
+        .await;
+    cancellation.cancel();
+    runner.wait_until_cancel_callback_entered().await;
+    tokio::time::timeout(Duration::from_millis(20), harness.handle.registry_counts())
+        .await
+        .expect("blocking cancel callback must not freeze actor")
+        .unwrap();
+    harness
+        .wait_for_status("child", lato_core::TaskStatus::Cancelled)
+        .await;
+    assert_eq!(
+        harness.handle.shutdown().await.unwrap(),
+        SinkShutdown::TimedOutDetached
+    );
+    runner.release_cancel_callback();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn blocking_completion_callback_never_stalls_cleanup_or_promotion() {
+    let runner = Arc::new(GatedTaskRunner::blocking_completion());
+    let harness = Harness::with_runner(
+        CoordinatorConfig {
+            max_global_running: 1,
+            max_running_per_root: 1,
+            teardown_drain_timeout: Duration::from_millis(20),
+            ..CoordinatorConfig::default()
+        },
+        runner.clone(),
+    )
+    .await;
+    let root = harness.register_root_scoped("root", "s", "t").await;
+    root.spawn(request("first")).await.unwrap();
+    root.spawn(request("second")).await.unwrap();
+    harness
+        .wait_for_status("first", lato_core::TaskStatus::Running)
+        .await;
+    runner.finish("first").await;
+    runner.wait_until_completion_callback_entered().await;
+    harness
+        .wait_for_status("second", lato_core::TaskStatus::Running)
+        .await;
+    assert_eq!(
+        harness.handle.shutdown().await.unwrap(),
+        SinkShutdown::TimedOutDetached
+    );
+    runner.release_completion_callback();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn callback_dispatch_saturation_is_bounded_and_observable() {
+    let runner = Arc::new(GatedTaskRunner::blocking_completion());
+    let harness = Harness::with_runner(
+        CoordinatorConfig {
+            max_global_running: 3,
+            max_running_per_root: 3,
+            callback_capacity: 1,
+            teardown_drain_timeout: Duration::from_millis(20),
+            ..CoordinatorConfig::default()
+        },
+        runner.clone(),
+    )
+    .await;
+    let root = harness.register_root_scoped("root", "s", "t").await;
+    for id in ["one", "two", "three"] {
+        root.spawn(request(id)).await.unwrap();
+        harness
+            .wait_for_status(id, lato_core::TaskStatus::Running)
+            .await;
+    }
+    runner.finish("one").await;
+    runner.wait_until_completion_callback_entered().await;
+    runner.finish("two").await;
+    runner.finish("three").await;
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if harness
+                .handle
+                .registry_counts()
+                .await
+                .unwrap()
+                .dropped_callback_work
+                >= 1
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        harness.handle.shutdown().await.unwrap(),
+        SinkShutdown::TimedOutDetached
+    );
+    runner.release_completion_callback();
 }
 
 #[tokio::test]
@@ -749,6 +1259,27 @@ async fn completion_callback_observes_workspace_and_reservation_cleanup_first() 
     assert!(child.workspace_lease.is_none());
     assert!(!child.has_parent_reservation);
     assert_eq!(harness.allocator.live_count().await, 0);
+}
+
+#[tokio::test]
+async fn normal_shutdown_drains_accepted_completion_callbacks() {
+    let runner = Arc::new(GatedTaskRunner::new(false));
+    let harness = Harness::with_runner(CoordinatorConfig::default(), runner.clone()).await;
+    let root = harness.register_root_scoped("root", "s", "t").await;
+    root.spawn(request("child")).await.unwrap();
+    harness
+        .wait_for_status("child", lato_core::TaskStatus::Running)
+        .await;
+    runner.finish("child").await;
+    harness
+        .wait_for_status("child", lato_core::TaskStatus::Completed)
+        .await;
+
+    assert_eq!(
+        harness.handle.shutdown().await.unwrap(),
+        SinkShutdown::Drained
+    );
+    assert_eq!(runner.completion_callbacks(), 1);
 }
 
 #[derive(Clone, Default)]
@@ -946,6 +1477,7 @@ async fn cancelling_partial_release_rolls_back_and_reports_incomplete_cleanup() 
         Ok(SinkShutdown::CleanupIncomplete {
             unreleased_leases: 1,
             sink_drained: true,
+            callbacks_drained: true,
         })
     ));
     actor.await.unwrap();
@@ -958,6 +1490,92 @@ struct FailOnceReleaseAllocator {
     fail: Arc<AtomicBool>,
     fail_always: bool,
     release_delay: Option<Duration>,
+}
+
+#[derive(Clone)]
+struct PanickingReleaseAllocator {
+    inner: MemoryWorkspaceAllocator,
+}
+
+#[async_trait::async_trait]
+impl WorkspaceAllocator for PanickingReleaseAllocator {
+    async fn allocate(&self, request: WorkspaceRequest) -> Result<WorkspaceLease, TaskError> {
+        self.inner.allocate(request).await
+    }
+
+    async fn release(&self, _lease: &WorkspaceLease) -> Result<(), TaskError> {
+        panic!("injected workspace release panic")
+    }
+}
+
+#[tokio::test]
+async fn workspace_release_panic_is_truthful_observable_and_actor_survives() {
+    let workspace = tempfile::tempdir().unwrap();
+    let inner = MemoryWorkspaceAllocator::new(workspace.path()).unwrap();
+    let allocator = Arc::new(PanickingReleaseAllocator {
+        inner: inner.clone(),
+    });
+    let runner = Arc::new(GatedTaskRunner::new(false));
+    let sink = Arc::new(MemoryTaskEventSink::default());
+    let (handle, _actor) = spawn_task_coordinator(
+        CoordinatorConfig::default(),
+        runner.clone(),
+        allocator,
+        sink.clone(),
+    );
+    let root = handle
+        .register_root(TaskRootRequest {
+            task_id: TaskId::from("root"),
+            owner: lato_core::TaskOwner::Interactive {
+                session_id: lato_core::SessionId::from("s"),
+                turn_id: lato_core::TurnId::from("t"),
+            },
+            profile: AgentProfile::worker(),
+            permissions: vec![ToolCapability::FileRead, ToolCapability::FileWrite],
+            budget: BudgetLimits::unlimited(),
+        })
+        .await
+        .unwrap();
+    root.spawn(request("child")).await.unwrap();
+    loop {
+        if handle
+            .inspect_admin(TaskId::from("child"))
+            .await
+            .unwrap()
+            .node
+            .status
+            == lato_core::TaskStatus::Running
+        {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    runner.finish("child").await;
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let snapshot = handle.inspect_admin(TaskId::from("child")).await.unwrap();
+            if let Some(error) = snapshot.cleanup_error {
+                assert_eq!(error.code, TaskErrorCode::WorkspaceRelease);
+                assert!(error.message.contains("panicked"));
+                assert!(snapshot.workspace_lease.is_some());
+                assert!(snapshot.has_parent_reservation);
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(sink.events().iter().any(|event| {
+        matches!(
+            &event.payload,
+            TaskEventPayload::WorkspaceLeaseReleaseFailed { error, .. }
+                if error.code == TaskErrorCode::WorkspaceRelease
+                    && error.message.contains("panicked")
+        )
+    }));
+    assert_eq!(handle.registry_counts().await.unwrap().completed, 1);
+    assert_eq!(inner.live_count().await, 1);
 }
 
 #[async_trait::async_trait]
@@ -1128,6 +1746,7 @@ async fn permanent_release_failure_makes_shutdown_explicitly_incomplete() {
         SinkShutdown::CleanupIncomplete {
             unreleased_leases: 1,
             sink_drained: true,
+            callbacks_drained: true,
         }
     );
     assert_eq!(inner.live_count().await, 1);
@@ -1191,6 +1810,7 @@ async fn slow_release_cannot_exceed_shutdown_bound_or_claim_clean_shutdown() {
         SinkShutdown::CleanupIncomplete {
             unreleased_leases: 1,
             sink_drained: true,
+            callbacks_drained: true,
         }
     );
 }
@@ -1293,6 +1913,7 @@ async fn cleanup_and_sink_failures_are_both_preserved_in_shutdown_outcome() {
         SinkShutdown::CleanupIncomplete {
             unreleased_leases: 1,
             sink_drained: false,
+            callbacks_drained: true,
         }
     );
     sink.release();

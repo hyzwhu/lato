@@ -9,10 +9,18 @@ use lato_core::{
     TaskId, ToolCapability, WorkspaceIntent,
 };
 
+#[derive(Debug)]
 pub(crate) struct SpawnStructure {
     pub owner: lato_core::TaskOwner,
     pub root_id: TaskId,
     pub depth: u32,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct PendingSpawnOccupancy {
+    pub duplicate: bool,
+    pub tasks: usize,
+    pub children: usize,
 }
 
 pub(crate) fn validate_structure(
@@ -21,6 +29,7 @@ pub(crate) fn validate_structure(
     caller_root: &TaskId,
     caller_parent: &TaskId,
     request: &SpawnTaskRequest,
+    pending: PendingSpawnOccupancy,
 ) -> Result<SpawnStructure, TaskError> {
     if !state.is_self_or_descendant(caller_root, caller_parent, caller_parent) {
         return Err(not_owned());
@@ -35,7 +44,7 @@ pub(crate) fn validate_structure(
             "terminal tasks cannot spawn children",
         ));
     }
-    if state.contains(&request.task_id) {
+    if state.contains(&request.task_id) || pending.duplicate {
         return Err(TaskError::new(
             TaskErrorCode::DuplicateTask,
             "task identifier is already registered",
@@ -51,13 +60,17 @@ pub(crate) fn validate_structure(
             "task depth limit is exhausted",
         ));
     }
-    if state.child_count(caller_parent) >= config.max_children_per_parent {
+    if state
+        .child_count(caller_parent)
+        .saturating_add(pending.children)
+        >= config.max_children_per_parent
+    {
         return Err(TaskError::new(
             TaskErrorCode::ChildLimit,
             "task child limit is exhausted",
         ));
     }
-    if state.tasks.len() >= config.max_total_tasks {
+    if state.tasks.len().saturating_add(pending.tasks) >= config.max_total_tasks {
         return Err(TaskError::new(
             TaskErrorCode::RetentionLimit,
             "task registry capacity is exhausted",
@@ -237,4 +250,84 @@ fn not_owned() -> TaskError {
         TaskErrorCode::NotFoundOrNotOwned,
         "task was not found in the requested scope",
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::task::state::RuntimeTaskRecord;
+    use crate::task::{SpawnMode, TaskRootRequest, root_node};
+    use lato_core::{
+        AgentProfile, BudgetAccount, ResultContract, SessionId, TaskOwner, TaskScope, TurnId,
+    };
+    use tokio_util::sync::CancellationToken;
+
+    fn root_record(id: &str) -> RuntimeTaskRecord {
+        let node = root_node(&TaskRootRequest {
+            task_id: TaskId::from(id),
+            owner: TaskOwner::Interactive {
+                session_id: SessionId::from("session"),
+                turn_id: TurnId::from("turn"),
+            },
+            profile: AgentProfile::worker(),
+            permissions: vec![ToolCapability::FileRead],
+            budget: BudgetLimits::unlimited(),
+        });
+        RuntimeTaskRecord {
+            node,
+            budget: BudgetAccount::new(BudgetLimits::unlimited()),
+            workspace_lease: None,
+            reservation: None,
+            reservation_parent_id: None,
+            cancellation: CancellationToken::new(),
+            depth: 0,
+            cleanup_error: None,
+            last_event_sequence: 0,
+        }
+    }
+
+    fn request(id: &str) -> SpawnTaskRequest {
+        SpawnTaskRequest {
+            task_id: TaskId::from(id),
+            scope: TaskScope {
+                objective: "test precedence".into(),
+                context_refs: Vec::new(),
+            },
+            profile: AgentProfile::worker(),
+            requested_capabilities: None,
+            budget: BudgetLimits::unlimited(),
+            result_contract: ResultContract {
+                schema: None,
+                max_output_bytes: 1,
+            },
+            mode: SpawnMode::Background,
+            cancellation: CancellationToken::new(),
+        }
+    }
+
+    #[test]
+    fn foreign_parent_precedes_duplicate_and_retention_errors() {
+        let mut state = CoordinatorState::default();
+        state
+            .tasks
+            .insert(TaskId::from("root-a"), root_record("root-a"));
+        state
+            .tasks
+            .insert(TaskId::from("root-b"), root_record("root-b"));
+        let config = CoordinatorConfig {
+            max_total_tasks: 2,
+            ..CoordinatorConfig::default()
+        };
+
+        let error = validate_structure(
+            &state,
+            &config,
+            &TaskId::from("root-a"),
+            &TaskId::from("root-b"),
+            &request("root-b"),
+            PendingSpawnOccupancy::default(),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, TaskErrorCode::NotFoundOrNotOwned);
+    }
 }

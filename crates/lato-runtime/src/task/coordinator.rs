@@ -4,13 +4,13 @@
 
 use crate::task::admission::{AdmissionDecision, decide};
 use crate::task::queue::{QueuedTask, SpawnQueue};
-use crate::task::spawn::{reserve, validate_structure};
+use crate::task::spawn::{PendingSpawnOccupancy, reserve, validate_structure};
 use crate::task::state::{CoordinatorState, RuntimeTaskRecord};
 use crate::task::{
     CoordinatorConfig, InspectCaller, RunnerEvent, ScopedTaskHandle, SinkShutdown,
-    SpawnDisposition, SpawnTaskRequest, TaskChildControl, TaskCommand, TaskCompletion,
-    TaskEventEnvelope, TaskEventPayload, TaskEventSink, TaskHandle, TaskReporter, TaskRunRequest,
-    TaskRunner, coordinator_closed, root_node,
+    SpawnDisposition, SpawnTaskRequest, TaskCallbackKind, TaskChildControl, TaskCommand,
+    TaskCommandSender, TaskCompletion, TaskEventEnvelope, TaskEventPayload, TaskEventSink,
+    TaskHandle, TaskReporter, TaskRunRequest, TaskRunner, coordinator_closed, root_node,
 };
 use futures_util::{
     FutureExt, StreamExt,
@@ -78,11 +78,44 @@ struct ShutdownState {
     deadline: Instant,
 }
 
+enum CallbackWork<C: TaskChildControl> {
+    Cancel {
+        task_id: TaskId,
+        control: Arc<C>,
+    },
+    Completed {
+        task_id: TaskId,
+        completion: TaskCompletion,
+    },
+}
+
+impl<C: TaskChildControl> CallbackWork<C> {
+    fn task_id(&self) -> &TaskId {
+        match self {
+            Self::Cancel { task_id, .. } | Self::Completed { task_id, .. } => task_id,
+        }
+    }
+
+    fn kind(&self) -> TaskCallbackKind {
+        match self {
+            Self::Cancel { .. } => TaskCallbackKind::Cancel,
+            Self::Completed { .. } => TaskCallbackKind::Completed,
+        }
+    }
+}
+
+struct CallbackOutcome {
+    task_id: TaskId,
+    kind: TaskCallbackKind,
+    error: Option<TaskError>,
+}
+
 pub struct TaskCoordinator<R: TaskRunner, A: WorkspaceAllocator> {
     config: CoordinatorConfig,
     runner: Arc<R>,
     workspace_allocator: Arc<A>,
     command_rx: mpsc::Receiver<TaskCommand>,
+    command_channel_closed: bool,
     _internal_tx: mpsc::Sender<RunnerEvent<R::Control>>,
     internal_rx: mpsc::Receiver<RunnerEvent<R::Control>>,
     event_tx: broadcast::Sender<TaskEventEnvelope>,
@@ -90,6 +123,11 @@ pub struct TaskCoordinator<R: TaskRunner, A: WorkspaceAllocator> {
     sink_drained: Option<tokio::sync::oneshot::Receiver<()>>,
     sink_worker: Option<std::thread::JoinHandle<()>>,
     dropped_sink_events: u64,
+    callback_tx: Option<std::sync::mpsc::SyncSender<CallbackWork<R::Control>>>,
+    callback_rx: mpsc::UnboundedReceiver<CallbackOutcome>,
+    callback_drained: Option<oneshot::Receiver<()>>,
+    callback_worker: Option<std::thread::JoinHandle<()>>,
+    dropped_callback_work: u64,
     state: CoordinatorState,
     queue: SpawnQueue,
     controls: HashMap<TaskId, crate::task::TaskControl<R::Control>>,
@@ -104,7 +142,7 @@ pub struct TaskCoordinator<R: TaskRunner, A: WorkspaceAllocator> {
     cleanup_inflight: HashSet<TaskId>,
     pending_completions: HashMap<TaskId, TaskCompletion>,
     shutdown: Option<ShutdownState>,
-    handle: TaskHandle,
+    weak_handle: TaskHandle,
     sequence: u64,
 }
 
@@ -126,15 +164,26 @@ where
     let (sink_drained_tx, sink_drained) = tokio::sync::oneshot::channel();
     let sink_worker = spawn_sink_dispatcher(event_sink, sink_rx, sink_drained_tx);
     let handle = TaskHandle {
-        command_tx,
+        command_tx: TaskCommandSender::Strong(command_tx),
         event_tx: event_tx.clone(),
     };
+    let weak_handle = handle.downgrade();
+    let (callback_tx, callback_work_rx) = std::sync::mpsc::sync_channel(config.callback_capacity);
+    let (callback_result_tx, callback_rx) = mpsc::unbounded_channel();
+    let (callback_drained_tx, callback_drained) = oneshot::channel();
+    let callback_worker = spawn_callback_dispatcher(
+        Arc::clone(&runner),
+        callback_work_rx,
+        callback_result_tx,
+        callback_drained_tx,
+    );
     let coordinator = TaskCoordinator {
         queue: SpawnQueue::new(config.max_queue),
         config,
         runner,
         workspace_allocator,
         command_rx,
+        command_channel_closed: false,
         _internal_tx: internal_tx,
         internal_rx,
         event_tx,
@@ -142,6 +191,11 @@ where
         sink_drained: Some(sink_drained),
         sink_worker: Some(sink_worker),
         dropped_sink_events: 0,
+        callback_tx: Some(callback_tx),
+        callback_rx,
+        callback_drained: Some(callback_drained),
+        callback_worker: Some(callback_worker),
+        dropped_callback_work: 0,
         state: CoordinatorState::default(),
         controls: HashMap::new(),
         jobs: FuturesUnordered::new(),
@@ -155,7 +209,7 @@ where
         cleanup_inflight: HashSet::new(),
         pending_completions: HashMap::new(),
         shutdown: None,
-        handle: handle.clone(),
+        weak_handle,
         sequence: 0,
     };
     let actor = tokio::spawn(coordinator.run());
@@ -168,6 +222,10 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
         reap.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             if self.shutdown.is_some() && self.jobs.is_empty() && self.validations.is_empty() {
+                let callbacks_drained = self.shutdown_callbacks().await;
+                while let Ok(outcome) = self.callback_rx.try_recv() {
+                    self.handle_callback_outcome(outcome);
+                }
                 let sink_outcome = self.shutdown_sink().await;
                 let unreleased_leases = self
                     .state
@@ -176,11 +234,16 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
                     .filter(|record| record.workspace_lease.is_some())
                     .count();
                 let outcome = if unreleased_leases == 0 {
-                    sink_outcome
+                    if callbacks_drained && sink_outcome == SinkShutdown::Drained {
+                        SinkShutdown::Drained
+                    } else {
+                        SinkShutdown::TimedOutDetached
+                    }
                 } else {
                     SinkShutdown::CleanupIncomplete {
                         unreleased_leases,
                         sink_drained: sink_outcome == SinkShutdown::Drained,
+                        callbacks_drained,
                     }
                 };
                 if let Some(shutdown) = self.shutdown.take() {
@@ -191,11 +254,14 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
                 break;
             }
             tokio::select! {
-                command = self.command_rx.recv() => {
+                command = self.command_rx.recv(), if !self.command_channel_closed => {
                     if let Some(command) = command {
                         self.handle_command(command).await;
-                    } else if self.shutdown.is_none() {
-                        self.begin_shutdown(None).await;
+                    } else {
+                        self.command_channel_closed = true;
+                        if self.shutdown.is_none() {
+                            self.begin_shutdown(None).await;
+                        }
                     }
                 }
                 event = self.internal_rx.recv() => {
@@ -211,6 +277,11 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
                 job = self.jobs.next(), if !self.jobs.is_empty() => {
                     if let Some(job) = job {
                         self.finish_job(job).await;
+                    }
+                }
+                callback = self.callback_rx.recv() => {
+                    if let Some(callback) = callback {
+                        self.handle_callback_outcome(callback);
                     }
                 }
                 _ = reap.tick() => self.reap_cancelled().await,
@@ -259,7 +330,10 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
                 let _ = reply.send(result);
             }
             TaskCommand::RegistryCounts { reply } => {
-                let _ = reply.send(self.state.counts(self.dropped_sink_events));
+                let _ = reply.send(
+                    self.state
+                        .counts(self.dropped_sink_events, self.dropped_callback_work),
+                );
             }
             TaskCommand::ShutdownRoot { root_id, reply } => {
                 let result = self.shutdown_root(&root_id);
@@ -341,37 +415,38 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
             let _ = reply.send(Err(coordinator_closed()));
             return;
         }
-        if self.pending_spawns.contains_key(&request.task_id) {
-            let _ = reply.send(Err(TaskError::new(
-                TaskErrorCode::DuplicateTask,
-                "task identifier is already pending profile validation",
-            )));
-            return;
-        }
-        if self
-            .state
-            .tasks
-            .len()
-            .saturating_add(self.pending_spawns.len())
-            >= self.config.max_total_tasks
-        {
-            let _ = reply.send(Err(TaskError::new(
-                TaskErrorCode::RetentionLimit,
-                "pending task validation capacity is exhausted",
-            )));
-            return;
-        }
-        if let Err(error) =
-            validate_structure(&self.state, &self.config, &root_id, &parent_id, &request)
-        {
-            let _ = reply.send(Err(error));
-            return;
-        }
-        if let Err(error) = request.profile.effective_capabilities(
-            &self.state.tasks[&parent_id].node.permissions,
-            request.requested_capabilities.as_deref(),
+        let pending_duplicate = self.pending_spawns.contains_key(&request.task_id);
+        let pending_child_count = self
+            .pending_spawns
+            .values()
+            .filter(|pending| pending.parent_id == parent_id)
+            .count();
+        let structure = match validate_structure(
+            &self.state,
+            &self.config,
+            &root_id,
+            &parent_id,
+            &request,
+            PendingSpawnOccupancy {
+                duplicate: pending_duplicate,
+                tasks: self.pending_spawns.len(),
+                children: pending_child_count,
+            },
         ) {
-            let _ = reply.send(Err(error));
+            Ok(structure) => structure,
+            Err(error) => {
+                let _ = reply.send(Err(error));
+                return;
+            }
+        };
+        if let AdmissionDecision::Reject(error) = decide(
+            &self.config,
+            self.state.running_count(),
+            self.state.running_count_for_root(&root_id),
+            self.queue.len(),
+        ) {
+            let _ =
+                reply.send(self.retain_admission_rejection(parent_id, request, structure, error));
             return;
         }
         let task_id = request.task_id.clone();
@@ -437,9 +512,12 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
             let Some(pending) = self.pending_spawns.remove(&task_id) else {
                 continue;
             };
-            let result = validation.and_then(|()| {
-                self.finish_spawn(pending.root_id, pending.parent_id, pending.request)
-            });
+            let result = self.finish_spawn(
+                pending.root_id,
+                pending.parent_id,
+                pending.request,
+                validation,
+            );
             let _ = pending.reply.send(result);
         }
     }
@@ -449,25 +527,37 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
         root_id: TaskId,
         parent_id: TaskId,
         request: SpawnTaskRequest,
+        profile_validation: Result<(), TaskError>,
     ) -> Result<SpawnDisposition, TaskError> {
         if self.shutdown.is_some() {
             return Err(coordinator_closed());
         }
-        let structure =
-            validate_structure(&self.state, &self.config, &root_id, &parent_id, &request)?;
+        let response_handle = self.weak_handle.upgrade().ok_or_else(coordinator_closed)?;
+        let structure = validate_structure(
+            &self.state,
+            &self.config,
+            &root_id,
+            &parent_id,
+            &request,
+            PendingSpawnOccupancy::default(),
+        )?;
         let admission = decide(
             &self.config,
             self.state.running_count(),
             self.state.running_count_for_root(&root_id),
             self.queue.len(),
         );
+        if let AdmissionDecision::Reject(error) = &admission {
+            return self.retain_admission_rejection(parent_id, request, structure, error.clone());
+        }
+        profile_validation?;
         let (permissions, effective_budget, reservation) =
             reserve(&mut self.state, &parent_id, &request)?;
         let task_id = request.task_id.clone();
         let initial_status = match admission {
             AdmissionDecision::Start => TaskStatus::Preparing,
             AdmissionDecision::Enqueue => TaskStatus::Queued,
-            AdmissionDecision::Reject(_) => TaskStatus::Failed,
+            AdmissionDecision::Reject(_) => unreachable!("admission rejection handled above"),
         };
         let node = TaskNode {
             id: task_id.clone(),
@@ -509,23 +599,59 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
                 })?;
                 self.commit_transition(task_id.clone(), TaskEventPayload::Queued);
             }
-            AdmissionDecision::Reject(error) => {
-                self.release_reservation(&task_id);
-                self.commit_transition(
-                    task_id,
-                    TaskEventPayload::AdmissionRejected {
-                        error: error.clone(),
-                    },
-                );
-                return Err(error);
-            }
+            AdmissionDecision::Reject(_) => unreachable!("admission rejection handled above"),
         }
 
         Ok(SpawnDisposition {
             task_id: task_id.clone(),
             status: initial_status,
-            handle: ScopedTaskHandle::new(root_id, task_id, self.handle.clone()),
+            handle: ScopedTaskHandle::new(root_id, task_id, response_handle),
         })
+    }
+
+    fn retain_admission_rejection(
+        &mut self,
+        parent_id: TaskId,
+        request: SpawnTaskRequest,
+        structure: crate::task::spawn::SpawnStructure,
+        error: TaskError,
+    ) -> Result<SpawnDisposition, TaskError> {
+        let permissions = self.state.tasks[&parent_id].node.permissions.clone();
+        let task_id = request.task_id.clone();
+        self.state.tasks.insert(
+            task_id.clone(),
+            RuntimeTaskRecord {
+                node: TaskNode {
+                    id: task_id.clone(),
+                    parent_id: Some(parent_id),
+                    root_id: structure.root_id,
+                    owner: structure.owner,
+                    profile: request.profile.clone(),
+                    scope: request.scope,
+                    status: TaskStatus::Failed,
+                    permissions,
+                    workspace_intent: request.profile.workspace,
+                    result_contract: request.result_contract,
+                },
+                budget: BudgetAccount::new(lato_core::BudgetLimits::limited(
+                    lato_core::BudgetAmount::ZERO,
+                )),
+                workspace_lease: None,
+                reservation: None,
+                reservation_parent_id: None,
+                cancellation: request.cancellation,
+                depth: structure.depth,
+                cleanup_error: None,
+                last_event_sequence: 0,
+            },
+        );
+        self.commit_transition(
+            task_id,
+            TaskEventPayload::AdmissionRejected {
+                error: error.clone(),
+            },
+        );
+        Err(error)
     }
 
     fn launch_preparation(&mut self, task_id: TaskId) {
@@ -538,15 +664,23 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
         let allocator = Arc::clone(&self.workspace_allocator);
         let job_task_id = task_id.clone();
         let future = async move {
-            match allocator
-                .allocate(WorkspaceRequest::new(
-                    task_id.clone(),
-                    node.workspace_intent,
-                ))
+            let allocation = allocator.allocate(WorkspaceRequest::new(
+                task_id.clone(),
+                node.workspace_intent,
+            ));
+            match std::panic::AssertUnwindSafe(allocation)
+                .catch_unwind()
                 .await
             {
-                Ok(lease) => TaskJobExit::WorkspaceAllocated(task_id, lease),
-                Err(error) => TaskJobExit::WorkspaceAllocationFailed(task_id, error),
+                Ok(Ok(lease)) => TaskJobExit::WorkspaceAllocated(task_id, lease),
+                Ok(Err(error)) => TaskJobExit::WorkspaceAllocationFailed(task_id, error),
+                Err(_) => TaskJobExit::WorkspaceAllocationFailed(
+                    task_id,
+                    TaskError::new(
+                        TaskErrorCode::WorkspaceAllocation,
+                        "workspace allocator panicked during task preparation",
+                    ),
+                ),
             }
         };
         self.push_job(job_task_id, JobPhase::Preparing, future);
@@ -566,8 +700,11 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
             .expect("runner starts only after actor accepts a workspace lease");
         let runner = Arc::clone(&self.runner);
         let event_tx = self._internal_tx.clone();
-        let scoped_handle =
-            ScopedTaskHandle::new(node.root_id.clone(), task_id.clone(), self.handle.clone());
+        let scoped_handle = ScopedTaskHandle::new(
+            node.root_id.clone(),
+            task_id.clone(),
+            self.weak_handle.clone(),
+        );
         let job_task_id = task_id.clone();
         let future = async move {
             let reporter = TaskReporter::new(task_id.clone(), event_tx.clone());
@@ -747,6 +884,13 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
         self.jobs.push(Box::pin(async move {
             match cleanup_task.await {
                 Ok(exit) => exit,
+                Err(error) if error.is_panic() => TaskJobExit::LeaseReleaseFailed(
+                    task_id,
+                    TaskError::new(
+                        TaskErrorCode::WorkspaceRelease,
+                        "workspace allocator panicked during lease release",
+                    ),
+                ),
                 Err(_) => TaskJobExit::Aborted(task_id, JobPhase::Cleanup),
             }
         }));
@@ -754,10 +898,10 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
 
     fn finish_terminal_cleanup(&mut self, task_id: &TaskId) {
         if let Some(completion) = self.pending_completions.remove(task_id) {
-            let runner = Arc::clone(&self.runner);
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                runner.on_completed(completion);
-            }));
+            self.dispatch_callback(CallbackWork::Completed {
+                task_id: task_id.clone(),
+                completion,
+            });
         }
         if self.shutdown.is_none() {
             self.promote_queue();
@@ -876,9 +1020,10 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
         }
         self.state.tasks[&task_id].cancellation.cancel();
         if let Some(control) = self.controls.get(&task_id) {
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                control.child().cancel();
-            }));
+            self.dispatch_callback(CallbackWork::Cancel {
+                task_id: task_id.clone(),
+                control: Arc::clone(control.child()),
+            });
         }
         self.commit_transition(task_id.clone(), TaskEventPayload::CancellationRequested);
         self.cancel_deadlines
@@ -1030,6 +1175,8 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
             replies,
             deadline: Instant::now() + self.config.teardown_drain_timeout,
         });
+        self.command_rx.close();
+        self.command_channel_closed = true;
 
         for abort in self.validation_aborts.values() {
             abort.abort();
@@ -1083,9 +1230,10 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
                     self.set_status(&task_id, TaskStatus::Running);
                     self.commit_transition(task_id, TaskEventPayload::Started);
                 } else {
-                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        started.control.child().cancel();
-                    }));
+                    self.dispatch_callback(CallbackWork::Cancel {
+                        task_id: task_id.clone(),
+                        control: Arc::clone(started.control.child()),
+                    });
                 }
                 let _ = acknowledgement.send(accepted);
             }
@@ -1125,6 +1273,69 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
         envelope
     }
 
+    fn dispatch_callback(&mut self, work: CallbackWork<R::Control>) {
+        let task_id = work.task_id().clone();
+        let kind = work.kind();
+        let result = match self.callback_tx.as_ref() {
+            Some(callback_tx) => callback_tx.try_send(work),
+            None => Err(std::sync::mpsc::TrySendError::Disconnected(work)),
+        };
+        if let Err(error) = result {
+            let reason = match error {
+                std::sync::mpsc::TrySendError::Full(_) => {
+                    "task callback dispatcher capacity is exhausted"
+                }
+                std::sync::mpsc::TrySendError::Disconnected(_) => {
+                    "task callback dispatcher is closed"
+                }
+            };
+            self.record_callback_failure(
+                task_id,
+                kind,
+                TaskError::new(TaskErrorCode::RunnerProtocolViolation, reason),
+            );
+        }
+    }
+
+    fn handle_callback_outcome(&mut self, outcome: CallbackOutcome) {
+        if let Some(error) = outcome.error {
+            self.record_callback_failure(outcome.task_id, outcome.kind, error);
+        }
+    }
+
+    fn record_callback_failure(
+        &mut self,
+        task_id: TaskId,
+        callback: TaskCallbackKind,
+        error: TaskError,
+    ) {
+        self.dropped_callback_work = self.dropped_callback_work.saturating_add(1);
+        if self.state.tasks.contains_key(&task_id) {
+            self.commit_transition(
+                task_id,
+                TaskEventPayload::CallbackDispatchFailed { callback, error },
+            );
+        }
+    }
+
+    async fn shutdown_callbacks(&mut self) -> bool {
+        self.callback_tx.take();
+        let Some(drained) = self.callback_drained.take() else {
+            return true;
+        };
+        if !matches!(
+            tokio::time::timeout(self.config.teardown_drain_timeout, drained).await,
+            Ok(Ok(()))
+        ) {
+            self.callback_worker.take();
+            return false;
+        }
+        if let Some(worker) = self.callback_worker.take() {
+            let _ = worker.join();
+        }
+        true
+    }
+
     async fn shutdown_sink(&mut self) -> SinkShutdown {
         self.sink_tx.take();
         let Some(drained) = self.sink_drained.take() else {
@@ -1142,6 +1353,38 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
         }
         SinkShutdown::Drained
     }
+}
+
+fn spawn_callback_dispatcher<R: TaskRunner>(
+    runner: Arc<R>,
+    callback_rx: std::sync::mpsc::Receiver<CallbackWork<R::Control>>,
+    result_tx: mpsc::UnboundedSender<CallbackOutcome>,
+    drained: oneshot::Sender<()>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::Builder::new()
+        .name("lato-task-callbacks".into())
+        .spawn(move || {
+            while let Ok(work) = callback_rx.recv() {
+                let task_id = work.task_id().clone();
+                let kind = work.kind();
+                let callback = || match work {
+                    CallbackWork::Cancel { control, .. } => control.cancel(),
+                    CallbackWork::Completed { completion, .. } => runner.on_completed(completion),
+                };
+                let error = std::panic::catch_unwind(std::panic::AssertUnwindSafe(callback))
+                    .err()
+                    .map(|_| {
+                        TaskError::new(TaskErrorCode::RunnerPanic, "task runner callback panicked")
+                    });
+                let _ = result_tx.send(CallbackOutcome {
+                    task_id,
+                    kind,
+                    error,
+                });
+            }
+            let _ = drained.send(());
+        })
+        .expect("task callback dispatcher thread must start")
 }
 
 fn spawn_sink_dispatcher(

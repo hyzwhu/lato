@@ -23,6 +23,7 @@ pub enum LimitBehavior {
 #[derive(Clone, Debug)]
 pub struct CoordinatorConfig {
     pub command_capacity: usize,
+    pub callback_capacity: usize,
     pub event_capacity: usize,
     pub active_message_capacity: usize,
     pub active_messages_per_task: usize,
@@ -46,6 +47,7 @@ impl Default for CoordinatorConfig {
     fn default() -> Self {
         Self {
             command_capacity: 128,
+            callback_capacity: 128,
             event_capacity: 256,
             active_message_capacity: 64,
             active_messages_per_task: 8,
@@ -72,6 +74,10 @@ impl CoordinatorConfig {
         assert!(
             self.command_capacity > 0,
             "command capacity must be positive"
+        );
+        assert!(
+            self.callback_capacity > 0,
+            "callback capacity must be positive"
         );
         assert!(self.event_capacity > 0, "event capacity must be positive");
         assert!(
@@ -183,22 +189,31 @@ pub struct RegistryCounts {
     pub completed: usize,
     pub total: usize,
     pub dropped_sink_events: u64,
+    pub dropped_callback_work: u64,
 }
 
-/// Result of draining coordinator-owned work and the observational event sink.
+/// Result of draining coordinator-owned work, callbacks, and the event sink.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SinkShutdown {
-    /// The dispatcher delivered every event it had accepted and exited.
+    /// Both dispatchers delivered every item they had accepted and exited.
     Drained,
     /// The bounded wait expired. The worker was detached because safe Rust
     /// cannot force-stop arbitrary callback code that is currently blocked.
     TimedOutDetached,
     /// Runner work is joined, but one or more allocator leases could not be
-    /// released. `sink_drained` independently preserves the sink outcome.
+    /// released. Dispatcher outcomes are preserved independently.
     CleanupIncomplete {
         unreleased_leases: usize,
         sink_drained: bool,
+        callbacks_drained: bool,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskCallbackKind {
+    Cancel,
+    Completed,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -295,6 +310,10 @@ pub enum TaskEventPayload {
         lease_id: lato_core::LeaseId,
         error: TaskError,
     },
+    CallbackDispatchFailed {
+        callback: TaskCallbackKind,
+        error: TaskError,
+    },
     SpawnAdmissionClosed,
     SpawnAdmissionOpened,
     CompletedRecordEvicted,
@@ -369,8 +388,14 @@ pub(crate) enum InspectCaller {
 
 #[derive(Clone)]
 pub struct TaskHandle {
-    pub(crate) command_tx: mpsc::Sender<TaskCommand>,
+    pub(crate) command_tx: TaskCommandSender,
     pub(crate) event_tx: broadcast::Sender<TaskEventEnvelope>,
+}
+
+#[derive(Clone)]
+pub(crate) enum TaskCommandSender {
+    Strong(mpsc::Sender<TaskCommand>),
+    Weak(mpsc::WeakSender<TaskCommand>),
 }
 
 impl TaskHandle {
@@ -429,10 +454,38 @@ impl TaskHandle {
     }
 
     async fn send(&self, command: TaskCommand) -> Result<(), TaskError> {
-        self.command_tx
+        let command_tx = match &self.command_tx {
+            TaskCommandSender::Strong(command_tx) => command_tx.clone(),
+            TaskCommandSender::Weak(command_tx) => {
+                command_tx.upgrade().ok_or_else(coordinator_closed)?
+            }
+        };
+        command_tx
             .send(command)
             .await
             .map_err(|_| coordinator_closed())
+    }
+
+    pub(crate) fn downgrade(&self) -> Self {
+        let command_tx = match &self.command_tx {
+            TaskCommandSender::Strong(command_tx) => command_tx.downgrade(),
+            TaskCommandSender::Weak(command_tx) => command_tx.clone(),
+        };
+        Self {
+            command_tx: TaskCommandSender::Weak(command_tx),
+            event_tx: self.event_tx.clone(),
+        }
+    }
+
+    pub(crate) fn upgrade(&self) -> Option<Self> {
+        let command_tx = match &self.command_tx {
+            TaskCommandSender::Strong(command_tx) => command_tx.clone(),
+            TaskCommandSender::Weak(command_tx) => command_tx.upgrade()?,
+        };
+        Some(Self {
+            command_tx: TaskCommandSender::Strong(command_tx),
+            event_tx: self.event_tx.clone(),
+        })
     }
 }
 
