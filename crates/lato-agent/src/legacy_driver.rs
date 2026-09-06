@@ -369,7 +369,9 @@ async fn run_compaction(
                 .saturating_sub(request.policy.summary_reserve_tokens)
                 .saturating_sub(protocol_overhead_tokens),
         };
-        let model_messages = if let Some(pass) = two_pass.take() {
+        let pass = two_pass.take();
+        let used_two_pass = pass.is_some();
+        let model_messages = if let Some(pass) = pass {
             if pass.prefix_len == 0 || pass.prefix_len > request.messages.len() {
                 return Err(AgentError::new(
                     "compaction.invalid_two_pass_prefix",
@@ -403,10 +405,12 @@ async fn run_compaction(
                 .len()
                 .div_ceil(4) as u64;
             if estimated_tokens.saturating_add(request.policy.summary_reserve_tokens) > window {
-                let Some(next) = stage.next() else {
-                    return Err(CompactionError::InputTooLarge.into());
-                };
-                stage = next;
+                if !used_two_pass {
+                    let Some(next) = stage.next() else {
+                        return Err(CompactionError::InputTooLarge.into());
+                    };
+                    stage = next;
+                }
                 continue;
             }
         }
@@ -452,10 +456,12 @@ async fn run_compaction(
                 if let Some(window) = error.context_window {
                     context_window = Some(context_window.map_or(window, |old| old.min(window)));
                 }
-                let Some(next) = stage.next() else {
-                    return Err(CompactionError::InputTooLarge.into());
-                };
-                stage = next;
+                if !used_two_pass {
+                    let Some(next) = stage.next() else {
+                        return Err(CompactionError::InputTooLarge.into());
+                    };
+                    stage = next;
+                }
                 last_error = Some(model_error(error));
             }
             Err(CompactionSampleError::Model(error)) => {

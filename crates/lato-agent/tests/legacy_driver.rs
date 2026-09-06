@@ -1,15 +1,27 @@
 use async_trait::async_trait;
-use lato_agent::{HistoryItem, LegacyTurnDriver, default_fake_stream};
-use lato_ai::{FakeModelStream, ModelStream, StreamPiece};
+use futures_util::stream;
+use lato_agent::{
+    CompactionInputStage, HistoryItem, LegacyTurnDriver, REQUIRED_SECTIONS,
+    build_compaction_prompt, default_fake_stream, prepare_compaction_input,
+    prepare_compaction_messages,
+};
+use lato_ai::{
+    ActiveModelPort, ActiveModelStream, FakeModelStream, ModelMetadata, ModelStream, StreamPiece,
+};
 use lato_core::{
-    Command, EventPayload, ModelError, PolicyMode, Retryability, SandboxProfile, SessionId,
-    StartBehavior, StartTurn, ToolCallId, TurnId, UserInput,
+    AgentError, Command, CompactSession, CompactionId, CompactionPolicy, CompactionTrigger,
+    EventPayload, ModelCapabilities, ModelContent, ModelError, ModelErrorKind, ModelEventStream,
+    ModelPort, ModelRequest, ModelRole, ModelSelection, ModelStopReason, PolicyMode, Retryability,
+    SandboxProfile, SessionId, StartBehavior, StartTurn, ToolCallId, TurnId, UserInput,
 };
 use lato_policy::{ApprovalLedger, PolicyEngine};
-use lato_runtime::spawn_session;
+use lato_runtime::{
+    CompactionControl, CompactionRequest, TurnDriver, TwoPassCompactionInput, spawn_session,
+};
 use lato_tools::{PolicyScope, ToolRuntimeBuilder};
 use lato_workspace::{FileLocks, SessionTrust};
 use std::{
+    collections::VecDeque,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -18,6 +30,7 @@ use std::{
 };
 use tokio::sync::{Mutex, Notify, mpsc};
 use tokio::time::timeout;
+use tokio_util::sync::CancellationToken;
 
 fn receiver_closed() -> ModelError {
     ModelError::new(
@@ -588,4 +601,323 @@ async fn steering_restarts_without_deadlock_or_stale_output() {
         1
     );
     assert!(!output.final_text.contains("old"));
+}
+
+const NOTE1_SENTINEL: &str = "SECRET_SPECULATIVE_NOTE1";
+
+enum CompactionStep {
+    Overflow { context_window: Option<u64> },
+    InvalidSummary,
+    Summary,
+    Fatal,
+}
+
+struct CanonicalCompactionPort {
+    steps: Mutex<VecDeque<CompactionStep>>,
+    requests: Mutex<Vec<ModelRequest>>,
+    calls: AtomicUsize,
+}
+
+impl CanonicalCompactionPort {
+    fn new(steps: impl IntoIterator<Item = CompactionStep>) -> Self {
+        Self {
+            steps: Mutex::new(steps.into_iter().collect()),
+            requests: Mutex::new(Vec::new()),
+            calls: AtomicUsize::new(0),
+        }
+    }
+}
+
+#[async_trait]
+impl ModelPort for CanonicalCompactionPort {
+    async fn stream(
+        &self,
+        request: ModelRequest,
+        _cancellation: CancellationToken,
+    ) -> Result<ModelEventStream, ModelError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.requests.lock().await.push(request);
+        let step = self
+            .steps
+            .lock()
+            .await
+            .pop_front()
+            .unwrap_or(CompactionStep::Fatal);
+        match step {
+            CompactionStep::Overflow { context_window } => {
+                let mut error = ModelError::new(
+                    "model.context_overflow",
+                    "scripted context overflow",
+                    Retryability::Never,
+                )
+                .with_kind(ModelErrorKind::ContextOverflow);
+                if let Some(context_window) = context_window {
+                    error = error.with_context_window(context_window);
+                }
+                Err(error)
+            }
+            CompactionStep::InvalidSummary => Ok(Box::pin(stream::iter(vec![
+                Ok(lato_core::ModelStreamEvent::TextDelta {
+                    text: "invalid".into(),
+                }),
+                Ok(lato_core::ModelStreamEvent::Completed {
+                    reason: ModelStopReason::Completed,
+                }),
+            ]))),
+            CompactionStep::Summary => Ok(Box::pin(stream::iter(vec![
+                Ok(lato_core::ModelStreamEvent::TextDelta {
+                    text: valid_compaction_summary(),
+                }),
+                Ok(lato_core::ModelStreamEvent::Completed {
+                    reason: ModelStopReason::Completed,
+                }),
+            ]))),
+            CompactionStep::Fatal => Err(ModelError::new(
+                "model.script_exhausted",
+                "compaction script exhausted",
+                Retryability::Never,
+            )),
+        }
+    }
+
+    fn capabilities(&self) -> ModelCapabilities {
+        ModelCapabilities {
+            context_window: Some(1_000_000),
+            ..ModelCapabilities::default()
+        }
+    }
+}
+
+fn model_text(role: ModelRole, text: impl Into<String>) -> lato_core::ModelMessage {
+    lato_core::ModelMessage {
+        role,
+        content: vec![ModelContent::Text { text: text.into() }],
+    }
+}
+
+fn compaction_source() -> Vec<lato_core::ModelMessage> {
+    let mut messages = vec![model_text(ModelRole::System, "system")];
+    for index in 0..40 {
+        messages.push(model_text(
+            if index % 2 == 0 {
+                ModelRole::User
+            } else {
+                ModelRole::Assistant
+            },
+            format!("history-{index} {}", "x".repeat(2_000)),
+        ));
+    }
+    messages.push(model_text(ModelRole::User, "latest objective"));
+    messages
+}
+
+fn valid_compaction_summary() -> String {
+    let detail = "retain facts, decisions, failures, fixes, and pending work ".repeat(2);
+    REQUIRED_SECTIONS
+        .iter()
+        .enumerate()
+        .map(|(index, heading)| format!("{}. {}: {detail}", index + 1, heading))
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+fn compaction_request(two_pass: bool) -> CompactionRequest {
+    let messages = compaction_source();
+    CompactionRequest {
+        compaction_id: CompactionId::from("fault-matrix-compaction"),
+        request: CompactSession {
+            user_context: None,
+            trigger: CompactionTrigger::Manual,
+        },
+        two_pass: two_pass.then(|| TwoPassCompactionInput {
+            note1: NOTE1_SENTINEL.into(),
+            prefix_len: messages.len() / 2,
+        }),
+        messages,
+        policy: CompactionPolicy::default(),
+    }
+}
+
+fn driver_with_canonical_port(port: Arc<dyn ModelPort>) -> Arc<LegacyTurnDriver> {
+    let cwd = std::env::current_dir().unwrap();
+    let selection = ModelSelection::new("test", "canonical-compaction").unwrap();
+    let active = ActiveModelPort {
+        selection,
+        metadata: ModelMetadata {
+            context_window: Some(30_000),
+            model_family: None,
+        },
+        capabilities: port.capabilities(),
+        generation: 0,
+        port,
+    };
+    let endpoint = ActiveModelStream {
+        stream: default_fake_stream(),
+        port: active,
+    };
+    let (updates, _updates_rx) = mpsc::unbounded_channel();
+    Arc::new(LegacyTurnDriver::new_with_endpoint(
+        "legacy-session".into(),
+        endpoint,
+        Arc::new(FileLocks::new()),
+        SessionTrust::for_headless_prompt(&cwd),
+        cwd,
+        updates,
+        None,
+    ))
+}
+
+fn request_contains(request: &ModelRequest, needle: &str) -> bool {
+    serde_json::to_string(&request.messages)
+        .unwrap()
+        .contains(needle)
+}
+
+fn expected_stage(
+    stage: CompactionInputStage,
+    context_window: u64,
+) -> Vec<lato_core::ModelMessage> {
+    if stage == CompactionInputStage::Prepared {
+        return prepare_compaction_messages(&compaction_source()).unwrap();
+    }
+    let prompt = build_compaction_prompt(None);
+    let protocol_overhead_tokens = u64::try_from(prompt.len())
+        .unwrap()
+        .div_ceil(4)
+        .saturating_add(256);
+    let stage_window = if stage == CompactionInputStage::Lossy {
+        context_window.saturating_mul(7).checked_div(10).unwrap()
+    } else {
+        context_window
+    };
+    let input_budget = stage_window
+        .saturating_sub(CompactionPolicy::default().summary_reserve_tokens)
+        .saturating_sub(protocol_overhead_tokens);
+    prepare_compaction_input(&compaction_source(), stage, input_budget).unwrap()
+}
+
+fn assert_request_stage(request: &ModelRequest, stage: CompactionInputStage, context_window: u64) {
+    let actual = &request.messages[..request.messages.len() - 1];
+    let expected = expected_stage(stage, context_window);
+    assert!(
+        actual == expected.as_slice(),
+        "request was not built from the expected {stage:?} stage"
+    );
+}
+
+async fn compact_with_script(
+    port: Arc<CanonicalCompactionPort>,
+    two_pass: bool,
+) -> Result<lato_core::CompactionCandidate, AgentError> {
+    let driver = driver_with_canonical_port(port);
+    timeout(
+        Duration::from_secs(2),
+        TurnDriver::compact(
+            driver.as_ref(),
+            compaction_request(two_pass),
+            CompactionControl {
+                cancellation: CancellationToken::new(),
+            },
+        ),
+    )
+    .await
+    .expect("compaction script timed out")
+}
+
+#[tokio::test]
+async fn compaction_two_pass_and_fallbacks_share_one_three_call_budget() {
+    let port = Arc::new(CanonicalCompactionPort::new([
+        CompactionStep::Overflow {
+            context_window: None,
+        },
+        CompactionStep::Overflow {
+            context_window: Some(20_000),
+        },
+        CompactionStep::Summary,
+    ]));
+
+    let candidate = compact_with_script(port.clone(), true).await.unwrap();
+    assert_eq!(
+        port.calls.load(Ordering::SeqCst),
+        usize::from(CompactionPolicy::default().max_attempts)
+    );
+    let requests = port.requests.lock().await;
+    assert!(request_contains(&requests[0], NOTE1_SENTINEL));
+    assert!(!request_contains(&requests[1], NOTE1_SENTINEL));
+    assert!(!request_contains(&requests[2], NOTE1_SENTINEL));
+    assert_request_stage(&requests[1], CompactionInputStage::Prepared, 30_000);
+    assert_request_stage(&requests[2], CompactionInputStage::Fitted, 20_000);
+    let fallback_sizes = requests[1..]
+        .iter()
+        .map(|request| serde_json::to_vec(&request.messages).unwrap().len())
+        .collect::<Vec<_>>();
+    assert!(fallback_sizes[0] > fallback_sizes[1], "{fallback_sizes:?}");
+    assert!(
+        !serde_json::to_string(&candidate.messages)
+            .unwrap()
+            .contains(NOTE1_SENTINEL)
+    );
+}
+
+#[tokio::test]
+async fn invalid_two_pass_and_two_fallback_overflows_never_make_a_fourth_call() {
+    let port = Arc::new(CanonicalCompactionPort::new([
+        CompactionStep::InvalidSummary,
+        CompactionStep::Overflow {
+            context_window: Some(20_000),
+        },
+        CompactionStep::Overflow {
+            context_window: Some(20_000),
+        },
+    ]));
+
+    let error = compact_with_script(port.clone(), true).await.unwrap_err();
+    assert!(error.code.starts_with("compaction."), "{error:?}");
+    assert_eq!(
+        port.calls.load(Ordering::SeqCst),
+        usize::from(CompactionPolicy::default().max_attempts)
+    );
+    let requests = port.requests.lock().await;
+    assert!(request_contains(&requests[0], NOTE1_SENTINEL));
+    assert!(
+        requests[1..]
+            .iter()
+            .all(|request| !request_contains(request, NOTE1_SENTINEL))
+    );
+    assert_request_stage(&requests[1], CompactionInputStage::Prepared, 30_000);
+    assert_request_stage(&requests[2], CompactionInputStage::Fitted, 20_000);
+}
+
+#[tokio::test]
+async fn prepared_fitted_and_lossy_failures_stop_at_the_global_budget() {
+    let port = Arc::new(CanonicalCompactionPort::new([
+        CompactionStep::Overflow {
+            context_window: Some(20_000),
+        },
+        CompactionStep::Overflow {
+            context_window: Some(20_000),
+        },
+        CompactionStep::Fatal,
+    ]));
+
+    let error = compact_with_script(port.clone(), false).await.unwrap_err();
+    assert!(error.code.starts_with("compaction."), "{error:?}");
+    assert_eq!(
+        port.calls.load(Ordering::SeqCst),
+        usize::from(CompactionPolicy::default().max_attempts)
+    );
+    let requests = port.requests.lock().await;
+    assert_request_stage(&requests[0], CompactionInputStage::Prepared, 30_000);
+    assert_request_stage(&requests[1], CompactionInputStage::Fitted, 20_000);
+    assert_request_stage(&requests[2], CompactionInputStage::Lossy, 20_000);
+    let sizes = requests
+        .iter()
+        .map(|request| serde_json::to_vec(&request.messages).unwrap().len())
+        .collect::<Vec<_>>();
+    assert!(sizes[0] > sizes[1] && sizes[1] > sizes[2], "{sizes:?}");
+    assert!(
+        requests
+            .iter()
+            .all(|request| !request_contains(request, NOTE1_SENTINEL))
+    );
 }

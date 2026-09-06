@@ -44,6 +44,11 @@ enum PrefireSlot {
     Ready(PrefireCache),
 }
 
+fn is_prefire_window(usage: &ContextUsage, threshold_percent: u8) -> bool {
+    usage.threshold_reached(threshold_percent.saturating_sub(PREFIRE_LEAD_PERCENT))
+        && !usage.threshold_reached(threshold_percent)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PromptKind {
     Start,
@@ -197,9 +202,7 @@ impl SessionActor {
                 let usage = self.context_tracker.measure(&self.history, active);
                 self.emit_context_usage(usage.clone())?;
                 let threshold = CompactionPolicy::default().threshold_percent;
-                if usage.threshold_reached(threshold.saturating_sub(PREFIRE_LEAD_PERCENT))
-                    && !usage.threshold_reached(threshold)
-                {
+                if is_prefire_window(&usage, threshold) {
                     self.start_prefire(active).await?;
                 }
                 let preflight_overflow =
@@ -1061,6 +1064,84 @@ mod tests {
             SessionTrust::for_headless_prompt(&cwd),
             cwd,
         )
+    }
+
+    fn model_text(role: ModelRole, value: impl Into<String>) -> ModelMessage {
+        ModelMessage {
+            role,
+            content: vec![ModelContent::Text { text: value.into() }],
+        }
+    }
+
+    fn ready_prefire(
+        messages: &[ModelMessage],
+        prefix_len: usize,
+        model_generation: u64,
+    ) -> PrefireSlot {
+        PrefireSlot::Ready(PrefireCache {
+            note1: "cached note one".into(),
+            prefix_len,
+            fingerprint: fingerprint_prefix(messages, prefix_len),
+            model_generation,
+            _pass1_latency_ms: 0,
+        })
+    }
+
+    #[test]
+    fn prefire_and_final_thresholds_have_exact_74_75_84_85_boundaries() {
+        let usage = |percent| ContextUsage {
+            estimated_input_tokens: percent,
+            context_window: 100,
+            utilization_percent: percent as u8,
+        };
+        let threshold = CompactionPolicy::default().threshold_percent;
+
+        assert!(!is_prefire_window(&usage(74), threshold));
+        assert!(!usage(74).threshold_reached(threshold));
+        assert!(is_prefire_window(&usage(75), threshold));
+        assert!(!usage(75).threshold_reached(threshold));
+        assert!(is_prefire_window(&usage(84), threshold));
+        assert!(!usage(84).threshold_reached(threshold));
+        assert!(!is_prefire_window(&usage(85), threshold));
+        assert!(usage(85).threshold_reached(threshold));
+    }
+
+    #[tokio::test]
+    async fn ready_prefire_reuses_an_appended_tail_exactly_once() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut actor = actor(vec![], directory.path().to_path_buf());
+        let mut messages = vec![
+            model_text(ModelRole::System, "system"),
+            model_text(ModelRole::User, "cached prefix"),
+        ];
+        actor.prefire = ready_prefire(&messages, messages.len(), 7);
+        messages.push(model_text(ModelRole::User, "appended tail"));
+
+        let pass = actor.take_prefire(&messages, 7).await.unwrap();
+        assert_eq!(pass.note1, "cached note one");
+        assert_eq!(pass.prefix_len, 2);
+        assert!(actor.take_prefire(&messages, 7).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn ready_prefire_invalidates_prefix_generation_and_length_mismatches() {
+        let directory = tempfile::tempdir().unwrap();
+        let original = vec![
+            model_text(ModelRole::System, "system"),
+            model_text(ModelRole::User, "cached prefix"),
+        ];
+
+        let mut actor = actor(vec![], directory.path().to_path_buf());
+        actor.prefire = ready_prefire(&original, original.len(), 7);
+        let mut mutated = original.clone();
+        mutated[1] = model_text(ModelRole::User, "mutated prefix");
+        assert!(actor.take_prefire(&mutated, 7).await.is_none());
+
+        actor.prefire = ready_prefire(&original, original.len(), 7);
+        assert!(actor.take_prefire(&original, 8).await.is_none());
+
+        actor.prefire = ready_prefire(&original, original.len(), 7);
+        assert!(actor.take_prefire(&original[..1], 7).await.is_none());
     }
 
     struct AllowTool;

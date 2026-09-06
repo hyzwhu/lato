@@ -115,6 +115,27 @@ fn message_tokens(message: &ModelMessage) -> u64 {
 mod tests {
     use super::*;
 
+    fn tool_call(call_id: &str) -> ModelMessage {
+        ModelMessage {
+            role: ModelRole::Assistant,
+            content: vec![ModelContent::ToolCall {
+                call_id: call_id.into(),
+                name: lato_core::ToolName::parse("test:lookup").unwrap(),
+                arguments: serde_json::json!({"query": "x".repeat(100)}),
+            }],
+        }
+    }
+
+    fn tool_result(call_id: &str) -> ModelMessage {
+        ModelMessage {
+            role: ModelRole::Tool,
+            content: vec![ModelContent::ToolResult {
+                call_id: call_id.into(),
+                output: "result".repeat(20),
+            }],
+        }
+    }
+
     fn history() -> Vec<ModelMessage> {
         (0..20)
             .map(|index| text(ModelRole::User, format!("{index}-{}", "x".repeat(100))))
@@ -129,6 +150,45 @@ mod tests {
         let split = split_for_two_pass(&history, 95);
         assert!(split.prefix_tokens.saturating_mul(100) >= split.total_tokens * 95);
         assert!(split.index == history.len() || history[split.index].role != ModelRole::Tool);
+    }
+
+    #[test]
+    fn split_is_exact_immediately_below_at_and_above_ninety_five_percent() {
+        let messages = (0..100)
+            .map(|_| text(ModelRole::User, "x".repeat(100)))
+            .collect::<Vec<_>>();
+
+        for percent in [94, 95, 96] {
+            let split = split_for_two_pass(&messages, percent);
+            let target = split
+                .total_tokens
+                .saturating_mul(u64::from(percent))
+                .div_ceil(100);
+            assert!(split.index > 0 && split.index < messages.len());
+            assert!(split.prefix_tokens >= target);
+            let previous = split
+                .prefix_tokens
+                .saturating_sub(message_tokens(&messages[split.index - 1]));
+            assert!(previous < target, "percent={percent}, split={split:?}");
+        }
+    }
+
+    #[test]
+    fn split_never_severs_an_assistant_tool_call_and_result_pair() {
+        for pair_index in 1..40 {
+            let mut messages = (0..40)
+                .map(|_| text(ModelRole::User, "x".repeat(100)))
+                .collect::<Vec<_>>();
+            messages.insert(pair_index, tool_call("pair"));
+            messages.insert(pair_index + 1, tool_result("pair"));
+
+            let split = split_for_two_pass(&messages, 95);
+            assert_ne!(
+                split.index,
+                pair_index + 1,
+                "split severed tool pair inserted at {pair_index}"
+            );
+        }
     }
 
     #[test]
