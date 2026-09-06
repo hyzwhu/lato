@@ -131,10 +131,14 @@ struct TaskNode {
     status: TaskStatus,
     budget: BudgetAccount,
     permissions: Vec<ToolCapability>,
-    workspace: Option<WorkspaceLease>,
+    workspace_intent: WorkspaceIntent,
     result_contract: ResultContract,
 }
 ```
+
+The provider-neutral node stores only `WorkspaceIntent`. The concrete
+`WorkspaceLease` remains in `lato-runtime`'s actor-owned runtime record so
+`lato-core` does not depend on `lato-workspace` and create a crate cycle.
 
 `TaskOwner` reserves both interactive and future workflow semantics:
 
