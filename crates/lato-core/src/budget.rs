@@ -2,6 +2,7 @@
 
 use crate::{TaskId, TaskUsage};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -65,21 +66,26 @@ pub enum BudgetError {
     UnknownReservation { task_id: TaskId, generation: u64 },
     #[error("budget reservation contents do not match task {task_id} generation {generation}")]
     ReservationMismatch { task_id: TaskId, generation: u64 },
+    #[error(
+        "budget reservation was issued by a different account for task {task_id} generation {generation}"
+    )]
+    ForeignReservation { task_id: TaskId, generation: u64 },
     #[error("budget reservation generation counter exhausted")]
     GenerationExhausted,
 }
 
 impl BudgetError {
-    pub const fn dimension(&self) -> BudgetDimension {
+    pub const fn dimension(&self) -> Option<BudgetDimension> {
         match self {
             Self::ArithmeticOverflow { dimension }
             | Self::ArithmeticUnderflow { dimension }
             | Self::LimitExceeded { dimension, .. }
             | Self::UsageRegression { dimension, .. }
-            | Self::ActualExceedsReservation { dimension, .. } => *dimension,
+            | Self::ActualExceedsReservation { dimension, .. } => Some(*dimension),
             Self::UnknownReservation { .. }
             | Self::ReservationMismatch { .. }
-            | Self::GenerationExhausted => BudgetDimension::ChildTasks,
+            | Self::ForeignReservation { .. }
+            | Self::GenerationExhausted => None,
         }
     }
 }
@@ -207,29 +213,117 @@ impl From<TaskUsage> for BudgetAmount {
     }
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct BudgetLimits {
-    pub maximum: Option<BudgetAmount>,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
+    pub tool_calls: Option<u64>,
+    pub cost_micros: Option<u64>,
+    pub wall_time_ms: Option<u64>,
+    pub retries: Option<u64>,
+    pub child_tasks: Option<u64>,
+    pub worktrees: Option<u64>,
 }
 
 impl BudgetLimits {
     pub const fn limited(maximum: BudgetAmount) -> Self {
         Self {
-            maximum: Some(maximum),
+            input_tokens: Some(maximum.input_tokens),
+            output_tokens: Some(maximum.output_tokens),
+            total_tokens: Some(maximum.total_tokens),
+            tool_calls: Some(maximum.tool_calls),
+            cost_micros: Some(maximum.cost_micros),
+            wall_time_ms: Some(maximum.wall_time_ms),
+            retries: Some(maximum.retries),
+            child_tasks: Some(maximum.child_tasks),
+            worktrees: Some(maximum.worktrees),
         }
     }
 
     pub const fn unlimited() -> Self {
-        Self { maximum: None }
+        Self {
+            input_tokens: None,
+            output_tokens: None,
+            total_tokens: None,
+            tool_calls: None,
+            cost_micros: None,
+            wall_time_ms: None,
+            retries: None,
+            child_tasks: None,
+            worktrees: None,
+        }
+    }
+
+    fn first_excess(&self, amount: BudgetAmount) -> Option<BudgetDimension> {
+        macro_rules! find_excess {
+            ($($field:ident => $dimension:ident,)*) => {
+                $(if self.$field.is_some_and(|limit| amount.$field > limit) {
+                    return Some(BudgetDimension::$dimension);
+                })*
+            };
+        }
+        budget_fields!(find_excess);
+        None
+    }
+
+    fn value(&self, dimension: BudgetDimension) -> Option<u64> {
+        match dimension {
+            BudgetDimension::InputTokens => self.input_tokens,
+            BudgetDimension::OutputTokens => self.output_tokens,
+            BudgetDimension::TotalTokens => self.total_tokens,
+            BudgetDimension::ToolCalls => self.tool_calls,
+            BudgetDimension::CostMicros => self.cost_micros,
+            BudgetDimension::WallTimeMs => self.wall_time_ms,
+            BudgetDimension::Retries => self.retries,
+            BudgetDimension::ChildTasks => self.child_tasks,
+            BudgetDimension::Worktrees => self.worktrees,
+        }
+    }
+
+    fn remaining_after(&self, committed: BudgetAmount) -> Self {
+        macro_rules! subtract_committed {
+            ($($field:ident => $dimension:ident,)*) => {
+                Self {
+                    $($field: self.$field.map(|limit| {
+                        limit.checked_sub(committed.$field).expect(
+                            "private budget state always satisfies each configured limit",
+                        )
+                    }),)*
+                }
+            };
+        }
+        budget_fields!(subtract_committed)
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+impl Default for BudgetLimits {
+    fn default() -> Self {
+        Self::unlimited()
+    }
+}
+
+#[derive(Debug)]
+struct BudgetAccountIdentity;
+
+#[derive(Clone, Debug)]
 pub struct BudgetReservation {
     pub task_id: TaskId,
     pub amount: BudgetAmount,
     generation: u64,
+    issuer: Arc<BudgetAccountIdentity>,
 }
+
+impl PartialEq for BudgetReservation {
+    fn eq(&self, other: &Self) -> bool {
+        self.task_id == other.task_id
+            && self.amount == other.amount
+            && self.generation == other.generation
+            && Arc::ptr_eq(&self.issuer, &other.issuer)
+    }
+}
+
+impl Eq for BudgetReservation {}
 
 impl BudgetReservation {
     pub const fn amount(&self) -> BudgetAmount {
@@ -243,6 +337,7 @@ impl BudgetReservation {
 
 #[derive(Debug)]
 pub struct BudgetAccount {
+    identity: Arc<BudgetAccountIdentity>,
     limits: BudgetLimits,
     spent: BudgetAmount,
     reserved: BudgetAmount,
@@ -253,6 +348,7 @@ pub struct BudgetAccount {
 impl BudgetAccount {
     pub fn new(limits: BudgetLimits) -> Self {
         Self {
+            identity: Arc::new(BudgetAccountIdentity),
             limits,
             spent: BudgetAmount::ZERO,
             reserved: BudgetAmount::ZERO,
@@ -273,13 +369,12 @@ impl BudgetAccount {
         self.reserved
     }
 
-    pub fn remaining(&self) -> Option<BudgetAmount> {
-        self.limits.maximum.map(|maximum| {
-            maximum
-                .checked_sub(self.spent)
-                .and_then(|amount| amount.checked_sub(self.reserved))
-                .expect("private budget state always satisfies its configured limit")
-        })
+    pub fn remaining(&self) -> BudgetLimits {
+        let committed = self
+            .spent
+            .checked_add(self.reserved)
+            .expect("private budget accounting never overflows");
+        self.limits.remaining_after(committed)
     }
 
     pub fn open_reservations(&self) -> usize {
@@ -301,6 +396,7 @@ impl BudgetAccount {
             task_id,
             amount,
             generation: self.next_generation,
+            issuer: Arc::clone(&self.identity),
         };
 
         self.open.insert(
@@ -371,6 +467,12 @@ impl BudgetAccount {
         &self,
         reservation: &BudgetReservation,
     ) -> Result<BudgetAmount, BudgetError> {
+        if !Arc::ptr_eq(&self.identity, &reservation.issuer) {
+            return Err(BudgetError::ForeignReservation {
+                task_id: reservation.task_id.clone(),
+                generation: reservation.generation,
+            });
+        }
         let key = (reservation.task_id.clone(), reservation.generation);
         let Some(stored) = self.open.get(&key).copied() else {
             return Err(BudgetError::UnknownReservation {
@@ -388,15 +490,15 @@ impl BudgetAccount {
     }
 
     fn check_limit(&self, spent: BudgetAmount, reserved: BudgetAmount) -> Result<(), BudgetError> {
-        let Some(maximum) = self.limits.maximum else {
-            return Ok(());
-        };
         let committed = spent.checked_add(reserved)?;
-        if let Some(dimension) = committed.first_excess(maximum) {
+        if let Some(dimension) = self.limits.first_excess(committed) {
             return Err(BudgetError::LimitExceeded {
                 dimension,
                 requested: committed.value(dimension),
-                available: maximum.value(dimension),
+                available: self
+                    .limits
+                    .value(dimension)
+                    .expect("exceeded dimensions always have a configured limit"),
             });
         }
         Ok(())
