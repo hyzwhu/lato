@@ -441,6 +441,13 @@ impl ToolRuntime {
 pub fn builtin_tool_runtime(
     environment: BuiltinToolEnvironment,
 ) -> Result<Arc<ToolRuntime>, RuntimeBuildError> {
+    builtin_tool_runtime_for_capabilities(environment, None)
+}
+
+pub fn builtin_tool_runtime_for_capabilities(
+    environment: BuiltinToolEnvironment,
+    capabilities: Option<&[lato_core::ToolCapability]>,
+) -> Result<Arc<ToolRuntime>, RuntimeBuildError> {
     let scope = PolicyScope {
         workspace_root: environment.cwd.clone(),
         mode: match environment.trust.mode {
@@ -459,7 +466,17 @@ pub fn builtin_tool_runtime(
         Duration::from_secs(60),
     ))));
     let mut builder = ToolRuntimeBuilder::new(policy, scope);
-    builder.register_builtin_tools(environment)?;
+    for tool in builtin_tools(environment)? {
+        let descriptor = tool.descriptor();
+        if capabilities.is_none_or(|allowed| {
+            descriptor
+                .capabilities
+                .iter()
+                .all(|capability| allowed.contains(capability))
+        }) {
+            builder.register(tool)?;
+        }
+    }
     Ok(Arc::new(builder.build()?))
 }
 

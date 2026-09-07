@@ -425,6 +425,12 @@ impl RuntimeSession {
         }
     }
 
+    pub async fn steer(&self, input: String) -> Result<(), AgentError> {
+        self.handle
+            .submit(Command::SteerTurn(UserInput::text(input)))
+            .await
+    }
+
     pub async fn shutdown(&self) -> Result<(), AgentError> {
         let _gate = self.submission_gate.lock().await;
         let result = self.handle.submit(Command::Shutdown).await;

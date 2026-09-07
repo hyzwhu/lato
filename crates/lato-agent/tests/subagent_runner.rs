@@ -2,11 +2,19 @@ use lato_agent::{
     BuiltinProfileName, ChildSessionConfig, ContextPackageBuilder, ContextPackageLimits,
     ContextReference, HistoryItem, RuntimeSession, default_fake_stream,
 };
-use lato_core::{BudgetAmount, ToolCapability, WorkspaceIntent};
+use lato_core::{
+    AgentProfile, BudgetAmount, BudgetLimits, ResultContract, SessionId, TaskId, TaskOwner,
+    TaskScope, ToolCapability, TurnId, VerificationPolicy, WorkspaceIntent,
+};
+use lato_runtime::{
+    CoordinatorConfig, NoopTaskEventSink, SpawnMode, SpawnTaskRequest, TaskRootRequest,
+    WaitOutcome, spawn_subagent_coordinator,
+};
 use lato_tools::{BuiltinToolEnvironment, builtin_tool_runtime};
 use lato_workspace::{FileLocks, SessionTrust};
 use std::{sync::Arc, time::Duration};
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 #[test]
 fn built_in_profiles_are_closed_and_resolve_expected_authority() {
@@ -106,4 +114,102 @@ async fn child_session_uses_injected_history_and_shuts_down_boundedly() {
         .cancel_and_join(Duration::from_secs(1))
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn real_runner_executes_a_child_runtime_and_returns_to_coordinator() {
+    let repo = tempfile::tempdir().unwrap();
+    run_git(repo.path(), &["init", "-q"]);
+    run_git(
+        repo.path(),
+        &["config", "user.email", "lato@example.invalid"],
+    );
+    run_git(repo.path(), &["config", "user.name", "Lato Test"]);
+    std::fs::write(repo.path().join("README.md"), "root\n").unwrap();
+    run_git(repo.path(), &["add", "README.md"]);
+    run_git(repo.path(), &["commit", "-qm", "initial"]);
+
+    let locks = Arc::new(FileLocks::new());
+    let trust = SessionTrust::for_headless_prompt(repo.path());
+    let (updates, _updates_rx) = mpsc::unbounded_channel();
+    let runner = Arc::new(lato_agent::ChildSessionRunner::new(
+        default_fake_stream(),
+        locks,
+        trust,
+        updates,
+        None,
+    ));
+    let allocator = Arc::new(
+        lato_workspace::GitWorkspaceAllocator::new(
+            repo.path(),
+            repo.path().join(".lato/worktrees"),
+        )
+        .unwrap(),
+    );
+    let (handle, actor) = spawn_subagent_coordinator(
+        CoordinatorConfig::default(),
+        runner,
+        allocator,
+        Arc::new(NoopTaskEventSink),
+    );
+    let root = handle
+        .register_root(TaskRootRequest {
+            task_id: TaskId::from("root"),
+            owner: TaskOwner::Interactive {
+                session_id: SessionId::from("parent-session"),
+                turn_id: TurnId::from("parent-turn"),
+            },
+            profile: AgentProfile {
+                name: "root".into(),
+                instructions: "coordinate".into(),
+                capabilities: vec![ToolCapability::FileRead, ToolCapability::NetworkRead],
+                workspace: WorkspaceIntent::IsolatedWorktree,
+                verification: VerificationPolicy::Accept,
+                definition_background: false,
+            },
+            permissions: vec![ToolCapability::FileRead, ToolCapability::NetworkRead],
+            budget: BudgetLimits::unlimited(),
+        })
+        .await
+        .unwrap();
+    root.spawn(SpawnTaskRequest {
+        task_id: TaskId::from("child"),
+        scope: TaskScope {
+            objective: "inspect".into(),
+            context_refs: vec!["README.md".into()],
+        },
+        profile: AgentProfile::explorer(),
+        requested_capabilities: None,
+        budget: BudgetLimits::unlimited(),
+        result_contract: ResultContract {
+            schema: None,
+            max_output_bytes: 1_024,
+        },
+        mode: SpawnMode::Background,
+        cancellation: CancellationToken::new(),
+    })
+    .await
+    .unwrap();
+
+    let outcome = root
+        .wait(TaskId::from("child"), Duration::from_secs(3))
+        .await
+        .unwrap();
+    let WaitOutcome::Finished(snapshot) = outcome else {
+        panic!("child task did not finish: {outcome:?}");
+    };
+    assert_eq!(snapshot.result.unwrap().output, "hi");
+    handle.shutdown().await.unwrap();
+    actor.await.unwrap();
+}
+
+fn run_git(cwd: &std::path::Path, args: &[&str]) {
+    assert!(
+        std::process::Command::new("git")
+            .current_dir(cwd)
+            .args(args)
+            .status()
+            .unwrap()
+            .success()
+    );
 }
