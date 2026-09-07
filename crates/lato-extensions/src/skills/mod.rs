@@ -10,9 +10,16 @@ pub const MAX_SKILL_CANDIDATES: usize = 1024;
 /// from consuming unbounded filesystem work before candidate materialization.
 pub const MAX_SKILL_DIRECTORIES_VISITED: usize = 2048;
 pub const MAX_SKILL_DIRECTORY_ENTRIES: usize = 8192;
+pub const MAX_MODEL_SKILL_LISTING_ENTRIES: usize = 128;
+pub const MAX_MODEL_SKILL_LISTING_BYTES: usize = 64 * 1024;
+pub const MAX_EXPANDED_SKILL_BODY_BYTES: usize = 128 * 1024;
 
+pub mod catalog;
 pub mod discovery;
 pub mod types;
 
+pub use catalog::SkillCatalog;
 pub use discovery::discover_skills;
-pub use types::{DiscoveredSkill, SkillDiagnostic, SkillDiscovery};
+pub use types::{
+    DiscoveredSkill, SkillDiagnostic, SkillDiscovery, SkillInvocation, SkillInvokeError,
+};

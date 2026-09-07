@@ -5,6 +5,7 @@
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use serde::{Deserialize, Serialize};
@@ -37,6 +38,31 @@ pub struct DiscoveredSkill {
     pub metadata: Option<BTreeMap<String, String>>,
     pub model: Option<String>,
     pub effort: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SkillInvocation {
+    pub qualified_name: String,
+    pub message: String,
+    pub allowed_tools: Option<Arc<[String]>>,
+    pub body_hash: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum SkillInvokeError {
+    #[error("skill `{requested}` was not found")]
+    NotFound { requested: String },
+    #[error("skill `{requested}` is ambiguous; use one of: {candidates:?}")]
+    Ambiguous {
+        requested: String,
+        candidates: Vec<String>,
+    },
+    #[error("skill `{qualified_name}` cannot be invoked by a user")]
+    UserInvocationDisabled { qualified_name: String },
+    #[error("skill `{qualified_name}` cannot be invoked by the model")]
+    ModelInvocationDisabled { qualified_name: String },
+    #[error("expanded skill body exceeds the {limit}-byte limit")]
+    ExpansionTooLarge { limit: usize },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
