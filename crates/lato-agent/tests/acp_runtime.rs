@@ -87,6 +87,7 @@ async fn acp_close_stops_and_removes_the_runtime_session() {
     .await
     .unwrap();
     assert!(host.task_backend(&sid).is_none());
+    assert!(host.session_plugin_snapshot(&sid).await.is_none());
     let response = host
         .handle(req(
             3,
@@ -96,6 +97,78 @@ async fn acp_close_stops_and_removes_the_runtime_session() {
         .await
         .unwrap();
     assert_eq!(response["error"]["message"], "unknown session");
+}
+
+#[tokio::test]
+async fn plugins_reload_publishes_and_fans_out_a_new_generation() {
+    let fixture = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let plugin = fixture.path().join(".lato/plugins/demo");
+    std::fs::create_dir_all(&plugin).unwrap();
+    std::fs::write(plugin.join("plugin.json"), r#"{"name":"demo"}"#).unwrap();
+    let (updates_tx, _updates_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut host = AcpHost::new_with_home(
+        fixture.path().to_path_buf(),
+        SessionTrust::for_interactive(fixture.path(), false),
+        updates_tx,
+        default_fake_stream(),
+        home.path().to_path_buf(),
+    );
+    let sid = new_session(&mut host).await;
+    let before = host
+        .session_plugin_snapshot(&sid)
+        .await
+        .unwrap()
+        .generation();
+    let response = host
+        .handle(req(
+            2,
+            "lato/plugins/reload",
+            serde_json::json!({"force": true}),
+        ))
+        .await
+        .unwrap();
+    let generation = response["result"]["generation"].as_u64().unwrap();
+    assert!(generation > before);
+    assert_eq!(response["result"]["discovered"], 1);
+    assert_eq!(response["result"]["active"], 0);
+    assert_eq!(
+        host.session_plugin_snapshot(&sid)
+            .await
+            .unwrap()
+            .generation(),
+        generation
+    );
+}
+
+#[tokio::test]
+async fn trusted_project_plugin_requires_persisted_enablement_to_be_active() {
+    let fixture = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let plugin = fixture.path().join(".lato/plugins/demo");
+    std::fs::create_dir_all(&plugin).unwrap();
+    std::fs::write(plugin.join("plugin.json"), r#"{"name":"demo"}"#).unwrap();
+    std::fs::write(
+        home.path().join("config.json"),
+        r#"{"plugins":{"enabled":["demo"],"disabled":[]}}"#,
+    )
+    .unwrap();
+    let (updates_tx, _updates_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut host = AcpHost::new_with_home(
+        fixture.path().to_path_buf(),
+        SessionTrust::for_headless_prompt(fixture.path()),
+        updates_tx,
+        default_fake_stream(),
+        home.path().to_path_buf(),
+    );
+    let sid = new_session(&mut host).await;
+    assert_eq!(
+        host.session_plugin_snapshot(&sid)
+            .await
+            .unwrap()
+            .active_names(),
+        vec!["demo"]
+    );
 }
 
 #[tokio::test]

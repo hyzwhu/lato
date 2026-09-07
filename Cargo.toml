@@ -28,7 +28,7 @@ lato-workspace = { path = "crates/lato-workspace" }
 lato-ai = { path = "crates/lato-ai" }
 lato-tools = { path = "crates/lato-tools" }
 lato-agent = { path = "crates/lato-agent" }
-lato-mcp = { path = "crates/lato-mcp" }
+lato-extensions = { path = "crates/lato-extensions" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "process", "io-util", "io-std", "fs", "signal"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

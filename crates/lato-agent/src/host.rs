@@ -1,10 +1,12 @@
 // Derived from: Grok Build@bb7f39d5858cbf5e00de639367f59debbdcb0138:crates/codegen/xai-grok-shell/src/session/acp_session_impl/model_switch.rs
+// Phase 6A derived from: Grok Build@bb7f39d5858cbf5e00de639367f59debbdcb0138:crates/codegen/xai-grok-shell/src/session/acp_session_impl/hooks_plugins.rs
 // License: Apache-2.0
-// Lato changes: ACP model selection targets one runtime session and publishes only committed changes
+// Lato changes: ACP model selection and plugin snapshots publish only committed session changes
 
 use crate::{
     ChildSessionRunner, PreparedModelSwitch, ProfileResultVerifier, RuntimeCompactionOutcome,
-    RuntimePromptOutcome, RuntimeSession, ToolApproval, TranscriptStore, import_legacy_if_needed,
+    RuntimePromptOutcome, RuntimeSession, SessionPluginSnapshots, ToolApproval, TranscriptStore,
+    import_legacy_if_needed,
 };
 use lato_ai::{
     ActiveModelStream, CATALOG, CredentialStore, CustomHttpModelStream, CustomModel,
@@ -16,9 +18,13 @@ use lato_core::{
     AgentProfile, BudgetAmount, BudgetLimits, EventStore, JournalReplay, SessionId, SessionStore,
     TaskId, TaskOwner, ToolCapability, TurnId, VerificationPolicy, WorkspaceIntent,
 };
-use lato_mcp::{PluginOrigin, PluginPackage, discover_plugin};
+use lato_extensions::{
+    DiscoveryConfig, PluginConfig, PluginSnapshot, ReloadRequest, SharedPluginRegistryHandle,
+    build_snapshot, discover_plugins,
+};
 use lato_protocol::{
-    JsonRpcReq, METHODS_IMPLEMENTED, PROTOCOL_VERSION, err, err_with_data, is_implemented, ok,
+    JsonRpcReq, METHODS_IMPLEMENTED, PROTOCOL_VERSION, PluginDiagnosticDto, PluginReloadRequest,
+    PluginReloadResponse, err, err_with_data, is_implemented, ok,
 };
 use lato_runtime::{
     ChannelBackend, CoordinatorConfig, NoopTaskEventSink, TaskHandle, TaskRootRequest,
@@ -43,7 +49,11 @@ pub struct AcpHost {
     events: Option<Arc<FileEventStore>>,
     credentials: Option<CredentialStore>,
     custom_models: Vec<CustomModel>,
-    plugins: Vec<PluginPackage>,
+    lato_home: PathBuf,
+    plugin_registry: SharedPluginRegistryHandle,
+    plugin_config: PluginConfig,
+    cli_plugin_dirs: Vec<PathBuf>,
+    session_plugins: SessionPluginSnapshots,
     tool_approval: Option<Arc<dyn ToolApproval>>,
     task_handle: TaskHandle,
     task_backends: HashMap<String, ChannelBackend>,
@@ -130,14 +140,29 @@ impl AcpHost {
             .as_deref()
             .and_then(|home| load_models_json(&home.join("models.json")).ok())
             .unwrap_or_default();
-        let plugins = discover_plugins(&cwd, lato_home.as_deref(), trust.cwd_trusted());
-        let runner = Arc::new(ChildSessionRunner::new(
-            default_endpoint.stream.clone(),
-            Arc::new(FileLocks::new()),
-            trust.clone(),
-            updates.clone(),
-            tool_approval.clone(),
-        ));
+        let lato_home_path = lato_home.clone().unwrap_or_default();
+        let plugin_config = load_plugin_config(lato_home.as_deref());
+        let cli_plugin_dirs = Vec::new();
+        let initial_discovery = discover_plugins(&DiscoveryConfig {
+            cwd: cwd.clone(),
+            lato_home: lato_home_path.clone(),
+            cli_plugin_dirs: cli_plugin_dirs.clone(),
+            project_trusted: trust.cwd_trusted(),
+        });
+        let initial_snapshot = build_snapshot(1, initial_discovery, &plugin_config)
+            .unwrap_or_else(|_| PluginSnapshot::empty());
+        let plugin_registry = SharedPluginRegistryHandle::new(Some(initial_snapshot));
+        let session_plugins = SessionPluginSnapshots::default();
+        let runner = Arc::new(
+            ChildSessionRunner::new(
+                default_endpoint.stream.clone(),
+                Arc::new(FileLocks::new()),
+                trust.clone(),
+                updates.clone(),
+                tool_approval.clone(),
+            )
+            .with_session_plugins(session_plugins.clone()),
+        );
         let verifier = Arc::new(ProfileResultVerifier);
         let sink = Arc::new(NoopTaskEventSink);
         let mut worktree_recovery = None;
@@ -218,7 +243,11 @@ impl AcpHost {
             events,
             credentials,
             custom_models,
-            plugins,
+            lato_home: lato_home_path,
+            plugin_registry,
+            plugin_config,
+            cli_plugin_dirs,
+            session_plugins,
             tool_approval,
             task_handle,
             task_backends: HashMap::new(),
@@ -332,25 +361,59 @@ impl AcpHost {
             )
             .await;
             return match session {
-                Ok(session) => Ok(Arc::new(session)),
+                Ok(session) => {
+                    let session = Arc::new(session);
+                    if let Err(error) = self.attach_session_plugins(sid, &session).await {
+                        let _ = self.teardown_task_root(sid).await;
+                        return Err(error);
+                    }
+                    Ok(session)
+                }
                 Err(error) => {
                     let _ = self.teardown_task_root(sid).await;
                     Err(error.to_string())
                 }
             };
         }
-        Ok(Arc::new(
-            RuntimeSession::new_with_endpoint_and_tool_runtime(
-                sid.to_string(),
-                self.default_endpoint.clone(),
-                self.locks.clone(),
-                self.trust.clone(),
-                self.cwd.clone(),
-                self.updates.clone(),
-                self.tool_approval.clone(),
-                tool_runtime,
-            ),
-        ))
+        let session = Arc::new(RuntimeSession::new_with_endpoint_and_tool_runtime(
+            sid.to_string(),
+            self.default_endpoint.clone(),
+            self.locks.clone(),
+            self.trust.clone(),
+            self.cwd.clone(),
+            self.updates.clone(),
+            self.tool_approval.clone(),
+            tool_runtime,
+        ));
+        if let Err(error) = self.attach_session_plugins(sid, &session).await {
+            let _ = self.teardown_task_root(sid).await;
+            return Err(error);
+        }
+        Ok(session)
+    }
+
+    async fn attach_session_plugins(
+        &self,
+        sid: &str,
+        session: &Arc<RuntimeSession>,
+    ) -> Result<(), String> {
+        let snapshot = self
+            .plugin_registry
+            .snapshot()
+            .await
+            .unwrap_or_else(PluginSnapshot::empty);
+        session
+            .stage_plugin_snapshot(Arc::clone(&snapshot))
+            .await
+            .map_err(|error| error.to_string())?;
+        self.session_plugins
+            .register(SessionId::from(sid), snapshot)
+            .await;
+        Ok(())
+    }
+
+    pub async fn session_plugin_snapshot(&self, sid: &str) -> Option<Arc<PluginSnapshot>> {
+        self.session_plugins.get(&SessionId::from(sid)).await
     }
 
     async fn make_new_runtime_session(&mut self, sid: &str) -> Result<Arc<RuntimeSession>, String> {
@@ -502,6 +565,9 @@ impl AcpHost {
                     let _ = self.updates.send(serde_json::json!({"jsonrpc":"2.0","id":format!("permission-{sid}"),"method":"session/request_permission","params":{"sessionId": sid,"options":["allow_once","allow_session","deny","cancel"]}}));
                 }
                 let outcome = session.prompt(text.clone()).await;
+                self.session_plugins
+                    .adopt(SessionId::from(sid), session.plugin_snapshot().await)
+                    .await;
                 if let Some(events) = &self.events {
                     let _ = events
                         .ensure_automatic_title(&SessionId::from(sid), &text)
@@ -722,9 +788,13 @@ impl AcpHost {
                 if let Err(error) = self.teardown_task_root(sid).await {
                     return Some(err(id, -32000, error));
                 }
-                if let Some(session) = self.sessions.remove(sid)
-                    && let Err(error) = session.shutdown().await
-                {
+                let shutdown_error = if let Some(session) = self.sessions.remove(sid) {
+                    session.shutdown().await.err()
+                } else {
+                    None
+                };
+                self.session_plugins.remove(&session_id).await;
+                if let Some(error) = shutdown_error {
                     return Some(err(id, -32000, error.to_string()));
                 }
                 if let Some(store) = &self.events
@@ -750,6 +820,7 @@ impl AcpHost {
                     if let Some(session) = self.sessions.remove(sid) {
                         let _ = session.shutdown().await;
                     }
+                    self.session_plugins.remove(&SessionId::from(sid)).await;
                 }
                 Some(ok(id, serde_json::json!({"closed": true})))
             }
@@ -970,18 +1041,85 @@ impl AcpHost {
                 }
             }
             "lato/plugins/reload" => {
-                let lato_home = std::env::var_os("LATO_HOME").map(PathBuf::from);
-                self.plugins =
-                    discover_plugins(&self.cwd, lato_home.as_deref(), self.trust.cwd_trusted());
-                Some(ok(
-                    id,
-                    serde_json::json!({
-                        "plugins":self.plugins.iter().map(|plugin| serde_json::json!({
-                            "root":plugin.root,"trusted":plugin.trusted,"hooksEnabled":plugin.hooks_enabled,
-                            "mcpEnabled":plugin.mcp_enabled,"skills":plugin.skills
-                        })).collect::<Vec<_>>()
-                    }),
-                ))
+                let params = match serde_json::from_value::<PluginReloadRequest>(
+                    req.params.unwrap_or_else(|| serde_json::json!({})),
+                ) {
+                    Ok(params) => params,
+                    Err(error) => return Some(err(id, -32602, error.to_string())),
+                };
+                let _requested_force = params.force;
+                self.plugin_config = load_plugin_config(
+                    (!self.lato_home.as_os_str().is_empty()).then_some(self.lato_home.as_path()),
+                );
+                let request = ReloadRequest {
+                    discovery: DiscoveryConfig {
+                        cwd: self.cwd.clone(),
+                        lato_home: self.lato_home.clone(),
+                        cli_plugin_dirs: self.cli_plugin_dirs.clone(),
+                        project_trusted: self.trust.cwd_trusted(),
+                    },
+                    plugin_config: self.plugin_config.clone(),
+                    force: true,
+                };
+                let outcome = match self.plugin_registry.reload(request).await {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        return Some(err_with_data(
+                            id,
+                            -32000,
+                            error.to_string(),
+                            serde_json::json!({"code": error.code()}),
+                        ));
+                    }
+                };
+                let snapshot = self
+                    .plugin_registry
+                    .snapshot()
+                    .await
+                    .expect("a successful reload always publishes a snapshot");
+                let mut failed_session_ids = Vec::new();
+                for (sid, session) in &self.sessions {
+                    if session
+                        .stage_plugin_snapshot(Arc::clone(&snapshot))
+                        .await
+                        .is_err()
+                    {
+                        failed_session_ids.push(sid.clone());
+                        continue;
+                    }
+                    self.session_plugins
+                        .adopt(
+                            SessionId::from(sid.as_str()),
+                            session.plugin_snapshot().await,
+                        )
+                        .await;
+                }
+                if !failed_session_ids.is_empty() {
+                    return Some(err_with_data(
+                        id,
+                        -32000,
+                        "plugin reload published but one or more sessions rejected adoption",
+                        serde_json::json!({
+                            "generation": outcome.generation,
+                            "failedSessionIds": failed_session_ids,
+                        }),
+                    ));
+                }
+                let response = PluginReloadResponse {
+                    generation: outcome.generation,
+                    discovered: outcome.discovered,
+                    active: outcome.active,
+                    diagnostics: snapshot
+                        .diagnostics()
+                        .iter()
+                        .map(|diagnostic| PluginDiagnosticDto {
+                            code: diagnostic.code.clone(),
+                            plugin_id: None,
+                            message: diagnostic.message.clone(),
+                        })
+                        .collect(),
+                };
+                Some(ok(id, serde_json::to_value(response).unwrap_or_default()))
             }
             "lato/auth/status" => {
                 let provider = req
@@ -1034,33 +1172,24 @@ fn host_task_budget() -> BudgetLimits {
     })
 }
 
-fn discover_plugins(
-    cwd: &std::path::Path,
-    lato_home: Option<&std::path::Path>,
-    project_trusted: bool,
-) -> Vec<PluginPackage> {
-    let mut plugins = Vec::new();
-    let locations = [
-        (cwd.join(".lato/plugins"), PluginOrigin::Project),
-        (
-            lato_home
-                .map(|home| home.join("plugins"))
-                .unwrap_or_default(),
-            PluginOrigin::User,
-        ),
-    ];
-    for (location, origin) in locations {
-        let Ok(entries) = std::fs::read_dir(location) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            if let Ok(plugin) = discover_plugin(&entry.path(), origin, project_trusted) {
-                plugins.push(plugin);
-            }
-        }
+fn load_plugin_config(lato_home: Option<&std::path::Path>) -> PluginConfig {
+    #[derive(serde::Deserialize)]
+    struct HostSettings {
+        #[serde(default)]
+        plugins: PluginConfig,
     }
-    plugins.sort_by(|a, b| a.root.cmp(&b.root));
-    plugins
+
+    let Some(path) = lato_home
+        .filter(|home| !home.as_os_str().is_empty())
+        .map(|home| home.join("config.json"))
+    else {
+        return PluginConfig::default();
+    };
+    std::fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<HostSettings>(&bytes).ok())
+        .map(|settings| settings.plugins)
+        .unwrap_or_default()
 }
 
 pub fn default_fake_stream() -> Arc<dyn ModelStream> {
@@ -1284,6 +1413,12 @@ mod tests {
     async fn e5_1_plugins_reload_preserves_project_trust_boundary() {
         let d = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(d.path().join(".lato/plugins/demo/hooks")).unwrap();
+        std::fs::write(
+            d.path().join(".lato/plugins/demo/plugin.json"),
+            r#"{"name":"demo","hooks":"hooks/hooks.json"}"#,
+        )
+        .unwrap();
+        std::fs::write(d.path().join(".lato/plugins/demo/hooks/hooks.json"), "{}").unwrap();
         let (tx, _) = tokio::sync::mpsc::unbounded_channel();
         let mut h = AcpHost::new(
             d.path().to_path_buf(),
@@ -1292,11 +1427,23 @@ mod tests {
             default_fake_stream(),
         );
         let response = h
-            .handle(req(1, "lato/plugins/reload", serde_json::json!({})))
+            .handle(req(
+                1,
+                "lato/plugins/reload",
+                serde_json::json!({"force": true}),
+            ))
             .await
             .unwrap();
-        assert_eq!(response["result"]["plugins"][0]["trusted"], false);
-        assert_eq!(response["result"]["plugins"][0]["hooksEnabled"], false);
+        assert_eq!(response["result"]["discovered"], 1);
+        assert_eq!(response["result"]["active"], 0);
+        assert!(response["result"]["generation"].as_u64().unwrap() > 1);
+        assert!(
+            response["result"]["diagnostics"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|diagnostic| diagnostic["code"] == "plugin.untrusted_project")
+        );
     }
 
     #[tokio::test]

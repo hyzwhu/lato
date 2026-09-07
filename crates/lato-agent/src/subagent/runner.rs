@@ -7,11 +7,16 @@ use super::{
     BuiltinProfileName, ChildMessage, ChildSessionControl, ContextPackageBuilder,
     ContextPackageLimits, ContextReference,
 };
-use crate::{ChildSessionConfig, HistoryItem, RuntimePromptOutcome, RuntimeSession, ToolApproval};
+use crate::{
+    ChildSessionConfig, HistoryItem, RuntimePromptOutcome, RuntimeSession, SessionPluginSnapshots,
+    ToolApproval,
+};
 use lato_ai::ModelStream;
 use lato_core::{
-    AgentProfile, BudgetAmount, TaskError, TaskErrorCode, TaskProgress, TaskResult, TaskUsage,
+    AgentProfile, BudgetAmount, SessionId, TaskError, TaskErrorCode, TaskProgress, TaskResult,
+    TaskUsage, ToolCapability, WorkspaceIntent,
 };
+use lato_extensions::{CapabilityCeiling, PluginSnapshot};
 use lato_runtime::{
     ChannelBackend, StartedTask, TaskCompletion, TaskReporter, TaskRunOutput, TaskRunRequest,
     TaskRunner,
@@ -33,6 +38,8 @@ pub struct ChildSessionRunner {
     context_limits: ContextPackageLimits,
     message_capacity: usize,
     shutdown_timeout: Duration,
+    session_plugins: SessionPluginSnapshots,
+    empty_snapshot: Arc<PluginSnapshot>,
 }
 
 impl ChildSessionRunner {
@@ -52,7 +59,14 @@ impl ChildSessionRunner {
             context_limits: ContextPackageLimits::default(),
             message_capacity: 8,
             shutdown_timeout: Duration::from_secs(5),
+            session_plugins: SessionPluginSnapshots::default(),
+            empty_snapshot: PluginSnapshot::empty(),
         }
+    }
+
+    pub fn with_session_plugins(mut self, session_plugins: SessionPluginSnapshots) -> Self {
+        self.session_plugins = session_plugins;
+        self
     }
 
     pub fn with_limits(
@@ -84,6 +98,30 @@ impl ChildSessionRunner {
         request: TaskRunRequest,
         reporter: TaskReporter<ChildSessionControl>,
     ) -> Result<(String, TaskUsage), TaskError> {
+        let parent_session_id = request
+            .node
+            .parent_id
+            .as_ref()
+            .map(|task_id| SessionId::from(task_id.to_string()));
+        let nested_parent = match parent_session_id.as_ref() {
+            Some(session_id) => self.session_plugins.get(session_id).await,
+            None => None,
+        };
+        let parent_plugins = match nested_parent {
+            Some(snapshot) => snapshot,
+            None => self
+                .session_plugins
+                .get(request.node.owner.session_id())
+                .await
+                .unwrap_or_else(|| Arc::clone(&self.empty_snapshot)),
+        };
+        let workspace_capabilities =
+            workspace_capabilities(request.node.workspace_intent, &request.node.permissions);
+        let child_plugins = parent_plugins.derive_child(&CapabilityCeiling {
+            parent: request.node.permissions.clone(),
+            profile: request.node.profile.capabilities.clone(),
+            workspace: workspace_capabilities,
+        });
         let trust = self.child_trust(&request);
         let tool_runtime = builtin_tool_runtime_for_capabilities_with_subagents(
             BuiltinToolEnvironment {
@@ -133,10 +171,15 @@ impl ChildSessionRunner {
                 approval: self.approval.clone(),
                 tool_runtime,
                 initial_history: vec![HistoryItem::System(package.render())],
+                plugin_snapshot: Arc::clone(&child_plugins),
             })
             .await
             .map_err(|error| task_error(TaskErrorCode::RunnerInitialization, error))?,
         );
+        let child_session_id = session.session_id().clone();
+        self.session_plugins
+            .register(child_session_id.clone(), child_plugins)
+            .await;
 
         let progress = Arc::new(Mutex::new(TaskProgress {
             phase: Some("running".into()),
@@ -156,6 +199,7 @@ impl ChildSessionRunner {
             .await
         {
             let _ = session.cancel_and_join(self.shutdown_timeout).await;
+            self.session_plugins.remove(&child_session_id).await;
             return Err(TaskError::new(
                 TaskErrorCode::Cancelled,
                 "task promotion was rejected by the coordinator",
@@ -198,6 +242,7 @@ impl ChildSessionRunner {
         };
 
         let shutdown = session.cancel_and_join(self.shutdown_timeout).await;
+        self.session_plugins.remove(&child_session_id).await;
         message_dispatch.abort();
         let _ = message_dispatch.await;
         let _ = relay_stop.send(());
@@ -217,6 +262,20 @@ impl ChildSessionRunner {
             .clone();
         outcome.map(|text| (text, usage))
     }
+}
+
+fn workspace_capabilities(
+    intent: WorkspaceIntent,
+    permissions: &[ToolCapability],
+) -> Vec<ToolCapability> {
+    let mut allowed = permissions.to_vec();
+    if matches!(
+        intent,
+        WorkspaceIntent::SharedReadOnly | WorkspaceIntent::ExternalLease
+    ) {
+        allowed.retain(|capability| capability != &ToolCapability::ExtensionInvoke);
+    }
+    allowed
 }
 
 fn result_contract_instruction(profile: &AgentProfile) -> String {

@@ -98,6 +98,7 @@ pub struct ChildSessionConfig {
     pub approval: Option<Arc<dyn ToolApproval>>,
     pub tool_runtime: Arc<lato_tools::ToolRuntime>,
     pub initial_history: Vec<HistoryItem>,
+    pub plugin_snapshot: Arc<PluginSnapshot>,
 }
 
 impl RuntimeSession {
@@ -125,7 +126,7 @@ impl RuntimeSession {
         }
         let runtime_driver: Arc<dyn TurnDriver> = driver.clone();
         let handle = spawn_session(session_id.clone(), runtime_driver);
-        Ok(Self {
+        let session = Self {
             session_id,
             handle,
             driver,
@@ -133,7 +134,11 @@ impl RuntimeSession {
             active_operation: Mutex::new(None),
             submission_gate: Mutex::new(()),
             plugin_state: Mutex::new(SessionPluginState::default()),
-        })
+        };
+        session
+            .stage_plugin_snapshot(config.plugin_snapshot)
+            .await?;
+        Ok(session)
     }
 
     #[allow(clippy::too_many_arguments)]

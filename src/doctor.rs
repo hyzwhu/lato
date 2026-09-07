@@ -4,7 +4,7 @@ use lato_core::{
     EnvironmentPolicy, NetworkPolicy, PolicyDecision, PolicyMode, PolicyRequest, SandboxObligation,
     SandboxProfile, SessionId, SideEffect, ToolCallId, ToolCapability, ToolName, TurnId,
 };
-use lato_mcp::{PluginOrigin, discover_plugin};
+use lato_extensions::{ManifestLoadResult, load_manifest};
 use lato_policy::{ApprovalLedger, PolicyEngine, redact_text};
 use lato_tools::{BuiltinToolEnvironment, ToolCatalog, builtin_tools};
 use lato_workspace::{
@@ -492,12 +492,8 @@ fn sandbox_check() -> DoctorCheck {
 
 fn trust_check(home: &Path, workspace: &Path) -> DoctorCheck {
     let trust = SessionTrust::for_interactive(workspace, false);
-    let project_plugins = count_plugins(
-        workspace.join(".lato/plugins"),
-        PluginOrigin::Project,
-        false,
-    );
-    let user_plugins = count_plugins(home.join("plugins"), PluginOrigin::User, true);
+    let project_plugins = count_plugins(workspace.join(".lato/plugins"));
+    let user_plugins = count_plugins(home.join("plugins"));
     check(
         "trust",
         DoctorStatus::Ok,
@@ -509,13 +505,18 @@ fn trust_check(home: &Path, workspace: &Path) -> DoctorCheck {
     )
 }
 
-fn count_plugins(root: PathBuf, origin: PluginOrigin, project_trusted: bool) -> usize {
+fn count_plugins(root: PathBuf) -> usize {
     let Ok(entries) = std::fs::read_dir(root) else {
         return 0;
     };
     entries
         .flatten()
-        .filter(|entry| discover_plugin(&entry.path(), origin, project_trusted).is_ok())
+        .filter(|entry| {
+            matches!(
+                load_manifest(&entry.path()),
+                Ok(ManifestLoadResult::Found(_) | ManifestLoadResult::Convention(_))
+            )
+        })
         .count()
 }
 

@@ -154,15 +154,17 @@ pub fn discover_plugins(config: &DiscoveryConfig) -> DiscoveryResult {
         &mut candidates,
         &mut result.diagnostics,
     );
-    scan_parent(
-        &config.lato_home.join("plugins"),
-        PluginScope::User,
-        PluginOrigin::User,
-        config.project_trusted,
-        &mut seen,
-        &mut candidates,
-        &mut result.diagnostics,
-    );
+    if !config.lato_home.as_os_str().is_empty() {
+        scan_parent(
+            &config.lato_home.join("plugins"),
+            PluginScope::User,
+            PluginOrigin::User,
+            config.project_trusted,
+            &mut seen,
+            &mut candidates,
+            &mut result.diagnostics,
+        );
+    }
 
     candidates.sort_by(|left, right| {
         left.scope

@@ -1005,7 +1005,7 @@ dependencies = [
  "lato-agent",
  "lato-ai",
  "lato-core",
- "lato-mcp",
+ "lato-extensions",
  "lato-policy",
  "lato-protocol",
  "lato-tools",
@@ -1032,7 +1032,6 @@ dependencies = [
  "lato-ai",
  "lato-core",
  "lato-extensions",
- "lato-mcp",
  "lato-policy",
  "lato-protocol",
  "lato-runtime",
@@ -1113,7 +1112,6 @@ name = "lato-mcp"
 version = "0.1.0"
 dependencies = [
  "reqwest",
- "serde",
  "serde_json",
  "tempfile",
  "tokio",

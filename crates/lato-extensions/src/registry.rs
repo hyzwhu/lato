@@ -255,6 +255,16 @@ fn load_plugin(
             ),
         );
     }
+    if !plugin.trusted {
+        push_diagnostic(
+            diagnostics,
+            "plugin.untrusted_project",
+            &format!(
+                "project plugin {:?} is discoverable but inactive until the workspace is trusted",
+                plugin.name()
+            ),
+        );
+    }
     let inline_hooks = inline(&plugin.manifest.hooks);
     let inline_mcp_servers = inline(&plugin.manifest.mcp_servers);
     LoadedPlugin {
