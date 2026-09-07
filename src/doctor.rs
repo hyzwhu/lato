@@ -380,6 +380,7 @@ fn tool_catalog_check(workspace: &Path) -> DoctorCheck {
         cwd: workspace.to_path_buf(),
         locks: Arc::new(FileLocks::new()),
         trust: SessionTrust::for_headless_prompt(workspace),
+        skill_resolver: None,
     };
     let tools = match builtin_tools(environment) {
         Ok(tools) => tools,

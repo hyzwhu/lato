@@ -36,6 +36,7 @@ fn builtin_adapters_exclude_session_bound_task_tools() {
         cwd: root.path().to_path_buf(),
         locks: Arc::new(FileLocks::new()),
         trust: SessionTrust::for_headless_prompt(root.path()),
+        skill_resolver: None,
     })
     .unwrap();
     let mut actual = tools
@@ -102,6 +103,7 @@ async fn cancelled_adapter_does_not_dispatch() {
         cwd: root.path().to_path_buf(),
         locks: Arc::new(FileLocks::new()),
         trust: SessionTrust::for_headless_prompt(root.path()),
+        skill_resolver: None,
     })
     .unwrap();
     let read = tools
@@ -127,6 +129,7 @@ async fn write_adapter_rejects_missing_execution_grant() {
         cwd: root.path().to_path_buf(),
         locks: Arc::new(FileLocks::new()),
         trust: SessionTrust::for_headless_prompt(root.path()),
+        skill_resolver: None,
     })
     .unwrap();
     let write = tools
@@ -152,6 +155,7 @@ async fn read_adapter_rejects_missing_execution_grant() {
         cwd: root.path().to_path_buf(),
         locks: Arc::new(FileLocks::new()),
         trust: SessionTrust::for_headless_prompt(root.path()),
+        skill_resolver: None,
     })
     .unwrap();
     let read = tools
@@ -176,6 +180,7 @@ async fn runtime_advertises_and_executes_the_same_tools() {
         cwd: root.path().to_path_buf(),
         locks: Arc::new(FileLocks::new()),
         trust: SessionTrust::for_headless_prompt(root.path()),
+        skill_resolver: None,
     })
     .unwrap();
     let definitions = runtime.model_definitions();
@@ -200,6 +205,7 @@ async fn compat_write_file_creates_missing_parent_directories() {
         cwd: root.path().to_path_buf(),
         locks: Arc::new(FileLocks::new()),
         trust: SessionTrust::for_headless_prompt(root.path()),
+        skill_resolver: None,
     })
     .unwrap();
     let contents = "pub fn generated() -> bool { true }\n";
@@ -231,6 +237,7 @@ async fn workspace_write_rejects_parent_traversal() {
         cwd: workspace.clone(),
         locks: Arc::new(FileLocks::new()),
         trust: SessionTrust::for_interactive_auto(&workspace),
+        skill_resolver: None,
     })
     .unwrap();
     let error = runtime
@@ -254,6 +261,7 @@ async fn workspace_write_rejects_absolute_outside_path() {
         cwd: workspace.path().to_path_buf(),
         locks: Arc::new(FileLocks::new()),
         trust: SessionTrust::for_interactive_auto(workspace.path()),
+        skill_resolver: None,
     })
     .unwrap();
     let error = runtime
@@ -278,6 +286,7 @@ async fn workspace_write_rejects_symlink_parent_escape() {
         cwd: workspace.path().to_path_buf(),
         locks: Arc::new(FileLocks::new()),
         trust: SessionTrust::for_interactive_auto(workspace.path()),
+        skill_resolver: None,
     })
     .unwrap();
     let error = runtime
@@ -303,6 +312,7 @@ async fn workspace_write_rejects_dangling_symlink_leaf() {
         cwd: workspace.path().to_path_buf(),
         locks: Arc::new(FileLocks::new()),
         trust: SessionTrust::for_interactive_auto(workspace.path()),
+        skill_resolver: None,
     })
     .unwrap();
     let error = runtime
@@ -328,6 +338,7 @@ async fn workspace_write_rejects_dangling_symlink_parent() {
         cwd: workspace.path().to_path_buf(),
         locks: Arc::new(FileLocks::new()),
         trust: SessionTrust::for_interactive_auto(workspace.path()),
+        skill_resolver: None,
     })
     .unwrap();
     let error = runtime
@@ -353,6 +364,7 @@ async fn read_only_write_is_denied_without_modifying_target() {
         cwd: workspace.path().to_path_buf(),
         locks: Arc::new(FileLocks::new()),
         trust,
+        skill_resolver: None,
     })
     .unwrap();
     let error = runtime
@@ -374,6 +386,7 @@ async fn unknown_wire_name_is_typed() {
         cwd: root.path().to_path_buf(),
         locks: Arc::new(FileLocks::new()),
         trust: SessionTrust::for_headless_prompt(root.path()),
+        skill_resolver: None,
     })
     .unwrap();
     let error = runtime
@@ -470,6 +483,7 @@ async fn higher_layer_replaces_a_builtin_without_duplicate_advertisement() {
             cwd: root.path().to_path_buf(),
             locks: Arc::new(FileLocks::new()),
             trust: SessionTrust::for_headless_prompt(root.path()),
+            skill_resolver: None,
         })
         .unwrap();
     let target = lato_core::ToolName::parse("builtin:read_file").unwrap();
@@ -541,6 +555,7 @@ async fn write_alias_consumes_allow_once_exactly_once() {
         cwd: root.path().to_path_buf(),
         locks: Arc::new(FileLocks::new()),
         trust: trust.clone(),
+        skill_resolver: None,
     })
     .unwrap();
 
@@ -582,6 +597,7 @@ async fn malformed_and_denied_calls_are_classified() {
         cwd: root.path().to_path_buf(),
         locks: Arc::new(FileLocks::new()),
         trust: SessionTrust::for_headless_prompt(root.path()),
+        skill_resolver: None,
     })
     .unwrap();
 
@@ -617,6 +633,7 @@ fn every_advertised_tool_has_one_executable_descriptor() {
         cwd: root.path().to_path_buf(),
         locks: Arc::new(FileLocks::new()),
         trust: SessionTrust::for_headless_prompt(root.path()),
+        skill_resolver: None,
     })
     .unwrap();
 
@@ -632,6 +649,39 @@ fn every_advertised_tool_has_one_executable_descriptor() {
                 .name
                 .local_name(),
             name
+        );
+    }
+}
+
+#[test]
+fn runtime_build_rejects_invalid_and_remote_schemas_offline() {
+    for (name, schema) in [
+        ("invalid", serde_json::json!({"type": 7})),
+        (
+            "remote",
+            serde_json::json!({"$ref": "https://example.invalid/tool.schema.json"}),
+        ),
+    ] {
+        let mut descriptor = fake_descriptor(
+            &format!("builtin:{name}"),
+            lato_core::ToolLayer::Builtin,
+            None,
+        );
+        descriptor.input_schema = schema;
+        let mut builder = test_runtime_builder();
+        builder
+            .register(Arc::new(FakeTool {
+                descriptor,
+                output: String::new(),
+            }))
+            .unwrap();
+        let error = match builder.build() {
+            Ok(_) => panic!("{name} schema unexpectedly compiled"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error, lato_tools::RuntimeBuildError::InvalidSchema { .. }),
+            "{error}"
         );
     }
 }

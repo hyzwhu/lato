@@ -128,6 +128,7 @@ impl ChildSessionRunner {
                 cwd: request.workspace_lease.root.clone(),
                 locks: Arc::clone(&self.locks),
                 trust: trust.clone(),
+                skill_resolver: None,
             },
             Some(&request.node.permissions),
             ChannelBackend::new(request.scoped_handle.clone()).into_resource(),

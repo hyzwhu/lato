@@ -92,6 +92,7 @@ async fn child_session_uses_injected_history_and_shuts_down_boundedly() {
         cwd: cwd.clone(),
         locks: locks.clone(),
         trust: trust.clone(),
+        skill_resolver: None,
     })
     .unwrap();
     let (updates, _) = mpsc::unbounded_channel();
@@ -194,6 +195,7 @@ async fn real_runner_executes_a_child_runtime_and_returns_to_coordinator() {
             cwd: repo.path().to_path_buf(),
             locks: Arc::new(FileLocks::new()),
             trust: SessionTrust::for_headless_prompt(repo.path()),
+            skill_resolver: None,
         },
         ChannelBackend::new(root).into_resource(),
     )

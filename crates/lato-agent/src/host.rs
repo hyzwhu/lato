@@ -377,6 +377,7 @@ impl AcpHost {
                 cwd: self.cwd.clone(),
                 locks: self.locks.clone(),
                 trust: self.trust.clone(),
+                skill_resolver: None,
             },
             backend.into_resource(),
         ) {

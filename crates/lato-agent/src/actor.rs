@@ -118,6 +118,7 @@ impl SessionActor {
             cwd: cwd.clone(),
             locks: locks.clone(),
             trust: trust.clone(),
+            skill_resolver: None,
         })
         .expect("static built-in tool descriptors must form a valid runtime");
         Self::new_with_tool_runtime(stream, locks, trust, cwd, tool_runtime)

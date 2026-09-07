@@ -122,6 +122,7 @@ async fn read_only_grant_cannot_search_replace_a_file_into_existence() {
             cwd: workspace.path().to_path_buf(),
             locks: Arc::new(FileLocks::new()),
             trust: SessionTrust::for_headless_prompt(workspace.path()),
+            skill_resolver: None,
         })
         .unwrap();
     let runtime = builder.build().unwrap();
@@ -161,6 +162,7 @@ async fn process_tool_consumes_grant_sandbox_not_session_trust() {
             cwd: workspace.path().to_path_buf(),
             locks: Arc::new(FileLocks::new()),
             trust,
+            skill_resolver: None,
         })
         .unwrap();
     let runtime = builder.build().unwrap();
@@ -202,6 +204,7 @@ async fn grant_path_does_not_forward_secret_environment() {
             cwd: workspace.path().to_path_buf(),
             locks: Arc::new(FileLocks::new()),
             trust: SessionTrust::for_headless_prompt(workspace.path()),
+            skill_resolver: None,
         })
         .unwrap();
     let runtime = builder.build().unwrap();

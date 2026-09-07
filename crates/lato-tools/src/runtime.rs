@@ -1,6 +1,6 @@
 use crate::{
-    BuiltinAdapterError, BuiltinToolEnvironment, CatalogError, RegistrationOutcome, ToolCatalog,
-    builtin_tools, task_tools,
+    BuiltinAdapterError, BuiltinToolEnvironment, CatalogError, RegistrationOutcome, SkillToolScope,
+    ToolCatalog, builtin_tools, task_tools,
 };
 use lato_core::{
     ApprovalFingerprint, ApprovalRequest, EnvironmentPolicy, ExecutionGrant, NetworkPolicy,
@@ -24,6 +24,7 @@ use std::{
 pub struct ToolRuntime {
     catalog: ToolCatalog,
     wire_names: BTreeMap<String, ToolName>,
+    validators: BTreeMap<ToolName, jsonschema::Validator>,
     policy: Arc<PolicyEngine>,
     scope: PolicyScope,
     sink: Arc<dyn PolicyEventSink>,
@@ -89,6 +90,8 @@ pub enum RuntimeBuildError {
         first: ToolName,
         second: ToolName,
     },
+    #[error("invalid input schema for tool {name}: {message}")]
+    InvalidSchema { name: ToolName, message: String },
 }
 
 impl ToolRuntimeBuilder {
@@ -122,6 +125,7 @@ impl ToolRuntimeBuilder {
 
     pub fn build(self) -> Result<ToolRuntime, RuntimeBuildError> {
         let mut wire_names = BTreeMap::new();
+        let mut validators = BTreeMap::new();
         for descriptor in self.catalog.descriptors() {
             let wire_name = descriptor.name.local_name().to_owned();
             if let Some(first) = wire_names.insert(wire_name.clone(), descriptor.name.clone()) {
@@ -131,10 +135,19 @@ impl ToolRuntimeBuilder {
                     second: descriptor.name,
                 });
             }
+            let validator = jsonschema::options()
+                .offline()
+                .build(&descriptor.input_schema)
+                .map_err(|error| RuntimeBuildError::InvalidSchema {
+                    name: descriptor.name.clone(),
+                    message: error.to_string(),
+                })?;
+            validators.insert(descriptor.name, validator);
         }
         Ok(ToolRuntime {
             catalog: self.catalog,
             wire_names,
+            validators,
             policy: self.policy,
             scope: self.scope,
             sink: self.sink,
@@ -144,9 +157,16 @@ impl ToolRuntimeBuilder {
 
 impl ToolRuntime {
     pub fn model_definitions(&self) -> Vec<Value> {
+        self.model_definitions_scoped(None)
+    }
+
+    pub fn model_definitions_scoped(&self, scope: Option<&SkillToolScope>) -> Vec<Value> {
         self.catalog
             .descriptors()
             .into_iter()
+            .filter(|descriptor| {
+                scope.is_none_or(|scope| scope.allows_name(descriptor.name.local_name()))
+            })
             .map(|descriptor| {
                 json!({
                     "type": "function",
@@ -203,6 +223,55 @@ impl ToolRuntime {
         wire_name: &str,
         arguments: Value,
     ) -> Result<PreparedToolCall, ToolError> {
+        self.prepare_scoped(context, wire_name, arguments, None)
+    }
+
+    pub fn resolve_and_validate(
+        &self,
+        wire_name: &str,
+        arguments: Value,
+    ) -> Result<ValidatedToolCall, ToolError> {
+        let Some(canonical_name) = self.resolve_wire_name(wire_name) else {
+            return Err(not_found(wire_name));
+        };
+        let canonical_arguments = canonical_arguments(&arguments).map_err(|error| {
+            ToolError::new(
+                "tool.invalid_arguments",
+                error.to_string(),
+                Retryability::Never,
+            )
+        })?;
+        let arguments: Value = serde_json::from_slice(&canonical_arguments).map_err(|error| {
+            ToolError::new(
+                "tool.invalid_arguments",
+                error.to_string(),
+                Retryability::Never,
+            )
+        })?;
+        let Some(validator) = self.validators.get(&canonical_name) else {
+            return Err(not_found(wire_name));
+        };
+        if let Err(error) = validator.validate(&arguments) {
+            return Err(ToolError::new(
+                "tool.invalid_arguments",
+                error.to_string(),
+                Retryability::Never,
+            ));
+        }
+        Ok(ValidatedToolCall {
+            wire_name: wire_name.to_owned(),
+            canonical_name,
+            arguments,
+        })
+    }
+
+    pub fn prepare_scoped(
+        &self,
+        context: ToolContext,
+        wire_name: &str,
+        arguments: Value,
+        scope: Option<&SkillToolScope>,
+    ) -> Result<PreparedToolCall, ToolError> {
         if context.cancellation.is_cancelled() {
             return Err(ToolError::new(
                 "tool.cancelled",
@@ -211,9 +280,16 @@ impl ToolRuntime {
             ));
         }
 
-        let Some(canonical) = self.resolve_wire_name(wire_name) else {
-            return Err(not_found(wire_name));
-        };
+        let validated = self.resolve_and_validate(wire_name, arguments)?;
+        let canonical = validated.canonical_name;
+        let arguments = validated.arguments;
+        if scope.is_some_and(|scope| !scope.allows_call(canonical.local_name(), &arguments)) {
+            return Err(ToolError::new(
+                "tool.not_allowed_by_skill",
+                format!("tool {wire_name} is not allowed by the active skill"),
+                Retryability::Never,
+            ));
+        }
         let Some(descriptor) = self.catalog.descriptor(&canonical).cloned() else {
             return Err(not_found(wire_name));
         };
@@ -223,13 +299,6 @@ impl ToolRuntime {
         let canonical_arguments = canonical_arguments(&arguments).map_err(|error| {
             ToolError::new(
                 "policy.fingerprint_failed",
-                error.to_string(),
-                Retryability::Never,
-            )
-        })?;
-        let arguments = serde_json::from_slice(&canonical_arguments).map_err(|error| {
-            ToolError::new(
-                "tool.invalid_arguments",
                 error.to_string(),
                 Retryability::Never,
             )
@@ -402,6 +471,23 @@ impl ToolRuntime {
         self.catalog.descriptor(&canonical).cloned()
     }
 
+    pub(crate) fn registered_local_names(&self) -> Vec<String> {
+        self.catalog
+            .descriptors()
+            .into_iter()
+            .map(|descriptor| descriptor.name.local_name().to_owned())
+            .collect()
+    }
+
+    pub(crate) fn has_local_name(&self, wire_name: &str) -> bool {
+        self.wire_names.contains_key(wire_name)
+    }
+
+    pub(crate) fn resolve_registered_name(&self, wire_name: &str) -> Option<ToolName> {
+        self.resolve_wire_name(wire_name)
+            .filter(|name| self.catalog.descriptor(name).is_some())
+    }
+
     fn emit_tool(
         &self,
         kind: PolicyEventKind,
@@ -436,6 +522,13 @@ impl ToolRuntime {
             self.wire_names.get(normalized).cloned()
         }
     }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ValidatedToolCall {
+    pub wire_name: String,
+    pub canonical_name: ToolName,
+    pub arguments: Value,
 }
 
 pub fn builtin_tool_runtime(

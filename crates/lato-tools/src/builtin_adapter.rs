@@ -1,4 +1,6 @@
-use crate::{ToolCall, connected_builtin_definitions, dispatch, search_replace};
+use crate::{
+    SkillResolver, SkillTool, ToolCall, connected_builtin_definitions, dispatch, search_replace,
+};
 use async_trait::async_trait;
 use lato_core::{
     ExecutionGrant, Retryability, SandboxObligation, SandboxProfile, SideEffect, Tool,
@@ -18,6 +20,7 @@ pub struct BuiltinToolEnvironment {
     pub cwd: PathBuf,
     pub locks: Arc<FileLocks>,
     pub trust: SessionTrust,
+    pub skill_resolver: Option<Arc<dyn SkillResolver>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -333,10 +336,14 @@ pub fn builtin_tools(
     }) {
         definitions.push(write_file_definition());
     }
-    definitions
+    let mut tools: Vec<Arc<dyn Tool>> = definitions
         .iter()
         .map(|definition| adapter_from_definition(definition, environment.clone()))
-        .collect()
+        .collect::<Result<_, _>>()?;
+    if let Some(resolver) = environment.skill_resolver {
+        tools.push(Arc::new(SkillTool::new(resolver)));
+    }
+    Ok(tools)
 }
 
 fn write_file_definition() -> Value {

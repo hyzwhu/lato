@@ -272,6 +272,7 @@ impl RuntimeSession {
             cwd: cwd.clone(),
             locks: locks.clone(),
             trust: trust.clone(),
+            skill_resolver: None,
         })
         .map_err(|error| {
             AgentError::new(
