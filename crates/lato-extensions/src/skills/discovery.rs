@@ -411,8 +411,7 @@ fn open_contained_file(plugin_root: &Path, candidate: &Path) -> io::Result<File>
 
 #[cfg(windows)]
 fn windows_paths_equal(left: &Path, right: &Path) -> bool {
-    left.to_string_lossy()
-        .eq_ignore_ascii_case(&right.to_string_lossy())
+    left.as_os_str() == right.as_os_str()
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -1014,5 +1013,28 @@ mod tests {
 
         let error = open_contained_file(&canonical_root, &canonical_candidate).unwrap_err();
         assert_ne!(error.kind(), std::io::ErrorKind::NotFound);
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use std::{ffi::OsString, os::windows::ffi::OsStringExt, path::PathBuf};
+
+    use super::windows_paths_equal;
+
+    #[test]
+    fn handle_path_comparison_is_case_sensitive_and_lossless() {
+        let upper = PathBuf::from(r"C:\Plugin\SKILL.md");
+        let lower = PathBuf::from(r"c:\plugin\skill.md");
+        assert!(!windows_paths_equal(&upper, &lower));
+
+        let mut surrogate_path = "C:\\Plugin\\".encode_utf16().collect::<Vec<_>>();
+        surrogate_path.push(0xd800);
+        surrogate_path.extend("\\SKILL.md".encode_utf16());
+        let surrogate_path = PathBuf::from(OsString::from_wide(&surrogate_path));
+
+        let replacement_path = PathBuf::from("C:\\Plugin\\�\\SKILL.md");
+        assert!(!windows_paths_equal(&surrogate_path, &replacement_path));
+        assert!(windows_paths_equal(&surrogate_path, &surrogate_path));
     }
 }
