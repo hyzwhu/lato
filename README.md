@@ -154,6 +154,17 @@ LATO_HOME=$(mktemp -d) lato -p "reply with hi only"
 # hi
 ```
 
+The Phase 5 release gate also contains a command-level task smoke that drives the
+real `lato` executable through a parent `spawn` → child worker → `inspect` → `wait`
+chain, validates the persisted journal, and checks that temporary worktrees are
+cleaned up. Run it against the just-installed binary with:
+
+```bash
+cargo install --path .
+LATO_SMOKE_BINARY="$(command -v lato)" \
+  cargo test --test phase5_command_smoke -- --nocapture
+```
+
 Use a real catalog model by selecting `provider/model`. Credentials resolve in this order: runtime override, persisted OAuth, persisted API key, then provider environment variables.
 
 Built-in China-region providers include:

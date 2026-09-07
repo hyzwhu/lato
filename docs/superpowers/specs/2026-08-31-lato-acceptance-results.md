@@ -162,3 +162,25 @@ Measured on macOS arm64 with Homebrew `rustc 1.98.0` from branch
 The downloadable Public Beta gate is green and the five archives are checksum-verified. LIVE provider
 coverage remains explicitly skipped. General Linux/Windows full-suite CI is a visible follow-up and
 must be green before promoting the Beta toward a stable release.
+
+## Phase 5 release baseline (2026-09-07)
+
+Measured on macOS arm64 with Rust 1.98.0 from branch
+`codex/phase-6a-plugin-runtime`, before beginning Phase 6A. The binary package
+version is `0.1.0-beta.2`.
+
+| Gate | Result | Evidence |
+|---|---|---|
+| Formatting | PASS | `cargo fmt --all -- --check` exited 0. |
+| Phase 5 focused suites | PASS | Runtime: 187 passed; workspace allocation/sandbox: 24 passed; tool runtime/policy: 25 passed; agent ACP/session/subagent: 26 passed; CLI/session/TUI: 37 passed. |
+| Workspace tests | PASS | `cargo test --workspace --no-fail-fast` completed with every unit, integration, and doc-test result group green. |
+| Clippy | PASS | `cargo clippy --workspace --all-targets --all-features -- -D warnings` exited 0 with no warnings. |
+| Real command task smoke | PASS | `phase5_command_smoke` invoked the real CLI against a bounded localhost SSE fixture and completed parent `spawn` → child worker → `inspect` → `wait` → final response. It also verified the canonical parent journal and empty task-worktree directory. |
+| Local install | PASS | `cargo install --path .` completed in release mode and replaced `/Users/huangyongzhao/.cargo/bin/lato`. |
+| Installed binary smoke | PASS | `LATO_SMOKE_BINARY="$(command -v lato)" cargo test --test phase5_command_smoke -- --nocapture`: 1 passed; `lato --version` printed `lato 0.1.0-beta.2`. |
+| LIVE providers | SKIPPED | The deterministic command smoke used a localhost provider fixture; no external provider credential or LIVE claim is involved. |
+
+This gate freezes the merged Phase 5B/5C task-runtime behavior as the baseline for
+the plugin and extension work. The smoke asserts the public task-tool names
+(`spawn`, `send`, `wait`, `cancel`, `inspect`) and rejects the removed
+`spawn_subagent` alias.
