@@ -28,6 +28,8 @@ pub struct CoordinatorConfig {
     pub event_capacity: usize,
     pub active_message_capacity: usize,
     pub active_messages_per_task: usize,
+    pub active_message_admission_timeout: Duration,
+    pub active_message_finalization_timeout: Duration,
     pub max_global_running: usize,
     pub max_running_per_root: usize,
     pub max_queue: usize,
@@ -59,6 +61,8 @@ impl Default for CoordinatorConfig {
             event_capacity: 256,
             active_message_capacity: 64,
             active_messages_per_task: 8,
+            active_message_admission_timeout: super::ACTIVE_MESSAGE_ADMISSION_TIMEOUT,
+            active_message_finalization_timeout: super::ACTIVE_MESSAGE_FINALIZATION_TIMEOUT,
             max_global_running: 8,
             max_running_per_root: 4,
             max_queue: 256,
@@ -102,6 +106,14 @@ impl CoordinatorConfig {
         assert!(
             self.active_messages_per_task > 0,
             "per-task active-message capacity must be positive"
+        );
+        assert!(
+            !self.active_message_admission_timeout.is_zero(),
+            "active-message admission timeout must be positive"
+        );
+        assert!(
+            !self.active_message_finalization_timeout.is_zero(),
+            "active-message finalization timeout must be positive"
         );
         assert!(
             self.max_global_running > 0,
@@ -505,7 +517,7 @@ pub(crate) enum TaskCommand {
     SendActiveMessage {
         request: ActiveMessageRequest,
         caller: InspectCaller,
-        permit: OwnedSemaphorePermit,
+        permit: Option<OwnedSemaphorePermit>,
         reply: oneshot::Sender<ActiveMessageOutcome>,
     },
     Cancel {
@@ -543,7 +555,6 @@ pub struct TaskHandle {
     pub(crate) command_tx: TaskCommandSender,
     pub(crate) event_tx: broadcast::Sender<TaskEventEnvelope>,
     pub(crate) active_message_slots: Arc<Semaphore>,
-    pub(crate) active_message_capacity: usize,
 }
 
 #[derive(Clone)]
@@ -747,7 +758,6 @@ impl TaskHandle {
             command_tx: TaskCommandSender::Weak(command_tx),
             event_tx: self.event_tx.clone(),
             active_message_slots: Arc::clone(&self.active_message_slots),
-            active_message_capacity: self.active_message_capacity,
         }
     }
 
@@ -760,7 +770,6 @@ impl TaskHandle {
             command_tx: TaskCommandSender::Strong(command_tx),
             event_tx: self.event_tx.clone(),
             active_message_slots: Arc::clone(&self.active_message_slots),
-            active_message_capacity: self.active_message_capacity,
         })
     }
 }
@@ -920,14 +929,9 @@ impl ScopedTaskHandle {
     }
 
     pub async fn send_active_message(&self, request: ActiveMessageRequest) -> ActiveMessageOutcome {
-        let permit = match Arc::clone(&self.inner.active_message_slots).try_acquire_owned() {
-            Ok(permit) => permit,
-            Err(_) => {
-                return ActiveMessageOutcome::Saturated {
-                    max_in_flight: self.inner.active_message_capacity,
-                };
-            }
-        };
+        let permit = Arc::clone(&self.inner.active_message_slots)
+            .try_acquire_owned()
+            .ok();
         let (reply, response) = oneshot::channel();
         if self
             .inner

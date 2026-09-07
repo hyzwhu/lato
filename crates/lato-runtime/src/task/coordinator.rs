@@ -14,8 +14,7 @@ use crate::task::spawn::{
 };
 use crate::task::state::{CoordinatorState, RuntimeTaskRecord};
 use crate::task::{
-    ACTIVE_MESSAGE_ADMISSION_TIMEOUT, ACTIVE_MESSAGE_FINALIZATION_TIMEOUT, ActiveMessage,
-    ActiveMessageAdmissionLease, ActiveMessageCompletion, ActiveMessageFuture,
+    ActiveMessage, ActiveMessageAdmissionLease, ActiveMessageCompletion, ActiveMessageFuture,
     ActiveMessageOutcome, ActiveMessageRequest, CancelOutcome, CancelTarget, CompletionDisposition,
     CoordinatorConfig, InspectCaller, OutputMetadata, RunnerEvent, ScopedTaskHandle, SinkShutdown,
     SpawnDisposition, SpawnMode, SpawnTaskRequest, TaskCallbackKind, TaskChildControl, TaskCommand,
@@ -112,6 +111,12 @@ struct PendingTerminalOutput {
     deadline: Instant,
 }
 
+struct MessageFactoryWork<C: TaskChildControl> {
+    control: Arc<C>,
+    delivery: crate::task::ActiveMessageDelivery,
+    response: oneshot::Sender<Result<BoxFuture<'static, crate::task::ActiveMessageAdmission>, ()>>,
+}
+
 struct DrainWaiter {
     target: CancelTarget,
     outcome: CancelOutcome,
@@ -193,6 +198,9 @@ pub struct TaskCoordinator<R: TaskRunner, A: WorkspaceAllocator> {
     callback_rx: mpsc::UnboundedReceiver<CallbackOutcome>,
     callback_drained: Option<oneshot::Receiver<()>>,
     callback_worker: Option<std::thread::JoinHandle<()>>,
+    message_factory_tx: Option<std::sync::mpsc::SyncSender<MessageFactoryWork<R::Control>>>,
+    message_factory_drained: Option<oneshot::Receiver<()>>,
+    message_factory_worker: Option<std::thread::JoinHandle<()>>,
     dropped_callback_work: u64,
     callback_execution_failures: u64,
     progress_poll_inflight: HashSet<TaskId>,
@@ -205,6 +213,7 @@ pub struct TaskCoordinator<R: TaskRunner, A: WorkspaceAllocator> {
     job_aborts: HashMap<TaskId, OwnedAbortHandle>,
     cancel_deadlines: HashMap<TaskId, Instant>,
     administrative_cancel_pending: HashSet<TaskId>,
+    cancellation_won: HashSet<TaskId>,
     drain_waiters: Vec<DrainWaiter>,
     abandoned_teardown_roots: HashSet<TaskId>,
     cancellation_batch_active: bool,
@@ -256,7 +265,6 @@ where
         command_tx: TaskCommandSender::Strong(command_tx),
         event_tx: event_tx.clone(),
         active_message_slots,
-        active_message_capacity: config.active_message_capacity,
     };
     let weak_handle = handle.downgrade();
     let (callback_tx, callback_work_rx) = std::sync::mpsc::sync_channel(config.callback_capacity);
@@ -268,6 +276,11 @@ where
         callback_result_tx,
         callback_drained_tx,
     );
+    let (message_factory_tx, message_factory_rx) =
+        std::sync::mpsc::sync_channel(config.active_message_capacity);
+    let (message_factory_drained_tx, message_factory_drained) = oneshot::channel();
+    let message_factory_worker =
+        spawn_message_factory_dispatcher(message_factory_rx, message_factory_drained_tx);
     let (output_load_tx, output_load_rx) = std::sync::mpsc::sync_channel(config.max_output_loads);
     let (output_load_event_tx, output_load_event_rx) = mpsc::unbounded_channel();
     let (output_load_drained_tx, output_load_drained) = oneshot::channel();
@@ -300,6 +313,9 @@ where
         callback_rx,
         callback_drained: Some(callback_drained),
         callback_worker: Some(callback_worker),
+        message_factory_tx: Some(message_factory_tx),
+        message_factory_drained: Some(message_factory_drained),
+        message_factory_worker: Some(message_factory_worker),
         dropped_callback_work: 0,
         callback_execution_failures: 0,
         progress_poll_inflight: HashSet::new(),
@@ -311,6 +327,7 @@ where
         job_aborts: HashMap::new(),
         cancel_deadlines: HashMap::new(),
         administrative_cancel_pending: HashSet::new(),
+        cancellation_won: HashSet::new(),
         drain_waiters: Vec::new(),
         abandoned_teardown_roots: HashSet::new(),
         cancellation_batch_active: false,
@@ -386,6 +403,23 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
         self.expire_drain_waiters(now);
         self.expire_waiters(now);
         self.expire_foreground(now);
+        if self
+            .shutdown
+            .as_ref()
+            .is_some_and(|shutdown| shutdown.deadline <= now)
+        {
+            // Drop unresolved admissions at the one global shutdown deadline.
+            // Their leases classify open work as revoked and claimed work as
+            // uncertain; cancellation remains the authoritative terminal cause.
+            self.active_messages = FuturesUnordered::new();
+            for record in self.state.tasks.values_mut() {
+                record.active_messages.force_uncertain_and_settle_all();
+            }
+            let finalizing: Vec<_> = self.pending_terminal_outputs.keys().cloned().collect();
+            for task_id in finalizing {
+                self.commit_cancelled(&task_id);
+            }
+        }
     }
 
     fn dispatch_progress_polls(&mut self) {
@@ -783,6 +817,8 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
             self.reopen_abandoned_teardown_roots();
             if self.shutdown.as_ref().is_some_and(|shutdown| {
                 self.jobs.is_empty()
+                    && self.active_messages.is_empty()
+                    && self.pending_terminal_outputs.is_empty()
                     && self.validations.is_empty()
                     && (self.output_loads_inflight == 0 || shutdown.deadline <= Instant::now())
             }) {
@@ -792,6 +828,8 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
                     .expect("shutdown finalization requires shutdown state")
                     .deadline;
                 let callbacks_drained = self.shutdown_callbacks(shutdown_deadline).await;
+                let message_factories_drained =
+                    self.shutdown_message_factories(shutdown_deadline).await;
                 let output_loads_drained = self.shutdown_output_loads(shutdown_deadline).await;
                 while let Ok(event) = self.output_load_event_rx.try_recv() {
                     match event {
@@ -816,6 +854,7 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
                     .count();
                 let outcome = if unreleased_leases == 0 {
                     if callbacks_drained
+                        && message_factories_drained
                         && output_loads_drained
                         && sink_outcome == SinkShutdown::Drained
                     {
@@ -827,7 +866,7 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
                     SinkShutdown::CleanupIncomplete {
                         unreleased_leases,
                         sink_drained: sink_outcome == SinkShutdown::Drained,
-                        callbacks_drained,
+                        callbacks_drained: callbacks_drained && message_factories_drained,
                     }
                 };
                 if let Some(shutdown) = self.shutdown.take() {
@@ -964,7 +1003,8 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
                     .filter(|snapshot| {
                         snapshot.node.parent_id.is_some()
                             && (matches!(snapshot.node.status, TaskStatus::Preparing)
-                                || snapshot.node.status.is_running())
+                                || snapshot.node.status.is_running()
+                                || snapshot.node.status == TaskStatus::Finalizing)
                     })
                     .collect();
                 let _ = reply.send(snapshots);
@@ -1006,14 +1046,12 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
                 let _ = reply.send(result);
             }
             TaskCommand::RegistryCounts { reply } => {
-                let mut counts = self.state.counts(
+                let counts = self.state.counts(
                     self.dropped_sink_events,
                     self.dropped_callback_work,
                     self.callback_execution_failures,
                     self.output_load_supervisors.load(Ordering::Acquire),
                 );
-                counts.finalizing = self.pending_terminal_outputs.len();
-                counts.running = counts.running.saturating_sub(counts.finalizing);
                 let _ = reply.send(counts);
             }
             TaskCommand::ShutdownRoot { root_id, reply } => {
@@ -1934,7 +1972,8 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
             .transition(status)
             .expect("coordinator only commits valid task transitions");
         record.node.status = status;
-        if status == TaskStatus::Verifying || status.is_terminal() {
+        if matches!(status, TaskStatus::Finalizing | TaskStatus::Verifying) || status.is_terminal()
+        {
             record.spawn_admission_closed = true;
         }
     }
@@ -1943,12 +1982,23 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
         &mut self,
         request: ActiveMessageRequest,
         caller: InspectCaller,
-        permit: tokio::sync::OwnedSemaphorePermit,
+        permit: Option<tokio::sync::OwnedSemaphorePermit>,
         reply: oneshot::Sender<ActiveMessageOutcome>,
     ) {
         let target = request.task_id().clone();
+        self.next_message_id = self
+            .next_message_id
+            .checked_add(1)
+            .expect("active-message identifier overflow");
+        let message_id = self.next_message_id;
+        let caller_task = match &caller {
+            InspectCaller::Scoped { task_id, .. } => Some(task_id.clone()),
+            InspectCaller::Admin => None,
+        };
         if !caller_owns(&self.state, &caller, &target) {
-            let _ = reply.send(ActiveMessageOutcome::NotFoundOrNotOwned);
+            let outcome = ActiveMessageOutcome::NotFoundOrNotOwned;
+            self.commit_active_message_rejection(caller_task.as_ref(), message_id, &outcome);
+            let _ = reply.send(outcome);
             return;
         }
         let Some((generation, cancellation, sender_session_id, sender_root_id, sender_task_id)) =
@@ -1975,7 +2025,17 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
                 .flatten()
             })
         else {
-            let _ = reply.send(ActiveMessageOutcome::NotActiveOrFinalizing);
+            let outcome = ActiveMessageOutcome::NotActiveOrFinalizing;
+            self.commit_active_message_rejection(Some(&target), message_id, &outcome);
+            let _ = reply.send(outcome);
+            return;
+        };
+        let Some(permit) = permit else {
+            let outcome = ActiveMessageOutcome::Saturated {
+                max_in_flight: self.config.active_message_capacity,
+            };
+            self.commit_active_message_rejection(Some(&target), message_id, &outcome);
+            let _ = reply.send(outcome);
             return;
         };
         if let Err(outcome) = self
@@ -1986,15 +2046,11 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
             .active_messages
             .begin(self.config.active_messages_per_task)
         {
+            self.commit_active_message_rejection(Some(&target), message_id, &outcome);
             let _ = reply.send(outcome);
             return;
         }
-
-        self.next_message_id = self
-            .next_message_id
-            .checked_add(1)
-            .expect("active-message identifier overflow");
-        let message_id = self.next_message_id;
+        let deadline = Instant::now() + self.config.active_message_admission_timeout;
         let lease = ActiveMessageAdmissionLease::new();
         let delivery = crate::task::ActiveMessageDelivery::new(
             ActiveMessage {
@@ -2009,10 +2065,17 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
             Arc::clone(&lease),
         );
         let control = Arc::clone(self.controls[&target].child());
-        let future = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            control.send_active_message(delivery)
-        }));
-        let Ok(future) = future else {
+        let (factory_response, factory_result) = oneshot::channel();
+        let work = MessageFactoryWork {
+            control,
+            delivery,
+            response: factory_response,
+        };
+        let dispatched = self
+            .message_factory_tx
+            .as_ref()
+            .is_some_and(|sender| sender.try_send(work).is_ok());
+        if !dispatched {
             let settled = lease.revoke();
             let _ = self
                 .state
@@ -2023,30 +2086,45 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
             self.commit_active_message_event(&target, message_id, &outcome);
             let _ = reply.send(outcome);
             return;
-        };
+        }
+        let future = Box::pin(async move {
+            match factory_result.await {
+                Ok(Ok(future)) => future.await,
+                Ok(Err(())) | Err(_) => crate::task::ActiveMessageAdmission::ChannelClosed,
+            }
+        });
         self.active_messages.push(ActiveMessageFuture::new(
             target,
             generation,
             message_id,
             future,
             cancellation,
-            Instant::now() + ACTIVE_MESSAGE_ADMISSION_TIMEOUT,
+            deadline,
             lease,
             permit,
             reply,
         ));
     }
 
+    fn commit_active_message_rejection(
+        &mut self,
+        event_task: Option<&TaskId>,
+        message_id: u64,
+        outcome: &ActiveMessageOutcome,
+    ) {
+        if let Some(task_id) = event_task.filter(|task_id| self.state.tasks.contains_key(*task_id))
+        {
+            self.commit_active_message_event(task_id, message_id, outcome);
+        }
+    }
+
     async fn finish_active_message(&mut self, mut completion: ActiveMessageCompletion) {
-        let current = self
+        let current_generation = self
             .state
             .tasks
             .get(&completion.task_id)
-            .is_some_and(|record| {
-                record.generation == Some(completion.generation)
-                    && !record.node.status.is_terminal()
-            });
-        if !current {
+            .is_some_and(|record| record.generation == Some(completion.generation));
+        if !current_generation {
             let outcome = if !completion.settled
                 || matches!(
                     completion.outcome,
@@ -2063,8 +2141,14 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
             }
             return;
         }
+        let terminal = self.state.tasks[&completion.task_id]
+            .node
+            .status
+            .is_terminal();
         let outcome = completion.protocol_outcome();
-        self.commit_active_message_event(&completion.task_id, completion.message_id, &outcome);
+        if !terminal {
+            self.commit_active_message_event(&completion.task_id, completion.message_id, &outcome);
+        }
         if let Some(reply) = completion.reply.take() {
             let _ = reply.send(outcome);
         }
@@ -2145,6 +2229,7 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
             .await;
             return;
         }
+        self.set_status(&task_id, TaskStatus::Finalizing);
         let clean = self.state.tasks.get_mut(&task_id).and_then(|record| {
             record.spawn_admission_closed = true;
             record.active_messages.start_finalizing()
@@ -2155,7 +2240,7 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
                 task_id,
                 PendingTerminalOutput {
                     output,
-                    deadline: Instant::now() + ACTIVE_MESSAGE_FINALIZATION_TIMEOUT,
+                    deadline: Instant::now() + self.config.active_message_finalization_timeout,
                 },
             );
             return;
@@ -2170,6 +2255,10 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
         mut output: crate::task::TaskRunOutput,
         clean: bool,
     ) {
+        if self.cancellation_won.contains(&task_id) {
+            self.commit_cancelled(&task_id);
+            return;
+        }
         if !clean {
             let error = TaskError::new(
                 TaskErrorCode::AdmissionUncertain,
@@ -2264,6 +2353,9 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
         if current.result.is_some() {
             return false;
         }
+        self.cancel_deadlines.remove(task_id);
+        self.cancellation_won.remove(task_id);
+        self.pending_terminal_outputs.remove(task_id);
         if !current.node.status.is_terminal() {
             self.set_status(task_id, status);
         } else {
@@ -2306,7 +2398,12 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
         self.cleanup_inflight.insert(task_id.clone());
         let allocator = Arc::clone(&self.workspace_allocator);
         let lease_id = lease.id.clone();
-        let timeout = self.config.teardown_drain_timeout;
+        let timeout = self
+            .shutdown
+            .as_ref()
+            .map_or(self.config.teardown_drain_timeout, |shutdown| {
+                shutdown.deadline.saturating_duration_since(Instant::now())
+            });
         let cleanup_task_id = task_id.clone();
         let cleanup_task = tokio::spawn(async move {
             match tokio::time::timeout(timeout, allocator.release(&lease)).await {
@@ -2424,6 +2521,7 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
                 !record.node.status.is_terminal()
                     && record.cancellation.is_cancelled()
                     && !self.cancel_deadlines.contains_key(*task_id)
+                    && !self.cancellation_won.contains(*task_id)
             })
             .map(|(task_id, _)| task_id.clone())
             .collect();
@@ -2438,6 +2536,7 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
             .map(|(task_id, _)| task_id.clone())
             .collect();
         for task_id in expired {
+            self.cancel_deadlines.remove(&task_id);
             if let Some(abort) = self.job_aborts.get(&task_id) {
                 abort.abort();
             }
@@ -2461,7 +2560,7 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
             return;
         }
         let status = self.state.tasks[&task_id].node.status;
-        let cancellation_already_tracked = self.cancel_deadlines.contains_key(&task_id);
+        let cancellation_already_tracked = !self.cancellation_won.insert(task_id.clone());
         let record = self
             .state
             .tasks
@@ -2637,6 +2736,35 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
         {
             return;
         }
+        if self.pending_terminal_outputs.contains_key(task_id) {
+            return;
+        }
+        if self.state.tasks[task_id].generation.is_some() {
+            if self.state.tasks[task_id].node.status != TaskStatus::Finalizing {
+                self.set_status(task_id, TaskStatus::Finalizing);
+                self.commit_transition(task_id.clone(), TaskEventPayload::Finalizing);
+            }
+            let settled = self
+                .state
+                .tasks
+                .get_mut(task_id)
+                .and_then(|record| record.active_messages.start_finalizing());
+            if settled.is_none() {
+                let output = TaskRunOutput::from(self.cancelled_result(task_id));
+                self.pending_terminal_outputs.insert(
+                    task_id.clone(),
+                    PendingTerminalOutput {
+                        output,
+                        deadline: Instant::now() + self.config.active_message_finalization_timeout,
+                    },
+                );
+                return;
+            }
+        }
+        self.commit_cancelled(task_id);
+    }
+
+    fn commit_cancelled(&mut self, task_id: &TaskId) {
         let result = self.cancelled_result(task_id);
         self.commit_terminal(
             task_id,
@@ -2896,6 +3024,24 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
         true
     }
 
+    async fn shutdown_message_factories(&mut self, deadline: Instant) -> bool {
+        self.message_factory_tx.take();
+        let Some(drained) = self.message_factory_drained.take() else {
+            return true;
+        };
+        if !matches!(
+            tokio::time::timeout(deadline.saturating_duration_since(Instant::now()), drained).await,
+            Ok(Ok(()))
+        ) {
+            self.message_factory_worker.take();
+            return false;
+        }
+        if let Some(worker) = self.message_factory_worker.take() {
+            let _ = worker.join();
+        }
+        true
+    }
+
     async fn shutdown_output_loads(&mut self, deadline: Instant) -> bool {
         self.output_load_tx.take();
         let Some(drained) = self.output_load_drained.take() else {
@@ -2968,6 +3114,25 @@ fn spawn_callback_dispatcher<R: TaskRunner>(
             let _ = drained.send(());
         })
         .expect("task callback dispatcher thread must start")
+}
+
+fn spawn_message_factory_dispatcher<C: TaskChildControl>(
+    work_rx: std::sync::mpsc::Receiver<MessageFactoryWork<C>>,
+    drained: oneshot::Sender<()>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::Builder::new()
+        .name("lato-task-active-messages".into())
+        .spawn(move || {
+            while let Ok(work) = work_rx.recv() {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    work.control.send_active_message(work.delivery)
+                }))
+                .map_err(|_| ());
+                let _ = work.response.send(result);
+            }
+            let _ = drained.send(());
+        })
+        .expect("active-message dispatcher thread must start")
 }
 
 fn spawn_output_load_dispatcher<R: TaskRunner>(
@@ -3149,19 +3314,21 @@ fn active_message_error(outcome: &ActiveMessageOutcome) -> TaskError {
             "active-message admission timed out",
         ),
         ActiveMessageOutcome::ChannelClosed => TaskError::new(
-            TaskErrorCode::CoordinatorClosed,
+            TaskErrorCode::ActiveMessageChannelClosed,
             "active-message channel closed",
         ),
         ActiveMessageOutcome::NotFoundOrNotOwned => TaskError::new(
             TaskErrorCode::NotFoundOrNotOwned,
             "task not found or not owned",
         ),
-        ActiveMessageOutcome::NotActiveOrFinalizing | ActiveMessageOutcome::Unsupported => {
-            TaskError::new(
-                TaskErrorCode::RunnerProtocolViolation,
-                "task cannot accept active messages",
-            )
-        }
+        ActiveMessageOutcome::NotActiveOrFinalizing => TaskError::new(
+            TaskErrorCode::ActiveMessageInactive,
+            "task is not active or is finalizing",
+        ),
+        ActiveMessageOutcome::Unsupported => TaskError::new(
+            TaskErrorCode::ActiveMessageUnsupported,
+            "task runner does not support active messages",
+        ),
         ActiveMessageOutcome::Accepted { .. } => unreachable!("accepted messages are not errors"),
     }
 }

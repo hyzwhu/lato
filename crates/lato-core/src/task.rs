@@ -44,6 +44,7 @@ pub enum TaskStatus {
     Running,
     WaitingForChildren,
     WaitingForApproval,
+    Finalizing,
     Verifying,
     Completed,
     Failed,
@@ -289,6 +290,12 @@ pub enum TaskErrorCode {
     RunnerProtocolViolation,
     #[serde(rename = "task.active_message_uncertain")]
     AdmissionUncertain,
+    #[serde(rename = "task.active_message_inactive")]
+    ActiveMessageInactive,
+    #[serde(rename = "task.active_message_unsupported")]
+    ActiveMessageUnsupported,
+    #[serde(rename = "task.active_message_channel_closed")]
+    ActiveMessageChannelClosed,
     #[serde(rename = "task.verification_failed")]
     VerificationFailed,
     #[serde(rename = "task.verification_pending")]
@@ -328,6 +335,9 @@ impl TaskErrorCode {
             Self::RunnerPanic => "task.runner_panic",
             Self::RunnerProtocolViolation => "task.runner_protocol_violation",
             Self::AdmissionUncertain => "task.active_message_uncertain",
+            Self::ActiveMessageInactive => "task.active_message_inactive",
+            Self::ActiveMessageUnsupported => "task.active_message_unsupported",
+            Self::ActiveMessageChannelClosed => "task.active_message_channel_closed",
             Self::VerificationFailed => "task.verification_failed",
             Self::VerificationPending => "task.verification_pending",
             Self::Cancelled => "task.cancelled",
@@ -342,9 +352,10 @@ impl TaskErrorCode {
             Self::QueueFull | Self::ConcurrencyLimit | Self::EventLagged => {
                 Retryability::AfterBackoff
             }
-            Self::WorkspaceAllocation | Self::WorkspaceRelease | Self::RunnerInitialization => {
-                Retryability::Safe
-            }
+            Self::WorkspaceAllocation
+            | Self::WorkspaceRelease
+            | Self::RunnerInitialization
+            | Self::ActiveMessageChannelClosed => Retryability::Safe,
             Self::VerificationPending | Self::AdmissionUncertain => Retryability::RequiresDecision,
             Self::InvalidIdentity
             | Self::NotFoundOrNotOwned
@@ -362,6 +373,8 @@ impl TaskErrorCode {
             | Self::SpawnAdmissionClosed
             | Self::RunnerPanic
             | Self::RunnerProtocolViolation
+            | Self::ActiveMessageInactive
+            | Self::ActiveMessageUnsupported
             | Self::VerificationFailed
             | Self::Cancelled
             | Self::TimedOut
@@ -441,11 +454,21 @@ fn allowed_transition(from: TaskStatus, to: TaskStatus) -> bool {
         Preparing => matches!(to, Running | Failed | Cancelled | TimedOut),
         Running => matches!(
             to,
-            WaitingForChildren | WaitingForApproval | Verifying | Failed | Cancelled | TimedOut
+            WaitingForChildren
+                | WaitingForApproval
+                | Finalizing
+                | Verifying
+                | Failed
+                | Cancelled
+                | TimedOut
         ),
         WaitingForChildren | WaitingForApproval => {
-            matches!(to, Running | Verifying | Failed | Cancelled | TimedOut)
+            matches!(
+                to,
+                Running | Finalizing | Verifying | Failed | Cancelled | TimedOut
+            )
         }
+        Finalizing => matches!(to, Verifying | Failed | Cancelled | TimedOut),
         Verifying => matches!(
             to,
             WaitingForChildren | WaitingForApproval | Completed | Failed | Cancelled | TimedOut

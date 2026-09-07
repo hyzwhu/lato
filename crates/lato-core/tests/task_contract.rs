@@ -38,19 +38,20 @@ fn terminal_task_cannot_transition_again() {
 
 #[test]
 fn transition_table_is_exhaustive_for_all_status_pairs() {
-    const STATUSES: [TaskStatus; 10] = [
+    const STATUSES: [TaskStatus; 11] = [
         TaskStatus::Queued,
         TaskStatus::Preparing,
         TaskStatus::Running,
         TaskStatus::WaitingForChildren,
         TaskStatus::WaitingForApproval,
+        TaskStatus::Finalizing,
         TaskStatus::Verifying,
         TaskStatus::Completed,
         TaskStatus::Failed,
         TaskStatus::Cancelled,
         TaskStatus::TimedOut,
     ];
-    const ALLOWED: [(TaskStatus, TaskStatus); 30] = [
+    const ALLOWED: [(TaskStatus, TaskStatus); 37] = [
         (TaskStatus::Queued, TaskStatus::Preparing),
         (TaskStatus::Queued, TaskStatus::Failed),
         (TaskStatus::Queued, TaskStatus::Cancelled),
@@ -61,20 +62,27 @@ fn transition_table_is_exhaustive_for_all_status_pairs() {
         (TaskStatus::Preparing, TaskStatus::TimedOut),
         (TaskStatus::Running, TaskStatus::WaitingForChildren),
         (TaskStatus::Running, TaskStatus::WaitingForApproval),
+        (TaskStatus::Running, TaskStatus::Finalizing),
         (TaskStatus::Running, TaskStatus::Verifying),
         (TaskStatus::Running, TaskStatus::Failed),
         (TaskStatus::Running, TaskStatus::Cancelled),
         (TaskStatus::Running, TaskStatus::TimedOut),
         (TaskStatus::WaitingForChildren, TaskStatus::Running),
+        (TaskStatus::WaitingForChildren, TaskStatus::Finalizing),
         (TaskStatus::WaitingForChildren, TaskStatus::Verifying),
         (TaskStatus::WaitingForChildren, TaskStatus::Failed),
         (TaskStatus::WaitingForChildren, TaskStatus::Cancelled),
         (TaskStatus::WaitingForChildren, TaskStatus::TimedOut),
         (TaskStatus::WaitingForApproval, TaskStatus::Running),
+        (TaskStatus::WaitingForApproval, TaskStatus::Finalizing),
         (TaskStatus::WaitingForApproval, TaskStatus::Verifying),
         (TaskStatus::WaitingForApproval, TaskStatus::Failed),
         (TaskStatus::WaitingForApproval, TaskStatus::Cancelled),
         (TaskStatus::WaitingForApproval, TaskStatus::TimedOut),
+        (TaskStatus::Finalizing, TaskStatus::Verifying),
+        (TaskStatus::Finalizing, TaskStatus::Failed),
+        (TaskStatus::Finalizing, TaskStatus::Cancelled),
+        (TaskStatus::Finalizing, TaskStatus::TimedOut),
         (TaskStatus::Verifying, TaskStatus::Completed),
         (TaskStatus::Verifying, TaskStatus::Failed),
         (TaskStatus::Verifying, TaskStatus::Cancelled),

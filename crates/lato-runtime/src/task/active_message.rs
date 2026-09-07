@@ -323,6 +323,22 @@ impl ActiveMessageLifecycle {
             }
         }
     }
+
+    pub(crate) fn force_uncertain_and_settle_all(&mut self) {
+        match self {
+            Self::Open {
+                in_flight,
+                disposition,
+            }
+            | Self::Finalizing {
+                in_flight,
+                disposition,
+            } => {
+                *in_flight = 0;
+                *disposition = TerminalDrainDisposition::Uncertain;
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]

@@ -173,6 +173,7 @@ impl CoordinatorState {
             match record.node.status {
                 TaskStatus::Queued => counts.queued += 1,
                 TaskStatus::Preparing => counts.preparing += 1,
+                TaskStatus::Finalizing => counts.finalizing += 1,
                 status if status.is_running() => counts.running += 1,
                 status if status.is_terminal() => counts.completed += 1,
                 _ => {}
