@@ -2,7 +2,7 @@
 
 Date: 2026-09-07
 
-Status: proposed for implementation review
+Status: approved
 
 ## 1. Purpose
 
@@ -50,7 +50,8 @@ Lato keeps Grok's observable semantics while adapting ownership boundaries:
 
 - extension parsing and execution live in `lato-extensions`;
 - lifecycle orchestration remains in `lato-agent`;
-- canonical journal contracts live in `lato-protocol`;
+- canonical journal contracts live in `lato-core`, matching the existing
+  event-store architecture, while protocol adapters expose diagnostics;
 - Lato's existing policy, approval, sandbox, and immutable-turn mechanisms
   remain authoritative;
 - hook failures are isolated and fail open, but an explicit decision from a
@@ -128,9 +129,10 @@ results into existing session/tool/compaction control flow. The current
 synchronous `lato-agent/src/hooks.rs` stub is replaced by the asynchronous,
 snapshot-backed adapter; it is not retained as an alternate hook path.
 
-`lato-protocol` owns versioned, serializable journal records for skill and hook
-activity. CLI and TUI layers render existing session errors and diagnostics but
-do not execute extensions.
+`lato-core` owns versioned, serializable journal records for skill and hook
+activity, as it already does for tool, compaction, and plugin-snapshot records.
+`lato-protocol` and the CLI/TUI layers expose diagnostics and render existing
+session errors but do not execute extensions.
 
 All catalogs and handler sets are immutable per plugin generation. The hook
 runtime may own live subprocess or HTTP client resources, but it cannot mutate
@@ -391,8 +393,10 @@ implicit deny.
 
 Every payload includes `schemaVersion`, canonical `event`, plugin generation,
 session and turn identifiers where available, workspace identity, and a
-bounded event-specific object. Payload construction redacts known secret
-fields before serialization. The event-specific content is:
+bounded event-specific object. As in Grok, the trusted hook receives the real
+bounded event input so it can inspect or rewrite it; redaction applies to logs,
+diagnostics, and journal persistence rather than the handler's stdin/HTTP body.
+The event-specific content is:
 
 - `SessionStart`: session source, model/provider identity, and effective
   capability names;
