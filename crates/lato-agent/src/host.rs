@@ -3,8 +3,8 @@
 // Lato changes: ACP model selection targets one runtime session and publishes only committed changes
 
 use crate::{
-    PreparedModelSwitch, RuntimeCompactionOutcome, RuntimePromptOutcome, RuntimeSession,
-    ToolApproval, TranscriptStore, import_legacy_if_needed,
+    ChildSessionRunner, PreparedModelSwitch, ProfileResultVerifier, RuntimeCompactionOutcome,
+    RuntimePromptOutcome, RuntimeSession, ToolApproval, TranscriptStore, import_legacy_if_needed,
 };
 use lato_ai::{
     ActiveModelStream, CATALOG, CredentialStore, CustomHttpModelStream, CustomModel,
@@ -12,13 +12,22 @@ use lato_ai::{
     api_key_login_allowed, custom_model_auth, dialect_implemented, get_auth_refreshing,
     load_models_json, lookup_model, oauth_allowed, phase0_supported, store_oauth,
 };
-use lato_core::{EventStore, JournalReplay, SessionId, SessionStore};
+use lato_core::{
+    AgentProfile, BudgetAmount, BudgetLimits, EventStore, JournalReplay, SessionId, SessionStore,
+    TaskId, TaskOwner, ToolCapability, TurnId, VerificationPolicy, WorkspaceIntent,
+};
 use lato_mcp::{PluginOrigin, PluginPackage, discover_plugin};
 use lato_protocol::{
     JsonRpcReq, METHODS_IMPLEMENTED, PROTOCOL_VERSION, err, err_with_data, is_implemented, ok,
 };
+use lato_runtime::{
+    ChannelBackend, CoordinatorConfig, NoopTaskEventSink, TaskHandle, TaskRootRequest,
+    spawn_subagent_coordinator_with_verifier,
+};
 use lato_store::{FileEventStore, derive_automatic_title};
-use lato_workspace::{ApprovalMode, FileLocks, SessionTrust};
+use lato_workspace::{
+    ApprovalMode, FileLocks, GitWorkspaceAllocator, MemoryWorkspaceAllocator, SessionTrust,
+};
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 pub struct AcpHost {
@@ -36,6 +45,12 @@ pub struct AcpHost {
     custom_models: Vec<CustomModel>,
     plugins: Vec<PluginPackage>,
     tool_approval: Option<Arc<dyn ToolApproval>>,
+    task_handle: TaskHandle,
+    task_backends: HashMap<String, ChannelBackend>,
+    next_task_root: u64,
+    _task_actor: tokio::task::JoinHandle<()>,
+    _task_events: tokio::task::JoinHandle<()>,
+    _worktree_recovery: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl AcpHost {
@@ -116,6 +131,80 @@ impl AcpHost {
             .and_then(|home| load_models_json(&home.join("models.json")).ok())
             .unwrap_or_default();
         let plugins = discover_plugins(&cwd, lato_home.as_deref(), trust.cwd_trusted());
+        let runner = Arc::new(ChildSessionRunner::new(
+            default_endpoint.stream.clone(),
+            Arc::new(FileLocks::new()),
+            trust.clone(),
+            updates.clone(),
+            tool_approval.clone(),
+        ));
+        let verifier = Arc::new(ProfileResultVerifier);
+        let sink = Arc::new(NoopTaskEventSink);
+        let mut worktree_recovery = None;
+        let (task_handle, task_actor) =
+            match GitWorkspaceAllocator::new(&cwd, cwd.join(".lato/worktrees")) {
+                Ok(allocator) => {
+                    let allocator = Arc::new(allocator);
+                    let recovery_allocator = Arc::clone(&allocator);
+                    let recovery_updates = updates.clone();
+                    worktree_recovery = Some(tokio::spawn(async move {
+                        match recovery_allocator.recover_stale().await {
+                            Ok(0) => {}
+                            Ok(recovered) => {
+                                let _ = recovery_updates.send(serde_json::json!({
+                                    "jsonrpc": "2.0",
+                                    "method": "lato/task/worktree_recovery",
+                                    "params": {"recovered": recovered},
+                                }));
+                            }
+                            Err(error) => {
+                                let _ = recovery_updates.send(serde_json::json!({
+                                    "jsonrpc": "2.0",
+                                    "method": "lato/task/worktree_recovery",
+                                    "params": {"error": error},
+                                }));
+                            }
+                        }
+                    }));
+                    spawn_subagent_coordinator_with_verifier(
+                        CoordinatorConfig::default(),
+                        runner,
+                        allocator,
+                        verifier,
+                        sink,
+                    )
+                }
+                Err(_) => spawn_subagent_coordinator_with_verifier(
+                    CoordinatorConfig::default(),
+                    runner,
+                    Arc::new(
+                        MemoryWorkspaceAllocator::new(&cwd)
+                            .expect("an existing host cwd is a valid memory workspace root"),
+                    ),
+                    verifier,
+                    sink,
+                ),
+            };
+        let mut task_events = task_handle.subscribe();
+        let task_updates = updates.clone();
+        let task_event_relay = tokio::spawn(async move {
+            loop {
+                match task_events.recv().await {
+                    Ok(event) => {
+                        if event.parent_id.is_none() {
+                            continue;
+                        }
+                        let _ = task_updates.send(serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "method": "lato/task/event",
+                            "params": event,
+                        }));
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
         Self {
             sessions: HashMap::new(),
             updates,
@@ -131,7 +220,66 @@ impl AcpHost {
             custom_models,
             plugins,
             tool_approval,
+            task_handle,
+            task_backends: HashMap::new(),
+            next_task_root: 1,
+            _task_actor: task_actor,
+            _task_events: task_event_relay,
+            _worktree_recovery: worktree_recovery,
         }
+    }
+
+    async fn ensure_task_root(&mut self, session_id: &str) -> Result<ChannelBackend, String> {
+        if let Some(backend) = self.task_backends.get(session_id) {
+            return Ok(backend.clone());
+        }
+        let root_sequence = self.next_task_root;
+        self.next_task_root = self.next_task_root.saturating_add(1);
+        let root_id = TaskId::from(format!("task-root-{session_id}-{root_sequence}"));
+        let root = self
+            .task_handle
+            .register_root(TaskRootRequest {
+                task_id: root_id,
+                owner: TaskOwner::Interactive {
+                    session_id: SessionId::from(session_id),
+                    turn_id: TurnId::from(format!("task-root-turn-{session_id}")),
+                },
+                profile: AgentProfile {
+                    name: "coordinator".into(),
+                    instructions: "Coordinate bounded child tasks.".into(),
+                    capabilities: all_task_capabilities(),
+                    workspace: WorkspaceIntent::IsolatedWorktree,
+                    verification: VerificationPolicy::Accept,
+                    definition_background: false,
+                },
+                permissions: all_task_capabilities(),
+                budget: host_task_budget(),
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+        let backend = ChannelBackend::new(root);
+        self.task_backends
+            .insert(session_id.to_owned(), backend.clone());
+        Ok(backend)
+    }
+
+    pub fn task_backend(&self, session_id: &str) -> Option<ChannelBackend> {
+        self.task_backends.get(session_id).cloned()
+    }
+
+    async fn teardown_task_root(&mut self, session_id: &str) -> Result<(), String> {
+        let Some(backend) = self.task_backends.remove(session_id) else {
+            return Ok(());
+        };
+        backend
+            .scoped_handle()
+            .teardown_root_and_drain()
+            .await
+            .map_err(|error| error.to_string())?;
+        self.task_handle
+            .shutdown_root(backend.scoped_handle().root_id().clone())
+            .await
+            .map_err(|error| error.to_string())
     }
 
     async fn make_runtime_session(
@@ -139,6 +287,21 @@ impl AcpHost {
         sid: &str,
         replay: Option<JournalReplay>,
     ) -> Result<Arc<RuntimeSession>, String> {
+        let backend = self.ensure_task_root(sid).await?;
+        let tool_runtime = match lato_tools::builtin_tool_runtime_with_subagents(
+            lato_tools::BuiltinToolEnvironment {
+                cwd: self.cwd.clone(),
+                locks: self.locks.clone(),
+                trust: self.trust.clone(),
+            },
+            backend.into_resource(),
+        ) {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                let _ = self.teardown_task_root(sid).await;
+                return Err(error.to_string());
+            }
+        };
         if let Some(events) = self.events.clone() {
             let replay = match replay {
                 Some(replay) => replay,
@@ -155,7 +318,7 @@ impl AcpHost {
                     .map_err(|error| format!("model.unavailable_on_resume: {error}"))?,
                 None => self.default_endpoint.clone(),
             };
-            return RuntimeSession::new_with_store_and_endpoint(
+            let session = RuntimeSession::new_with_store_endpoint_and_tool_runtime(
                 sid.to_string(),
                 endpoint,
                 self.locks.clone(),
@@ -165,20 +328,29 @@ impl AcpHost {
                 self.tool_approval.clone(),
                 store,
                 replay,
+                tool_runtime,
             )
-            .await
-            .map(Arc::new)
-            .map_err(|error| error.to_string());
+            .await;
+            return match session {
+                Ok(session) => Ok(Arc::new(session)),
+                Err(error) => {
+                    let _ = self.teardown_task_root(sid).await;
+                    Err(error.to_string())
+                }
+            };
         }
-        Ok(Arc::new(RuntimeSession::new_with_endpoint(
-            sid.to_string(),
-            self.default_endpoint.clone(),
-            self.locks.clone(),
-            self.trust.clone(),
-            self.cwd.clone(),
-            self.updates.clone(),
-            self.tool_approval.clone(),
-        )))
+        Ok(Arc::new(
+            RuntimeSession::new_with_endpoint_and_tool_runtime(
+                sid.to_string(),
+                self.default_endpoint.clone(),
+                self.locks.clone(),
+                self.trust.clone(),
+                self.cwd.clone(),
+                self.updates.clone(),
+                self.tool_approval.clone(),
+                tool_runtime,
+            ),
+        ))
     }
 
     async fn make_new_runtime_session(&mut self, sid: &str) -> Result<Arc<RuntimeSession>, String> {
@@ -352,9 +524,14 @@ impl AcpHost {
                     .as_ref()
                     .and_then(|p| p.get("sessionId"))
                     .and_then(|v| v.as_str())
-                    && let Some(session) = self.sessions.get(sid).cloned()
                 {
-                    let _ = session.cancel().await;
+                    if let Some(session) = self.sessions.get(sid).cloned() {
+                        let _ = session.cancel().await;
+                    }
+                    if let Some(backend) = self.task_backends.get(sid).cloned() {
+                        let _ = backend.scoped_handle().teardown_root_and_drain().await;
+                        let _ = backend.scoped_handle().open_spawn_admission().await;
+                    }
                 }
                 Some(ok(id, serde_json::json!({"status":"cancelled"})))
             }
@@ -542,6 +719,9 @@ impl AcpHost {
                 {
                     return Some(err(id, -32000, "session_busy"));
                 }
+                if let Err(error) = self.teardown_task_root(sid).await {
+                    return Some(err(id, -32000, error));
+                }
                 if let Some(session) = self.sessions.remove(sid)
                     && let Err(error) = session.shutdown().await
                 {
@@ -560,14 +740,16 @@ impl AcpHost {
                 Some(ok(id, serde_json::json!({"deleted": true})))
             }
             "session/close" => {
-                if let Some(sid) = req
+                let sid = req
                     .params
                     .as_ref()
                     .and_then(|p| p.get("sessionId"))
-                    .and_then(|v| v.as_str())
-                    && let Some(session) = self.sessions.remove(sid)
-                {
-                    let _ = session.shutdown().await;
+                    .and_then(|v| v.as_str());
+                if let Some(sid) = sid {
+                    let _ = self.teardown_task_root(sid).await;
+                    if let Some(session) = self.sessions.remove(sid) {
+                        let _ = session.shutdown().await;
+                    }
                 }
                 Some(ok(id, serde_json::json!({"closed": true})))
             }
@@ -824,6 +1006,32 @@ impl AcpHost {
             _ => Some(ok(id, serde_json::json!({"ok": true}))),
         }
     }
+}
+
+fn all_task_capabilities() -> Vec<ToolCapability> {
+    vec![
+        ToolCapability::FileRead,
+        ToolCapability::FileWrite,
+        ToolCapability::ProcessSpawn,
+        ToolCapability::NetworkRead,
+        ToolCapability::NetworkWrite,
+        ToolCapability::TaskControl,
+        ToolCapability::ExtensionInvoke,
+    ]
+}
+
+fn host_task_budget() -> BudgetLimits {
+    BudgetLimits::limited(BudgetAmount {
+        input_tokens: 10_000_000,
+        output_tokens: 2_000_000,
+        total_tokens: 12_000_000,
+        tool_calls: 100_000,
+        cost_micros: 100_000_000,
+        wall_time_ms: 86_400_000,
+        retries: 1_024,
+        child_tasks: 1_024,
+        worktrees: 128,
+    })
 }
 
 fn discover_plugins(

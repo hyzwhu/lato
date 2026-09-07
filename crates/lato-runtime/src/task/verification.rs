@@ -1,5 +1,6 @@
 use futures_util::future::BoxFuture;
 use lato_core::{TaskError, TaskErrorCode, TaskId, TaskNode, TaskResult, VerificationPolicy};
+use lato_workspace::WorkspaceLease;
 use serde_json::Value;
 use std::sync::Arc;
 
@@ -7,6 +8,7 @@ use std::sync::Arc;
 pub struct VerificationRequest {
     pub node: TaskNode,
     pub result: TaskResult,
+    pub workspace_lease: Option<WorkspaceLease>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -245,6 +247,7 @@ mod tests {
                 duration_ms: 0,
                 output_ref: None,
             },
+            workspace_lease: None,
         }
     }
 

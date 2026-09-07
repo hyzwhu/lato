@@ -353,7 +353,44 @@ where
     R: TaskRunner,
     A: WorkspaceAllocator,
 {
-    spawn_task_coordinator_with_verifier(
+    spawn_subagent_coordinator(config, runner, workspace_allocator, event_sink)
+}
+
+pub fn spawn_task_coordinator_with_verifier<R, A>(
+    config: CoordinatorConfig,
+    runner: Arc<R>,
+    workspace_allocator: Arc<A>,
+    verifier: Arc<dyn TaskVerifier>,
+    event_sink: Arc<dyn TaskEventSink>,
+) -> (TaskHandle, JoinHandle<()>)
+where
+    R: TaskRunner,
+    A: WorkspaceAllocator,
+{
+    spawn_subagent_coordinator_with_verifier(
+        config,
+        runner,
+        workspace_allocator,
+        verifier,
+        event_sink,
+    )
+}
+
+/// Starts the authoritative Grok-derived subagent coordinator.
+///
+/// The older `spawn_task_coordinator` name is retained as a compatibility
+/// entry point and delegates here; both names always start this same actor.
+pub fn spawn_subagent_coordinator<R, A>(
+    config: CoordinatorConfig,
+    runner: Arc<R>,
+    workspace_allocator: Arc<A>,
+    event_sink: Arc<dyn TaskEventSink>,
+) -> (TaskHandle, JoinHandle<()>)
+where
+    R: TaskRunner,
+    A: WorkspaceAllocator,
+{
+    spawn_subagent_coordinator_with_verifier(
         config,
         runner,
         workspace_allocator,
@@ -362,7 +399,7 @@ where
     )
 }
 
-pub fn spawn_task_coordinator_with_verifier<R, A>(
+pub fn spawn_subagent_coordinator_with_verifier<R, A>(
     config: CoordinatorConfig,
     runner: Arc<R>,
     workspace_allocator: Arc<A>,
@@ -3074,6 +3111,7 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
                 .expect("verification output is stored before launch")
                 .result
                 .clone(),
+            workspace_lease: record.workspace_lease.clone(),
         };
         let verifier = Arc::clone(&self.verifier);
         let timeout = self.config.verification_timeout;

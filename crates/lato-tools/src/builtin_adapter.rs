@@ -1,4 +1,4 @@
-use crate::{ToolCall, create_subagent_worktree, dispatch, search_replace, v1_tool_definitions};
+use crate::{ToolCall, connected_builtin_definitions, dispatch, search_replace};
 use async_trait::async_trait;
 use lato_core::{
     ExecutionGrant, Retryability, SandboxObligation, SandboxProfile, SideEffect, Tool,
@@ -71,15 +71,6 @@ impl Tool for LegacyDispatchTool {
                 }
                 invoke_compat_search_replace(&self.environment, grant, &arguments).await
             }
-            "spawn_subagent" => {
-                if matches!(
-                    self.descriptor.side_effect,
-                    SideEffect::WorkspaceMutation | SideEffect::ExternalMutation
-                ) {
-                    self.environment.trust.allow_once();
-                }
-                invoke_compat_spawn_subagent(&self.environment, grant, &arguments).await
-            }
             "run_terminal_command" => {
                 if matches!(
                     self.descriptor.side_effect,
@@ -87,7 +78,13 @@ impl Tool for LegacyDispatchTool {
                 ) {
                     self.environment.trust.allow_once();
                 }
-                invoke_compat_run_terminal(&self.environment, grant, &arguments).await
+                invoke_compat_run_terminal(
+                    &self.environment,
+                    grant,
+                    &arguments,
+                    context.cancellation.clone(),
+                )
+                .await
             }
             _ => {
                 if matches!(
@@ -196,28 +193,11 @@ async fn invoke_compat_search_replace(
         .map(|_| "ok".into())
 }
 
-async fn invoke_compat_spawn_subagent(
-    environment: &BuiltinToolEnvironment,
-    grant: &ExecutionGrant,
-    arguments: &Value,
-) -> Result<String, String> {
-    let session_id = arguments
-        .get("session_id")
-        .or_else(|| arguments.get("sessionId"))
-        .and_then(Value::as_str)
-        .ok_or("missing session_id")?;
-    let root = environment.cwd.join(".lato/worktrees");
-    let path = root.join(session_id);
-    validate_write_obligation(&grant.sandbox, &path)?;
-    require_compat_mutating_approval(&environment.trust)?;
-    let worktree = create_subagent_worktree(&environment.cwd, &root, session_id).await?;
-    Ok(serde_json::json!({"worktree": worktree.path, "branch": worktree.branch}).to_string())
-}
-
 async fn invoke_compat_run_terminal(
     environment: &BuiltinToolEnvironment,
     grant: &ExecutionGrant,
     arguments: &Value,
+    cancellation: tokio_util::sync::CancellationToken,
 ) -> Result<String, String> {
     let cmd = arguments
         .get("cmd")
@@ -225,7 +205,13 @@ async fn invoke_compat_run_terminal(
         .and_then(Value::as_str)
         .ok_or("missing command")?;
     require_compat_mutating_approval(&environment.trust)?;
-    crate::run_terminal_command_with_obligation(cmd, &environment.cwd, &grant.sandbox).await
+    crate::run_terminal_command_with_obligation_cancellable(
+        cmd,
+        &environment.cwd,
+        &grant.sandbox,
+        cancellation,
+    )
+    .await
 }
 
 fn validate_write_obligation(obligation: &SandboxObligation, path: &Path) -> Result<(), String> {
@@ -341,11 +327,7 @@ fn require_compat_mutating_approval(trust: &SessionTrust) -> Result<(), String> 
 pub fn builtin_tools(
     environment: BuiltinToolEnvironment,
 ) -> Result<Vec<Arc<dyn Tool>>, BuiltinAdapterError> {
-    let definitions = v1_tool_definitions();
-    let definitions = definitions
-        .as_array()
-        .ok_or_else(|| BuiltinAdapterError::InvalidDefinition("root must be an array".into()))?;
-    let mut definitions = definitions.clone();
+    let mut definitions = connected_builtin_definitions();
     if !definitions.iter().any(|definition| {
         definition.pointer("/function/name").and_then(Value::as_str) == Some("write_file")
     }) {
@@ -459,7 +441,7 @@ fn metadata(name: &str) -> Result<ToolMetadata, BuiltinAdapterError> {
             SideEffect::ExternalMutation,
             ToolConcurrency::Serial,
             ToolIdempotency::NonIdempotent,
-            ToolCancellation::Unsupported,
+            ToolCancellation::KillProcess,
         ),
         "web_fetch" => (
             vec![ToolCapability::NetworkRead],
@@ -467,13 +449,6 @@ fn metadata(name: &str) -> Result<ToolMetadata, BuiltinAdapterError> {
             ToolConcurrency::Parallel,
             ToolIdempotency::Idempotent,
             ToolCancellation::Cooperative,
-        ),
-        "spawn_subagent" => (
-            vec![ToolCapability::TaskControl, ToolCapability::FileWrite],
-            SideEffect::WorkspaceMutation,
-            ToolConcurrency::Serial,
-            ToolIdempotency::NonIdempotent,
-            ToolCancellation::Unsupported,
         ),
         "todo_write" => (
             vec![ToolCapability::TaskControl],
@@ -492,7 +467,9 @@ fn metadata(name: &str) -> Result<ToolMetadata, BuiltinAdapterError> {
 }
 
 fn classify_legacy_error(message: String) -> ToolError {
-    let code = if message.starts_with("missing ") {
+    let code = if message == "tool cancelled" {
+        "tool.cancelled"
+    } else if message.starts_with("missing ") {
         "tool.invalid_arguments"
     } else if let Some(code) = sandbox_error_code(&message) {
         code

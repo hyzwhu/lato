@@ -30,7 +30,7 @@ fn test_runtime_builder() -> lato_tools::ToolRuntimeBuilder {
 }
 
 #[test]
-fn builtin_adapters_match_the_v1_model_definition_set() {
+fn builtin_adapters_exclude_session_bound_task_tools() {
     let root = tempfile::tempdir().unwrap();
     let tools = builtin_tools(BuiltinToolEnvironment {
         cwd: root.path().to_path_buf(),
@@ -48,7 +48,6 @@ fn builtin_adapters_match_the_v1_model_definition_set() {
         "read_file",
         "run_terminal_command",
         "search_replace",
-        "spawn_subagent",
         "todo_write",
         "web_fetch",
         "write_file",
@@ -58,7 +57,8 @@ fn builtin_adapters_match_the_v1_model_definition_set() {
     actual.sort();
     expected.sort();
     assert_eq!(actual, expected);
-    assert_eq!(actual.len(), 9);
+    assert_eq!(actual.len(), 8);
+    assert!(!actual.iter().any(|name| name == "spawn_subagent"));
     assert_eq!(
         actual
             .iter()
@@ -179,7 +179,7 @@ async fn runtime_advertises_and_executes_the_same_tools() {
     })
     .unwrap();
     let definitions = runtime.model_definitions();
-    assert_eq!(definitions.len(), 9);
+    assert_eq!(definitions.len(), 8);
     for name in ["read_file", "Lato:read_file", "builtin:read_file"] {
         let output = runtime
             .invoke(

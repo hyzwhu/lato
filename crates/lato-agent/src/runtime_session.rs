@@ -18,6 +18,7 @@ use lato_runtime::{
 use lato_workspace::{FileLocks, SessionTrust};
 use std::{path::PathBuf, sync::Arc};
 use tokio::sync::{Mutex, broadcast, mpsc};
+use tokio::time::Duration;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RuntimePromptOutcome {
@@ -68,7 +69,53 @@ pub struct RuntimeSession {
     submission_gate: Mutex<()>,
 }
 
+pub struct ChildSessionConfig {
+    pub session_id: String,
+    pub stream: Arc<dyn ModelStream>,
+    pub locks: Arc<FileLocks>,
+    pub trust: SessionTrust,
+    pub cwd: PathBuf,
+    pub updates: mpsc::UnboundedSender<serde_json::Value>,
+    pub approval: Option<Arc<dyn ToolApproval>>,
+    pub tool_runtime: Arc<lato_tools::ToolRuntime>,
+    pub initial_history: Vec<HistoryItem>,
+}
+
 impl RuntimeSession {
+    pub async fn new_child(config: ChildSessionConfig) -> Result<Self, AgentError> {
+        let session_id = SessionId::parse(config.session_id.clone()).map_err(|error| {
+            AgentError::new(
+                "task.child.invalid_session_id",
+                ErrorCategory::Task,
+                error.to_string(),
+                Retryability::Never,
+            )
+        })?;
+        let driver = Arc::new(LegacyTurnDriver::new_with_tool_runtime(
+            config.session_id,
+            config.stream,
+            config.locks,
+            config.trust,
+            config.cwd,
+            config.updates.clone(),
+            config.approval,
+            config.tool_runtime,
+        ));
+        if !config.initial_history.is_empty() {
+            driver.replace_history(config.initial_history).await;
+        }
+        let runtime_driver: Arc<dyn TurnDriver> = driver.clone();
+        let handle = spawn_session(session_id.clone(), runtime_driver);
+        Ok(Self {
+            session_id,
+            handle,
+            driver,
+            updates: config.updates,
+            active_operation: Mutex::new(None),
+            submission_gate: Mutex::new(()),
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         session_id: String,
@@ -123,6 +170,40 @@ impl RuntimeSession {
     }
 
     #[allow(clippy::too_many_arguments)]
+    pub fn new_with_endpoint_and_tool_runtime(
+        session_id: String,
+        endpoint: ActiveModelStream,
+        locks: Arc<FileLocks>,
+        trust: SessionTrust,
+        cwd: PathBuf,
+        updates: mpsc::UnboundedSender<serde_json::Value>,
+        approval: Option<Arc<dyn ToolApproval>>,
+        tool_runtime: Arc<lato_tools::ToolRuntime>,
+    ) -> Self {
+        let session_id = SessionId::from(session_id);
+        let driver = Arc::new(LegacyTurnDriver::new_with_endpoint_and_tool_runtime(
+            session_id.to_string(),
+            endpoint,
+            locks,
+            trust,
+            cwd,
+            updates.clone(),
+            approval,
+            tool_runtime,
+        ));
+        let runtime_driver: Arc<dyn TurnDriver> = driver.clone();
+        let handle = spawn_session(session_id.clone(), runtime_driver);
+        Self {
+            session_id,
+            handle,
+            driver,
+            updates,
+            active_operation: Mutex::new(None),
+            submission_gate: Mutex::new(()),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub async fn new_with_store(
         session_id: String,
         stream: Arc<dyn ModelStream>,
@@ -160,13 +241,54 @@ impl RuntimeSession {
         store: Arc<dyn SessionStore>,
         replay: JournalReplay,
     ) -> Result<Self, AgentError> {
+        let tool_runtime = lato_tools::builtin_tool_runtime(lato_tools::BuiltinToolEnvironment {
+            cwd: cwd.clone(),
+            locks: locks.clone(),
+            trust: trust.clone(),
+        })
+        .map_err(|error| {
+            AgentError::new(
+                "tool.runtime_initialization",
+                ErrorCategory::Tool,
+                error.to_string(),
+                Retryability::Never,
+            )
+        })?;
+        Self::new_with_store_endpoint_and_tool_runtime(
+            session_id,
+            endpoint,
+            locks,
+            trust,
+            cwd,
+            updates,
+            approval,
+            store,
+            replay,
+            tool_runtime,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn new_with_store_endpoint_and_tool_runtime(
+        session_id: String,
+        endpoint: ActiveModelStream,
+        locks: Arc<FileLocks>,
+        trust: SessionTrust,
+        cwd: PathBuf,
+        updates: mpsc::UnboundedSender<serde_json::Value>,
+        approval: Option<Arc<dyn ToolApproval>>,
+        store: Arc<dyn SessionStore>,
+        replay: JournalReplay,
+        tool_runtime: Arc<lato_tools::ToolRuntime>,
+    ) -> Result<Self, AgentError> {
         if let Some(unresolved) = replay.projection.unresolved_tools.first() {
             return Err(journal_error(JournalError::IncompleteSideEffect {
                 call_id: unresolved.call_id.clone(),
             }));
         }
         let session_id = SessionId::from(session_id);
-        let driver = Arc::new(LegacyTurnDriver::new_with_endpoint(
+        let driver = Arc::new(LegacyTurnDriver::new_with_endpoint_and_tool_runtime(
             session_id.to_string(),
             endpoint,
             locks,
@@ -174,6 +296,7 @@ impl RuntimeSession {
             cwd,
             updates.clone(),
             approval,
+            tool_runtime,
         ));
         let mut history =
             model_messages_to_history(&replay.projection.messages).map_err(journal_error)?;
@@ -378,11 +501,40 @@ impl RuntimeSession {
         }
     }
 
+    pub async fn steer(&self, input: String) -> Result<(), AgentError> {
+        self.handle
+            .submit(Command::SteerTurn(UserInput::text(input)))
+            .await
+    }
+
     pub async fn shutdown(&self) -> Result<(), AgentError> {
         let _gate = self.submission_gate.lock().await;
         let result = self.handle.submit(Command::Shutdown).await;
         *self.active_operation.lock().await = None;
         result
+    }
+
+    pub async fn cancel_and_join(&self, deadline: Duration) -> Result<(), AgentError> {
+        self.cancel().await?;
+        tokio::time::timeout(deadline, self.shutdown())
+            .await
+            .map_err(|_| {
+                AgentError::new(
+                    "task.child.shutdown_timeout",
+                    ErrorCategory::Task,
+                    "child runtime session did not shut down before its deadline",
+                    Retryability::Safe,
+                )
+            })??;
+        Ok(())
+    }
+
+    pub fn subscribe(&self) -> broadcast::Receiver<lato_core::EventEnvelope> {
+        self.handle.subscribe()
+    }
+
+    pub fn session_id(&self) -> &SessionId {
+        &self.session_id
     }
 
     pub async fn history_snapshot(&self) -> Vec<HistoryItem> {

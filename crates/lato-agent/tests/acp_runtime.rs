@@ -1,7 +1,10 @@
 use lato_agent::{AcpHost, REQUIRED_SECTIONS, default_fake_stream};
 use lato_ai::{FakeModelStream, StreamPiece};
+use lato_core::{AgentProfile, BudgetAmount, BudgetLimits, ResultContract, TaskId, TaskScope};
 use lato_protocol::JsonRpcReq;
+use lato_runtime::{SpawnMode, SpawnTaskRequest, SubagentBackend};
 use lato_workspace::SessionTrust;
+use tokio_util::sync::CancellationToken;
 
 fn req(id: i32, method: &str, params: serde_json::Value) -> JsonRpcReq {
     JsonRpcReq {
@@ -75,6 +78,7 @@ async fn acp_prompt_emits_delta_and_returns_the_same_final_text() {
 async fn acp_close_stops_and_removes_the_runtime_session() {
     let (mut host, _) = host();
     let sid = new_session(&mut host).await;
+    assert!(host.task_backend(&sid).is_some());
     host.handle(req(
         2,
         "session/close",
@@ -82,6 +86,7 @@ async fn acp_close_stops_and_removes_the_runtime_session() {
     ))
     .await
     .unwrap();
+    assert!(host.task_backend(&sid).is_none());
     let response = host
         .handle(req(
             3,
@@ -91,6 +96,65 @@ async fn acp_close_stops_and_removes_the_runtime_session() {
         .await
         .unwrap();
     assert_eq!(response["error"]["message"], "unknown session");
+}
+
+#[tokio::test]
+async fn task_lifecycle_is_exposed_as_additive_acp_events() {
+    let (mut host, mut updates) = host();
+    let sid = new_session(&mut host).await;
+    let backend = host.task_backend(&sid).unwrap();
+    backend
+        .spawn(SpawnTaskRequest {
+            task_id: TaskId::from("event-child"),
+            scope: TaskScope {
+                objective: "inspect the workspace".into(),
+                context_refs: Vec::new(),
+            },
+            profile: AgentProfile::explorer(),
+            requested_capabilities: None,
+            budget: BudgetLimits::limited(BudgetAmount {
+                input_tokens: 10_000,
+                output_tokens: 2_000,
+                total_tokens: 12_000,
+                tool_calls: 16,
+                cost_micros: 100_000,
+                wall_time_ms: 10_000,
+                retries: 1,
+                child_tasks: 0,
+                worktrees: 0,
+            }),
+            result_contract: ResultContract {
+                schema: None,
+                max_output_bytes: 4_096,
+            },
+            mode: SpawnMode::Background,
+            cancellation: CancellationToken::new(),
+        })
+        .await
+        .unwrap();
+    let spawned = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            let update = updates.recv().await.unwrap();
+            if update["method"] == "lato/task/event"
+                && update["params"]["session_id"] == sid
+                && update["params"]["task_id"] == "event-child"
+                && update["params"]["payload"]["type"] == "spawn_accepted"
+            {
+                return update;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(spawned["params"]["task_id"], "event-child");
+
+    host.handle(req(
+        2,
+        "session/close",
+        serde_json::json!({"sessionId": sid}),
+    ))
+    .await
+    .unwrap();
 }
 
 #[tokio::test]

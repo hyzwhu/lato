@@ -3,6 +3,8 @@ use lato_workspace::{
     HostSandboxBackend, SandboxBackend, SandboxCommand, SandboxProfile, wrap_shell_command,
 };
 use std::path::Path;
+use std::process::Stdio;
+use tokio_util::sync::CancellationToken;
 
 pub async fn run_terminal_command(cmd: &str, cwd: &Path) -> Result<String, String> {
     run_terminal_command_sandboxed(cmd, cwd, SandboxProfile::Off).await
@@ -18,7 +20,7 @@ pub async fn run_terminal_command_sandboxed(
         return run_windows_restricted(cmd, cwd, profile).await;
     }
     let wrapped = wrap_shell_command(profile, cwd, cmd)?;
-    spawn_wrapped(wrapped, cwd, None).await
+    spawn_wrapped(wrapped, cwd, None, None).await
 }
 
 pub async fn run_terminal_command_with_obligation(
@@ -38,26 +40,70 @@ pub async fn run_terminal_command_with_backend(
     let wrapped = backend
         .prepare(obligation, cmd)
         .map_err(|error| format!("{}: {error}", error.code()))?;
-    spawn_wrapped(wrapped, cwd, Some(obligation)).await
+    spawn_wrapped(wrapped, cwd, Some(obligation), None).await
+}
+
+pub async fn run_terminal_command_with_obligation_cancellable(
+    cmd: &str,
+    cwd: &Path,
+    obligation: &SandboxObligation,
+    cancellation: CancellationToken,
+) -> Result<String, String> {
+    let wrapped = HostSandboxBackend::new()
+        .prepare(obligation, cmd)
+        .map_err(|error| format!("{}: {error}", error.code()))?;
+    spawn_wrapped(wrapped, cwd, Some(obligation), Some(&cancellation)).await
 }
 
 async fn spawn_wrapped(
     wrapped: SandboxCommand,
     cwd: &Path,
     obligation: Option<&SandboxObligation>,
+    cancellation: Option<&CancellationToken>,
 ) -> Result<String, String> {
     let mut command = tokio::process::Command::new(&wrapped.program);
-    command.args(&wrapped.args).current_dir(cwd);
+    command
+        .args(&wrapped.args)
+        .current_dir(cwd)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        command.as_std_mut().process_group(0);
+    }
     if let Some(obligation) = obligation {
         command.env_clear();
         for (key, value) in child_environment(obligation) {
             command.env(key, value);
         }
     }
-    let out = command
-        .output()
-        .await
+    let child = command
+        .spawn()
         .map_err(|e| format!("sandbox launch failed: {e}"))?;
+    let process_id = child.id();
+    let mut wait = Box::pin(child.wait_with_output());
+    let out = if let Some(cancellation) = cancellation {
+        tokio::select! {
+            output = &mut wait => output,
+            _ = cancellation.cancelled() => {
+                terminate_process_tree(process_id);
+                if tokio::time::timeout(std::time::Duration::from_secs(2), &mut wait)
+                    .await
+                    .is_err()
+                {
+                    kill_process_tree(process_id);
+                    #[cfg(unix)]
+                    let _ = wait.await;
+                }
+                return Err("tool cancelled".into());
+            }
+        }
+    } else {
+        wait.await
+    }
+    .map_err(|e| format!("sandbox process failed: {e}"))?;
     let mut s = String::new();
     s.push_str(&String::from_utf8_lossy(&out.stdout));
     s.push_str(&String::from_utf8_lossy(&out.stderr));
@@ -67,6 +113,28 @@ async fn spawn_wrapped(
         Err(format!("command failed ({:?}): {s}", out.status.code()))
     }
 }
+
+#[cfg(unix)]
+fn terminate_process_tree(process_id: Option<u32>) {
+    if let Some(process_id) = process_id.and_then(|id| i32::try_from(id).ok()) {
+        // SAFETY: a negative PID targets the isolated process group created above.
+        unsafe { libc::kill(-process_id, libc::SIGTERM) };
+    }
+}
+
+#[cfg(not(unix))]
+fn terminate_process_tree(_process_id: Option<u32>) {}
+
+#[cfg(unix)]
+fn kill_process_tree(process_id: Option<u32>) {
+    if let Some(process_id) = process_id.and_then(|id| i32::try_from(id).ok()) {
+        // SAFETY: a negative PID targets the isolated process group created above.
+        unsafe { libc::kill(-process_id, libc::SIGKILL) };
+    }
+}
+
+#[cfg(not(unix))]
+fn kill_process_tree(_process_id: Option<u32>) {}
 
 fn child_environment(obligation: &SandboxObligation) -> Vec<(String, String)> {
     std::env::vars()
@@ -187,6 +255,51 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let out = run_terminal_command("echo hello", d.path()).await.unwrap();
         assert!(out.contains("hello"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancellation_terminates_the_entire_shell_process_group() {
+        let directory = tempfile::tempdir().unwrap();
+        let obligation = SandboxObligation::off(directory.path());
+        let cancellation = CancellationToken::new();
+        let child_cancellation = cancellation.clone();
+        let cwd = directory.path().to_path_buf();
+        let run = tokio::spawn(async move {
+            run_terminal_command_with_obligation_cancellable(
+                "sleep 30 & child=$!; printf '%s' \"$child\" > child.pid; wait",
+                &cwd,
+                &obligation,
+                child_cancellation,
+            )
+            .await
+        });
+        let pid_path = directory.path().join("child.pid");
+        let child_pid = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Ok(value) = std::fs::read_to_string(&pid_path)
+                    && let Ok(pid) = value.parse::<i32>()
+                {
+                    break pid;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        cancellation.cancel();
+        assert_eq!(run.await.unwrap().unwrap_err(), "tool cancelled");
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                // SAFETY: signal 0 only checks whether the captured child PID exists.
+                if unsafe { libc::kill(child_pid, 0) } != 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("background child survived process-group cancellation");
     }
 
     #[cfg(target_os = "macos")]
