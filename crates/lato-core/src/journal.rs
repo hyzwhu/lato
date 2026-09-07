@@ -133,6 +133,9 @@ pub enum JournalRecord {
         model_family: Option<String>,
         context_window: Option<u64>,
     },
+    PluginSnapshotAdopted {
+        summary: crate::PluginSnapshotSummary,
+    },
     SessionStopped,
     LegacyTranscriptImported {
         source_version: u32,
@@ -371,6 +374,7 @@ pub fn project_journal(
             | JournalRecord::CompactionRequested { .. }
             | JournalRecord::CompactionFailed { .. }
             | JournalRecord::CompactionCancelled { .. }
+            | JournalRecord::PluginSnapshotAdopted { .. }
             | JournalRecord::LegacyTranscriptImported { .. } => {}
             JournalRecord::ModelSelected {
                 selection,

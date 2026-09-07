@@ -43,4 +43,15 @@ mod tests {
     fn a1_8_load_not_implemented() {
         assert!(!is_implemented("session/load"));
     }
+
+    #[test]
+    fn plugin_reload_is_advertised_exactly_once() {
+        assert_eq!(
+            METHODS_IMPLEMENTED
+                .iter()
+                .filter(|method| **method == "lato/plugins/reload")
+                .count(),
+            1
+        );
+    }
 }

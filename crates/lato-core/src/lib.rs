@@ -16,7 +16,10 @@ pub use budget::*;
 pub use command::{Command, StartBehavior, StartTurn, UserInput};
 pub use compaction::*;
 pub use error::{AgentError, ErrorCategory, Retryability};
-pub use event::{CancelReason, EVENT_SCHEMA_VERSION, EventEnvelope, EventPayload, TurnOutput};
+pub use event::{
+    CancelReason, EVENT_SCHEMA_VERSION, EventEnvelope, EventPayload, PluginSnapshotSummary,
+    TurnOutput,
+};
 pub use id::{
     AgentId, CompactionId, EventId, IdError, JournalRecordId, LeaseId, ModelCallId, SessionId,
     TaskId, ToolCallId, TurnId,

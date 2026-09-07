@@ -6,6 +6,14 @@ use crate::{
 pub const EVENT_SCHEMA_VERSION: u16 = 1;
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct PluginSnapshotSummary {
+    pub generation: u64,
+    pub discovered: usize,
+    pub active: usize,
+    pub project_trusted: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct EventEnvelope {
     pub schema_version: u16,
     pub event_id: EventId,
@@ -55,6 +63,9 @@ pub enum EventPayload {
     },
     CompactionCancelled {
         compaction_id: CompactionId,
+    },
+    PluginSnapshotAdopted {
+        summary: PluginSnapshotSummary,
     },
     SessionStopped,
 }

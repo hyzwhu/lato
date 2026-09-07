@@ -1,6 +1,7 @@
 use lato_core::{
     AgentError, CancelReason, Command, ErrorCategory, EventEnvelope, EventId, EventPayload,
-    Retryability, SessionId, StartBehavior, StartTurn, TurnId, TurnOutput, UserInput,
+    PluginSnapshotSummary, Retryability, SessionId, StartBehavior, StartTurn, TurnId, TurnOutput,
+    UserInput,
 };
 
 #[test]
@@ -65,4 +66,23 @@ fn cancellation_reason_is_explicit() {
         reason: CancelReason::Replaced,
     };
     assert_eq!(serde_json::to_value(payload).unwrap()["reason"], "replaced");
+}
+
+#[test]
+fn plugin_snapshot_command_and_event_have_stable_shapes() {
+    let summary = PluginSnapshotSummary {
+        generation: 4,
+        discovered: 2,
+        active: 1,
+        project_trusted: true,
+    };
+    let command = serde_json::to_value(Command::AdoptPluginSnapshot {
+        summary: summary.clone(),
+    })
+    .unwrap();
+    assert_eq!(command["type"], "adopt_plugin_snapshot");
+    assert_eq!(command["summary"]["generation"], 4);
+    let event = serde_json::to_value(EventPayload::PluginSnapshotAdopted { summary }).unwrap();
+    assert_eq!(event["type"], "plugin_snapshot_adopted");
+    assert_eq!(event["summary"]["project_trusted"], true);
 }

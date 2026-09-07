@@ -1,7 +1,7 @@
 use lato_core::{
     JOURNAL_SCHEMA_VERSION, JournalEnvelope, JournalError, JournalRecord, JournalRecordId,
-    ModelContent, ModelSelection, Retryability, SessionId, ToolCallId, ToolError, ToolName, TurnId,
-    journal_request_hash, project_journal,
+    ModelContent, ModelSelection, PluginSnapshotSummary, Retryability, SessionId, ToolCallId,
+    ToolError, ToolName, TurnId, journal_request_hash, project_journal,
 };
 
 #[test]
@@ -107,6 +107,23 @@ fn journal_errors_have_stable_codes() {
     };
     assert_eq!(error.code(), "journal.incomplete_side_effect");
     assert_eq!(error.retryability(), Retryability::Never);
+}
+
+#[test]
+fn plugin_snapshot_adoption_round_trips_through_journal() {
+    let record = JournalRecord::PluginSnapshotAdopted {
+        summary: PluginSnapshotSummary {
+            generation: 4,
+            discovered: 2,
+            active: 1,
+            project_trusted: true,
+        },
+    };
+    let encoded = serde_json::to_vec(&record).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<JournalRecord>(&encoded).unwrap(),
+        record
+    );
 }
 
 fn envelope(
