@@ -2,7 +2,10 @@
 // License: Apache-2.0
 // Lato changes: real task-tree records own hierarchical budgets and workspace leases
 
-use crate::task::{CompletionDisposition, OutputMetadata, RegistryCounts, SpawnMode, TaskSnapshot};
+use crate::task::{
+    ActiveMessageLifecycle, CompletionDisposition, OutputMetadata, RegistryCounts, SpawnMode,
+    TaskSnapshot,
+};
 use lato_core::{
     BudgetAccount, BudgetReservation, TaskId, TaskNode, TaskProgress, TaskResult, TaskStatus,
 };
@@ -28,6 +31,8 @@ pub(crate) struct RuntimeTaskRecord {
     pub(crate) output_metadata: Option<OutputMetadata>,
     pub(crate) spawn_mode: Option<SpawnMode>,
     pub(crate) enqueued_at: tokio::time::Instant,
+    pub(crate) active_messages: ActiveMessageLifecycle,
+    pub(crate) generation: Option<u64>,
 }
 
 #[derive(Default)]
@@ -224,6 +229,8 @@ mod tests {
             output_metadata: None,
             spawn_mode: None,
             enqueued_at: tokio::time::Instant::now(),
+            active_messages: ActiveMessageLifecycle::default(),
+            generation: Some(1),
         }
     }
 

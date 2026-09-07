@@ -1,4 +1,5 @@
 // Derived from: Grok Build@bb7f39d5858cbf5e00de639367f59debbdcb0138:crates/codegen/xai-grok-tools/src/implementations/grok_build/task/coordinator.rs
+// Derived from: Grok Build@bb7f39d5858cbf5e00de639367f59debbdcb0138:crates/codegen/xai-grok-tools/src/implementations/grok_build/task/coordinator/active_message.rs
 // License: Apache-2.0
 // Lato changes: bounded Tokio actor with a single committed root transition path
 
@@ -13,11 +14,14 @@ use crate::task::spawn::{
 };
 use crate::task::state::{CoordinatorState, RuntimeTaskRecord};
 use crate::task::{
-    CancelOutcome, CancelTarget, CompletionDisposition, CoordinatorConfig, InspectCaller,
-    OutputMetadata, RunnerEvent, ScopedTaskHandle, SinkShutdown, SpawnDisposition, SpawnMode,
-    SpawnTaskRequest, TaskCallbackKind, TaskChildControl, TaskCommand, TaskCommandSender,
-    TaskCompletion, TaskEventEnvelope, TaskEventPayload, TaskEventSink, TaskHandle, TaskReporter,
-    TaskRunRequest, TaskRunner, WaitOutcome, coordinator_closed, root_node,
+    ACTIVE_MESSAGE_ADMISSION_TIMEOUT, ACTIVE_MESSAGE_FINALIZATION_TIMEOUT, ActiveMessage,
+    ActiveMessageAdmissionLease, ActiveMessageCompletion, ActiveMessageFuture,
+    ActiveMessageOutcome, ActiveMessageRequest, CancelOutcome, CancelTarget, CompletionDisposition,
+    CoordinatorConfig, InspectCaller, OutputMetadata, RunnerEvent, ScopedTaskHandle, SinkShutdown,
+    SpawnDisposition, SpawnMode, SpawnTaskRequest, TaskCallbackKind, TaskChildControl, TaskCommand,
+    TaskCommandSender, TaskCompletion, TaskEventEnvelope, TaskEventPayload, TaskEventSink,
+    TaskHandle, TaskReporter, TaskRunOutput, TaskRunRequest, TaskRunner, WaitOutcome,
+    coordinator_closed, root_node,
 };
 use futures_util::{
     FutureExt, StreamExt,
@@ -100,6 +104,11 @@ impl OwnedAbortHandle {
 
 struct ShutdownState {
     replies: Vec<oneshot::Sender<SinkShutdown>>,
+    deadline: Instant,
+}
+
+struct PendingTerminalOutput {
+    output: TaskRunOutput,
     deadline: Instant,
 }
 
@@ -192,6 +201,7 @@ pub struct TaskCoordinator<R: TaskRunner, A: WorkspaceAllocator> {
     queue: SpawnQueue,
     controls: HashMap<TaskId, crate::task::TaskControl<R::Control>>,
     jobs: FuturesUnordered<BoxFuture<'static, TaskJobExit>>,
+    active_messages: FuturesUnordered<ActiveMessageFuture>,
     job_aborts: HashMap<TaskId, OwnedAbortHandle>,
     cancel_deadlines: HashMap<TaskId, Instant>,
     administrative_cancel_pending: HashSet<TaskId>,
@@ -205,6 +215,7 @@ pub struct TaskCoordinator<R: TaskRunner, A: WorkspaceAllocator> {
     validation_results: HashMap<TaskId, Result<(), TaskError>>,
     cleanup_inflight: HashSet<TaskId>,
     pending_completions: HashMap<TaskId, TaskCompletion>,
+    pending_terminal_outputs: HashMap<TaskId, PendingTerminalOutput>,
     waiters: HashMap<TaskId, Vec<BlockingWaiter>>,
     foreground_waiters: HashMap<TaskId, ForegroundWaiter>,
     completed_order: VecDeque<TaskId>,
@@ -218,6 +229,8 @@ pub struct TaskCoordinator<R: TaskRunner, A: WorkspaceAllocator> {
     shutdown: Option<ShutdownState>,
     weak_handle: TaskHandle,
     sequence: u64,
+    next_message_id: u64,
+    next_generation: u64,
 }
 
 pub fn spawn_task_coordinator<R, A>(
@@ -237,9 +250,13 @@ where
     let (sink_tx, sink_rx) = mpsc::channel(config.event_capacity);
     let (sink_drained_tx, sink_drained) = tokio::sync::oneshot::channel();
     let sink_worker = spawn_sink_dispatcher(event_sink, sink_rx, sink_drained_tx);
+    let active_message_slots =
+        Arc::new(tokio::sync::Semaphore::new(config.active_message_capacity));
     let handle = TaskHandle {
         command_tx: TaskCommandSender::Strong(command_tx),
         event_tx: event_tx.clone(),
+        active_message_slots,
+        active_message_capacity: config.active_message_capacity,
     };
     let weak_handle = handle.downgrade();
     let (callback_tx, callback_work_rx) = std::sync::mpsc::sync_channel(config.callback_capacity);
@@ -290,6 +307,7 @@ where
         state: CoordinatorState::default(),
         controls: HashMap::new(),
         jobs: FuturesUnordered::new(),
+        active_messages: FuturesUnordered::new(),
         job_aborts: HashMap::new(),
         cancel_deadlines: HashMap::new(),
         administrative_cancel_pending: HashSet::new(),
@@ -303,6 +321,7 @@ where
         validation_results: HashMap::new(),
         cleanup_inflight: HashSet::new(),
         pending_completions: HashMap::new(),
+        pending_terminal_outputs: HashMap::new(),
         waiters: HashMap::new(),
         foreground_waiters: HashMap::new(),
         completed_order: VecDeque::new(),
@@ -316,6 +335,8 @@ where
         shutdown: None,
         weak_handle,
         sequence: 0,
+        next_message_id: 0,
+        next_generation: 0,
     };
     let actor = tokio::spawn(coordinator.run());
     (handle, actor)
@@ -327,6 +348,9 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
         deadline = deadline.min(self.next_progress_poll);
         for candidate in self.cancel_deadlines.values().copied() {
             deadline = deadline.min(candidate);
+        }
+        for pending in self.pending_terminal_outputs.values() {
+            deadline = deadline.min(pending.deadline);
         }
         for waiter in &self.drain_waiters {
             deadline = deadline.min(waiter.deadline);
@@ -357,6 +381,7 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
             self.dispatch_progress_polls();
         }
         self.reap_cancelled().await;
+        self.reap_terminalization_deadlines().await;
         self.reap_closed_drain_waiters();
         self.expire_drain_waiters(now);
         self.expire_waiters(now);
@@ -839,6 +864,11 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
                         self.finish_job(job).await;
                     }
                 }
+                completion = self.active_messages.next(), if !self.active_messages.is_empty() => {
+                    if let Some(completion) = completion {
+                        self.finish_active_message(completion).await;
+                    }
+                }
                 callback = self.callback_rx.recv() => {
                     if let Some(callback) = callback {
                         self.handle_callback_outcome(callback);
@@ -950,6 +980,12 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
                 caller,
                 reply,
             } => self.register_foreground_waiter(task_id, caller, reply),
+            TaskCommand::SendActiveMessage {
+                request,
+                caller,
+                permit,
+                reply,
+            } => self.begin_active_message(request, caller, permit, reply),
             TaskCommand::Cancel {
                 target,
                 caller,
@@ -970,12 +1006,15 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
                 let _ = reply.send(result);
             }
             TaskCommand::RegistryCounts { reply } => {
-                let _ = reply.send(self.state.counts(
+                let mut counts = self.state.counts(
                     self.dropped_sink_events,
                     self.dropped_callback_work,
                     self.callback_execution_failures,
                     self.output_load_supervisors.load(Ordering::Acquire),
-                ));
+                );
+                counts.finalizing = self.pending_terminal_outputs.len();
+                counts.running = counts.running.saturating_sub(counts.finalizing);
+                let _ = reply.send(counts);
             }
             TaskCommand::ShutdownRoot { root_id, reply } => {
                 let result = self.shutdown_root(&root_id);
@@ -1022,6 +1061,8 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
                 output_metadata: None,
                 spawn_mode: None,
                 enqueued_at: Instant::now(),
+                active_messages: Default::default(),
+                generation: None,
             },
         );
         self.commit_transition(task_id, TaskEventPayload::RootRegistered);
@@ -1669,6 +1710,8 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
                     request.mode
                 }),
                 enqueued_at,
+                active_messages: Default::default(),
+                generation: None,
             },
         );
         self.commit_transition(task_id.clone(), TaskEventPayload::SpawnAccepted);
@@ -1751,6 +1794,8 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
                 output_metadata: None,
                 spawn_mode: Some(request.mode),
                 enqueued_at: Instant::now(),
+                active_messages: Default::default(),
+                generation: None,
             },
         );
         let result = lato_core::TaskResult {
@@ -1894,7 +1939,190 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
         }
     }
 
-    async fn complete_task(&mut self, task_id: TaskId, mut output: crate::task::TaskRunOutput) {
+    fn begin_active_message(
+        &mut self,
+        request: ActiveMessageRequest,
+        caller: InspectCaller,
+        permit: tokio::sync::OwnedSemaphorePermit,
+        reply: oneshot::Sender<ActiveMessageOutcome>,
+    ) {
+        let target = request.task_id().clone();
+        if !caller_owns(&self.state, &caller, &target) {
+            let _ = reply.send(ActiveMessageOutcome::NotFoundOrNotOwned);
+            return;
+        }
+        let Some((generation, cancellation, sender_session_id, sender_root_id, sender_task_id)) =
+            self.state.tasks.get(&target).and_then(|record| {
+                (record.node.status.is_running()
+                    && !record.cancellation.is_cancelled()
+                    && self.controls.contains_key(&target))
+                .then(|| {
+                    let (root_id, task_id) = match &caller {
+                        InspectCaller::Scoped { root_id, task_id } => {
+                            (root_id.clone(), task_id.clone())
+                        }
+                        InspectCaller::Admin => return None,
+                    };
+                    let sender = &self.state.tasks[&task_id];
+                    Some((
+                        record.generation?,
+                        record.cancellation.clone(),
+                        sender.node.owner.session_id().clone(),
+                        root_id,
+                        task_id,
+                    ))
+                })
+                .flatten()
+            })
+        else {
+            let _ = reply.send(ActiveMessageOutcome::NotActiveOrFinalizing);
+            return;
+        };
+        if let Err(outcome) = self
+            .state
+            .tasks
+            .get_mut(&target)
+            .expect("owned message target remains registered")
+            .active_messages
+            .begin(self.config.active_messages_per_task)
+        {
+            let _ = reply.send(outcome);
+            return;
+        }
+
+        self.next_message_id = self
+            .next_message_id
+            .checked_add(1)
+            .expect("active-message identifier overflow");
+        let message_id = self.next_message_id;
+        let lease = ActiveMessageAdmissionLease::new();
+        let delivery = crate::task::ActiveMessageDelivery::new(
+            ActiveMessage {
+                message_id,
+                sender_session_id,
+                sender_root_id,
+                sender_task_id,
+                text: Arc::clone(request.text()),
+            },
+            request.operation(),
+            generation,
+            Arc::clone(&lease),
+        );
+        let control = Arc::clone(self.controls[&target].child());
+        let future = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            control.send_active_message(delivery)
+        }));
+        let Ok(future) = future else {
+            let settled = lease.revoke();
+            let _ = self
+                .state
+                .tasks
+                .get_mut(&target)
+                .and_then(|record| record.active_messages.finish(settled));
+            let outcome = ActiveMessageOutcome::ChannelClosed;
+            self.commit_active_message_event(&target, message_id, &outcome);
+            let _ = reply.send(outcome);
+            return;
+        };
+        self.active_messages.push(ActiveMessageFuture::new(
+            target,
+            generation,
+            message_id,
+            future,
+            cancellation,
+            Instant::now() + ACTIVE_MESSAGE_ADMISSION_TIMEOUT,
+            lease,
+            permit,
+            reply,
+        ));
+    }
+
+    async fn finish_active_message(&mut self, mut completion: ActiveMessageCompletion) {
+        let current = self
+            .state
+            .tasks
+            .get(&completion.task_id)
+            .is_some_and(|record| {
+                record.generation == Some(completion.generation)
+                    && !record.node.status.is_terminal()
+            });
+        if !current {
+            let outcome = if !completion.settled
+                || matches!(
+                    completion.outcome,
+                    crate::task::ActiveMessageCompletionKind::Admission(
+                        crate::task::ActiveMessageAdmission::Admitted
+                    )
+                ) {
+                ActiveMessageOutcome::AdmissionUncertain
+            } else {
+                completion.protocol_outcome()
+            };
+            if let Some(reply) = completion.reply.take() {
+                let _ = reply.send(outcome);
+            }
+            return;
+        }
+        let outcome = completion.protocol_outcome();
+        self.commit_active_message_event(&completion.task_id, completion.message_id, &outcome);
+        if let Some(reply) = completion.reply.take() {
+            let _ = reply.send(outcome);
+        }
+        let ready = self
+            .state
+            .tasks
+            .get_mut(&completion.task_id)
+            .and_then(|record| record.active_messages.finish(completion.settled));
+        if let Some(clean) = ready
+            && let Some(pending) = self.pending_terminal_outputs.remove(&completion.task_id)
+        {
+            self.finish_terminal_output(completion.task_id.clone(), pending.output, clean)
+                .await;
+        }
+    }
+
+    fn commit_active_message_event(
+        &mut self,
+        task_id: &TaskId,
+        message_id: u64,
+        outcome: &ActiveMessageOutcome,
+    ) {
+        let payload = match outcome {
+            ActiveMessageOutcome::Accepted { .. } => {
+                TaskEventPayload::ActiveMessageAccepted { message_id }
+            }
+            ActiveMessageOutcome::AdmissionUncertain => {
+                TaskEventPayload::ActiveMessageUncertain { message_id }
+            }
+            _ => TaskEventPayload::ActiveMessageRejected {
+                message_id,
+                error: active_message_error(outcome),
+            },
+        };
+        self.commit_transition(task_id.clone(), payload);
+    }
+
+    async fn reap_terminalization_deadlines(&mut self) {
+        let now = Instant::now();
+        let expired: Vec<_> = self
+            .pending_terminal_outputs
+            .iter()
+            .filter(|(_, pending)| pending.deadline <= now)
+            .map(|(task_id, _)| task_id.clone())
+            .collect();
+        for task_id in expired {
+            let Some(pending) = self.pending_terminal_outputs.remove(&task_id) else {
+                continue;
+            };
+            if let Some(record) = self.state.tasks.get_mut(&task_id) {
+                record.active_messages.force_uncertain();
+            }
+            self.finish_terminal_output(task_id, pending.output, false)
+                .await;
+        }
+    }
+
+    async fn complete_task(&mut self, task_id: TaskId, output: crate::task::TaskRunOutput) {
         let Some(status) = self
             .state
             .tasks
@@ -1916,6 +2144,39 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
             )
             .await;
             return;
+        }
+        let clean = self.state.tasks.get_mut(&task_id).and_then(|record| {
+            record.spawn_admission_closed = true;
+            record.active_messages.start_finalizing()
+        });
+        self.commit_transition(task_id.clone(), TaskEventPayload::Finalizing);
+        if clean.is_none() {
+            self.pending_terminal_outputs.insert(
+                task_id,
+                PendingTerminalOutput {
+                    output,
+                    deadline: Instant::now() + ACTIVE_MESSAGE_FINALIZATION_TIMEOUT,
+                },
+            );
+            return;
+        }
+        self.finish_terminal_output(task_id, output, clean.unwrap())
+            .await;
+    }
+
+    async fn finish_terminal_output(
+        &mut self,
+        task_id: TaskId,
+        mut output: crate::task::TaskRunOutput,
+        clean: bool,
+    ) {
+        if !clean {
+            let error = TaskError::new(
+                TaskErrorCode::AdmissionUncertain,
+                "task active-message admission could not be proven committed or revoked",
+            );
+            output.result.success = false;
+            output.result.error = Some(error);
         }
         self.set_status(&task_id, TaskStatus::Verifying);
         self.commit_transition(task_id.clone(), TaskEventPayload::VerificationStarted);
@@ -2476,6 +2737,15 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
             } => {
                 let accepted = self.is_live_preparing(&task_id);
                 if accepted {
+                    self.next_generation = self
+                        .next_generation
+                        .checked_add(1)
+                        .expect("active task generation overflow");
+                    self.state
+                        .tasks
+                        .get_mut(&task_id)
+                        .expect("promoted task remains registered")
+                        .generation = Some(self.next_generation);
                     self.controls.insert(task_id.clone(), started.control);
                     self.set_status(&task_id, TaskStatus::Running);
                     self.commit_transition(task_id, TaskEventPayload::Started);
@@ -2860,6 +3130,40 @@ fn not_found() -> TaskError {
         TaskErrorCode::NotFoundOrNotOwned,
         "task was not found in the requested scope",
     )
+}
+
+fn active_message_error(outcome: &ActiveMessageOutcome) -> TaskError {
+    match outcome {
+        ActiveMessageOutcome::Saturated { .. } | ActiveMessageOutcome::Limit { .. } => {
+            TaskError::new(
+                TaskErrorCode::MessageLimit,
+                "active-message admission limit reached",
+            )
+        }
+        ActiveMessageOutcome::AdmissionUncertain => TaskError::new(
+            TaskErrorCode::AdmissionUncertain,
+            "active-message admission is uncertain",
+        ),
+        ActiveMessageOutcome::NotAcceptedBeforeDeadline => TaskError::new(
+            TaskErrorCode::TimedOut,
+            "active-message admission timed out",
+        ),
+        ActiveMessageOutcome::ChannelClosed => TaskError::new(
+            TaskErrorCode::CoordinatorClosed,
+            "active-message channel closed",
+        ),
+        ActiveMessageOutcome::NotFoundOrNotOwned => TaskError::new(
+            TaskErrorCode::NotFoundOrNotOwned,
+            "task not found or not owned",
+        ),
+        ActiveMessageOutcome::NotActiveOrFinalizing | ActiveMessageOutcome::Unsupported => {
+            TaskError::new(
+                TaskErrorCode::RunnerProtocolViolation,
+                "task cannot accept active messages",
+            )
+        }
+        ActiveMessageOutcome::Accepted { .. } => unreachable!("accepted messages are not errors"),
+    }
 }
 
 fn truncate_utf8(value: &mut String, max_bytes: usize) -> OutputMetadata {

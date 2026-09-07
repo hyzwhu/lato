@@ -363,6 +363,8 @@ mod tests {
             output_metadata: None,
             spawn_mode: None,
             enqueued_at: tokio::time::Instant::now(),
+            active_messages: Default::default(),
+            generation: None,
         }
     }
 

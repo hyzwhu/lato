@@ -39,6 +39,7 @@ Every copied production file and its tests must add a row before merge.
 | `crates/lato-agent/src/two_pass.rs` | Grok Build `crates/codegen/xai-grok-shell/src/session/helpers/session_compact.rs` | Structural derivation | 95-percent prefix split, bounded NOTE1, deterministic invalidation | Uses a fixed repository-owned fingerprint and keeps speculative output out of durable history |
 | `crates/lato-agent/src/actor.rs` (Phase 4C3 additions) | Grok Build `crates/codegen/xai-grok-shell/src/session/compaction.rs` and `session/helpers/session_compact.rs` | Structural derivation | 75-percent prefire, tool-output preflight, provider-overflow recovery, suppression gate | Preserves the enclosing turn, refuses replay after output, and delegates every replacement to Lato runtime |
 | `crates/lato-runtime/src/session.rs` (Phase 4C3 additions) | Grok Build `crates/codegen/xai-grok-shell/src/session/compaction.rs` | Structural derivation | Non-installing prefire and cancellation ownership | Runs pass one under the active turn token without changing session phase, journaling, or installing history |
+| `crates/lato-runtime/src/task/active_message.rs` and active-message coordinator additions | Grok Build `crates/codegen/xai-grok-tools/src/implementations/grok_build/task/active_message.rs` and `task/coordinator/active_message.rs` | Structural derivation | Atomic admission leases, bounded ingress, generation checks, finalization drain | Uses provider-neutral task-tree identity and omits product UI and session-host behavior |
 
 ## Required source header
 

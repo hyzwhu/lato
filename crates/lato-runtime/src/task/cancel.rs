@@ -352,6 +352,8 @@ mod tests {
             output_metadata: None,
             spawn_mode: Some(SpawnMode::Background),
             enqueued_at: tokio::time::Instant::now(),
+            active_messages: Default::default(),
+            generation: Some(1),
         }
     }
 

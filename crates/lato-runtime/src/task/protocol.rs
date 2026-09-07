@@ -2,7 +2,7 @@
 // License: Apache-2.0
 // Lato changes: stable provider-neutral task protocol and bounded actor handles
 
-use super::{CancelOutcome, CancelTarget};
+use super::{ActiveMessageOutcome, ActiveMessageRequest, CancelOutcome, CancelTarget};
 use lato_core::{
     AgentProfile, BudgetAmount, BudgetLimits, ResultContract, SessionId, TaskError, TaskErrorCode,
     TaskId, TaskNode, TaskOwner, TaskResult, TaskScope, TaskStatus, TaskUsage, ToolCapability,
@@ -11,7 +11,7 @@ use lato_core::{
 use lato_workspace::WorkspaceLease;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{sync::Arc, time::Duration};
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, broadcast, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -502,6 +502,12 @@ pub(crate) enum TaskCommand {
         caller: InspectCaller,
         reply: oneshot::Sender<Result<CompletionDisposition, TaskError>>,
     },
+    SendActiveMessage {
+        request: ActiveMessageRequest,
+        caller: InspectCaller,
+        permit: OwnedSemaphorePermit,
+        reply: oneshot::Sender<ActiveMessageOutcome>,
+    },
     Cancel {
         target: CancelTarget,
         caller: InspectCaller,
@@ -536,6 +542,8 @@ pub(crate) enum InspectCaller {
 pub struct TaskHandle {
     pub(crate) command_tx: TaskCommandSender,
     pub(crate) event_tx: broadcast::Sender<TaskEventEnvelope>,
+    pub(crate) active_message_slots: Arc<Semaphore>,
+    pub(crate) active_message_capacity: usize,
 }
 
 #[derive(Clone)]
@@ -738,6 +746,8 @@ impl TaskHandle {
         Self {
             command_tx: TaskCommandSender::Weak(command_tx),
             event_tx: self.event_tx.clone(),
+            active_message_slots: Arc::clone(&self.active_message_slots),
+            active_message_capacity: self.active_message_capacity,
         }
     }
 
@@ -749,6 +759,8 @@ impl TaskHandle {
         Some(Self {
             command_tx: TaskCommandSender::Strong(command_tx),
             event_tx: self.event_tx.clone(),
+            active_message_slots: Arc::clone(&self.active_message_slots),
+            active_message_capacity: self.active_message_capacity,
         })
     }
 }
@@ -905,6 +917,37 @@ impl ScopedTaskHandle {
             })
             .await?;
         response.await.map_err(|_| coordinator_closed())?
+    }
+
+    pub async fn send_active_message(&self, request: ActiveMessageRequest) -> ActiveMessageOutcome {
+        let permit = match Arc::clone(&self.inner.active_message_slots).try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                return ActiveMessageOutcome::Saturated {
+                    max_in_flight: self.inner.active_message_capacity,
+                };
+            }
+        };
+        let (reply, response) = oneshot::channel();
+        if self
+            .inner
+            .send(TaskCommand::SendActiveMessage {
+                request,
+                caller: InspectCaller::Scoped {
+                    root_id: self.root_id.clone(),
+                    task_id: self.task_id.clone(),
+                },
+                permit,
+                reply,
+            })
+            .await
+            .is_err()
+        {
+            return ActiveMessageOutcome::ChannelClosed;
+        }
+        response
+            .await
+            .unwrap_or(ActiveMessageOutcome::ChannelClosed)
     }
 
     pub async fn cancel_task(&self, task_id: TaskId) -> Result<CancelOutcome, TaskError> {

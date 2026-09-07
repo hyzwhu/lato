@@ -2,6 +2,7 @@
 // License: Apache-2.0
 // Lato changes: provider-neutral actor boundary with root registration only
 
+mod active_message;
 mod admission;
 mod cancel;
 mod coordinator;
@@ -12,6 +13,7 @@ mod runner;
 mod spawn;
 mod state;
 
+pub use active_message::*;
 pub use admission::*;
 pub use cancel::*;
 pub use coordinator::{TaskCoordinator, spawn_task_coordinator};

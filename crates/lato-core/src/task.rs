@@ -287,7 +287,7 @@ pub enum TaskErrorCode {
     RunnerPanic,
     #[serde(rename = "task.runner_protocol_violation")]
     RunnerProtocolViolation,
-    #[serde(rename = "task.message_admission_uncertain")]
+    #[serde(rename = "task.active_message_uncertain")]
     AdmissionUncertain,
     #[serde(rename = "task.verification_failed")]
     VerificationFailed,
@@ -327,7 +327,7 @@ impl TaskErrorCode {
             Self::RunnerInitialization => "task.runner_initialization",
             Self::RunnerPanic => "task.runner_panic",
             Self::RunnerProtocolViolation => "task.runner_protocol_violation",
-            Self::AdmissionUncertain => "task.message_admission_uncertain",
+            Self::AdmissionUncertain => "task.active_message_uncertain",
             Self::VerificationFailed => "task.verification_failed",
             Self::VerificationPending => "task.verification_pending",
             Self::Cancelled => "task.cancelled",

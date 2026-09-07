@@ -2,7 +2,7 @@
 // License: Apache-2.0
 // Lato changes: injectable child-runner protocol with acknowledged startup
 
-use crate::task::ScopedTaskHandle;
+use crate::task::{ActiveMessageAdmission, ActiveMessageDelivery, ScopedTaskHandle};
 use futures_util::future::BoxFuture;
 use lato_core::{AgentProfile, TaskError, TaskId, TaskNode, TaskProgress, TaskResult, TaskUsage};
 use lato_workspace::WorkspaceLease;
@@ -10,29 +10,11 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ActiveMessageKind {
-    Queue,
-    Steer,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ActiveMessageDelivery {
-    pub message_id: u64,
-    pub sender_id: TaskId,
-    pub kind: ActiveMessageKind,
-    pub message: String,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ActiveMessageAdmission {
-    Accepted,
-    Rejected,
-    Uncertain,
-}
-
 pub trait TaskChildControl: Send + Sync + 'static {
     fn progress(&self) -> TaskProgress;
+    /// Creates one admission future without blocking the coordinator actor.
+    /// Implementations must return promptly; asynchronous admission work
+    /// belongs in the returned bounded future.
     fn send_active_message(
         &self,
         delivery: ActiveMessageDelivery,
