@@ -289,11 +289,11 @@ fn scopes_support_compatibility_aliases_wildcards_and_canonical_validation() {
     .unwrap();
 
     let aliases =
-        SkillToolScope::compile(&["Read|write|Grep|Glob|WebFetch".into()], runtime.as_ref())
-            .unwrap();
-    for name in ["read_file", "write_file", "grep", "list_dir", "web_fetch"] {
+        SkillToolScope::compile(&["Read|write|Grep|WebFetch".into()], runtime.as_ref()).unwrap();
+    for name in ["read_file", "write_file", "grep", "web_fetch"] {
         assert!(aliases.allows_name(name), "{name}");
     }
+    assert!(!aliases.allows_name("list_dir"));
     assert!(!aliases.allows_name("run_terminal_command"));
 
     let wildcard = SkillToolScope::compile(&["*".into()], runtime.as_ref()).unwrap();
@@ -318,6 +318,69 @@ fn scopes_support_compatibility_aliases_wildcards_and_canonical_validation() {
         .resolve_and_validate("read_file", json!({}))
         .unwrap_err();
     assert_eq!(error.code, "tool.invalid_arguments");
+}
+
+#[test]
+fn compatibility_aliases_never_expand_to_sibling_tool_identities() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = builtin_tool_runtime(environment(
+        root.path(),
+        SessionTrust::for_headless_prompt(root.path()),
+        None,
+    ))
+    .unwrap();
+
+    let read = SkillToolScope::compile(&["Read".into()], runtime.as_ref()).unwrap();
+    assert_eq!(scoped_names(runtime.as_ref(), &read), vec!["read_file"]);
+    for (name, arguments) in [
+        ("list_dir", json!({"path":"src"})),
+        ("grep", json!({"path":"src","pattern":"needle"})),
+    ] {
+        let error = runtime
+            .prepare_scoped(context("read-sibling"), name, arguments, Some(&read))
+            .err()
+            .unwrap();
+        assert_eq!(error.code, "tool.not_allowed_by_skill");
+    }
+
+    let grep = SkillToolScope::compile(&["Grep".into()], runtime.as_ref()).unwrap();
+    assert_eq!(scoped_names(runtime.as_ref(), &grep), vec!["grep"]);
+    let error = runtime
+        .prepare_scoped(
+            context("grep-does-not-grant-glob"),
+            "list_dir",
+            json!({"path":"src"}),
+            Some(&grep),
+        )
+        .err()
+        .unwrap();
+    assert_eq!(error.code, "tool.not_allowed_by_skill");
+
+    let glob = SkillToolScope::compile(&["Glob".into()], runtime.as_ref()).unwrap();
+    assert!(scoped_names(runtime.as_ref(), &glob).is_empty());
+    for (name, arguments) in [
+        ("list_dir", json!({"path":"src"})),
+        ("grep", json!({"path":"src","pattern":"needle"})),
+    ] {
+        let error = runtime
+            .prepare_scoped(context("glob-no-substitute"), name, arguments, Some(&glob))
+            .err()
+            .unwrap();
+        assert_eq!(error.code, "tool.not_allowed_by_skill");
+    }
+}
+
+fn scoped_names(runtime: &lato_tools::ToolRuntime, scope: &SkillToolScope) -> Vec<String> {
+    runtime
+        .model_definitions_scoped(Some(scope))
+        .into_iter()
+        .filter_map(|definition| {
+            definition
+                .pointer("/function/name")
+                .and_then(|name| name.as_str())
+                .map(str::to_owned)
+        })
+        .collect()
 }
 
 #[test]

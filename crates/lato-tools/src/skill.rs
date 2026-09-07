@@ -305,10 +305,11 @@ fn compile_rule(
 fn compatible_tool_names(name: &str, runtime: &ToolRuntime) -> HashSet<String> {
     let aliases: &[&str] = match name {
         "Bash" | "bash" => &["run_terminal_command"],
-        "Read" | "read" => &["read_file", "list_dir", "grep"],
-        "Write" | "Edit" => &["write_file", "search_replace"],
+        "Read" | "read" => &["read_file"],
+        "Write" => &["write_file"],
+        "Edit" => &["edit_file"],
         "Grep" => &["grep"],
-        "Glob" => &["list_dir"],
+        "Glob" => &["glob"],
         "WebFetch" => &["web_fetch"],
         _ => &[],
     };
@@ -334,7 +335,7 @@ fn argument_field_for(name: &str, targets: &HashSet<String>) -> Option<&'static 
     } else if targets.iter().any(|name| {
         matches!(
             name.as_str(),
-            "read_file" | "list_dir" | "grep" | "write_file" | "search_replace"
+            "read_file" | "write_file" | "edit_file" | "grep" | "glob"
         )
     }) {
         Some("path")
@@ -353,7 +354,7 @@ fn compile_argument_matcher(
     let path = targets.iter().any(|name| {
         matches!(
             name.as_str(),
-            "read_file" | "list_dir" | "grep" | "write_file" | "search_replace"
+            "read_file" | "write_file" | "edit_file" | "grep" | "glob"
         )
     });
     if command {
@@ -468,6 +469,9 @@ fn glob_matches(pattern: &glob::Pattern, text: &str, context: MatchContext) -> b
 }
 
 fn matches_command_prefix(command: &str, pattern: &str) -> bool {
+    // Intentional narrowing: do not let a bare `git` pattern authorize
+    // `gitleaks`; the pinned Grok allow evaluator uses this word boundary even
+    // though its broader generic rule matcher also has a raw-prefix path.
     command == pattern
         || (command.starts_with(pattern) && command.as_bytes().get(pattern.len()) == Some(&b' '))
 }
@@ -571,9 +575,9 @@ fn normalized_scope_name(name: &str) -> &str {
         "Bash" | "bash" => "run_terminal_command",
         "Read" | "read" => "read_file",
         "Write" | "write" => "write_file",
-        "Edit" => "search_replace",
+        "Edit" => "edit_file",
         "Grep" => "grep",
-        "Glob" => "list_dir",
+        "Glob" => "glob",
         "WebFetch" => "web_fetch",
         _ => name,
     }
