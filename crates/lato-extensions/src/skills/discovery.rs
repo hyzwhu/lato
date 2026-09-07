@@ -15,6 +15,7 @@ use crate::{LoadedPlugin, PluginSnapshot};
 
 use super::{
     DiscoveredSkill, MAX_BODY_PEEK_BYTES, MAX_DESCRIPTION_CHARS, MAX_FRONTMATTER_BYTES,
+    MAX_SKILL_CANDIDATES, MAX_SKILL_DIRECTORIES_VISITED, MAX_SKILL_DIRECTORY_ENTRIES,
     MAX_SKILL_FILE_BYTES, MAX_SKILL_WALK_DEPTH, SkillDiagnostic, SkillDiscovery,
 };
 
@@ -31,12 +32,19 @@ pub fn discover_skills(snapshot: &PluginSnapshot) -> SkillDiscovery {
         ..SkillDiscovery::default()
     };
     let mut candidates = Vec::new();
+    let mut budget = DiscoveryBudget::default();
 
     for plugin in snapshot.active_plugins() {
         let mut roots = plugin.skill_dirs.clone();
         roots.sort();
         for skill_root in roots {
-            collect_candidates(plugin, &skill_root, &mut candidates);
+            collect_candidates(
+                plugin,
+                &skill_root,
+                &mut candidates,
+                &mut budget,
+                &mut discovery.diagnostics,
+            );
         }
     }
 
@@ -68,20 +76,70 @@ struct PreparedCandidate<'a> {
     canonical_path: PathBuf,
 }
 
+#[derive(Default)]
+struct DiscoveryBudget {
+    directories_visited: usize,
+    directory_entries: usize,
+    candidate_limit_reported: bool,
+    directory_limit_reported: bool,
+    directory_entry_limit_reported: bool,
+}
+
+impl DiscoveryBudget {
+    fn candidates_exhausted(&self, candidates: &[Candidate<'_>]) -> bool {
+        candidates.len() >= MAX_SKILL_CANDIDATES && self.candidate_limit_reported
+    }
+
+    fn admit_directory(&mut self, path: &Path, diagnostics: &mut Vec<SkillDiagnostic>) -> bool {
+        if self.directories_visited >= MAX_SKILL_DIRECTORIES_VISITED {
+            if !self.directory_limit_reported {
+                push_diagnostic(
+                    diagnostics,
+                    "skill.directory_limit",
+                    path,
+                    format!(
+                        "skill discovery exceeds {MAX_SKILL_DIRECTORIES_VISITED} visited directories"
+                    ),
+                );
+                self.directory_limit_reported = true;
+            }
+            return false;
+        }
+        self.directories_visited += 1;
+        true
+    }
+
+    fn push_candidate<'a>(
+        &mut self,
+        candidate: Candidate<'a>,
+        out: &mut Vec<Candidate<'a>>,
+        diagnostics: &mut Vec<SkillDiagnostic>,
+    ) -> bool {
+        if out.len() >= MAX_SKILL_CANDIDATES {
+            if !self.candidate_limit_reported {
+                push_diagnostic(
+                    diagnostics,
+                    "skill.candidate_limit",
+                    &candidate.path,
+                    format!("skill discovery exceeds {MAX_SKILL_CANDIDATES} candidates"),
+                );
+                self.candidate_limit_reported = true;
+            }
+            return false;
+        }
+        out.push(candidate);
+        true
+    }
+}
+
 fn collect_candidates<'a>(
     plugin: &'a LoadedPlugin,
     skill_root: &Path,
     out: &mut Vec<Candidate<'a>>,
+    budget: &mut DiscoveryBudget,
+    diagnostics: &mut Vec<SkillDiagnostic>,
 ) {
-    let root_skill = skill_root.join("SKILL.md");
-    if root_skill.is_file() {
-        out.push(Candidate {
-            plugin,
-            skill_root: skill_root.to_owned(),
-            path: root_skill,
-        });
-    }
-    walk_for_skill_md(plugin, skill_root, skill_root, out, 0);
+    walk_for_skill_md(plugin, skill_root, skill_root, out, budget, diagnostics, 0);
 }
 
 fn walk_for_skill_md<'a>(
@@ -89,31 +147,192 @@ fn walk_for_skill_md<'a>(
     skill_root: &Path,
     dir: &Path,
     out: &mut Vec<Candidate<'a>>,
+    budget: &mut DiscoveryBudget,
+    diagnostics: &mut Vec<SkillDiagnostic>,
     depth: usize,
 ) {
-    if depth > MAX_SKILL_WALK_DEPTH {
+    // Grok discovers a SKILL.md in a child at depth five, but does not descend
+    // into that child's contents. Since this function owns the self check,
+    // permit that final candidate directory and stop before its read_dir.
+    if depth > MAX_SKILL_WALK_DEPTH + 1
+        || budget.candidates_exhausted(out)
+        || !budget.admit_directory(dir, diagnostics)
+    {
         return;
     }
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
+
+    let canonical_dir = match dunce::canonicalize(dir) {
+        Ok(path) => path,
+        Err(error) => {
+            push_diagnostic(diagnostics, "skill.canonicalize_directory", dir, error);
+            return;
+        }
     };
-    let mut dirs = entries
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| path.is_dir())
-        .collect::<Vec<_>>();
-    dirs.sort();
-    for child in dirs {
-        let skill = child.join("SKILL.md");
-        if skill.is_file() {
-            out.push(Candidate {
+    if !canonical_dir.starts_with(&plugin.canonical_root) {
+        push_diagnostic(
+            diagnostics,
+            "skill.directory_escape",
+            dir,
+            "canonical skill directory escapes the plugin root",
+        );
+        return;
+    }
+
+    let skill = dir.join("SKILL.md");
+    if skill.is_file()
+        && !budget.push_candidate(
+            Candidate {
                 plugin,
                 skill_root: skill_root.to_owned(),
                 path: skill,
-            });
-        }
-        walk_for_skill_md(plugin, skill_root, &child, out, depth + 1);
+            },
+            out,
+            diagnostics,
+        )
+    {
+        return;
     }
+
+    if depth > MAX_SKILL_WALK_DEPTH {
+        return;
+    }
+
+    let mut dirs = collect_child_directories(plugin, dir, budget, diagnostics);
+    dirs.sort();
+    for child in dirs {
+        walk_for_skill_md(
+            plugin,
+            skill_root,
+            &child,
+            out,
+            budget,
+            diagnostics,
+            depth + 1,
+        );
+        if budget.candidates_exhausted(out) {
+            break;
+        }
+    }
+}
+
+fn collect_child_directories(
+    plugin: &LoadedPlugin,
+    dir: &Path,
+    budget: &mut DiscoveryBudget,
+    diagnostics: &mut Vec<SkillDiagnostic>,
+) -> Vec<PathBuf> {
+    // Directory entry classification is advisory: a same-authority process
+    // can replace an entry before the child canonicalize/read_dir step. Such a
+    // replacement can consume only the bounded traversal budget, and every
+    // resulting SKILL.md still passes the handle-based secure open before any
+    // content is read. Ordinary symlinks and Windows reparse points are
+    // rejected here to avoid intentionally walking their target trees.
+    let remaining = MAX_SKILL_DIRECTORY_ENTRIES.saturating_sub(budget.directory_entries);
+    if remaining == 0 {
+        report_directory_entry_limit(dir, budget, diagnostics);
+        return Vec::new();
+    }
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries.take(remaining + 1).collect::<Vec<_>>(),
+        Err(error) => {
+            push_diagnostic(diagnostics, "skill.read_directory", dir, error);
+            return Vec::new();
+        }
+    };
+    if entries.len() > remaining {
+        budget.directory_entries = MAX_SKILL_DIRECTORY_ENTRIES;
+        report_directory_entry_limit(dir, budget, diagnostics);
+        return Vec::new();
+    }
+    budget.directory_entries += entries.len();
+
+    entries
+        .into_iter()
+        .filter_map(|entry| match entry {
+            Ok(entry) => match entry.file_type() {
+                Ok(file_type)
+                    if entry_is_directory_link_or_reparse(&entry, &file_type, diagnostics) =>
+                {
+                    let path = entry.path();
+                    let (code, message) = match dunce::canonicalize(&path) {
+                        Ok(target) if !target.starts_with(&plugin.canonical_root) => (
+                            "skill.path_escape",
+                            "symlink skill directory escapes the plugin root",
+                        ),
+                        _ => (
+                            "skill.directory_symlink",
+                            "symlink skill directories are not traversed",
+                        ),
+                    };
+                    push_diagnostic(diagnostics, code, &path, message);
+                    None
+                }
+                Ok(file_type) if file_type.is_dir() => Some(entry.path()),
+                Ok(_) => None,
+                Err(error) => {
+                    push_diagnostic(diagnostics, "skill.directory_entry_type", dir, error);
+                    None
+                }
+            },
+            Err(error) => {
+                push_diagnostic(diagnostics, "skill.read_directory_entry", dir, error);
+                None
+            }
+        })
+        .collect()
+}
+
+#[cfg(not(windows))]
+fn entry_is_directory_link_or_reparse(
+    _entry: &fs::DirEntry,
+    file_type: &fs::FileType,
+    _diagnostics: &mut Vec<SkillDiagnostic>,
+) -> bool {
+    file_type.is_symlink()
+}
+
+#[cfg(windows)]
+fn entry_is_directory_link_or_reparse(
+    entry: &fs::DirEntry,
+    file_type: &fs::FileType,
+    diagnostics: &mut Vec<SkillDiagnostic>,
+) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+    if file_type.is_symlink() {
+        return true;
+    }
+    match fs::symlink_metadata(entry.path()) {
+        Ok(metadata) => metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0,
+        Err(error) => {
+            push_diagnostic(
+                diagnostics,
+                "skill.directory_entry_metadata",
+                &entry.path(),
+                error,
+            );
+            // A classification failure cannot safely widen traversal.
+            true
+        }
+    }
+}
+
+fn report_directory_entry_limit(
+    path: &Path,
+    budget: &mut DiscoveryBudget,
+    diagnostics: &mut Vec<SkillDiagnostic>,
+) {
+    if budget.directory_entry_limit_reported {
+        return;
+    }
+    push_diagnostic(
+        diagnostics,
+        "skill.directory_entry_limit",
+        path,
+        format!("skill discovery exceeds {MAX_SKILL_DIRECTORY_ENTRIES} directory entries"),
+    );
+    budget.directory_entry_limit_reported = true;
 }
 
 fn prepare_candidate<'a>(

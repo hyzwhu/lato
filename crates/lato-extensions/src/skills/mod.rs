@@ -3,6 +3,13 @@ pub const MAX_FRONTMATTER_BYTES: usize = 4 * 1024;
 pub const MAX_DESCRIPTION_CHARS: usize = 1024;
 pub const MAX_BODY_PEEK_BYTES: usize = 2 * 1024;
 pub const MAX_SKILL_WALK_DEPTH: usize = 5;
+/// Full-snapshot cap: Phase 6A itself admits at most 1,024 plugins, so this
+/// still permits one candidate per plugin before later catalog truncation.
+pub const MAX_SKILL_CANDIDATES: usize = 1024;
+/// Full-snapshot traversal caps prevent a trusted but malformed plugin tree
+/// from consuming unbounded filesystem work before candidate materialization.
+pub const MAX_SKILL_DIRECTORIES_VISITED: usize = 2048;
+pub const MAX_SKILL_DIRECTORY_ENTRIES: usize = 8192;
 
 pub mod discovery;
 pub mod types;

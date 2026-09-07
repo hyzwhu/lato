@@ -6,7 +6,9 @@ use std::{
 
 use lato_extensions::{
     DiscoveryConfig, PluginConfig, PluginSnapshot, build_snapshot, discover_plugins,
-    skills::{MAX_SKILL_FILE_BYTES, discover_skills},
+    skills::{
+        MAX_SKILL_CANDIDATES, MAX_SKILL_DIRECTORIES_VISITED, MAX_SKILL_FILE_BYTES, discover_skills,
+    },
 };
 
 struct Fixture {
@@ -367,6 +369,90 @@ fn rejects_symlink_escape() {
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.code == "skill.path_escape")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn never_recurses_into_an_external_symlink_directory_tree() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = Fixture::new();
+    let plugin = fixture.plugin("demo");
+    let outside = fixture._temp.path().join("wide-outside");
+    for index in 0..64 {
+        write_skill(
+            &outside,
+            &format!("branch-{index:03}"),
+            "---\ndescription: escaped\n---\nbody",
+        );
+    }
+    symlink(outside.join("skills"), plugin.join("skills/external")).unwrap();
+
+    let result = discover_skills(&fixture.snapshot(&plugin, true));
+
+    assert!(result.skills.is_empty());
+    assert_eq!(
+        result
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "skill.path_escape")
+            .count(),
+        1,
+        "one directory-level diagnostic proves the wide target was not traversed"
+    );
+}
+
+#[test]
+fn candidate_limit_is_bounded_and_deterministic() {
+    let fixture = Fixture::new();
+    let plugin = fixture.plugin("demo");
+    for index in 0..=MAX_SKILL_CANDIDATES {
+        write_skill(
+            &plugin,
+            &format!("candidate-{index:04}"),
+            "---\ndescription: candidate\n---\nbody",
+        );
+    }
+
+    let result = discover_skills(&fixture.snapshot(&plugin, true));
+
+    assert_eq!(result.skills.len(), MAX_SKILL_CANDIDATES);
+    assert_eq!(result.skills[0].name, "candidate-0000");
+    assert_eq!(
+        result.skills.last().unwrap().name,
+        format!("candidate-{:04}", MAX_SKILL_CANDIDATES - 1)
+    );
+    assert_eq!(
+        result
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "skill.candidate_limit")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn directory_visit_limit_is_bounded_and_deterministic() {
+    let fixture = Fixture::new();
+    let plugin = fixture.plugin("demo");
+    for index in 0..MAX_SKILL_DIRECTORIES_VISITED {
+        fs::create_dir_all(plugin.join(format!("skills/directory-{index:04}"))).unwrap();
+    }
+
+    let result = discover_skills(&fixture.snapshot(&plugin, true));
+
+    let diagnostics = result
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.code == "skill.directory_limit")
+        .collect::<Vec<_>>();
+    assert_eq!(diagnostics.len(), 1);
+    assert!(
+        diagnostics[0].path.ends_with("skills/directory-2047"),
+        "first excluded directory must be stable: {}",
+        diagnostics[0].path
     );
 }
 
