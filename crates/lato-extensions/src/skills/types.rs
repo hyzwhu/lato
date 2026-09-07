@@ -1,3 +1,7 @@
+// Derived from: Grok Build@bb7f39d5858cbf5e00de639367f59debbdcb0138:crates/codegen/xai-grok-tools/src/implementations/skills/types.rs
+// License: Apache-2.0
+// Lato changes: models immutable plugin-scoped skill materialization and bounded diagnostics
+
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},

@@ -4,7 +4,8 @@
 
 use std::{
     collections::{BTreeMap, HashSet},
-    fs,
+    fs::{self, File},
+    io::{self, Read},
     path::{Path, PathBuf},
 };
 
@@ -44,10 +45,9 @@ pub fn discover_skills(snapshot: &PluginSnapshot) -> SkillDiscovery {
         .filter_map(|candidate| prepare_candidate(candidate, &mut discovery.diagnostics))
         .collect::<Vec<_>>();
     candidates.sort_by(|left, right| {
-        left.plugin
-            .name
-            .cmp(&right.plugin.name)
-            .then_with(|| left.canonical_path.cmp(&right.canonical_path))
+        left.canonical_path
+            .cmp(&right.canonical_path)
+            .then_with(|| left.plugin.id.0.cmp(&right.plugin.id.0))
     });
     let mut seen = HashSet::new();
     for candidate in candidates {
@@ -145,15 +145,27 @@ fn prepare_candidate<'a>(
 
 fn materialize_candidate(
     candidate: PreparedCandidate<'_>,
-    seen: &mut HashSet<PathBuf>,
+    seen: &mut HashSet<(crate::PluginId, PathBuf)>,
     discovery: &mut SkillDiscovery,
 ) {
     let canonical_path = candidate.canonical_path;
-    if !seen.insert(canonical_path.clone()) {
+    if !seen.insert((candidate.plugin.id.clone(), canonical_path.clone())) {
         return;
     }
 
-    let metadata = match fs::metadata(&canonical_path) {
+    let mut file = match open_contained_file(&candidate.plugin.canonical_root, &canonical_path) {
+        Ok(file) => file,
+        Err(error) => {
+            push_diagnostic(
+                &mut discovery.diagnostics,
+                "skill.secure_open",
+                &canonical_path,
+                error,
+            );
+            return;
+        }
+    };
+    let metadata = match file.metadata() {
         Ok(metadata) => metadata,
         Err(error) => {
             push_diagnostic(
@@ -165,6 +177,15 @@ fn materialize_candidate(
             return;
         }
     };
+    if !metadata.is_file() {
+        push_diagnostic(
+            &mut discovery.diagnostics,
+            "skill.not_regular_file",
+            &canonical_path,
+            "SKILL.md is not a regular file",
+        );
+        return;
+    }
     if metadata.len() > MAX_SKILL_FILE_BYTES as u64 {
         push_diagnostic(
             &mut discovery.diagnostics,
@@ -174,18 +195,20 @@ fn materialize_candidate(
         );
         return;
     }
-    let bytes = match fs::read(&canonical_path) {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            push_diagnostic(
-                &mut discovery.diagnostics,
-                "skill.read",
-                &canonical_path,
-                error,
-            );
-            return;
-        }
-    };
+    let mut bytes = Vec::new();
+    let read_result = file
+        .by_ref()
+        .take(MAX_SKILL_FILE_BYTES as u64 + 1)
+        .read_to_end(&mut bytes);
+    if let Err(error) = read_result {
+        push_diagnostic(
+            &mut discovery.diagnostics,
+            "skill.read",
+            &canonical_path,
+            error,
+        );
+        return;
+    }
     if bytes.len() > MAX_SKILL_FILE_BYTES {
         push_diagnostic(
             &mut discovery.diagnostics,
@@ -255,6 +278,151 @@ fn materialize_candidate(
     });
 }
 
+/// Opens a canonical candidate without following any path component after the
+/// containment decision. On Unix this walks from `/` using directory handles,
+/// so renaming an ancestor or replacing any component with a symlink cannot
+/// redirect the final open outside the plugin root.
+#[cfg(unix)]
+fn open_contained_file(plugin_root: &Path, candidate: &Path) -> io::Result<File> {
+    use std::{
+        ffi::CString,
+        os::{
+            fd::{AsRawFd, FromRawFd, OwnedFd},
+            unix::ffi::OsStrExt,
+        },
+        path::Component,
+    };
+
+    candidate.strip_prefix(plugin_root).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "skill path escapes the plugin root",
+        )
+    })?;
+    if !candidate.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "canonical skill path is not absolute",
+        ));
+    }
+
+    let mut components = candidate
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(value) => Some(Ok(value)),
+            Component::RootDir => None,
+            _ => Some(Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "canonical skill path contains an invalid component",
+            ))),
+        })
+        .peekable();
+    let root = File::open("/")?;
+    let mut directory: Option<OwnedFd> = None;
+
+    while let Some(component) = components.next() {
+        let component = component?;
+        let name = CString::new(component.as_bytes()).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "path component contains NUL")
+        })?;
+        let parent_fd = directory
+            .as_ref()
+            .map_or_else(|| root.as_raw_fd(), AsRawFd::as_raw_fd);
+        let flags = libc::O_RDONLY
+            | libc::O_CLOEXEC
+            | libc::O_NOFOLLOW
+            | if components.peek().is_some() {
+                libc::O_DIRECTORY
+            } else {
+                libc::O_NONBLOCK
+            };
+        // SAFETY: `parent_fd` remains owned for the call, `name` is a valid
+        // NUL-terminated component, and a successful descriptor is immediately
+        // transferred into `OwnedFd`.
+        let fd = unsafe { libc::openat(parent_fd, name.as_ptr(), flags) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `openat` returned a new owned descriptor.
+        directory = Some(unsafe { OwnedFd::from_raw_fd(fd) });
+    }
+
+    directory.map(File::from).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "skill path has no file component",
+        )
+    })
+}
+
+/// Windows opens once, resolves the object name from that same handle, and
+/// requires it to equal the already containment-checked canonical candidate.
+/// A path replacement can therefore only fail the comparison, never redirect
+/// the subsequent metadata check or read.
+#[cfg(windows)]
+fn open_contained_file(plugin_root: &Path, candidate: &Path) -> io::Result<File> {
+    use std::{
+        ffi::OsString,
+        os::windows::{ffi::OsStringExt, io::AsRawHandle},
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_NAME_NORMALIZED, GetFinalPathNameByHandleW, VOLUME_NAME_DOS,
+    };
+
+    candidate.strip_prefix(plugin_root).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "skill path escapes the plugin root",
+        )
+    })?;
+    let file = File::open(candidate)?;
+    // Windows extended-length paths contain at most 32,767 UTF-16 code units.
+    // Keeping a fixed-size buffer makes the handle-path validation bounded.
+    let mut buffer = vec![0_u16; 32_768];
+    // SAFETY: the file handle is live for the call and the buffer exposes its
+    // complete writable range.
+    let length = unsafe {
+        GetFinalPathNameByHandleW(
+            file.as_raw_handle(),
+            buffer.as_mut_ptr(),
+            buffer.len() as u32,
+            FILE_NAME_NORMALIZED | VOLUME_NAME_DOS,
+        )
+    };
+    if length == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if length as usize >= buffer.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "resolved skill path exceeds the Windows path bound",
+        ));
+    }
+    let opened_path = PathBuf::from(OsString::from_wide(&buffer[..length as usize]));
+    let opened_path = dunce::simplified(&opened_path);
+    if !windows_paths_equal(opened_path, candidate) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "opened skill object does not match the contained canonical path",
+        ));
+    }
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn windows_paths_equal(left: &Path, right: &Path) -> bool {
+    left.to_string_lossy()
+        .eq_ignore_ascii_case(&right.to_string_lossy())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_contained_file(_plugin_root: &Path, _candidate: &Path) -> io::Result<File> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "secure skill traversal is not implemented on this platform",
+    ))
+}
+
 struct ParsedSkill {
     name: String,
     description: String,
@@ -285,7 +453,8 @@ fn parse_skill(
         None => BTreeMap::new(),
     };
 
-    let frontmatter_name = coerce_to_string(map.get("name"));
+    let frontmatter_name =
+        parse_optional_scalar(&map, "name", "skill.invalid_name", path, diagnostics);
     let name = [frontmatter_name.as_deref(), fallback_name]
         .into_iter()
         .flatten()
@@ -295,24 +464,39 @@ fn parse_skill(
             "frontmatter and directory names do not yield a valid skill name".to_owned()
         })?;
 
-    let authored_description = coerce_to_string(map.get("description"));
-    if map.contains_key("description") && authored_description.is_none() {
-        push_diagnostic(
-            diagnostics,
-            "skill.invalid_description",
-            path,
-            "description must be a scalar",
-        );
-    }
+    let authored_description = parse_optional_scalar(
+        &map,
+        "description",
+        "skill.invalid_description",
+        path,
+        diagnostics,
+    );
     let has_authored_description = authored_description.is_some();
     let description = authored_description
         .map(|value| truncate_chars(value, MAX_DESCRIPTION_CHARS))
         .or_else(|| derive_body_description(&body))
         .unwrap_or_else(|| name.clone());
-    let when_to_use = coerce_to_string(map.get("when-to-use").or_else(|| map.get("when_to_use")))
-        .map(|value| truncate_chars(value, MAX_DESCRIPTION_CHARS));
-    let argument_hint = coerce_to_string(map.get("argument-hint"))
-        .map(|value| truncate_bytes(value, MAX_ARGUMENT_HINT_BYTES));
+    let when_key = if map.contains_key("when-to-use") {
+        "when-to-use"
+    } else {
+        "when_to_use"
+    };
+    let when_to_use = parse_optional_scalar(
+        &map,
+        when_key,
+        "skill.invalid_when_to_use",
+        path,
+        diagnostics,
+    )
+    .map(|value| truncate_chars(value, MAX_DESCRIPTION_CHARS));
+    let argument_hint = parse_optional_scalar(
+        &map,
+        "argument-hint",
+        "skill.invalid_argument_hint",
+        path,
+        diagnostics,
+    )
+    .map(|value| truncate_bytes(value, MAX_ARGUMENT_HINT_BYTES));
     let allowed_tools = parse_allowed_tools(map.get("allowed-tools"), path, diagnostics);
     let paths = parse_paths(map.get("paths"), path, diagnostics);
     let metadata = parse_metadata(map.get("metadata"), path, diagnostics);
@@ -324,17 +508,33 @@ fn parse_skill(
         when_to_use,
         argument_hint,
         allowed_tools,
-        user_invocable: map.get("user-invocable").is_none_or(parse_boolean),
-        disable_model_invocation: map
-            .get("disable-model-invocation")
-            .is_some_and(parse_boolean),
+        user_invocable: parse_optional_boolean(
+            map.get("user-invocable"),
+            true,
+            "skill.invalid_user_invocable",
+            path,
+            diagnostics,
+        ),
+        disable_model_invocation: parse_optional_boolean(
+            map.get("disable-model-invocation"),
+            false,
+            "skill.invalid_disable_model_invocation",
+            path,
+            diagnostics,
+        ),
         body,
         paths,
-        license: coerce_to_string(map.get("license")),
-        compatibility: coerce_to_string(map.get("compatibility")),
+        license: parse_optional_scalar(&map, "license", "skill.invalid_license", path, diagnostics),
+        compatibility: parse_optional_scalar(
+            &map,
+            "compatibility",
+            "skill.invalid_compatibility",
+            path,
+            diagnostics,
+        ),
         metadata,
-        model: coerce_to_string(map.get("model")),
-        effort: coerce_to_string(map.get("effort")),
+        model: parse_optional_scalar(&map, "model", "skill.invalid_model", path, diagnostics),
+        effort: parse_optional_scalar(&map, "effort", "skill.invalid_effort", path, diagnostics),
     })
 }
 
@@ -390,6 +590,26 @@ fn coerce_to_string(value: Option<&Value>) -> Option<String> {
     }
 }
 
+fn parse_optional_scalar(
+    values: &BTreeMap<String, Value>,
+    key: &str,
+    diagnostic_code: &'static str,
+    path: &Path,
+    diagnostics: &mut Vec<SkillDiagnostic>,
+) -> Option<String> {
+    let value = values.get(key)?;
+    let parsed = coerce_to_string(Some(value));
+    if parsed.is_none() {
+        push_diagnostic(
+            diagnostics,
+            diagnostic_code,
+            path,
+            format!("{key} must be a non-empty scalar"),
+        );
+    }
+    parsed
+}
+
 fn nonempty(value: &str) -> Option<String> {
     let value = value.trim();
     (!value.is_empty()).then(|| value.to_owned())
@@ -397,6 +617,28 @@ fn nonempty(value: &str) -> Option<String> {
 
 fn parse_boolean(value: &Value) -> bool {
     matches!(value, Value::Bool(true)) || matches!(value, Value::String(value) if value == "true")
+}
+
+fn parse_optional_boolean(
+    value: Option<&Value>,
+    default: bool,
+    diagnostic_code: &'static str,
+    path: &Path,
+    diagnostics: &mut Vec<SkillDiagnostic>,
+) -> bool {
+    let Some(value) = value else {
+        return default;
+    };
+    if !matches!(value, Value::Bool(_) | Value::String(_) | Value::Number(_)) {
+        push_diagnostic(
+            diagnostics,
+            diagnostic_code,
+            path,
+            "boolean option must be a scalar",
+        );
+        return default;
+    }
+    parse_boolean(value)
 }
 
 fn parse_allowed_tools(
@@ -409,8 +651,18 @@ fn parse_allowed_tools(
         Value::String(value) => split_top_level(value, '(', ')', true),
         Value::Sequence(values) => values
             .iter()
-            .filter_map(Value::as_str)
-            .filter_map(nonempty)
+            .filter_map(|value| match value.as_str().and_then(nonempty) {
+                Some(value) => Some(value),
+                None => {
+                    push_diagnostic(
+                        diagnostics,
+                        "skill.invalid_allowed_tool",
+                        path,
+                        "allowed-tools list entry must be a non-empty string",
+                    );
+                    None
+                }
+            })
             .collect(),
         _ => {
             push_diagnostic(
@@ -460,7 +712,18 @@ fn parse_paths(
         Value::String(value) => split_top_level(value, '{', '}', false),
         Value::Sequence(values) => values
             .iter()
-            .filter_map(Value::as_str)
+            .filter_map(|value| match value.as_str() {
+                Some(value) => Some(value),
+                None => {
+                    push_diagnostic(
+                        diagnostics,
+                        "skill.invalid_path_entry",
+                        path,
+                        "paths list entry must be a string",
+                    );
+                    None
+                }
+            })
             .flat_map(|value| split_top_level(value, '{', '}', false))
             .collect(),
         _ => {
@@ -498,7 +761,18 @@ fn parse_metadata(
     };
     let metadata = values
         .iter()
-        .filter_map(|(key, value)| Some((key.as_str()?.to_owned(), value.as_str()?.to_owned())))
+        .filter_map(|(key, value)| match (key.as_str(), value.as_str()) {
+            (Some(key), Some(value)) => Some((key.to_owned(), value.to_owned())),
+            _ => {
+                push_diagnostic(
+                    diagnostics,
+                    "skill.invalid_metadata_entry",
+                    path,
+                    "metadata key and value must both be strings",
+                );
+                None
+            }
+        })
         .collect::<BTreeMap<_, _>>();
     (!metadata.is_empty()).then_some(metadata)
 }
@@ -561,70 +835,53 @@ fn valid_skill_name(value: &str) -> bool {
 
 fn derive_body_description(body: &str) -> Option<String> {
     let peek = truncate_bytes(body.to_owned(), MAX_BODY_PEEK_BYTES);
-    first_prose_paragraph(&peek)
-        .or_else(|| first_heading(&peek))
-        .map(|value| truncate_chars(value, MAX_DESCRIPTION_CHARS))
+    extract_lead_block(&peek, false).or_else(|| extract_lead_block(&peek, true))
 }
 
-fn first_prose_paragraph(body: &str) -> Option<String> {
-    let mut paragraph = Vec::new();
-    let mut fenced = false;
-    for line in body.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-            fenced = !fenced;
-            continue;
-        }
-        if fenced
-            || trimmed.starts_with('#')
-            || trimmed.starts_with('>')
-            || trimmed.starts_with("- ")
-            || trimmed.starts_with("* ")
-            || trimmed.starts_with("+ ")
-            || is_ordered_list(trimmed)
-            || trimmed.contains(" | ")
-        {
-            if !paragraph.is_empty() {
-                break;
+/// First top-level prose paragraph (and heading when requested), using the
+/// pinned Grok Build Markdown event semantics. Lists, tables, code blocks,
+/// blockquotes, and image alt text never become descriptions.
+fn extract_lead_block(body: &str, include_headings: bool) -> Option<String> {
+    use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
+
+    let options =
+        Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
+    let mut skip_depth = 0_usize;
+    let mut image_depth = 0_usize;
+    let mut capturing = false;
+    let mut buffer = String::new();
+
+    for event in Parser::new_ext(body, options) {
+        match event {
+            Event::Start(Tag::List(_) | Tag::BlockQuote(_)) => skip_depth += 1,
+            Event::End(TagEnd::List(_) | TagEnd::BlockQuote(_)) => {
+                skip_depth = skip_depth.saturating_sub(1);
             }
-            continue;
-        }
-        if trimmed.is_empty() {
-            if !paragraph.is_empty() {
-                break;
+            Event::Start(Tag::Paragraph) if skip_depth == 0 => {
+                capturing = true;
+                buffer.clear();
             }
-        } else {
-            paragraph.push(trimmed);
+            Event::Start(Tag::Heading { .. }) if include_headings && skip_depth == 0 => {
+                capturing = true;
+                buffer.clear();
+            }
+            Event::End(TagEnd::Paragraph | TagEnd::Heading(_)) if capturing => {
+                let text = buffer.split_whitespace().collect::<Vec<_>>().join(" ");
+                if !text.is_empty() {
+                    return Some(truncate_chars(text, MAX_DESCRIPTION_CHARS));
+                }
+                capturing = false;
+            }
+            Event::Start(Tag::Image { .. }) => image_depth += 1,
+            Event::End(TagEnd::Image) => image_depth = image_depth.saturating_sub(1),
+            Event::Text(text) | Event::Code(text) if capturing && image_depth == 0 => {
+                buffer.push_str(&text);
+            }
+            Event::SoftBreak | Event::HardBreak if capturing => buffer.push(' '),
+            _ => {}
         }
     }
-    (!paragraph.is_empty()).then(|| flatten_inline(&paragraph.join(" ")))
-}
-
-fn first_heading(body: &str) -> Option<String> {
-    body.lines().find_map(|line| {
-        let heading = line
-            .trim()
-            .strip_prefix('#')?
-            .trim_start_matches('#')
-            .trim();
-        (!heading.is_empty()).then(|| flatten_inline(heading))
-    })
-}
-
-fn is_ordered_list(value: &str) -> bool {
-    value.split_once(". ").is_some_and(|(prefix, _)| {
-        !prefix.is_empty() && prefix.bytes().all(|byte| byte.is_ascii_digit())
-    })
-}
-
-fn flatten_inline(value: &str) -> String {
-    value
-        .chars()
-        .filter(|character| !matches!(character, '`' | '*' | '_'))
-        .collect::<String>()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+    None
 }
 
 fn quote_problematic_values(frontmatter: &str) -> String {
@@ -731,4 +988,31 @@ fn push_diagnostic(
         message.to_string(),
         MAX_DIAGNOSTIC_BYTES,
     ));
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::{fs, os::unix::fs::symlink};
+
+    use super::open_contained_file;
+
+    #[test]
+    fn secure_open_rejects_ancestor_replaced_after_canonicalization() {
+        let temp = tempfile::tempdir().unwrap();
+        let plugin_root = temp.path().join("plugin");
+        let skill_dir = plugin_root.join("skills/example");
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(skill_dir.join("SKILL.md"), "inside").unwrap();
+        fs::write(outside.join("SKILL.md"), "outside").unwrap();
+
+        let canonical_root = dunce::canonicalize(&plugin_root).unwrap();
+        let canonical_candidate = dunce::canonicalize(skill_dir.join("SKILL.md")).unwrap();
+        fs::rename(&skill_dir, plugin_root.join("skills/original")).unwrap();
+        symlink(&outside, &skill_dir).unwrap();
+
+        let error = open_contained_file(&canonical_root, &canonical_candidate).unwrap_err();
+        assert_ne!(error.kind(), std::io::ErrorKind::NotFound);
+    }
 }
