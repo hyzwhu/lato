@@ -53,6 +53,13 @@ pub struct PreparedToolCall {
     fingerprint: ApprovalFingerprint,
     decision: PolicyDecision,
     audit: PreparedToolAudit,
+    skill_scope_guard: Option<SkillScopeGuard>,
+}
+
+struct SkillScopeGuard {
+    scope: SkillToolScope,
+    cwd: PathBuf,
+    original_arguments: Value,
 }
 
 impl PreparedToolCall {
@@ -282,20 +289,17 @@ impl ToolRuntime {
 
         let validated = self.resolve_and_validate(wire_name, arguments)?;
         let canonical = validated.canonical_name;
-        let arguments = validated.arguments;
-        if scope.is_some_and(|scope| {
-            !scope.allows_call(
-                canonical.local_name(),
-                &arguments,
-                &self.scope.workspace_root,
-            )
-        }) {
-            return Err(ToolError::new(
-                "tool.not_allowed_by_skill",
-                format!("tool {wire_name} is not allowed by the active skill"),
-                Retryability::Never,
-            ));
-        }
+        let original_arguments = validated.arguments;
+        let arguments = match scope {
+            Some(scope) => scope
+                .canonicalize_call(
+                    canonical.local_name(),
+                    &original_arguments,
+                    &self.scope.workspace_root,
+                )
+                .ok_or_else(|| not_allowed_by_skill(wire_name))?,
+            None => original_arguments.clone(),
+        };
         let Some(descriptor) = self.catalog.descriptor(&canonical).cloned() else {
             return Err(not_found(wire_name));
         };
@@ -348,6 +352,11 @@ impl ToolRuntime {
             fingerprint,
             decision,
             audit,
+            skill_scope_guard: scope.cloned().map(|scope| SkillScopeGuard {
+                scope,
+                cwd: self.scope.workspace_root.clone(),
+                original_arguments,
+            }),
         })
     }
 
@@ -388,6 +397,34 @@ impl ToolRuntime {
                 "policy.grant_mismatch",
                 "the prepared tool call changed after authorization",
             ));
+        }
+        // Scope preparation fingerprints the resolved path instead of the
+        // caller's symlink spelling. Re-resolve immediately before consuming
+        // the grant so a target swapped in the meantime fails closed. This
+        // narrows the remaining OS-level race; eliminating it entirely would
+        // require descriptor-relative openat-style I/O in every path tool.
+        if let Some(guard) = &prepared.skill_scope_guard {
+            let original_still_resolves_to_prepared = guard
+                .scope
+                .canonicalize_call(
+                    prepared.request.tool_name.local_name(),
+                    &guard.original_arguments,
+                    &guard.cwd,
+                )
+                .is_some_and(|arguments| arguments == prepared.arguments);
+            let prepared_target_still_allowed = guard
+                .scope
+                .canonicalize_call(
+                    prepared.request.tool_name.local_name(),
+                    &prepared.arguments,
+                    &guard.cwd,
+                )
+                .is_some_and(|arguments| arguments == prepared.arguments);
+            if !original_still_resolves_to_prepared || !prepared_target_still_allowed {
+                return Err(not_allowed_by_skill(
+                    prepared.request.tool_name.local_name(),
+                ));
+            }
         }
         self.policy
             .consume(&grant, &prepared.fingerprint, &prepared.request)
@@ -644,6 +681,14 @@ fn policy_engine_error(error: lato_policy::PolicyError) -> ToolError {
 
 fn policy_error(code: impl Into<String>, message: impl Into<String>) -> ToolError {
     ToolError::new(code, message, Retryability::Never)
+}
+
+fn not_allowed_by_skill(wire_name: &str) -> ToolError {
+    ToolError::new(
+        "tool.not_allowed_by_skill",
+        format!("tool {wire_name} is not allowed by the active skill"),
+        Retryability::Never,
+    )
 }
 
 fn not_found(wire_name: &str) -> ToolError {

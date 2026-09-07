@@ -229,6 +229,8 @@ async fn skill_invocation_rejects_oversized_metadata() {
 #[test]
 fn scoped_runtime_filters_definitions_and_checks_grouped_arguments() {
     let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("src")).unwrap();
+    std::fs::write(root.path().join("src/lib.rs"), "lib").unwrap();
     let runtime = builtin_tool_runtime(environment(
         root.path(),
         SessionTrust::for_headless_prompt(root.path()),
@@ -386,6 +388,8 @@ fn scoped_names(runtime: &lato_tools::ToolRuntime, scope: &SkillToolScope) -> Ve
 #[test]
 fn path_scopes_normalize_under_cwd_and_block_traversal() {
     let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("src")).unwrap();
+    std::fs::write(root.path().join("src/lib.rs"), "lib").unwrap();
     let runtime = builtin_tool_runtime(environment(
         root.path(),
         SessionTrust::for_headless_prompt(root.path()),
@@ -462,6 +466,10 @@ fn path_scopes_normalize_under_cwd_and_block_traversal() {
 #[test]
 fn path_scopes_support_recursive_globs_and_character_classes() {
     let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("projects/demo/src")).unwrap();
+    std::fs::create_dir_all(root.path().join("src")).unwrap();
+    std::fs::write(root.path().join("projects/demo/src/main.rs"), "main").unwrap();
+    std::fs::write(root.path().join("src/lib.rs"), "lib").unwrap();
     let runtime = builtin_tool_runtime(environment(
         root.path(),
         SessionTrust::for_headless_prompt(root.path()),
@@ -482,6 +490,204 @@ fn path_scopes_support_recursive_globs_and_character_classes() {
             )
             .unwrap();
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn path_scopes_match_lexical_and_resolved_targets() {
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("allowed/real-dir")).unwrap();
+    std::fs::create_dir(root.path().join("sibling")).unwrap();
+    std::fs::write(root.path().join("allowed/real.txt"), "inside").unwrap();
+    std::fs::write(root.path().join("sibling/secret.txt"), "sibling").unwrap();
+    std::fs::write(outside.path().join("secret.txt"), "outside").unwrap();
+    symlink("real.txt", root.path().join("allowed/inside-link.txt")).unwrap();
+    symlink("real-dir", root.path().join("allowed/inside-dir")).unwrap();
+    symlink(
+        "../sibling/secret.txt",
+        root.path().join("allowed/sibling-file.txt"),
+    )
+    .unwrap();
+    symlink(
+        outside.path().join("secret.txt"),
+        root.path().join("allowed/outside-file.txt"),
+    )
+    .unwrap();
+    symlink("../sibling", root.path().join("allowed/sibling-dir")).unwrap();
+    symlink(outside.path(), root.path().join("allowed/outside-dir")).unwrap();
+    symlink("missing.txt", root.path().join("allowed/dangling")).unwrap();
+    symlink("cycle-b", root.path().join("allowed/cycle-a")).unwrap();
+    symlink("cycle-a", root.path().join("allowed/cycle-b")).unwrap();
+
+    let runtime = builtin_tool_runtime(environment(
+        root.path(),
+        SessionTrust::for_headless_prompt(root.path()),
+        None,
+    ))
+    .unwrap();
+    let read = SkillToolScope::compile(&["Read(allowed/**)".into()], runtime.as_ref()).unwrap();
+
+    runtime
+        .prepare_scoped(
+            context("inside-link"),
+            "read_file",
+            json!({"path":"allowed/inside-link.txt"}),
+            Some(&read),
+        )
+        .unwrap();
+    for (call_id, path) in [
+        ("sibling-link", "allowed/sibling-dir/secret.txt"),
+        ("outside-link", "allowed/outside-dir/secret.txt"),
+        ("sibling-file-link", "allowed/sibling-file.txt"),
+        ("outside-file-link", "allowed/outside-file.txt"),
+        ("missing-read-target", "allowed/not-created.txt"),
+        ("dangling-link", "allowed/dangling"),
+        ("cycle-link", "allowed/cycle-a"),
+    ] {
+        let error = runtime
+            .prepare_scoped(
+                context(call_id),
+                "read_file",
+                json!({"path":path}),
+                Some(&read),
+            )
+            .err()
+            .unwrap();
+        assert_eq!(error.code, "tool.not_allowed_by_skill", "{call_id}");
+    }
+
+    let grep = SkillToolScope::compile(&["Grep(allowed/**)".into()], runtime.as_ref()).unwrap();
+    runtime
+        .prepare_scoped(
+            context("grep-inside-link"),
+            "grep",
+            json!({"path":"allowed/inside-link.txt","pattern":"inside"}),
+            Some(&grep),
+        )
+        .unwrap();
+    for (call_id, path) in [
+        ("grep-sibling-dir", "allowed/sibling-dir"),
+        ("grep-outside-file", "allowed/outside-file.txt"),
+        ("grep-missing-target", "allowed/not-created.txt"),
+        ("grep-dangling", "allowed/dangling"),
+        ("grep-cycle", "allowed/cycle-a"),
+    ] {
+        let error = runtime
+            .prepare_scoped(
+                context(call_id),
+                "grep",
+                json!({"path":path,"pattern":"secret"}),
+                Some(&grep),
+            )
+            .err()
+            .unwrap();
+        assert_eq!(error.code, "tool.not_allowed_by_skill", "{call_id}");
+    }
+
+    let write = SkillToolScope::compile(&["Write(allowed/**)".into()], runtime.as_ref()).unwrap();
+    runtime
+        .prepare_scoped(
+            context("new-file"),
+            "write_file",
+            json!({"path":"allowed/real-dir/new/nested.txt","contents":"new"}),
+            Some(&write),
+        )
+        .unwrap();
+    runtime
+        .prepare_scoped(
+            context("new-file-through-inside-link"),
+            "write_file",
+            json!({"path":"allowed/inside-dir/new.txt","contents":"new"}),
+            Some(&write),
+        )
+        .unwrap();
+    for (call_id, path) in [
+        ("write-sibling-dir", "allowed/sibling-dir/new.txt"),
+        ("write-outside-dir", "allowed/outside-dir/new.txt"),
+        ("write-sibling-file", "allowed/sibling-file.txt"),
+        ("write-outside-file", "allowed/outside-file.txt"),
+        ("write-dangling", "allowed/dangling/new.txt"),
+        ("write-cycle", "allowed/cycle-a/new.txt"),
+    ] {
+        let error = runtime
+            .prepare_scoped(
+                context(call_id),
+                "write_file",
+                json!({"path":path,"contents":"new"}),
+                Some(&write),
+            )
+            .err()
+            .unwrap();
+        assert_eq!(error.code, "tool.not_allowed_by_skill", "{call_id}");
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn scoped_path_execution_fails_closed_if_the_resolved_target_changes() {
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("allowed")).unwrap();
+    std::fs::create_dir_all(root.path().join("sibling")).unwrap();
+    std::fs::write(root.path().join("allowed/real.txt"), "inside").unwrap();
+    std::fs::write(root.path().join("sibling/secret.txt"), "secret").unwrap();
+    symlink("real.txt", root.path().join("allowed/link.txt")).unwrap();
+
+    let runtime = builtin_tool_runtime(environment(
+        root.path(),
+        SessionTrust::for_headless_prompt(root.path()),
+        None,
+    ))
+    .unwrap();
+    let scope = SkillToolScope::compile(&["Read(allowed/**)".into()], runtime.as_ref()).unwrap();
+    let prepared_link_swap = runtime
+        .prepare_scoped(
+            context("link-swap"),
+            "read_file",
+            json!({"path":"allowed/link.txt"}),
+            Some(&scope),
+        )
+        .unwrap();
+
+    std::fs::remove_file(root.path().join("allowed/link.txt")).unwrap();
+    symlink(
+        "../sibling/secret.txt",
+        root.path().join("allowed/link.txt"),
+    )
+    .unwrap();
+    let error = runtime
+        .execute_without_approval_for_test(prepared_link_swap)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "tool.not_allowed_by_skill");
+
+    std::fs::remove_file(root.path().join("allowed/link.txt")).unwrap();
+    symlink("real.txt", root.path().join("allowed/link.txt")).unwrap();
+    let prepared_target_swap = runtime
+        .prepare_scoped(
+            context("target-swap"),
+            "read_file",
+            json!({"path":"allowed/link.txt"}),
+            Some(&scope),
+        )
+        .unwrap();
+
+    std::fs::remove_file(root.path().join("allowed/real.txt")).unwrap();
+    symlink(
+        "../sibling/secret.txt",
+        root.path().join("allowed/real.txt"),
+    )
+    .unwrap();
+
+    let error = runtime
+        .execute_without_approval_for_test(prepared_target_swap)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "tool.not_allowed_by_skill");
 }
 
 #[test]

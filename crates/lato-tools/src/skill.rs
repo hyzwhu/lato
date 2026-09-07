@@ -168,9 +168,14 @@ enum ArgumentMatcher {
         pattern: String,
         glob: glob::Pattern,
     },
-    Path(glob::Pattern),
+    Path(Option<glob::Pattern>),
     Domain(String),
     Freeform(glob::Pattern),
+}
+
+enum MatchedArgument {
+    Original,
+    ResolvedPath(PathBuf),
 }
 
 impl SkillToolScope {
@@ -214,13 +219,22 @@ impl SkillToolScope {
     }
 
     pub fn allows_call(&self, wire_name: &str, arguments: &Value, cwd: &Path) -> bool {
+        self.canonicalize_call(wire_name, arguments, cwd).is_some()
+    }
+
+    pub(crate) fn canonicalize_call(
+        &self,
+        wire_name: &str,
+        arguments: &Value,
+        cwd: &Path,
+    ) -> Option<Value> {
         let name = normalized_scope_name(wire_name);
-        self.rules.iter().any(|rule| {
+        self.rules.iter().find_map(|rule| {
             if !rule.wire_names.contains(name) {
-                return false;
+                return None;
             }
             let Some(matcher) = &rule.argument_matcher else {
-                return true;
+                return Some(arguments.clone());
             };
             let candidate = rule
                 .argument_field
@@ -228,24 +242,50 @@ impl SkillToolScope {
                 .and_then(Value::as_str)
                 .map(str::to_owned)
                 .or_else(|| serde_json::to_string(arguments).ok());
-            candidate.is_some_and(|candidate| matcher.matches(&candidate, cwd))
+            let candidate = candidate?;
+            let MatchedArgument::ResolvedPath(resolved) = matcher.matches(&candidate, cwd, name)?
+            else {
+                return Some(arguments.clone());
+            };
+            let field = rule.argument_field?;
+            let mut canonical = arguments.clone();
+            canonical.as_object_mut()?.insert(
+                field.to_owned(),
+                Value::String(path_match_string(&resolved)),
+            );
+            Some(canonical)
         })
     }
 }
 
 impl ArgumentMatcher {
-    fn matches(&self, candidate: &str, cwd: &Path) -> bool {
+    fn matches(&self, candidate: &str, cwd: &Path, tool_name: &str) -> Option<MatchedArgument> {
         match self {
             Self::Bash { pattern, glob } => {
                 let command = candidate.trim_start();
-                matches_command_prefix(command, pattern)
-                    || glob_matches(glob, command, MatchContext::Freeform)
+                (matches_command_prefix(command, pattern)
+                    || glob_matches(glob, command, MatchContext::Freeform))
+                .then_some(MatchedArgument::Original)
             }
-            Self::Path(pattern) => normalized_path_forms(candidate, cwd)
-                .iter()
-                .any(|path| glob_matches(pattern, path, MatchContext::Path)),
-            Self::Domain(pattern) => domain_matches(pattern, candidate),
-            Self::Freeform(pattern) => glob_matches(pattern, candidate, MatchContext::Freeform),
+            Self::Path(pattern) => {
+                let paths = resolve_scoped_path(candidate, cwd, tool_name == "write_file")?;
+                let matches = pattern.as_ref().is_none_or(|pattern| {
+                    paths
+                        .lexical_forms
+                        .iter()
+                        .any(|path| glob_matches(pattern, path, MatchContext::Path))
+                        && paths
+                            .resolved_forms
+                            .iter()
+                            .any(|path| glob_matches(pattern, path, MatchContext::Path))
+                });
+                matches.then_some(MatchedArgument::ResolvedPath(paths.resolved))
+            }
+            Self::Domain(pattern) => {
+                domain_matches(pattern, candidate).then_some(MatchedArgument::Original)
+            }
+            Self::Freeform(pattern) => glob_matches(pattern, candidate, MatchContext::Freeform)
+                .then_some(MatchedArgument::Original),
         }
     }
 }
@@ -275,10 +315,12 @@ fn compile_rule(
     if targets.is_empty() {
         return Ok(());
     }
+    let field = argument_field_for(name.trim(), &targets);
+    let path_rule = field == Some("path");
     let (argument_matcher, argument_field) = match pattern.as_deref().map(str::trim) {
+        None | Some("") | Some("*") if path_rule => (Some(ArgumentMatcher::Path(None)), field),
         None | Some("") | Some("*") => (None, None),
         Some(pattern) => {
-            let field = argument_field_for(name.trim(), &targets);
             let bash_empty = (matches!(name.trim(), "Bash" | "bash")
                 || targets.contains("run_terminal_command"))
                 && pattern
@@ -373,7 +415,7 @@ fn compile_argument_matcher(
         return Ok(ArgumentMatcher::Freeform(compile_glob(pattern)?));
     }
     if path {
-        return Ok(ArgumentMatcher::Path(compile_glob(pattern)?));
+        return Ok(ArgumentMatcher::Path(Some(compile_glob(pattern)?)));
     }
     Ok(ArgumentMatcher::Freeform(compile_glob(pattern)?))
 }
@@ -476,22 +518,81 @@ fn matches_command_prefix(command: &str, pattern: &str) -> bool {
         || (command.starts_with(pattern) && command.as_bytes().get(pattern.len()) == Some(&b' '))
 }
 
-fn normalized_path_forms(path: &str, cwd: &Path) -> Vec<String> {
-    let cwd = absolute_lexical_cwd(cwd);
+struct ResolvedScopedPath {
+    resolved: PathBuf,
+    lexical_forms: Vec<String>,
+    resolved_forms: Vec<String>,
+}
+
+fn resolve_scoped_path(path: &str, cwd: &Path, allow_missing: bool) -> Option<ResolvedScopedPath> {
+    let lexical_cwd = absolute_lexical_cwd(cwd);
+    let resolved_cwd = std::fs::canonicalize(&lexical_cwd).ok()?;
     let raw = Path::new(path);
     if is_tilde_path(raw) {
-        return Vec::new();
+        return None;
     }
-    let absolute = if raw.is_absolute() {
+    let lexical = if raw.is_absolute() {
         normalize_lexically(raw)
     } else {
-        normalize_lexically(&cwd.join(raw))
+        normalize_lexically(&lexical_cwd.join(raw))
     };
-    if !absolute.starts_with(&cwd) {
-        return Vec::new();
+    if !lexical.starts_with(&lexical_cwd) {
+        return None;
     }
-    let mut forms = vec![path_match_string(&absolute)];
-    if let Ok(relative) = absolute.strip_prefix(&cwd) {
+
+    let resolved = match std::fs::symlink_metadata(&lexical) {
+        Ok(_) => std::fs::canonicalize(&lexical).ok()?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && allow_missing => {
+            canonicalize_missing_target(&lexical)?
+        }
+        Err(_) => return None,
+    };
+    if !resolved.starts_with(&resolved_cwd) {
+        return None;
+    }
+    let relative = resolved.strip_prefix(&resolved_cwd).ok()?;
+    Some(ResolvedScopedPath {
+        resolved: resolved.clone(),
+        lexical_forms: path_forms(&lexical, &lexical_cwd),
+        resolved_forms: path_forms(&resolved, &resolved_cwd)
+            .into_iter()
+            .chain(std::iter::once(path_match_string(
+                &lexical_cwd.join(relative),
+            )))
+            .collect(),
+    })
+}
+
+fn canonicalize_missing_target(path: &Path) -> Option<PathBuf> {
+    // Resolve the nearest existing ancestor first. Encountering a dangling or
+    // cyclic symlink makes canonicalize fail, so missing write targets never
+    // reconstruct through an unresolved link.
+    let mut cursor = path.to_path_buf();
+    let mut missing = Vec::new();
+    loop {
+        match std::fs::symlink_metadata(&cursor) {
+            Ok(_) => {
+                let mut resolved = std::fs::canonicalize(&cursor).ok()?;
+                if !missing.is_empty() && !std::fs::metadata(&resolved).ok()?.is_dir() {
+                    return None;
+                }
+                for component in missing.iter().rev() {
+                    resolved.push(component);
+                }
+                return Some(normalize_lexically(&resolved));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                missing.push(cursor.file_name()?.to_os_string());
+                cursor = cursor.parent()?.to_path_buf();
+            }
+            Err(_) => return None,
+        }
+    }
+}
+
+fn path_forms(path: &Path, root: &Path) -> Vec<String> {
+    let mut forms = vec![path_match_string(path)];
+    if let Ok(relative) = path.strip_prefix(root) {
         let relative = path_match_string(relative);
         if relative.is_empty() || relative == "." {
             forms.extend([".".to_owned(), "./".to_owned()]);
