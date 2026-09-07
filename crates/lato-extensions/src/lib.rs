@@ -1,6 +1,7 @@
 pub mod discovery;
 pub mod manifest;
 pub mod registry;
+pub mod reload;
 pub mod trust;
 
 pub use discovery::{
@@ -15,6 +16,7 @@ pub use registry::{
     CapabilityCeiling, LoadedPlugin, PluginComponentKind, PluginConfig, PluginSnapshot,
     RegistryBuildError, build_snapshot,
 };
+pub use reload::{ReloadError, ReloadOutcome, ReloadRequest, SharedPluginRegistryHandle};
 
 pub const MAX_PLUGIN_NAME_LEN: usize = 64;
 pub const MAX_COMPONENT_PATHS: usize = 64;
