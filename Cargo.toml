@@ -10,6 +10,7 @@ members = [
     "crates/lato-ai",
     "crates/lato-tools",
     "crates/lato-agent",
+    "crates/lato-extensions",
     "crates/lato-mcp",
     "crates/lato-store",
 ]
