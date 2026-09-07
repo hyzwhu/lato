@@ -10,10 +10,10 @@ lato-core = { path = "../lato-core" }
 lato-store = { path = "../lato-store" }
 lato-workspace = { path = "../lato-workspace" }
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 
 [dev-dependencies]
-serde_json = "1"
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "test-util", "time"] }

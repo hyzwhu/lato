@@ -21,7 +21,9 @@ use crate::task::{
     ScopedTaskHandle, SinkShutdown, SpawnDisposition, SpawnMode, SpawnTaskRequest,
     TaskCallbackKind, TaskChildControl, TaskCommand, TaskCommandSender, TaskCompletion,
     TaskEventEnvelope, TaskEventPayload, TaskEventSink, TaskHandle, TaskReporter, TaskRunOutput,
-    TaskRunRequest, TaskRunner, WaitOutcome, coordinator_closed, root_node,
+    TaskRunRequest, TaskRunner, TaskVerifier, VerificationDecision, VerificationOutcome,
+    VerificationRequest, VerificationResume, VerificationWait, WaitOutcome, coordinator_closed,
+    root_node,
 };
 use futures_util::{
     FutureExt, StreamExt,
@@ -29,7 +31,8 @@ use futures_util::{
     stream::FuturesUnordered,
 };
 use lato_core::{
-    BudgetAccount, TaskError, TaskErrorCode, TaskId, TaskMachine, TaskNode, TaskStatus,
+    BudgetAccount, BudgetAmount, BudgetDimension, BudgetLimits, TaskError, TaskErrorCode, TaskId,
+    TaskMachine, TaskNode, TaskStatus, TaskUsage,
 };
 use lato_workspace::{WorkspaceAllocator, WorkspaceRequest};
 use std::{
@@ -74,7 +77,8 @@ struct ProfileValidation {
 
 enum TaskJobExit {
     WorkspaceAllocated(TaskId, lato_workspace::WorkspaceLease),
-    Completed(TaskId, crate::task::TaskRunOutput),
+    Completed(TaskId, u64, crate::task::TaskRunOutput),
+    VerificationFinished(TaskId, u64, VerificationOutcome),
     WorkspaceAllocationFailed(TaskId, TaskError),
     LeaseReleased(TaskId, lato_core::LeaseId),
     LeaseReleaseFailed(TaskId, TaskError),
@@ -85,6 +89,7 @@ enum TaskJobExit {
 enum JobPhase {
     Preparing,
     Running,
+    Verifying,
     Cleanup,
 }
 
@@ -207,6 +212,7 @@ enum OutputLoadEvent {
 pub struct TaskCoordinator<R: TaskRunner, A: WorkspaceAllocator> {
     config: CoordinatorConfig,
     runner: Arc<R>,
+    verifier: Arc<dyn TaskVerifier>,
     workspace_allocator: Arc<A>,
     command_rx: mpsc::Receiver<TaskCommand>,
     command_channel_closed: bool,
@@ -280,6 +286,26 @@ where
     R: TaskRunner,
     A: WorkspaceAllocator,
 {
+    spawn_task_coordinator_with_verifier(
+        config,
+        runner,
+        workspace_allocator,
+        Arc::new(crate::task::PolicyTaskVerifier::default()),
+        event_sink,
+    )
+}
+
+pub fn spawn_task_coordinator_with_verifier<R, A>(
+    config: CoordinatorConfig,
+    runner: Arc<R>,
+    workspace_allocator: Arc<A>,
+    verifier: Arc<dyn TaskVerifier>,
+    event_sink: Arc<dyn TaskEventSink>,
+) -> (TaskHandle, JoinHandle<()>)
+where
+    R: TaskRunner,
+    A: WorkspaceAllocator,
+{
     config.assert_valid();
     let (command_tx, command_rx) = mpsc::channel(config.command_capacity);
     let (internal_tx, internal_rx) = mpsc::channel(config.command_capacity);
@@ -333,6 +359,7 @@ where
         queue: SpawnQueue::new(config.max_queue),
         config,
         runner,
+        verifier,
         workspace_allocator,
         command_rx,
         command_channel_closed: false,
@@ -1089,6 +1116,15 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
                 let result = self.set_root_spawn_admission(&root_id, &caller, closed);
                 let _ = reply.send(result);
             }
+            TaskCommand::ResumeVerification {
+                task_id,
+                caller,
+                resume,
+                reply,
+            } => {
+                let result = self.resume_verification(&task_id, &caller, resume);
+                let _ = reply.send(result);
+            }
             TaskCommand::RegistryCounts { reply } => {
                 let counts = self.state.counts(
                     self.dropped_sink_events,
@@ -1147,6 +1183,10 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
                 enqueued_at: Instant::now(),
                 active_messages: Default::default(),
                 generation: None,
+                verification_output: None,
+                verification_wait: None,
+                budget_failure: None,
+                budget_settled: false,
             },
         );
         self.commit_transition(task_id, TaskEventPayload::RootRegistered);
@@ -1796,6 +1836,10 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
                 enqueued_at,
                 active_messages: Default::default(),
                 generation: None,
+                verification_output: None,
+                verification_wait: None,
+                budget_failure: None,
+                budget_settled: false,
             },
         );
         self.commit_transition(task_id.clone(), TaskEventPayload::SpawnAccepted);
@@ -1880,6 +1924,10 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
                 enqueued_at: Instant::now(),
                 active_messages: Default::default(),
                 generation: None,
+                verification_output: None,
+                verification_wait: None,
+                budget_failure: None,
+                budget_settled: false,
             },
         );
         let result = lato_core::TaskResult {
@@ -1935,6 +1983,16 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
     }
 
     fn launch_runner(&mut self, task_id: TaskId) {
+        self.next_generation = self
+            .next_generation
+            .checked_add(1)
+            .expect("active task generation overflow");
+        let generation = self.next_generation;
+        self.state
+            .tasks
+            .get_mut(&task_id)
+            .expect("prepared task remains registered")
+            .generation = Some(generation);
         let record = self
             .state
             .tasks
@@ -1955,7 +2013,7 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
         );
         let job_task_id = task_id.clone();
         let future = async move {
-            let reporter = TaskReporter::new(task_id.clone(), event_tx.clone());
+            let reporter = TaskReporter::new(task_id.clone(), generation, event_tx.clone());
             let run = runner.run(
                 TaskRunRequest {
                     node,
@@ -1979,7 +2037,7 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
                     output_ref: None,
                 }),
             };
-            TaskJobExit::Completed(task_id, output)
+            TaskJobExit::Completed(task_id, generation, output)
         };
         self.push_job(job_task_id, JobPhase::Running, future);
     }
@@ -2421,8 +2479,6 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
             output.result.success = false;
             output.result.error = Some(error);
         }
-        self.set_status(&task_id, TaskStatus::Verifying);
-        self.commit_transition(task_id.clone(), TaskEventPayload::VerificationStarted);
         if output.result.output_ref.is_none() {
             output.result.output_ref = output.external_snapshot_ref.take();
         }
@@ -2432,14 +2488,8 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
             .max_output_bytes;
         let metadata = truncate_utf8(&mut output.result.output, cap);
         self.state.tasks.get_mut(&task_id).unwrap().output_metadata = Some(metadata);
-        let (terminal_status, terminal_event) = if output.result.success {
-            (
-                TaskStatus::Completed,
-                TaskEventPayload::Completed {
-                    result: output.result.clone(),
-                },
-            )
-        } else {
+        output.result.usage = self.state.tasks[&task_id].usage.clone();
+        if !output.result.success {
             let error = output.result.error.clone().unwrap_or_else(|| {
                 TaskError::new(
                     TaskErrorCode::RunnerProtocolViolation,
@@ -2447,19 +2497,204 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
                 )
             });
             output.result.error = Some(error.clone());
-            (TaskStatus::Failed, TaskEventPayload::Failed { error })
+            self.commit_terminal(
+                &task_id,
+                TaskStatus::Failed,
+                output.result,
+                TaskEventPayload::Failed { error },
+                None,
+            );
+            return;
+        }
+        self.set_status(&task_id, TaskStatus::Verifying);
+        self.state
+            .tasks
+            .get_mut(&task_id)
+            .expect("verifying task remains registered")
+            .verification_output = Some(output);
+        self.commit_transition(task_id.clone(), TaskEventPayload::VerificationStarted);
+        self.launch_verification(task_id);
+    }
+
+    fn launch_verification(&mut self, task_id: TaskId) {
+        let record = &self.state.tasks[&task_id];
+        let generation = record
+            .generation
+            .expect("verification follows an acknowledged runner generation");
+        let request = VerificationRequest {
+            node: record.node.clone(),
+            result: record
+                .verification_output
+                .as_ref()
+                .expect("verification output is stored before launch")
+                .result
+                .clone(),
         };
-        let completion = TaskCompletion {
-            task_id: task_id.clone(),
-            result: output.result.clone(),
-        };
-        self.commit_terminal(
-            &task_id,
-            terminal_status,
-            output.result,
-            terminal_event,
-            Some(completion),
+        let verifier = Arc::clone(&self.verifier);
+        let timeout = self.config.verification_timeout;
+        let verification_task_id = task_id.clone();
+        let verification_task = tokio::spawn(async move {
+            let verification =
+                std::panic::AssertUnwindSafe(verifier.verify(request)).catch_unwind();
+            let outcome = match tokio::time::timeout(timeout, verification).await {
+                Ok(Ok(outcome)) => outcome,
+                Ok(Err(_)) => VerificationOutcome::Failed(TaskError::new(
+                    TaskErrorCode::VerificationFailed,
+                    "task verifier panicked",
+                )),
+                Err(_) => VerificationOutcome::Failed(TaskError::new(
+                    TaskErrorCode::VerificationFailed,
+                    "task verification timed out",
+                )),
+            };
+            TaskJobExit::VerificationFinished(verification_task_id, generation, outcome)
+        });
+        self.job_aborts.insert(
+            task_id.clone(),
+            OwnedAbortHandle::Tokio(verification_task.abort_handle()),
         );
+        self.jobs.push(Box::pin(async move {
+            match verification_task.await {
+                Ok(exit) => exit,
+                Err(error) if error.is_panic() => TaskJobExit::VerificationFinished(
+                    task_id,
+                    generation,
+                    VerificationOutcome::Failed(TaskError::new(
+                        TaskErrorCode::VerificationFailed,
+                        "task verifier panicked outside its verification future",
+                    )),
+                ),
+                Err(_) => TaskJobExit::Aborted(task_id, JobPhase::Verifying),
+            }
+        }));
+    }
+
+    fn finish_verification(&mut self, task_id: TaskId, outcome: VerificationOutcome) {
+        if self.state.tasks[&task_id].node.status != TaskStatus::Verifying {
+            return;
+        }
+        match outcome {
+            VerificationOutcome::Passed => {
+                self.commit_transition(task_id.clone(), TaskEventPayload::VerificationPassed);
+                let output = self
+                    .state
+                    .tasks
+                    .get_mut(&task_id)
+                    .unwrap()
+                    .verification_output
+                    .take();
+                let Some(output) = output else { return };
+                let completion = TaskCompletion {
+                    task_id: task_id.clone(),
+                    result: output.result.clone(),
+                };
+                self.commit_terminal(
+                    &task_id,
+                    TaskStatus::Completed,
+                    output.result.clone(),
+                    TaskEventPayload::Completed {
+                        result: output.result,
+                    },
+                    Some(completion),
+                );
+            }
+            VerificationOutcome::Failed(error) => {
+                self.commit_transition(
+                    task_id.clone(),
+                    TaskEventPayload::VerificationFailed {
+                        error: error.clone(),
+                    },
+                );
+                let Some(mut output) = self
+                    .state
+                    .tasks
+                    .get_mut(&task_id)
+                    .unwrap()
+                    .verification_output
+                    .take()
+                else {
+                    return;
+                };
+                output.result.success = false;
+                output.result.error = Some(error.clone());
+                self.commit_terminal(
+                    &task_id,
+                    TaskStatus::Failed,
+                    output.result,
+                    TaskEventPayload::Failed { error },
+                    None,
+                );
+            }
+            VerificationOutcome::WaitingForChild { reviewer_task_id } => {
+                self.state
+                    .tasks
+                    .get_mut(&task_id)
+                    .unwrap()
+                    .verification_wait = Some(VerificationWait::Child(reviewer_task_id.clone()));
+                self.set_status(&task_id, TaskStatus::WaitingForChildren);
+                self.commit_transition(
+                    task_id,
+                    TaskEventPayload::VerificationWaitingForChild { reviewer_task_id },
+                );
+            }
+            VerificationOutcome::WaitingForApproval { approval_id } => {
+                self.state
+                    .tasks
+                    .get_mut(&task_id)
+                    .unwrap()
+                    .verification_wait = Some(VerificationWait::Approval(approval_id.clone()));
+                self.set_status(&task_id, TaskStatus::WaitingForApproval);
+                self.commit_transition(
+                    task_id,
+                    TaskEventPayload::VerificationWaitingForApproval { approval_id },
+                );
+            }
+        }
+    }
+
+    fn resume_verification(
+        &mut self,
+        task_id: &TaskId,
+        caller: &InspectCaller,
+        resume: VerificationResume,
+    ) -> Result<(), TaskError> {
+        if !caller_owns(&self.state, caller, task_id) {
+            return Err(not_found());
+        }
+        let record = self.state.tasks.get(task_id).ok_or_else(not_found)?;
+        let decision = match (&record.verification_wait, resume) {
+            (
+                Some(VerificationWait::Child(expected)),
+                VerificationResume::Child {
+                    reviewer_task_id,
+                    decision,
+                },
+            ) if expected == &reviewer_task_id => decision,
+            (
+                Some(VerificationWait::Approval(expected)),
+                VerificationResume::Approval {
+                    approval_id,
+                    decision,
+                },
+            ) if expected == &approval_id => decision,
+            _ => {
+                return Err(TaskError::new(
+                    TaskErrorCode::VerificationPending,
+                    "verification resume does not match the pending task and identifier",
+                ));
+            }
+        };
+        self.state.tasks.get_mut(task_id).unwrap().verification_wait = None;
+        self.set_status(task_id, TaskStatus::Verifying);
+        self.commit_transition(task_id.clone(), TaskEventPayload::VerificationResumed);
+        self.finish_verification(
+            task_id.clone(),
+            match decision {
+                VerificationDecision::Passed => VerificationOutcome::Passed,
+                VerificationDecision::Failed(error) => VerificationOutcome::Failed(error),
+            },
+        );
+        Ok(())
     }
 
     async fn fail_task(&mut self, task_id: TaskId, error: TaskError) {
@@ -2518,6 +2753,8 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
         let record = self.state.tasks.get_mut(task_id).unwrap();
         record.usage = result.usage.clone();
         record.result = Some(result);
+        record.verification_output = None;
+        record.verification_wait = None;
         if let Some(completion) = completion {
             self.pending_completions.insert(task_id.clone(), completion);
         }
@@ -2605,25 +2842,44 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
     }
 
     fn release_reservation(&mut self, task_id: &TaskId) {
-        let reservation = self
-            .state
-            .tasks
-            .get_mut(task_id)
-            .and_then(|record| record.reservation.take());
-        let parent_id = self
-            .state
-            .tasks
-            .get(task_id)
-            .and_then(|record| record.reservation_parent_id.clone());
-        if let (Some(reservation), Some(parent_id)) = (reservation, parent_id) {
-            let _ = self
-                .state
-                .tasks
-                .get_mut(&parent_id)
-                .expect("reservation parent remains retained")
-                .budget
-                .release(reservation);
+        let Some((reservation, parent_id, mut actual)) =
+            self.state.tasks.get_mut(task_id).and_then(|record| {
+                if record.budget_settled {
+                    return None;
+                }
+                record.budget_settled = true;
+                Some((
+                    record.reservation.take()?,
+                    record.reservation_parent_id.clone()?,
+                    record.budget.spent(),
+                ))
+            })
+        else {
+            return;
+        };
+        actual.child_tasks = actual.child_tasks.saturating_add(1);
+        if self.state.tasks[task_id].node.workspace_intent
+            == lato_core::WorkspaceIntent::IsolatedWorktree
+        {
+            actual.worktrees = actual.worktrees.saturating_add(1);
         }
+        let reserved = reservation.amount();
+        let bounded = min_budget(actual, reserved);
+        let overflow = actual
+            .checked_sub(bounded)
+            .expect("bounded settlement never exceeds actual usage");
+        let parent = &mut self
+            .state
+            .tasks
+            .get_mut(&parent_id)
+            .expect("reservation parent remains retained")
+            .budget;
+        parent
+            .settle(reservation, bounded)
+            .expect("bounded child usage fits its actor-owned reservation");
+        parent
+            .apply_cumulative_usage(BudgetAmount::ZERO, overflow)
+            .expect("unreserved overflow exists only under an unlimited parent dimension");
     }
 
     fn promote_queue(&mut self) {
@@ -2742,6 +2998,13 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
             });
         }
         self.commit_transition(task_id.clone(), TaskEventPayload::CancellationRequested);
+        if matches!(
+            status,
+            TaskStatus::WaitingForChildren | TaskStatus::WaitingForApproval
+        ) {
+            self.terminalize_cancelled(&task_id);
+            return;
+        }
         if self.state.tasks[&task_id].node.parent_id.is_none() {
             self.cancel_deadlines
                 .insert(task_id.clone(), Instant::now() + self.config.cancel_grace);
@@ -2755,7 +3018,8 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
     async fn finish_job(&mut self, exit: TaskJobExit) {
         let task_id = match &exit {
             TaskJobExit::WorkspaceAllocated(task_id, _)
-            | TaskJobExit::Completed(task_id, _)
+            | TaskJobExit::Completed(task_id, _, _)
+            | TaskJobExit::VerificationFinished(task_id, _, _)
             | TaskJobExit::WorkspaceAllocationFailed(task_id, _)
             | TaskJobExit::LeaseReleased(task_id, _)
             | TaskJobExit::LeaseReleaseFailed(task_id, _)
@@ -2836,7 +3100,16 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
         } else {
             match exit {
                 TaskJobExit::WorkspaceAllocated(_, _) => unreachable!("handled above"),
-                TaskJobExit::Completed(_, output) => self.complete_task(task_id, output).await,
+                TaskJobExit::Completed(_, generation, output) => {
+                    if self.generation_is_current(&task_id, generation) {
+                        self.complete_task(task_id, output).await;
+                    }
+                }
+                TaskJobExit::VerificationFinished(_, generation, outcome) => {
+                    if self.generation_is_current(&task_id, generation) {
+                        self.finish_verification(task_id, outcome);
+                    }
+                }
                 TaskJobExit::WorkspaceAllocationFailed(_, error) => {
                     self.fail_task(task_id, error).await;
                 }
@@ -2870,7 +3143,7 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
                 TaskErrorCode::Cancelled,
                 "task was cancelled",
             )),
-            usage: Default::default(),
+            usage: record.usage.clone(),
             duration_ms: 0,
             output_ref: None,
         };
@@ -2893,7 +3166,9 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
         if self.pending_terminal_outputs.contains_key(task_id) {
             return;
         }
-        if self.state.tasks[task_id].generation.is_some() {
+        if self.state.tasks[task_id].generation.is_some()
+            && self.state.tasks[task_id].node.status == TaskStatus::Running
+        {
             if self.state.tasks[task_id].node.status != TaskStatus::Finalizing {
                 self.set_status(task_id, TaskStatus::Finalizing);
                 self.commit_transition(task_id.clone(), TaskEventPayload::Finalizing);
@@ -2919,6 +3194,25 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
     }
 
     fn commit_cancelled(&mut self, task_id: &TaskId) {
+        if let Some(error) = self.state.tasks[task_id].budget_failure.clone() {
+            let record = &self.state.tasks[task_id];
+            let result = lato_core::TaskResult {
+                success: false,
+                output: String::new(),
+                error: Some(error.clone()),
+                usage: record.usage.clone(),
+                duration_ms: 0,
+                output_ref: None,
+            };
+            self.commit_terminal(
+                task_id,
+                TaskStatus::Failed,
+                result,
+                TaskEventPayload::Failed { error },
+                None,
+            );
+            return;
+        }
         let result = self.cancelled_result(task_id);
         self.commit_terminal(
             task_id,
@@ -3014,20 +3308,13 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
         match event {
             RunnerEvent::Started {
                 task_id,
+                generation,
                 started,
                 acknowledgement,
             } => {
-                let accepted = self.is_live_preparing(&task_id);
+                let accepted = self.is_live_preparing(&task_id)
+                    && self.generation_is_current(&task_id, generation);
                 if accepted {
-                    self.next_generation = self
-                        .next_generation
-                        .checked_add(1)
-                        .expect("active task generation overflow");
-                    self.state
-                        .tasks
-                        .get_mut(&task_id)
-                        .expect("promoted task remains registered")
-                        .generation = Some(self.next_generation);
                     self.controls.insert(task_id.clone(), started.control);
                     self.set_status(&task_id, TaskStatus::Running);
                     self.commit_transition(task_id, TaskEventPayload::Started);
@@ -3039,19 +3326,22 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
                 }
                 let _ = acknowledgement.send(accepted);
             }
-            RunnerEvent::Usage { task_id, usage } => {
-                if let Some(record) = self.state.tasks.get_mut(&task_id)
-                    && !record.node.status.is_terminal()
-                    && usage.total_tokens >= record.usage.total_tokens
-                    && usage.tool_calls >= record.usage.tool_calls
-                {
-                    record.usage = usage.clone();
-                    self.commit_transition(task_id, TaskEventPayload::UsageUpdated { usage });
-                }
+            RunnerEvent::Usage {
+                task_id,
+                generation,
+                usage,
+            } => {
+                self.handle_cumulative_usage(task_id, generation, usage)
+                    .await;
             }
-            RunnerEvent::Progress { task_id, progress } => {
+            RunnerEvent::Progress {
+                task_id,
+                generation,
+                progress,
+            } => {
                 if let Some(record) = self.state.tasks.get_mut(&task_id)
                     && !record.node.status.is_terminal()
+                    && record.generation == Some(generation)
                     && progress.completed_units >= record.progress.completed_units
                     && progress != record.progress
                 {
@@ -3059,6 +3349,63 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
                     self.commit_transition(task_id, TaskEventPayload::ProgressUpdated { progress });
                 }
             }
+        }
+    }
+
+    fn generation_is_current(&self, task_id: &TaskId, generation: u64) -> bool {
+        self.state.tasks.get(task_id).is_some_and(|record| {
+            record.generation == Some(generation) && !record.node.status.is_terminal()
+        })
+    }
+
+    async fn handle_cumulative_usage(&mut self, task_id: TaskId, generation: u64, next: TaskUsage) {
+        if !self.generation_is_current(&task_id, generation) {
+            return;
+        }
+        let (previous, remaining, already_exhausted) = {
+            let record = &self.state.tasks[&task_id];
+            (
+                record.usage.clone(),
+                record.budget.remaining(),
+                record.budget_failure.is_some(),
+            )
+        };
+        if usage_regressed(&previous, &next) || already_exhausted {
+            return;
+        }
+        let (accepted, exhausted) = cap_cumulative_usage(&previous, next, &remaining);
+        if accepted != previous {
+            let record = self
+                .state
+                .tasks
+                .get_mut(&task_id)
+                .expect("usage target remains registered");
+            if record
+                .budget
+                .apply_cumulative_usage((&previous).into(), (&accepted).into())
+                .is_err()
+            {
+                return;
+            }
+            record.usage = accepted.clone();
+            self.commit_transition(
+                task_id.clone(),
+                TaskEventPayload::UsageUpdated { usage: accepted },
+            );
+        }
+        let Some(dimension) = exhausted else {
+            return;
+        };
+        let error = budget_exhausted_error(dimension);
+        self.state
+            .tasks
+            .get_mut(&task_id)
+            .expect("budget target remains registered")
+            .budget_failure = Some(error.clone());
+        self.commit_transition(task_id.clone(), TaskEventPayload::BudgetExhausted { error });
+        let descendants = self.state.descendants_including(&task_id);
+        for descendant in descendants {
+            self.request_cancel(descendant).await;
         }
     }
 
@@ -3540,6 +3887,73 @@ fn active_message_error(outcome: &ActiveMessageOutcome) -> TaskError {
         ),
         ActiveMessageOutcome::Accepted { .. } => unreachable!("accepted messages are not errors"),
     }
+}
+
+fn usage_regressed(previous: &TaskUsage, next: &TaskUsage) -> bool {
+    next.input_tokens < previous.input_tokens
+        || next.output_tokens < previous.output_tokens
+        || next.total_tokens < previous.total_tokens
+        || next.tool_calls < previous.tool_calls
+        || next.cost_micros < previous.cost_micros
+        || next.retries < previous.retries
+}
+
+fn min_budget(left: BudgetAmount, right: BudgetAmount) -> BudgetAmount {
+    BudgetAmount {
+        input_tokens: left.input_tokens.min(right.input_tokens),
+        output_tokens: left.output_tokens.min(right.output_tokens),
+        total_tokens: left.total_tokens.min(right.total_tokens),
+        tool_calls: left.tool_calls.min(right.tool_calls),
+        cost_micros: left.cost_micros.min(right.cost_micros),
+        wall_time_ms: left.wall_time_ms.min(right.wall_time_ms),
+        retries: left.retries.min(right.retries),
+        child_tasks: left.child_tasks.min(right.child_tasks),
+        worktrees: left.worktrees.min(right.worktrees),
+    }
+}
+
+fn cap_cumulative_usage(
+    previous: &TaskUsage,
+    next: TaskUsage,
+    remaining: &BudgetLimits,
+) -> (TaskUsage, Option<BudgetDimension>) {
+    let mut accepted = next;
+    let mut exhausted = None;
+    macro_rules! cap {
+        ($field:ident, $dimension:ident) => {
+            if let Some(remaining) = remaining.$field {
+                let maximum = previous.$field.saturating_add(remaining);
+                if accepted.$field > maximum {
+                    accepted.$field = maximum;
+                    if exhausted.is_none() {
+                        exhausted = Some(BudgetDimension::$dimension);
+                    }
+                }
+            }
+        };
+    }
+    cap!(input_tokens, InputTokens);
+    cap!(output_tokens, OutputTokens);
+    cap!(total_tokens, TotalTokens);
+    cap!(tool_calls, ToolCalls);
+    cap!(cost_micros, CostMicros);
+    cap!(retries, Retries);
+    (accepted, exhausted)
+}
+
+fn budget_exhausted_error(dimension: BudgetDimension) -> TaskError {
+    let code = match dimension {
+        BudgetDimension::InputTokens => TaskErrorCode::BudgetExceededInputTokens,
+        BudgetDimension::OutputTokens => TaskErrorCode::BudgetExceededOutputTokens,
+        BudgetDimension::TotalTokens => TaskErrorCode::BudgetExceededTotalTokens,
+        BudgetDimension::ToolCalls => TaskErrorCode::BudgetExceededToolCalls,
+        BudgetDimension::CostMicros => TaskErrorCode::BudgetExceededCostMicros,
+        BudgetDimension::Retries => TaskErrorCode::BudgetExceededRetries,
+        BudgetDimension::WallTimeMs | BudgetDimension::ChildTasks | BudgetDimension::Worktrees => {
+            TaskErrorCode::BudgetExceeded
+        }
+    };
+    TaskError::new(code, format!("task budget exhausted in {dimension}"))
 }
 
 fn truncate_utf8(value: &mut String, max_bytes: usize) -> OutputMetadata {

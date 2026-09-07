@@ -12,11 +12,15 @@ mod queue;
 mod runner;
 mod spawn;
 mod state;
+mod verification;
 
 pub use active_message::*;
 pub use admission::*;
 pub use cancel::*;
-pub use coordinator::{TaskCoordinator, spawn_task_coordinator};
+pub use coordinator::{
+    TaskCoordinator, spawn_task_coordinator, spawn_task_coordinator_with_verifier,
+};
 pub use protocol::*;
 pub use queue::*;
 pub use runner::*;
+pub use verification::*;

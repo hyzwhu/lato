@@ -33,6 +33,10 @@ pub(crate) struct RuntimeTaskRecord {
     pub(crate) enqueued_at: tokio::time::Instant,
     pub(crate) active_messages: ActiveMessageLifecycle,
     pub(crate) generation: Option<u64>,
+    pub(crate) verification_output: Option<crate::task::TaskRunOutput>,
+    pub(crate) verification_wait: Option<crate::task::VerificationWait>,
+    pub(crate) budget_failure: Option<lato_core::TaskError>,
+    pub(crate) budget_settled: bool,
 }
 
 #[derive(Default)]
@@ -90,6 +94,7 @@ impl CoordinatorState {
             has_parent_reservation: record.reservation.is_some(),
             event_sequence: record.last_event_sequence,
             cleanup_error: record.cleanup_error.clone(),
+            verification_wait: record.verification_wait.clone(),
             elapsed_ms: record
                 .enqueued_at
                 .elapsed()
@@ -234,6 +239,10 @@ mod tests {
             enqueued_at: tokio::time::Instant::now(),
             active_messages: ActiveMessageLifecycle::default(),
             generation: Some(1),
+            verification_output: None,
+            verification_wait: None,
+            budget_failure: None,
+            budget_settled: false,
         }
     }
 

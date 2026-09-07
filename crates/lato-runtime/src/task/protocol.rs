@@ -56,6 +56,7 @@ pub struct CoordinatorConfig {
     pub teardown_drain_timeout: Duration,
     pub queued_reap_interval: Duration,
     pub profile_validation_timeout: Duration,
+    pub verification_timeout: Duration,
     pub admission_behavior: LimitBehavior,
 }
 
@@ -89,6 +90,7 @@ impl Default for CoordinatorConfig {
             teardown_drain_timeout: Duration::from_secs(30),
             queued_reap_interval: Duration::from_millis(250),
             profile_validation_timeout: Duration::from_secs(5),
+            verification_timeout: Duration::from_secs(30),
             admission_behavior: LimitBehavior::Queue,
         }
     }
@@ -171,6 +173,10 @@ impl CoordinatorConfig {
             !self.profile_validation_timeout.is_zero(),
             "profile validation timeout must be positive"
         );
+        assert!(
+            !self.verification_timeout.is_zero(),
+            "verification timeout must be positive"
+        );
     }
 }
 
@@ -244,6 +250,7 @@ pub struct TaskSnapshot {
     pub has_parent_reservation: bool,
     pub event_sequence: u64,
     pub cleanup_error: Option<TaskError>,
+    pub verification_wait: Option<super::VerificationWait>,
     pub elapsed_ms: u64,
     pub progress: lato_core::TaskProgress,
     pub usage: TaskUsage,
@@ -413,6 +420,17 @@ pub enum TaskEventPayload {
     CancellationRequested,
     Finalizing,
     VerificationStarted,
+    VerificationPassed,
+    VerificationFailed {
+        error: TaskError,
+    },
+    VerificationWaitingForChild {
+        reviewer_task_id: TaskId,
+    },
+    VerificationWaitingForApproval {
+        approval_id: String,
+    },
+    VerificationResumed,
     Completed {
         result: TaskResult,
     },
@@ -539,6 +557,12 @@ pub(crate) enum TaskCommand {
         root_id: TaskId,
         caller: InspectCaller,
         closed: bool,
+        reply: oneshot::Sender<Result<(), TaskError>>,
+    },
+    ResumeVerification {
+        task_id: TaskId,
+        caller: InspectCaller,
+        resume: super::VerificationResume,
         reply: oneshot::Sender<Result<(), TaskError>>,
     },
     RegistryCounts {
@@ -702,6 +726,22 @@ impl TaskHandle {
 
     pub async fn open_spawn_admission(&self, root_id: TaskId) -> Result<(), TaskError> {
         self.set_spawn_admission(root_id, false).await
+    }
+
+    pub async fn resume_verification_admin(
+        &self,
+        task_id: TaskId,
+        resume: super::VerificationResume,
+    ) -> Result<(), TaskError> {
+        let (reply, response) = oneshot::channel();
+        self.send(TaskCommand::ResumeVerification {
+            task_id,
+            caller: InspectCaller::Admin,
+            resume,
+            reply,
+        })
+        .await?;
+        response.await.map_err(|_| coordinator_closed())?
     }
 
     pub async fn teardown_root_and_drain(
@@ -1024,6 +1064,26 @@ impl ScopedTaskHandle {
 
     pub async fn open_spawn_admission(&self) -> Result<(), TaskError> {
         self.set_spawn_admission(false).await
+    }
+
+    pub async fn resume_verification(
+        &self,
+        task_id: TaskId,
+        resume: super::VerificationResume,
+    ) -> Result<(), TaskError> {
+        let (reply, response) = oneshot::channel();
+        self.inner
+            .send(TaskCommand::ResumeVerification {
+                task_id,
+                caller: InspectCaller::Scoped {
+                    root_id: self.root_id.clone(),
+                    task_id: self.task_id.clone(),
+                },
+                resume,
+                reply,
+            })
+            .await?;
+        response.await.map_err(|_| coordinator_closed())?
     }
 
     pub async fn teardown_root_and_drain(&self) -> Result<CancelOutcome, TaskError> {

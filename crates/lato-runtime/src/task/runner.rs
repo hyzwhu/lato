@@ -94,29 +94,50 @@ pub struct TaskCompletion {
 pub(crate) enum RunnerEvent<C: TaskChildControl> {
     Started {
         task_id: TaskId,
+        generation: u64,
         started: StartedTask<C>,
         acknowledgement: oneshot::Sender<bool>,
     },
     Usage {
         task_id: TaskId,
+        generation: u64,
         usage: TaskUsage,
     },
     Progress {
         task_id: TaskId,
+        generation: u64,
         progress: TaskProgress,
     },
 }
 
-#[derive(Clone)]
 pub struct TaskReporter<C: TaskChildControl> {
     task_id: TaskId,
+    generation: u64,
     event_tx: mpsc::Sender<RunnerEvent<C>>,
+}
+
+impl<C: TaskChildControl> Clone for TaskReporter<C> {
+    fn clone(&self) -> Self {
+        Self {
+            task_id: self.task_id.clone(),
+            generation: self.generation,
+            event_tx: self.event_tx.clone(),
+        }
+    }
 }
 
 impl<C: TaskChildControl> TaskReporter<C> {
     #[allow(dead_code)]
-    pub(crate) fn new(task_id: TaskId, event_tx: mpsc::Sender<RunnerEvent<C>>) -> Self {
-        Self { task_id, event_tx }
+    pub(crate) fn new(
+        task_id: TaskId,
+        generation: u64,
+        event_tx: mpsc::Sender<RunnerEvent<C>>,
+    ) -> Self {
+        Self {
+            task_id,
+            generation,
+            event_tx,
+        }
     }
 
     pub async fn started(&self, started: StartedTask<C>) -> bool {
@@ -125,6 +146,7 @@ impl<C: TaskChildControl> TaskReporter<C> {
             .event_tx
             .send(RunnerEvent::Started {
                 task_id: self.task_id.clone(),
+                generation: self.generation,
                 started,
                 acknowledgement,
             })
@@ -140,6 +162,7 @@ impl<C: TaskChildControl> TaskReporter<C> {
         self.event_tx
             .send(RunnerEvent::Usage {
                 task_id: self.task_id.clone(),
+                generation: self.generation,
                 usage,
             })
             .await
@@ -150,6 +173,7 @@ impl<C: TaskChildControl> TaskReporter<C> {
         self.event_tx
             .send(RunnerEvent::Progress {
                 task_id: self.task_id.clone(),
+                generation: self.generation,
                 progress,
             })
             .await

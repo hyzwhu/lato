@@ -272,6 +272,18 @@ pub enum TaskErrorCode {
     BudgetReservation,
     #[serde(rename = "task.budget_exceeded")]
     BudgetExceeded,
+    #[serde(rename = "task.budget_exceeded.input_tokens")]
+    BudgetExceededInputTokens,
+    #[serde(rename = "task.budget_exceeded.output_tokens")]
+    BudgetExceededOutputTokens,
+    #[serde(rename = "task.budget_exceeded.total_tokens")]
+    BudgetExceededTotalTokens,
+    #[serde(rename = "task.budget_exceeded.tool_calls")]
+    BudgetExceededToolCalls,
+    #[serde(rename = "task.budget_exceeded.cost_micros")]
+    BudgetExceededCostMicros,
+    #[serde(rename = "task.budget_exceeded.retries")]
+    BudgetExceededRetries,
     #[serde(rename = "task.capability_expansion")]
     CapabilityExpansion,
     #[serde(rename = "task.invalid_profile")]
@@ -298,6 +310,8 @@ pub enum TaskErrorCode {
     ActiveMessageChannelClosed,
     #[serde(rename = "task.verification_failed")]
     VerificationFailed,
+    #[serde(rename = "task.verification.schema_unsupported")]
+    VerificationSchemaUnsupported,
     #[serde(rename = "task.verification_pending")]
     VerificationPending,
     #[serde(rename = "task.cancelled")]
@@ -326,6 +340,12 @@ impl TaskErrorCode {
             Self::RetentionLimit => "task.limit.retention",
             Self::BudgetReservation => "task.budget_reservation",
             Self::BudgetExceeded => "task.budget_exceeded",
+            Self::BudgetExceededInputTokens => "task.budget_exceeded.input_tokens",
+            Self::BudgetExceededOutputTokens => "task.budget_exceeded.output_tokens",
+            Self::BudgetExceededTotalTokens => "task.budget_exceeded.total_tokens",
+            Self::BudgetExceededToolCalls => "task.budget_exceeded.tool_calls",
+            Self::BudgetExceededCostMicros => "task.budget_exceeded.cost_micros",
+            Self::BudgetExceededRetries => "task.budget_exceeded.retries",
             Self::CapabilityExpansion => "task.capability_expansion",
             Self::InvalidProfile => "task.invalid_profile",
             Self::SpawnAdmissionClosed => "task.spawn_admission_closed",
@@ -339,6 +359,7 @@ impl TaskErrorCode {
             Self::ActiveMessageUnsupported => "task.active_message_unsupported",
             Self::ActiveMessageChannelClosed => "task.active_message_channel_closed",
             Self::VerificationFailed => "task.verification_failed",
+            Self::VerificationSchemaUnsupported => "task.verification.schema_unsupported",
             Self::VerificationPending => "task.verification_pending",
             Self::Cancelled => "task.cancelled",
             Self::TimedOut => "task.timed_out",
@@ -368,6 +389,12 @@ impl TaskErrorCode {
             | Self::RetentionLimit
             | Self::BudgetReservation
             | Self::BudgetExceeded
+            | Self::BudgetExceededInputTokens
+            | Self::BudgetExceededOutputTokens
+            | Self::BudgetExceededTotalTokens
+            | Self::BudgetExceededToolCalls
+            | Self::BudgetExceededCostMicros
+            | Self::BudgetExceededRetries
             | Self::CapabilityExpansion
             | Self::InvalidProfile
             | Self::SpawnAdmissionClosed
@@ -376,6 +403,7 @@ impl TaskErrorCode {
             | Self::ActiveMessageInactive
             | Self::ActiveMessageUnsupported
             | Self::VerificationFailed
+            | Self::VerificationSchemaUnsupported
             | Self::Cancelled
             | Self::TimedOut
             | Self::CoordinatorClosed => Retryability::Never,

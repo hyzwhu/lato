@@ -354,6 +354,10 @@ mod tests {
             enqueued_at: tokio::time::Instant::now(),
             active_messages: Default::default(),
             generation: Some(1),
+            verification_output: None,
+            verification_wait: None,
+            budget_failure: None,
+            budget_settled: false,
         }
     }
 

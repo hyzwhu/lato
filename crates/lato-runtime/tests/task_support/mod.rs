@@ -102,6 +102,7 @@ pub struct GatedTaskRunner {
     started: Mutex<Vec<TaskId>>,
     gates: Mutex<HashMap<TaskId, Arc<Notify>>>,
     finish_gates: Mutex<HashMap<TaskId, Arc<Notify>>>,
+    reporters: Mutex<HashMap<TaskId, TaskReporter<ControlledTaskControl>>>,
     changed: Notify,
     active_runs: Arc<AtomicUsize>,
     completion_callbacks: AtomicUsize,
@@ -134,6 +135,7 @@ impl GatedTaskRunner {
             started: Mutex::new(Vec::new()),
             gates: Mutex::new(HashMap::new()),
             finish_gates: Mutex::new(HashMap::new()),
+            reporters: Mutex::new(HashMap::new()),
             changed: Notify::new(),
             active_runs: Arc::new(AtomicUsize::new(0)),
             completion_callbacks: AtomicUsize::new(0),
@@ -227,6 +229,25 @@ impl GatedTaskRunner {
         }
     }
 
+    pub async fn report_usage(&self, task_id: &str, usage: lato_core::TaskUsage) -> bool {
+        self.reporters
+            .lock()
+            .await
+            .get(&TaskId::from(task_id))
+            .expect("task reporter is available after runner entry")
+            .report_usage(usage)
+            .await
+    }
+
+    pub async fn reporter(&self, task_id: &str) -> TaskReporter<ControlledTaskControl> {
+        self.reporters
+            .lock()
+            .await
+            .get(&TaskId::from(task_id))
+            .expect("task reporter is available after runner entry")
+            .clone()
+    }
+
     pub fn active_runs(&self) -> usize {
         self.active_runs.load(Ordering::Acquire)
     }
@@ -312,6 +333,10 @@ impl TaskRunner for GatedTaskRunner {
             .lock()
             .await
             .insert(task_id.clone(), finish_gate.clone());
+        self.reporters
+            .lock()
+            .await
+            .insert(task_id.clone(), reporter.clone());
         self.entered.lock().await.insert(task_id.clone());
         self.changed.notify_waiters();
         if self.pause_before_start {
