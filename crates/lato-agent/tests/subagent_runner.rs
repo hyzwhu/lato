@@ -2,13 +2,14 @@ use lato_agent::{
     BuiltinProfileName, ChildSessionConfig, ContextPackageBuilder, ContextPackageLimits,
     ContextReference, HistoryItem, RuntimeSession, default_fake_stream,
 };
+use lato_ai::{FakeModelStream, StreamPiece};
 use lato_core::{
     AgentProfile, BudgetAmount, BudgetLimits, ResultContract, SessionId, TaskId, TaskOwner,
     TaskScope, ToolCapability, TurnId, VerificationPolicy, WorkspaceIntent,
 };
 use lato_runtime::{
     CoordinatorConfig, NoopTaskEventSink, SpawnMode, SpawnTaskRequest, TaskRootRequest,
-    WaitOutcome, spawn_subagent_coordinator,
+    WaitOutcome, spawn_subagent_coordinator_with_verifier,
 };
 use lato_tools::{BuiltinToolEnvironment, builtin_tool_runtime};
 use lato_workspace::{FileLocks, SessionTrust};
@@ -133,7 +134,18 @@ async fn real_runner_executes_a_child_runtime_and_returns_to_coordinator() {
     let trust = SessionTrust::for_headless_prompt(repo.path());
     let (updates, _updates_rx) = mpsc::unbounded_channel();
     let runner = Arc::new(lato_agent::ChildSessionRunner::new(
-        default_fake_stream(),
+        Arc::new(FakeModelStream::new(vec![vec![StreamPiece::Text(
+            serde_json::json!({
+                "answer": "README exists",
+                "evidence": [{
+                    "id": "readme",
+                    "summary": "repository readme",
+                    "location": "README.md"
+                }],
+                "citations": ["readme"]
+            })
+            .to_string(),
+        )]])),
         locks,
         trust,
         updates,
@@ -146,10 +158,11 @@ async fn real_runner_executes_a_child_runtime_and_returns_to_coordinator() {
         )
         .unwrap(),
     );
-    let (handle, actor) = spawn_subagent_coordinator(
+    let (handle, actor) = spawn_subagent_coordinator_with_verifier(
         CoordinatorConfig::default(),
         runner,
         allocator,
+        Arc::new(lato_agent::ProfileResultVerifier),
         Arc::new(NoopTaskEventSink),
     );
     let root = handle
@@ -198,9 +211,80 @@ async fn real_runner_executes_a_child_runtime_and_returns_to_coordinator() {
     let WaitOutcome::Finished(snapshot) = outcome else {
         panic!("child task did not finish: {outcome:?}");
     };
-    assert_eq!(snapshot.result.unwrap().output, "hi");
+    assert_eq!(snapshot.node.status, lato_core::TaskStatus::Completed);
+    assert!(snapshot.result.unwrap().output.contains("README exists"));
     handle.shutdown().await.unwrap();
     actor.await.unwrap();
+}
+
+#[tokio::test]
+async fn profile_verifier_accepts_structured_outputs_and_rejects_escaped_paths() {
+    use lato_runtime::{TaskVerifier, VerificationOutcome, VerificationRequest};
+
+    let worker = lato_agent::WorkerOutput {
+        summary: "implemented".into(),
+        changed_files: vec!["src/lib.rs".into()],
+        tests: vec![lato_agent::WorkerTestResult {
+            command: "cargo test".into(),
+            passed: true,
+            summary: "passed".into(),
+        }],
+        artifacts: Vec::new(),
+    };
+    let request = verification_request(
+        AgentProfile::worker(),
+        serde_json::to_string(&worker).unwrap(),
+    );
+    assert_eq!(
+        lato_agent::ProfileResultVerifier.verify(request).await,
+        VerificationOutcome::Passed
+    );
+
+    let escaped = lato_agent::WorkerOutput {
+        changed_files: vec!["../outside".into()],
+        ..worker
+    };
+    let outcome = lato_agent::ProfileResultVerifier
+        .verify(verification_request(
+            AgentProfile::worker(),
+            serde_json::to_string(&escaped).unwrap(),
+        ))
+        .await;
+    assert!(matches!(outcome, VerificationOutcome::Failed(_)));
+
+    fn verification_request(profile: AgentProfile, output: String) -> VerificationRequest {
+        VerificationRequest {
+            node: lato_core::TaskNode {
+                id: TaskId::from("verify"),
+                parent_id: Some(TaskId::from("root")),
+                root_id: TaskId::from("root"),
+                owner: TaskOwner::Interactive {
+                    session_id: SessionId::from("session"),
+                    turn_id: TurnId::from("turn"),
+                },
+                profile: profile.clone(),
+                scope: TaskScope {
+                    objective: "verify".into(),
+                    context_refs: Vec::new(),
+                },
+                status: lato_core::TaskStatus::Verifying,
+                permissions: profile.capabilities.clone(),
+                workspace_intent: profile.workspace,
+                result_contract: ResultContract {
+                    schema: None,
+                    max_output_bytes: 4_096,
+                },
+            },
+            result: lato_core::TaskResult {
+                success: true,
+                output,
+                error: None,
+                usage: Default::default(),
+                duration_ms: 0,
+                output_ref: None,
+            },
+        }
+    }
 }
 
 fn run_git(cwd: &std::path::Path, args: &[&str]) {
