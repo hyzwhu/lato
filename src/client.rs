@@ -238,9 +238,11 @@ pub async fn run_prompt_over_acp_with_stream(
     trust: SessionTrust,
     text: String,
     stream: Arc<dyn ModelStream>,
+    plugin_dirs: Vec<std::path::PathBuf>,
 ) -> Result<String, String> {
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-    let mut host = AcpHost::new_with_home(cwd, trust, tx, stream, lato_home);
+    let mut host =
+        AcpHost::new_with_home_and_plugin_dirs(cwd, trust, tx, stream, lato_home, plugin_dirs);
     let _ = host
         .handle(req(1, "initialize", serde_json::json!({})))
         .await;
@@ -287,9 +289,18 @@ impl InteractiveAcpClient {
         trust: SessionTrust,
         stream: Arc<dyn ModelStream>,
         approval: Option<Arc<dyn ToolApproval>>,
+        plugin_dirs: Vec<std::path::PathBuf>,
     ) -> Result<Self, String> {
-        Self::initialize_with_approval(cwd, lato_home, trust, stream, approval, SessionStart::New)
-            .await
+        Self::initialize_with_approval(
+            cwd,
+            lato_home,
+            trust,
+            stream,
+            approval,
+            plugin_dirs,
+            SessionStart::New,
+        )
+        .await
     }
 
     pub async fn resume_session_with_approval(
@@ -299,6 +310,7 @@ impl InteractiveAcpClient {
         stream: Arc<dyn ModelStream>,
         approval: Option<Arc<dyn ToolApproval>>,
         session_id: String,
+        plugin_dirs: Vec<std::path::PathBuf>,
     ) -> Result<Self, String> {
         Self::initialize_with_approval(
             cwd,
@@ -306,6 +318,7 @@ impl InteractiveAcpClient {
             trust,
             stream,
             approval,
+            plugin_dirs,
             SessionStart::Resume(session_id),
         )
         .await
@@ -317,11 +330,19 @@ impl InteractiveAcpClient {
         trust: SessionTrust,
         stream: Arc<dyn ModelStream>,
         approval: Option<Arc<dyn ToolApproval>>,
+        plugin_dirs: Vec<std::path::PathBuf>,
         start: SessionStart,
     ) -> Result<Self, String> {
         let (tx, updates) = tokio::sync::mpsc::unbounded_channel();
-        let mut host =
-            AcpHost::new_with_approval_and_home(cwd, trust, tx, stream, approval, lato_home);
+        let mut host = AcpHost::new_with_approval_home_and_plugin_dirs(
+            cwd,
+            trust,
+            tx,
+            stream,
+            approval,
+            lato_home,
+            plugin_dirs,
+        );
         let _ = host
             .handle(req(1, "initialize", serde_json::json!({})))
             .await;
@@ -755,6 +776,7 @@ mod tests {
             trust,
             default_fake_stream(),
             None,
+            Vec::new(),
         )
         .await
         .unwrap();
@@ -818,6 +840,7 @@ mod tests {
             trust,
             switchable.clone(),
             None,
+            Vec::new(),
         )
         .await
         .unwrap();

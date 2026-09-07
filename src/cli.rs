@@ -169,26 +169,101 @@ fn requested_local_facts(input: &str) -> Vec<LocalFact> {
 }
 
 pub async fn run(args: Vec<String>) -> i32 {
-    match crate::args::parse(args) {
-        Ok(Invocation::InteractiveNew { language, sandbox }) => {
-            interactive(InteractiveStartup::New, language, sandbox).await
-        }
-        Ok(Invocation::Prompt(args)) => prompt(args).await,
-        Ok(Invocation::Sessions(command)) => crate::sessions::run(command).await,
-        Ok(Invocation::Resume {
-            session_id,
-            language,
-            sandbox,
-        }) => interactive(InteractiveStartup::Resume(session_id), language, sandbox).await,
-        Ok(Invocation::Login { provider, method }) => login(provider, method).await,
-        Ok(Invocation::Doctor(args)) => doctor_cmd(args).await,
-        Ok(Invocation::Acp) => crate::stdio::run().await,
+    let invocation = match crate::args::parse(args) {
+        Ok(invocation) => match canonicalize_invocation_plugin_dirs(invocation) {
+            Ok(invocation) => invocation,
+            Err(error) => {
+                eprintln!("error: {error}");
+                return 2;
+            }
+        },
         Err(error) => {
             let code = error.exit_code();
             let _ = error.print();
-            code
+            return code;
+        }
+    };
+    match invocation {
+        Invocation::InteractiveNew {
+            language,
+            sandbox,
+            plugin_dirs,
+        } => interactive(InteractiveStartup::New, language, sandbox, plugin_dirs).await,
+        Invocation::Prompt(args) => prompt(args).await,
+        Invocation::Sessions(command) => crate::sessions::run(command).await,
+        Invocation::Resume {
+            session_id,
+            language,
+            sandbox,
+            plugin_dirs,
+        } => {
+            interactive(
+                InteractiveStartup::Resume(session_id),
+                language,
+                sandbox,
+                plugin_dirs,
+            )
+            .await
+        }
+        Invocation::Login { provider, method } => login(provider, method).await,
+        Invocation::Doctor(args) => doctor_cmd(args).await,
+        Invocation::Acp { plugin_dirs } => crate::stdio::run(plugin_dirs).await,
+    }
+}
+
+fn canonicalize_invocation_plugin_dirs(invocation: Invocation) -> Result<Invocation, String> {
+    Ok(match invocation {
+        Invocation::InteractiveNew {
+            language,
+            sandbox,
+            plugin_dirs,
+        } => Invocation::InteractiveNew {
+            language,
+            sandbox,
+            plugin_dirs: canonicalize_plugin_dirs(plugin_dirs)?,
+        },
+        Invocation::Prompt(mut args) => {
+            args.plugin_dirs = canonicalize_plugin_dirs(args.plugin_dirs)?;
+            Invocation::Prompt(args)
+        }
+        Invocation::Resume {
+            session_id,
+            language,
+            sandbox,
+            plugin_dirs,
+        } => Invocation::Resume {
+            session_id,
+            language,
+            sandbox,
+            plugin_dirs: canonicalize_plugin_dirs(plugin_dirs)?,
+        },
+        Invocation::Acp { plugin_dirs } => Invocation::Acp {
+            plugin_dirs: canonicalize_plugin_dirs(plugin_dirs)?,
+        },
+        other => other,
+    })
+}
+
+fn canonicalize_plugin_dirs(plugin_dirs: Vec<PathBuf>) -> Result<Vec<PathBuf>, String> {
+    let mut canonical = Vec::with_capacity(plugin_dirs.len());
+    for plugin_dir in plugin_dirs {
+        if !plugin_dir.is_dir() {
+            return Err(format!(
+                "plugin directory not found: {}",
+                plugin_dir.display()
+            ));
+        }
+        let resolved = plugin_dir.canonicalize().map_err(|error| {
+            format!(
+                "cannot resolve plugin directory {}: {error}",
+                plugin_dir.display()
+            )
+        })?;
+        if !canonical.contains(&resolved) {
+            canonical.push(resolved);
         }
     }
+    Ok(canonical)
 }
 
 struct CatalogLiveProbe;
@@ -282,7 +357,16 @@ async fn prompt(args: PromptArgs) -> i32 {
     } else {
         default_fake_stream()
     };
-    match crate::client::run_prompt_over_acp_with_stream(cwd, home, trust, text, stream).await {
+    match crate::client::run_prompt_over_acp_with_stream(
+        cwd,
+        home,
+        trust,
+        text,
+        stream,
+        args.plugin_dirs,
+    )
+    .await
+    {
         Ok(s) => {
             println!("{s}");
             0
@@ -303,6 +387,7 @@ async fn interactive(
     startup: InteractiveStartup,
     language_override: Option<Language>,
     sandbox_override: Option<SandboxArg>,
+    plugin_dirs: Vec<PathBuf>,
 ) -> i32 {
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         let message = match startup {
@@ -408,6 +493,7 @@ async fn interactive(
                             trust.clone(),
                             stream.clone(),
                             inline_approval,
+                            plugin_dirs.clone(),
                         )
                         .await?
                     }
@@ -419,6 +505,7 @@ async fn interactive(
                             stream.clone(),
                             inline_approval,
                             id.clone(),
+                            plugin_dirs.clone(),
                         )
                         .await?
                     }

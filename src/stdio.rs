@@ -3,7 +3,7 @@ use lato_protocol::JsonRpcReq;
 use lato_workspace::SessionTrust;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-pub async fn run() -> i32 {
+pub async fn run(plugin_dirs: Vec<std::path::PathBuf>) -> i32 {
     let cwd = match std::env::current_dir() {
         Ok(v) => v,
         Err(e) => {
@@ -13,12 +13,13 @@ pub async fn run() -> i32 {
     };
     let trust = SessionTrust::for_interactive(&cwd, true);
     let (updates_tx, mut updates_rx) = tokio::sync::mpsc::unbounded_channel();
-    let mut host = AcpHost::new_with_home(
+    let mut host = AcpHost::new_with_home_and_plugin_dirs(
         cwd,
         trust,
         updates_tx,
         default_fake_stream(),
         crate::cli::lato_home(),
+        plugin_dirs,
     );
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     let mut stdout = tokio::io::stdout();

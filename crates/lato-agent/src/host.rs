@@ -80,7 +80,26 @@ impl AcpHost {
         stream: Arc<dyn ModelStream>,
         lato_home: PathBuf,
     ) -> Self {
-        Self::build(cwd, trust, updates, stream, None, Some(lato_home))
+        Self::new_with_home_and_plugin_dirs(cwd, trust, updates, stream, lato_home, Vec::new())
+    }
+
+    pub fn new_with_home_and_plugin_dirs(
+        cwd: PathBuf,
+        trust: SessionTrust,
+        updates: tokio::sync::mpsc::UnboundedSender<serde_json::Value>,
+        stream: Arc<dyn ModelStream>,
+        lato_home: PathBuf,
+        cli_plugin_dirs: Vec<PathBuf>,
+    ) -> Self {
+        Self::build(
+            cwd,
+            trust,
+            updates,
+            stream,
+            None,
+            Some(lato_home),
+            cli_plugin_dirs,
+        )
     }
 
     pub fn new_with_approval(
@@ -91,7 +110,15 @@ impl AcpHost {
         tool_approval: Option<Arc<dyn ToolApproval>>,
     ) -> Self {
         let lato_home = std::env::var_os("LATO_HOME").map(PathBuf::from);
-        Self::build(cwd, trust, updates, stream, tool_approval, lato_home)
+        Self::build(
+            cwd,
+            trust,
+            updates,
+            stream,
+            tool_approval,
+            lato_home,
+            Vec::new(),
+        )
     }
 
     pub fn new_with_approval_and_home(
@@ -102,7 +129,35 @@ impl AcpHost {
         tool_approval: Option<Arc<dyn ToolApproval>>,
         lato_home: PathBuf,
     ) -> Self {
-        Self::build(cwd, trust, updates, stream, tool_approval, Some(lato_home))
+        Self::new_with_approval_home_and_plugin_dirs(
+            cwd,
+            trust,
+            updates,
+            stream,
+            tool_approval,
+            lato_home,
+            Vec::new(),
+        )
+    }
+
+    pub fn new_with_approval_home_and_plugin_dirs(
+        cwd: PathBuf,
+        trust: SessionTrust,
+        updates: tokio::sync::mpsc::UnboundedSender<serde_json::Value>,
+        stream: Arc<dyn ModelStream>,
+        tool_approval: Option<Arc<dyn ToolApproval>>,
+        lato_home: PathBuf,
+        cli_plugin_dirs: Vec<PathBuf>,
+    ) -> Self {
+        Self::build(
+            cwd,
+            trust,
+            updates,
+            stream,
+            tool_approval,
+            Some(lato_home),
+            cli_plugin_dirs,
+        )
     }
 
     fn build(
@@ -112,6 +167,7 @@ impl AcpHost {
         stream: Arc<dyn ModelStream>,
         tool_approval: Option<Arc<dyn ToolApproval>>,
         lato_home: Option<PathBuf>,
+        cli_plugin_dirs: Vec<PathBuf>,
     ) -> Self {
         let default_endpoint = if let Some(port) = stream.active_model_port() {
             ActiveModelStream { stream, port }
@@ -142,7 +198,6 @@ impl AcpHost {
             .unwrap_or_default();
         let lato_home_path = lato_home.clone().unwrap_or_default();
         let plugin_config = load_plugin_config(lato_home.as_deref());
-        let cli_plugin_dirs = Vec::new();
         let initial_discovery = discover_plugins(&DiscoveryConfig {
             cwd: cwd.clone(),
             lato_home: lato_home_path.clone(),

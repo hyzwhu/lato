@@ -1,5 +1,6 @@
 use crate::tui::i18n::Language;
 use clap::{ArgAction, ArgGroup, CommandFactory, Parser, Subcommand, ValueEnum, error::ErrorKind};
+use std::path::PathBuf;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub enum SandboxArg {
@@ -14,6 +15,7 @@ pub struct PromptArgs {
     pub ask: bool,
     pub sandbox: SandboxArg,
     pub model: Option<String>,
+    pub plugin_dirs: Vec<PathBuf>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -34,6 +36,7 @@ pub enum Invocation {
     InteractiveNew {
         language: Option<Language>,
         sandbox: Option<SandboxArg>,
+        plugin_dirs: Vec<PathBuf>,
     },
     Prompt(PromptArgs),
     Sessions(SessionCommand),
@@ -41,13 +44,16 @@ pub enum Invocation {
         session_id: String,
         language: Option<Language>,
         sandbox: Option<SandboxArg>,
+        plugin_dirs: Vec<PathBuf>,
     },
     Login {
         provider: String,
         method: LoginMethod,
     },
     Doctor(DoctorArgs),
-    Acp,
+    Acp {
+        plugin_dirs: Vec<PathBuf>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -84,6 +90,15 @@ struct Cli {
     /// Model selection in provider/model form
     #[arg(long)]
     model: Option<String>,
+
+    /// Load a trusted plugin root for this process; may be repeated
+    #[arg(
+        long = "plugin-dir",
+        global = true,
+        value_name = "PATH",
+        action = ArgAction::Append
+    )]
+    plugin_dirs: Vec<PathBuf>,
 
     /// Prompt text; multiple words are joined with spaces
     #[arg(value_name = "TEXT", num_args = 0..)]
@@ -172,6 +187,14 @@ impl Cli {
                     "--sandbox is only available in interactive mode, resume, or -p",
                 ));
             }
+            if !self.plugin_dirs.is_empty()
+                && !matches!(&command, Command::Resume { .. } | Command::Acp)
+            {
+                return Err(semantic_error(
+                    ErrorKind::ArgumentConflict,
+                    "--plugin-dir is only available in interactive mode, resume, -p, or acp",
+                ));
+            }
             return Ok(match command {
                 Command::Sessions { json, action } => {
                     if json && action.is_some() {
@@ -197,6 +220,7 @@ impl Cli {
                     session_id,
                     language: self.language,
                     sandbox: self.sandbox,
+                    plugin_dirs: self.plugin_dirs,
                 },
                 Command::Login {
                     provider,
@@ -214,7 +238,9 @@ impl Cli {
                 Command::Doctor { json, strict, live } => {
                     Invocation::Doctor(DoctorArgs { json, strict, live })
                 }
-                Command::Acp => Invocation::Acp,
+                Command::Acp => Invocation::Acp {
+                    plugin_dirs: self.plugin_dirs,
+                },
             });
         }
 
@@ -236,6 +262,7 @@ impl Cli {
                 ask: self.ask,
                 sandbox: self.sandbox.unwrap_or(SandboxArg::Off),
                 model: self.model,
+                plugin_dirs: self.plugin_dirs,
             }));
         }
 
@@ -248,6 +275,7 @@ impl Cli {
         Ok(Invocation::InteractiveNew {
             language: self.language,
             sandbox: self.sandbox,
+            plugin_dirs: self.plugin_dirs,
         })
     }
 }
@@ -262,7 +290,7 @@ pub fn parse(args: Vec<String>) -> Result<Invocation, clap::Error> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Invocation, LoginMethod, SandboxArg, SessionCommand, parse};
+    use super::{Invocation, LoginMethod, PathBuf, PromptArgs, SandboxArg, SessionCommand, parse};
     use crate::tui::i18n::Language;
     use clap::error::ErrorKind;
 
@@ -340,7 +368,8 @@ mod tests {
                 parse(vec!["--sandbox".into(), name.into()]).unwrap(),
                 Invocation::InteractiveNew {
                     language: None,
-                    sandbox: Some(profile)
+                    sandbox: Some(profile),
+                    plugin_dirs: vec![],
                 }
             );
             for args in [
@@ -352,7 +381,8 @@ mod tests {
                     Invocation::Resume {
                         session_id: "session-1".into(),
                         language: None,
-                        sandbox: Some(profile)
+                        sandbox: Some(profile),
+                        plugin_dirs: vec![],
                     }
                 );
             }
@@ -361,7 +391,8 @@ mod tests {
             parse(vec![]).unwrap(),
             Invocation::InteractiveNew {
                 language: None,
-                sandbox: None
+                sandbox: None,
+                plugin_dirs: vec![],
             }
         );
         assert!(matches!(
@@ -480,6 +511,31 @@ mod tests {
                 language: Some(Language::En),
                 ..
             })
+        ));
+    }
+
+    #[test]
+    fn parses_repeatable_plugin_dirs_for_host_modes() {
+        let dirs = vec![PathBuf::from("first"), PathBuf::from("second")];
+        assert!(matches!(
+            parse(vec![
+                "acp".into(),
+                "--plugin-dir".into(),
+                "first".into(),
+                "--plugin-dir".into(),
+                "second".into(),
+            ]),
+            Ok(Invocation::Acp { plugin_dirs }) if plugin_dirs == dirs
+        ));
+        assert!(matches!(
+            parse(vec![
+                "--plugin-dir".into(),
+                "first".into(),
+                "-p".into(),
+                "hello".into(),
+            ]),
+            Ok(Invocation::Prompt(PromptArgs { plugin_dirs, .. }))
+                if plugin_dirs == vec![PathBuf::from("first")]
         ));
     }
 

@@ -1006,6 +1006,7 @@ mod tests {
             trust.clone(),
             lato_agent::default_fake_stream(),
             None,
+            Vec::new(),
         )
         .await
         .unwrap();
