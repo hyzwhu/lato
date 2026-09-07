@@ -20,7 +20,8 @@ pub use admission::*;
 pub use backend::*;
 pub use cancel::*;
 pub use coordinator::{
-    TaskCoordinator, spawn_task_coordinator, spawn_task_coordinator_with_verifier,
+    TaskCoordinator, spawn_subagent_coordinator, spawn_subagent_coordinator_with_verifier,
+    spawn_task_coordinator, spawn_task_coordinator_with_verifier,
 };
 pub use protocol::*;
 pub use queue::*;
