@@ -47,6 +47,7 @@ pub struct AcpHost {
     tool_approval: Option<Arc<dyn ToolApproval>>,
     task_handle: TaskHandle,
     task_backends: HashMap<String, ChannelBackend>,
+    next_task_root: u64,
     _task_actor: tokio::task::JoinHandle<()>,
     _task_events: tokio::task::JoinHandle<()>,
     _worktree_recovery: Option<tokio::task::JoinHandle<()>>,
@@ -190,6 +191,9 @@ impl AcpHost {
             loop {
                 match task_events.recv().await {
                     Ok(event) => {
+                        if event.parent_id.is_none() {
+                            continue;
+                        }
                         let _ = task_updates.send(serde_json::json!({
                             "jsonrpc": "2.0",
                             "method": "lato/task/event",
@@ -218,6 +222,7 @@ impl AcpHost {
             tool_approval,
             task_handle,
             task_backends: HashMap::new(),
+            next_task_root: 1,
             _task_actor: task_actor,
             _task_events: task_event_relay,
             _worktree_recovery: worktree_recovery,
@@ -228,7 +233,9 @@ impl AcpHost {
         if let Some(backend) = self.task_backends.get(session_id) {
             return Ok(backend.clone());
         }
-        let root_id = TaskId::from(format!("task-root-{session_id}"));
+        let root_sequence = self.next_task_root;
+        self.next_task_root = self.next_task_root.saturating_add(1);
+        let root_id = TaskId::from(format!("task-root-{session_id}-{root_sequence}"));
         let root = self
             .task_handle
             .register_root(TaskRootRequest {
