@@ -1,5 +1,8 @@
 // Derived from: Grok Build@bb7f39d5858cbf5e00de639367f59debbdcb0138:crates/codegen/xai-grok-tools/src/implementations/skills/skill.rs
 // Derived from: Grok Build@bb7f39d5858cbf5e00de639367f59debbdcb0138:crates/codegen/xai-grok-workspace/src/permission/rules.rs
+// Derived from: Grok Build@bb7f39d5858cbf5e00de639367f59debbdcb0138:crates/codegen/xai-grok-workspace/src/permission/policy.rs
+// Derived from: Grok Build@bb7f39d5858cbf5e00de639367f59debbdcb0138:crates/codegen/xai-grok-paths/src/lib.rs
+// Derived from: Grok Build@bb7f39d5858cbf5e00de639367f59debbdcb0138:crates/codegen/xai-grok-tools/src/implementations/grok_build/web_fetch/domain.rs
 // License: Apache-2.0
 // Lato changes: generic resolver boundary, bounded metadata, and immutable runtime scope compilation
 
@@ -9,11 +12,14 @@ use lato_core::{
     Retryability, SideEffect, Tool, ToolCancellation, ToolCapability, ToolConcurrency, ToolContext,
     ToolDescriptor, ToolError, ToolIdempotency, ToolLayer, ToolName, ToolOutput, ToolSource,
 };
-use regex::Regex;
 use semver::Version;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::HashSet,
+    path::{Component, Path, PathBuf},
+    sync::Arc,
+};
 
 const MAX_QUALIFIED_NAME_BYTES: usize = 129;
 const MAX_ALLOWED_TOOL_SPECS: usize = 128;
@@ -152,8 +158,19 @@ pub struct SkillToolScope {
 #[derive(Clone, Debug)]
 struct AllowedToolRule {
     wire_names: HashSet<String>,
-    argument_pattern: Option<Regex>,
+    argument_matcher: Option<ArgumentMatcher>,
     argument_field: Option<&'static str>,
+}
+
+#[derive(Clone, Debug)]
+enum ArgumentMatcher {
+    Bash {
+        pattern: String,
+        glob: glob::Pattern,
+    },
+    Path(glob::Pattern),
+    Domain(String),
+    Freeform(glob::Pattern),
 }
 
 impl SkillToolScope {
@@ -162,15 +179,27 @@ impl SkillToolScope {
             return Ok(Self {
                 rules: vec![AllowedToolRule {
                     wire_names: runtime.registered_local_names().into_iter().collect(),
-                    argument_pattern: None,
+                    argument_matcher: None,
                     argument_field: None,
                 }],
             });
         }
+        if specs.len() > MAX_ALLOWED_TOOL_SPECS {
+            return Err(tool_error(
+                "skill.invalid_allowed_tool",
+                "allowed-tools exceeds 128 entries",
+            ));
+        }
         let mut rules = Vec::new();
-        for spec in specs.iter().take(MAX_ALLOWED_TOOL_SPECS) {
-            if spec.is_empty() || spec.len() > MAX_ALLOWED_TOOL_SPEC_BYTES {
+        for spec in specs {
+            if spec.is_empty() {
                 continue;
+            }
+            if spec.len() > MAX_ALLOWED_TOOL_SPEC_BYTES {
+                return Err(tool_error(
+                    "skill.invalid_allowed_tool",
+                    "allowed-tools entry exceeds 128 bytes",
+                ));
             }
             for alternative in split_top_level_alternatives(spec) {
                 compile_rule(alternative.trim(), runtime, &mut rules)?;
@@ -184,13 +213,13 @@ impl SkillToolScope {
         self.rules.iter().any(|rule| rule.wire_names.contains(name))
     }
 
-    pub fn allows_call(&self, wire_name: &str, arguments: &Value) -> bool {
+    pub fn allows_call(&self, wire_name: &str, arguments: &Value, cwd: &Path) -> bool {
         let name = normalized_scope_name(wire_name);
         self.rules.iter().any(|rule| {
             if !rule.wire_names.contains(name) {
                 return false;
             }
-            let Some(pattern) = &rule.argument_pattern else {
+            let Some(matcher) = &rule.argument_matcher else {
                 return true;
             };
             let candidate = rule
@@ -199,16 +228,32 @@ impl SkillToolScope {
                 .and_then(Value::as_str)
                 .map(str::to_owned)
                 .or_else(|| serde_json::to_string(arguments).ok());
-            candidate.is_some_and(|candidate| {
-                let candidate = if rule.argument_field == Some("command") {
-                    candidate.trim_start()
-                } else {
-                    candidate.as_str()
-                };
-                pattern.is_match(candidate)
-            })
+            candidate.is_some_and(|candidate| matcher.matches(&candidate, cwd))
         })
     }
+}
+
+impl ArgumentMatcher {
+    fn matches(&self, candidate: &str, cwd: &Path) -> bool {
+        match self {
+            Self::Bash { pattern, glob } => {
+                let command = candidate.trim_start();
+                matches_command_prefix(command, pattern)
+                    || glob_matches(glob, command, MatchContext::Freeform)
+            }
+            Self::Path(pattern) => normalized_path_forms(candidate, cwd)
+                .iter()
+                .any(|path| glob_matches(pattern, path, MatchContext::Path)),
+            Self::Domain(pattern) => domain_matches(pattern, candidate),
+            Self::Freeform(pattern) => glob_matches(pattern, candidate, MatchContext::Freeform),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum MatchContext {
+    Path,
+    Freeform,
 }
 
 fn compile_rule(
@@ -219,39 +264,39 @@ fn compile_rule(
     if spec == "*" {
         out.push(AllowedToolRule {
             wire_names: runtime.registered_local_names().into_iter().collect(),
-            argument_pattern: None,
+            argument_matcher: None,
             argument_field: None,
         });
         return Ok(());
     }
 
-    let (name, pattern) = match spec.find('(') {
-        Some(open) if spec.ends_with(')') => (&spec[..open], Some(&spec[open + 1..spec.len() - 1])),
-        Some(_) => {
-            return Err(tool_error(
-                "skill.invalid_allowed_tool",
-                "malformed grouped tool rule",
-            ));
-        }
-        None => (spec, None),
-    };
+    let (name, pattern) = parse_grouped_rule(spec)?;
     let targets = compatible_tool_names(name.trim(), runtime);
     if targets.is_empty() {
         return Ok(());
     }
-    let (argument_pattern, argument_field) = match pattern.map(str::trim) {
+    let (argument_matcher, argument_field) = match pattern.as_deref().map(str::trim) {
         None | Some("") | Some("*") => (None, None),
         Some(pattern) => {
             let field = argument_field_for(name.trim(), &targets);
-            (
-                Some(compile_argument_pattern(pattern, field == Some("command"))?),
-                field,
-            )
+            let bash_empty = (matches!(name.trim(), "Bash" | "bash")
+                || targets.contains("run_terminal_command"))
+                && pattern
+                    .strip_suffix(":*")
+                    .is_some_and(|value| value.trim().is_empty());
+            if bash_empty {
+                (None, None)
+            } else {
+                (
+                    Some(compile_argument_matcher(name.trim(), &targets, pattern)?),
+                    field,
+                )
+            }
         }
     };
     out.push(AllowedToolRule {
         wire_names: targets,
-        argument_pattern,
+        argument_matcher,
         argument_field,
     });
     Ok(())
@@ -260,9 +305,8 @@ fn compile_rule(
 fn compatible_tool_names(name: &str, runtime: &ToolRuntime) -> HashSet<String> {
     let aliases: &[&str] = match name {
         "Bash" | "bash" => &["run_terminal_command"],
-        "Read" | "read" => &["read_file"],
-        "Write" => &["write_file"],
-        "Edit" => &["search_replace"],
+        "Read" | "read" => &["read_file", "list_dir", "grep"],
+        "Write" | "Edit" => &["write_file", "search_replace"],
         "Grep" => &["grep"],
         "Glob" => &["list_dir"],
         "WebFetch" => &["web_fetch"],
@@ -299,27 +343,38 @@ fn argument_field_for(name: &str, targets: &HashSet<String>) -> Option<&'static 
     }
 }
 
-fn compile_argument_pattern(pattern: &str, command: bool) -> Result<Regex, ToolError> {
-    let prefix = command && pattern.ends_with(":*");
-    let pattern = if prefix {
-        pattern.strip_suffix(":*").unwrap().trim()
-    } else {
-        pattern.trim()
-    };
-    let mut regex = String::from("^");
-    for character in pattern.chars() {
-        match character {
-            '*' => regex.push_str(".*"),
-            '?' => regex.push('.'),
-            other => regex.push_str(&regex::escape(&other.to_string())),
+fn compile_argument_matcher(
+    name: &str,
+    targets: &HashSet<String>,
+    pattern: &str,
+) -> Result<ArgumentMatcher, ToolError> {
+    let command = matches!(name, "Bash" | "bash") || targets.contains("run_terminal_command");
+    let web_fetch = matches!(name, "WebFetch") || targets.contains("web_fetch");
+    let path = targets.iter().any(|name| {
+        matches!(
+            name.as_str(),
+            "read_file" | "list_dir" | "grep" | "write_file" | "search_replace"
+        )
+    });
+    if command {
+        let pattern = pattern
+            .strip_suffix(":*")
+            .unwrap_or(pattern)
+            .trim()
+            .to_owned();
+        let glob = compile_glob(&pattern)?;
+        return Ok(ArgumentMatcher::Bash { pattern, glob });
+    }
+    if web_fetch {
+        if let Some(domain) = pattern.strip_prefix("domain:") {
+            return Ok(ArgumentMatcher::Domain(normalize_domain(domain)));
         }
+        return Ok(ArgumentMatcher::Freeform(compile_glob(pattern)?));
     }
-    if prefix || (command && !pattern.contains(['*', '?'])) {
-        regex.push_str("(?:$| )");
-    } else {
-        regex.push('$');
+    if path {
+        return Ok(ArgumentMatcher::Path(compile_glob(pattern)?));
     }
-    Regex::new(&regex).map_err(|error| tool_error("skill.invalid_allowed_tool", error))
+    Ok(ArgumentMatcher::Freeform(compile_glob(pattern)?))
 }
 
 fn split_top_level_alternatives(spec: &str) -> Vec<&str> {
@@ -328,9 +383,9 @@ fn split_top_level_alternatives(spec: &str) -> Vec<&str> {
     let mut out = Vec::new();
     for (index, character) in spec.char_indices() {
         match character {
-            '(' => depth = depth.saturating_add(1),
-            ')' => depth = depth.saturating_sub(1),
-            '|' if depth == 0 => {
+            '(' if is_unescaped(spec.as_bytes(), index) => depth = depth.saturating_add(1),
+            ')' if is_unescaped(spec.as_bytes(), index) => depth = depth.saturating_sub(1),
+            '|' if depth == 0 && is_unescaped(spec.as_bytes(), index) => {
                 out.push(&spec[start..index]);
                 start = index + character.len_utf8();
             }
@@ -339,6 +394,169 @@ fn split_top_level_alternatives(spec: &str) -> Vec<&str> {
     }
     out.push(&spec[start..]);
     out
+}
+
+fn parse_grouped_rule(spec: &str) -> Result<(&str, Option<String>), ToolError> {
+    let Some(open) = find_first_unescaped(spec, b'(') else {
+        return Ok((spec, None));
+    };
+    let content = &spec[open + 1..];
+    let Some(close) = find_last_unescaped(content, b')') else {
+        return Err(tool_error(
+            "skill.invalid_allowed_tool",
+            "malformed grouped tool rule: missing closing parenthesis",
+        ));
+    };
+    let raw = content[..close].trim();
+    let pattern = if raw.is_empty() || raw == "*" {
+        None
+    } else {
+        Some(unescape_rule_content(raw))
+    };
+    Ok((&spec[..open], pattern))
+}
+
+fn is_unescaped(bytes: &[u8], position: usize) -> bool {
+    let mut backslashes = 0usize;
+    let mut index = position;
+    while index > 0 && bytes[index - 1] == b'\\' {
+        backslashes += 1;
+        index -= 1;
+    }
+    backslashes.is_multiple_of(2)
+}
+
+fn find_first_unescaped(value: &str, target: u8) -> Option<usize> {
+    value
+        .as_bytes()
+        .iter()
+        .enumerate()
+        .find(|(index, byte)| **byte == target && is_unescaped(value.as_bytes(), *index))
+        .map(|(index, _)| index)
+}
+
+fn find_last_unescaped(value: &str, target: u8) -> Option<usize> {
+    (0..value.len())
+        .rev()
+        .find(|index| value.as_bytes()[*index] == target && is_unescaped(value.as_bytes(), *index))
+}
+
+fn unescape_rule_content(value: &str) -> String {
+    if !value.contains('\\') {
+        return value.to_owned();
+    }
+    value
+        .replace("\\(", "(")
+        .replace("\\)", ")")
+        .replace("\\\\", "\\")
+}
+
+fn compile_glob(pattern: &str) -> Result<glob::Pattern, ToolError> {
+    glob::Pattern::new(pattern)
+        .map_err(|error| tool_error("skill.invalid_allowed_tool", error.to_string()))
+}
+
+fn glob_matches(pattern: &glob::Pattern, text: &str, context: MatchContext) -> bool {
+    pattern.matches_with(
+        text,
+        glob::MatchOptions {
+            require_literal_separator: matches!(context, MatchContext::Path),
+            require_literal_leading_dot: false,
+            ..Default::default()
+        },
+    )
+}
+
+fn matches_command_prefix(command: &str, pattern: &str) -> bool {
+    command == pattern
+        || (command.starts_with(pattern) && command.as_bytes().get(pattern.len()) == Some(&b' '))
+}
+
+fn normalized_path_forms(path: &str, cwd: &Path) -> Vec<String> {
+    let cwd = absolute_lexical_cwd(cwd);
+    let raw = Path::new(path);
+    if is_tilde_path(raw) {
+        return Vec::new();
+    }
+    let absolute = if raw.is_absolute() {
+        normalize_lexically(raw)
+    } else {
+        normalize_lexically(&cwd.join(raw))
+    };
+    if !absolute.starts_with(&cwd) {
+        return Vec::new();
+    }
+    let mut forms = vec![path_match_string(&absolute)];
+    if let Ok(relative) = absolute.strip_prefix(&cwd) {
+        let relative = path_match_string(relative);
+        if relative.is_empty() || relative == "." {
+            forms.extend([".".to_owned(), "./".to_owned()]);
+        } else {
+            forms.push(format!("./{relative}"));
+            forms.push(relative);
+        }
+    }
+    forms
+}
+
+fn absolute_lexical_cwd(cwd: &Path) -> PathBuf {
+    if cwd.is_absolute() {
+        normalize_lexically(cwd)
+    } else {
+        std::env::current_dir()
+            .map(|current| normalize_lexically(&current.join(cwd)))
+            .unwrap_or_else(|_| normalize_lexically(cwd))
+    }
+}
+
+fn normalize_lexically(path: &Path) -> PathBuf {
+    let mut components = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => match components.last() {
+                Some(Component::Normal(_)) => {
+                    components.pop();
+                }
+                Some(Component::RootDir) => {}
+                _ => components.push(component),
+            },
+            _ => components.push(component),
+        }
+    }
+    if components.is_empty() {
+        PathBuf::from(".")
+    } else {
+        components.into_iter().collect()
+    }
+}
+
+fn is_tilde_path(path: &Path) -> bool {
+    matches!(
+        path.components().next(),
+        Some(Component::Normal(first)) if first.to_string_lossy().starts_with('~')
+    )
+}
+
+fn path_match_string(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+fn domain_matches(pattern: &str, url: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(url) else {
+        return false;
+    };
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    let domain = normalize_domain(host);
+    let pattern = normalize_domain(pattern);
+    !pattern.is_empty() && (domain == pattern || domain.ends_with(&format!(".{pattern}")))
+}
+
+fn normalize_domain(value: &str) -> String {
+    let value = value.trim().trim_end_matches('/').trim_end_matches('.');
+    value.strip_prefix("www.").unwrap_or(value).to_lowercase()
 }
 
 fn normalized_scope_name(name: &str) -> &str {

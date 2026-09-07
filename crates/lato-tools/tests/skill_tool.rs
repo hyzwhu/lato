@@ -1,10 +1,12 @@
 use async_trait::async_trait;
 use lato_core::{
-    SessionId, SideEffect, ToolCallId, ToolCapability, ToolContext, ToolError, TurnId,
+    PolicyMode, SandboxProfile, SessionId, SideEffect, ToolCallId, ToolCapability, ToolContext,
+    ToolError, TurnId,
 };
+use lato_policy::{ApprovalLedger, PolicyEngine, PolicyEvent, PolicyEventSink};
 use lato_tools::{
-    BuiltinToolEnvironment, ResolvedSkill, SkillResolver, SkillToolScope, builtin_tool_runtime,
-    builtin_tools,
+    BuiltinToolEnvironment, PolicyScope, ResolvedSkill, SkillResolver, SkillToolScope,
+    ToolRuntimeBuilder, builtin_tool_runtime, builtin_tools,
 };
 use lato_workspace::{FileLocks, SessionTrust};
 use serde_json::json;
@@ -12,6 +14,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
 };
+use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Default)]
@@ -315,4 +318,210 @@ fn scopes_support_compatibility_aliases_wildcards_and_canonical_validation() {
         .resolve_and_validate("read_file", json!({}))
         .unwrap_err();
     assert_eq!(error.code, "tool.invalid_arguments");
+}
+
+#[test]
+fn path_scopes_normalize_under_cwd_and_block_traversal() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = builtin_tool_runtime(environment(
+        root.path(),
+        SessionTrust::for_headless_prompt(root.path()),
+        None,
+    ))
+    .unwrap();
+    let scope = SkillToolScope::compile(&["Read(src/*)".into()], runtime.as_ref()).unwrap();
+
+    for (call_id, path) in [
+        ("relative", "src/lib.rs".to_owned()),
+        (
+            "absolute",
+            root.path()
+                .join("src/lib.rs")
+                .to_string_lossy()
+                .into_owned(),
+        ),
+    ] {
+        runtime
+            .prepare_scoped(
+                context(call_id),
+                "read_file",
+                json!({"path": path}),
+                Some(&scope),
+            )
+            .unwrap();
+    }
+
+    let error = runtime
+        .prepare_scoped(
+            context("traversal"),
+            "read_file",
+            json!({"path":"src/../Cargo.toml"}),
+            Some(&scope),
+        )
+        .err()
+        .unwrap();
+    assert_eq!(error.code, "tool.not_allowed_by_skill");
+
+    let absolute_pattern = format!("Read({})", root.path().join("src/*").to_string_lossy());
+    let absolute_scope = SkillToolScope::compile(&[absolute_pattern], runtime.as_ref()).unwrap();
+    runtime
+        .prepare_scoped(
+            context("absolute-pattern-relative-argument"),
+            "read_file",
+            json!({"path":"src/lib.rs"}),
+            Some(&absolute_scope),
+        )
+        .unwrap();
+
+    let anywhere_inside = SkillToolScope::compile(&["Read(**)".into()], runtime.as_ref()).unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    for path in [
+        "../../outside.txt".to_owned(),
+        outside
+            .path()
+            .join("outside.txt")
+            .to_string_lossy()
+            .into_owned(),
+    ] {
+        let error = runtime
+            .prepare_scoped(
+                context("outside-root"),
+                "read_file",
+                json!({"path":path}),
+                Some(&anywhere_inside),
+            )
+            .err()
+            .unwrap();
+        assert_eq!(error.code, "tool.not_allowed_by_skill");
+    }
+}
+
+#[test]
+fn path_scopes_support_recursive_globs_and_character_classes() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = builtin_tool_runtime(environment(
+        root.path(),
+        SessionTrust::for_headless_prompt(root.path()),
+        None,
+    ))
+    .unwrap();
+    for (spec, path) in [
+        ("Read(**/src/**)", "projects/demo/src/main.rs"),
+        ("Read(src/[lm]ib.rs)", "src/lib.rs"),
+    ] {
+        let scope = SkillToolScope::compile(&[spec.into()], runtime.as_ref()).unwrap();
+        runtime
+            .prepare_scoped(
+                context(spec),
+                "read_file",
+                json!({"path": path}),
+                Some(&scope),
+            )
+            .unwrap();
+    }
+}
+
+#[test]
+fn grouped_rules_parse_escaped_parentheses() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = builtin_tool_runtime(environment(
+        root.path(),
+        SessionTrust::for_headless_prompt(root.path()),
+        None,
+    ))
+    .unwrap();
+    let scope =
+        SkillToolScope::compile(&[r"Bash(printf \(ok\):*)".into()], runtime.as_ref()).unwrap();
+    runtime
+        .prepare_scoped(
+            context("escaped-parentheses"),
+            "run_terminal_command",
+            json!({"command":"printf (ok) now"}),
+            Some(&scope),
+        )
+        .unwrap();
+}
+
+#[test]
+fn web_fetch_domain_rules_match_exact_hosts_and_subdomains_only() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = builtin_tool_runtime(environment(
+        root.path(),
+        SessionTrust::for_headless_prompt(root.path()),
+        None,
+    ))
+    .unwrap();
+    let scope = SkillToolScope::compile(&["WebFetch(domain:example.com)".into()], runtime.as_ref())
+        .unwrap();
+    for (call_id, url) in [
+        ("exact-domain", "https://example.com/path"),
+        ("subdomain", "https://api.example.com/path"),
+    ] {
+        runtime
+            .prepare_scoped(
+                context(call_id),
+                "web_fetch",
+                json!({"url": url}),
+                Some(&scope),
+            )
+            .unwrap();
+    }
+    let error = runtime
+        .prepare_scoped(
+            context("wrong-domain"),
+            "web_fetch",
+            json!({"url":"https://notexample.com/path"}),
+            Some(&scope),
+        )
+        .err()
+        .unwrap();
+    assert_eq!(error.code, "tool.not_allowed_by_skill");
+}
+
+#[derive(Default)]
+struct CountingPolicySink(AtomicUsize);
+
+impl PolicyEventSink for CountingPolicySink {
+    fn emit(&self, _event: PolicyEvent) {
+        self.0.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+#[test]
+fn scope_rejection_happens_before_policy_evaluation() {
+    let root = tempfile::tempdir().unwrap();
+    let sink = Arc::new(CountingPolicySink::default());
+    let policy = Arc::new(PolicyEngine::with_sink(
+        Arc::new(ApprovalLedger::new(Duration::from_secs(60))),
+        sink.clone(),
+    ));
+    let mut builder = ToolRuntimeBuilder::new(
+        policy,
+        PolicyScope {
+            workspace_root: root.path().to_path_buf(),
+            mode: PolicyMode::Always,
+            project_trusted: true,
+            sandbox_profile: SandboxProfile::Off,
+        },
+    );
+    builder
+        .register_builtin_tools(environment(
+            root.path(),
+            SessionTrust::for_headless_prompt(root.path()),
+            None,
+        ))
+        .unwrap();
+    let runtime = builder.build().unwrap();
+    let scope = SkillToolScope::compile(&["read_file".into()], &runtime).unwrap();
+    let error = runtime
+        .prepare_scoped(
+            context("scope-before-policy"),
+            "write_file",
+            json!({"path":"x","contents":"x"}),
+            Some(&scope),
+        )
+        .err()
+        .unwrap();
+    assert_eq!(error.code, "tool.not_allowed_by_skill");
+    assert_eq!(sink.0.load(Ordering::Acquire), 0);
 }

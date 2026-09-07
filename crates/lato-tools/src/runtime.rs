@@ -283,7 +283,13 @@ impl ToolRuntime {
         let validated = self.resolve_and_validate(wire_name, arguments)?;
         let canonical = validated.canonical_name;
         let arguments = validated.arguments;
-        if scope.is_some_and(|scope| !scope.allows_call(canonical.local_name(), &arguments)) {
+        if scope.is_some_and(|scope| {
+            !scope.allows_call(
+                canonical.local_name(),
+                &arguments,
+                &self.scope.workspace_root,
+            )
+        }) {
             return Err(ToolError::new(
                 "tool.not_allowed_by_skill",
                 format!("tool {wire_name} is not allowed by the active skill"),
