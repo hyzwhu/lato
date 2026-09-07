@@ -389,8 +389,15 @@ async fn turn_and_workflow_cancellation_match_only_their_owner_scope() {
 }
 
 #[tokio::test]
-async fn root_cancellation_includes_workflow_owned_descendants_but_not_the_root_node() {
+async fn root_cancellation_spares_workflow_work_while_teardown_cleans_every_owner() {
     let harness = Harness::new(CoordinatorConfig::default()).await;
+    let interactive = harness
+        .register_root_scoped("interactive-root", "session", "turn")
+        .await;
+    interactive
+        .spawn(request("interactive-child"))
+        .await
+        .unwrap();
     let workflow = harness
         .handle
         .register_root(TaskRootRequest {
@@ -406,13 +413,50 @@ async fn root_cancellation_includes_workflow_owned_descendants_but_not_the_root_
         .await
         .unwrap();
     workflow.spawn(request("workflow-child")).await.unwrap();
-    harness
-        .wait_for_status("workflow-child", TaskStatus::Running)
-        .await;
+    for id in ["interactive-child", "workflow-child"] {
+        harness.wait_for_status(id, TaskStatus::Running).await;
+    }
+
+    assert_eq!(
+        harness
+            .handle
+            .cancel_root(TaskId::from("interactive-root"))
+            .await
+            .unwrap()
+            .matched,
+        1
+    );
+    assert_eq!(
+        wait_terminal(&harness, "interactive-child")
+            .await
+            .node
+            .status,
+        TaskStatus::Cancelled
+    );
     assert_eq!(
         harness
             .handle
             .cancel_root(TaskId::from("workflow-root"))
+            .await
+            .unwrap()
+            .matched,
+        0
+    );
+    assert_eq!(
+        harness
+            .handle
+            .inspect_admin(TaskId::from("workflow-child"))
+            .await
+            .unwrap()
+            .node
+            .status,
+        TaskStatus::Running
+    );
+
+    assert_eq!(
+        harness
+            .handle
+            .teardown_root_and_drain(TaskId::from("workflow-root"))
             .await
             .unwrap()
             .matched,
@@ -421,16 +465,6 @@ async fn root_cancellation_includes_workflow_owned_descendants_but_not_the_root_
     assert_eq!(
         wait_terminal(&harness, "workflow-child").await.node.status,
         TaskStatus::Cancelled
-    );
-    assert_eq!(
-        harness
-            .handle
-            .inspect_admin(TaskId::from("workflow-root"))
-            .await
-            .unwrap()
-            .node
-            .status,
-        TaskStatus::Running
     );
 }
 

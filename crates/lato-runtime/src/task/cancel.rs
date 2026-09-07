@@ -89,7 +89,9 @@ pub(crate) fn resolve_cancellation(
                 .tasks
                 .iter()
                 .filter(|(_, record)| {
-                    record.node.parent_id.is_some() && &record.node.root_id == root_id
+                    record.node.parent_id.is_some()
+                        && &record.node.root_id == root_id
+                        && matches!(record.node.owner, TaskOwner::Interactive { .. })
                 })
                 .map(|(task_id, _)| task_id.clone())
                 .collect()
@@ -300,4 +302,98 @@ fn not_found() -> TaskError {
         TaskErrorCode::NotFoundOrNotOwned,
         "task was not found in the requested scope",
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::task::SpawnMode;
+    use crate::task::state::RuntimeTaskRecord;
+    use lato_core::{
+        AgentProfile, BudgetAccount, BudgetLimits, ResultContract, TaskNode, TaskProgress,
+        TaskScope, TaskStatus,
+    };
+    use tokio_util::sync::CancellationToken;
+
+    fn record(id: &str, parent_id: Option<&str>, owner: TaskOwner) -> RuntimeTaskRecord {
+        let profile = AgentProfile::worker();
+        RuntimeTaskRecord {
+            node: TaskNode {
+                id: TaskId::from(id),
+                parent_id: parent_id.map(TaskId::from),
+                root_id: TaskId::from("root"),
+                owner,
+                scope: TaskScope {
+                    objective: id.into(),
+                    context_refs: Vec::new(),
+                },
+                permissions: Vec::new(),
+                workspace_intent: profile.workspace,
+                result_contract: ResultContract {
+                    schema: None,
+                    max_output_bytes: 1,
+                },
+                profile,
+                status: TaskStatus::Running,
+            },
+            budget: BudgetAccount::new(BudgetLimits::unlimited()),
+            workspace_lease: None,
+            reservation: None,
+            reservation_parent_id: None,
+            cancellation: CancellationToken::new(),
+            spawn_admission_closed: false,
+            depth: u32::from(parent_id.is_some()),
+            cleanup_error: None,
+            last_event_sequence: 0,
+            progress: TaskProgress::default(),
+            usage: Default::default(),
+            result: None,
+            completion_disposition: None,
+            output_metadata: None,
+            spawn_mode: Some(SpawnMode::Background),
+            enqueued_at: tokio::time::Instant::now(),
+        }
+    }
+
+    #[test]
+    fn root_cancel_spares_workflow_descendants_but_teardown_includes_them() {
+        let interactive = TaskOwner::Interactive {
+            session_id: SessionId::from("session"),
+            turn_id: TurnId::from("turn"),
+        };
+        let workflow = TaskOwner::Workflow {
+            run_id: "run".into(),
+            session_id: SessionId::from("session"),
+        };
+        let mut state = CoordinatorState::default();
+        for entry in [
+            record("root", None, interactive.clone()),
+            record("interactive-child", Some("root"), interactive),
+            record("workflow-child", Some("root"), workflow),
+        ] {
+            state.tasks.insert(entry.node.id.clone(), entry);
+        }
+        state.roots.insert(TaskId::from("root"));
+
+        let root_id = TaskId::from("root");
+        let cancelled = resolve_cancellation(
+            &state,
+            &InspectCaller::Admin,
+            &CancelTarget::root(root_id.clone()),
+        )
+        .unwrap();
+        assert_eq!(cancelled.task_ids, vec![TaskId::from("interactive-child")]);
+
+        let mut teardown = resolve_root_teardown(&state, &InspectCaller::Admin, &root_id)
+            .unwrap()
+            .task_ids;
+        teardown.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        assert_eq!(
+            teardown,
+            vec![
+                TaskId::from("interactive-child"),
+                TaskId::from("workflow-child")
+            ]
+        );
+    }
 }
