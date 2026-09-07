@@ -184,3 +184,27 @@ This gate freezes the merged Phase 5B/5C task-runtime behavior as the baseline f
 the plugin and extension work. The smoke asserts the public task-tool names
 (`spawn`, `send`, `wait`, `cancel`, `inspect`) and rejects the removed
 `spawn_subagent` alias.
+
+## Phase 6A plugin runtime foundation gate (2026-09-07)
+
+Measured on macOS arm64 with Rust 1.98.0 from branch
+`codex/phase-6a-plugin-runtime`. The binary package version is
+`0.1.0-beta.2`.
+
+| Gate | Result | Evidence |
+|---|---|---|
+| Formatting | PASS | `cargo fmt --all -- --check` exited 0. |
+| Plugin runtime | PASS | `cargo test -p lato-extensions`: 23 passed; manifest containment, deterministic CLI/project/user discovery, trust and enablement, immutable snapshots, monotone child narrowing, atomic reload, last-known-good retention, and cross-session CLI-root isolation are covered. |
+| Typed contracts and runtime | PASS | `cargo test -p lato-core`: 72 passed; `cargo test -p lato-protocol`: 5 passed; `cargo test -p lato-runtime`: 190 passed including 2 compile-fail doc-tests. Plugin snapshot adoption is journaled before publication. |
+| Agent and CLI integration | PASS | Focused agent suites: 36 passed. `plugin_cli`, Phase 5 command smoke, headless, TUI, and sessions suites: 40 passed. Real-process ACP coverage proves two repeatable `--plugin-dir` roots reach a session snapshot; missing roots fail before session creation with exit 2. |
+| Workspace tests | PASS | `CARGO_INCREMENTAL=0 cargo test --workspace --no-fail-fast`: **843 passed, 0 failed, 0 ignored**, including doc-tests. Incremental output was disabled after the first build attempt exhausted the isolated worktree's build volume; no test assertion failed in that attempt. |
+| Clippy and diff | PASS | `CARGO_INCREMENTAL=0 cargo clippy --workspace --all-targets --all-features -- -D warnings` and `git diff --check` exited 0. |
+| Trust and activation | PASS | CLI and user sources are trusted; project sources remain inactive for an untrusted folder. Project/user plugins default disabled, CLI overrides default enabled, and explicit disable wins. Components are cataloged only; no Phase 6B hook/skill or Phase 6C MCP execution claim is made. |
+| Reload and session isolation | PASS | Explicit `lato/plugins/reload` forces rediscovery and publishes a higher generation. Idle sessions adopt immediately; active turns retain their immutable generation until the next safe boundary. Child snapshots intersect parent, profile, and workspace `ExtensionInvoke` capability and never read a newer shared snapshot after construction. |
+| Local install | PASS | `CARGO_INCREMENTAL=0 cargo install --path .` replaced `/Users/huangyongzhao/.cargo/bin/lato`; `lato --version` printed `lato 0.1.0-beta.2`. |
+| Installed binary smoke | PASS | `LATO_SMOKE_BINARY="$(command -v lato)" cargo test --test phase5_command_smoke -- --nocapture`: 1 passed on unchanged retry after the localhost fixture first encountered the documented transient macOS `WouldBlock (os 35)`. Timeout and assertions were not weakened. |
+| LIVE providers and remote platforms | SKIPPED | Tests used local deterministic fixtures. No vendor credentials, external provider, remote CI, Linux, or Windows validation is claimed for this gate. |
+
+Phase 6A freezes the plugin catalog and session-snapshot boundary. Skills and
+hooks remain Phase 6B work; MCP server startup and tool execution remain Phase
+6C work.

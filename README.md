@@ -134,6 +134,19 @@ repeated automatic work according to their turn, context, credit, or authenticat
 lifetime. Manual `/compact` remains available while automatic compaction is suppressed,
 and `/status` reports the active suppression mode.
 
+## Plugins
+
+Lato discovers plugin roots from repeatable `--plugin-dir` arguments,
+`.lato/plugins/*` in the project, and `$LATO_HOME/plugins/*`, in that priority
+order. CLI and user plugins are trusted; project plugins activate only for a
+trusted folder. A plugin must also be enabled before it is active.
+
+The canonical manifest is `plugin.json`. Component paths are confined to the
+plugin root. `lato/plugins/reload` atomically rebuilds the registry and updates
+live sessions at the next safe turn boundary.
+
+Phase 6A catalogs skill, hook, and MCP components but does not execute them.
+
 ## Doctor
 
 ```bash
