@@ -3,8 +3,8 @@
 // Lato changes: adapts the backend resource to Lato's bounded Phase 5A coordinator handle
 
 use super::{
-    ActiveMessageOutcome, ActiveMessageRequest, CancelOutcome, ScopedTaskHandle,
-    SpawnDisposition, SpawnTaskRequest, TaskSnapshot, WaitOutcome,
+    ActiveMessageOutcome, ActiveMessageRequest, CancelOutcome, ScopedTaskHandle, SpawnDisposition,
+    SpawnTaskRequest, TaskSnapshot, WaitOutcome,
 };
 use async_trait::async_trait;
 use lato_core::{TaskError, TaskErrorCode, TaskId};

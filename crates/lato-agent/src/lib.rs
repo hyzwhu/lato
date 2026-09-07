@@ -9,6 +9,7 @@ pub mod host;
 pub mod journal;
 pub mod legacy_driver;
 pub mod runtime_session;
+pub mod subagent;
 pub mod transcript;
 mod two_pass;
 
@@ -23,5 +24,6 @@ pub use host::*;
 pub use journal::*;
 pub use legacy_driver::*;
 pub use runtime_session::*;
+pub use subagent::*;
 pub use transcript::*;
 pub(crate) use two_pass::*;
