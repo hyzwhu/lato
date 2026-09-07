@@ -294,6 +294,13 @@ impl Default for ActiveMessageLifecycle {
 }
 
 impl ActiveMessageLifecycle {
+    #[cfg(debug_assertions)]
+    pub(crate) fn in_flight_for_audit(&self) -> usize {
+        match self {
+            Self::Open { in_flight, .. } | Self::Finalizing { in_flight, .. } => *in_flight,
+        }
+    }
+
     pub(crate) fn begin(&mut self, cap: usize) -> Result<(), ActiveMessageOutcome> {
         let Self::Open { in_flight, .. } = self else {
             return Err(ActiveMessageOutcome::NotActiveOrFinalizing);

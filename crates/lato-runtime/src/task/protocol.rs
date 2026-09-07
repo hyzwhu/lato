@@ -325,6 +325,24 @@ pub struct RegistryCounts {
     pub output_load_supervisors: usize,
 }
 
+/// Immutable coordinator consistency report used by the Phase 5A stress tests.
+///
+/// This is compiled only for debug/test builds and is intentionally absent
+/// from release artifacts and all product-facing task surfaces.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct CoordinatorInvariantAudit {
+    pub failures: Vec<String>,
+    pub live_runners: usize,
+    pub preparing: usize,
+    pub running: usize,
+    pub finalizing: usize,
+    pub terminal_with_open_reservations: usize,
+    pub terminal_with_live_workspace_leases: usize,
+    pub cycle_count: usize,
+}
+
 /// Result of draining coordinator-owned work, callbacks, and the event sink.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SinkShutdown {
@@ -582,6 +600,10 @@ pub(crate) enum TaskCommand {
     RegistryCounts {
         reply: oneshot::Sender<RegistryCounts>,
     },
+    #[cfg(debug_assertions)]
+    InvariantAudit {
+        reply: oneshot::Sender<CoordinatorInvariantAudit>,
+    },
     ShutdownRoot {
         root_id: TaskId,
         reply: oneshot::Sender<Result<(), TaskError>>,
@@ -698,6 +720,14 @@ impl TaskHandle {
     pub async fn registry_counts(&self) -> Result<RegistryCounts, TaskError> {
         let (reply, response) = oneshot::channel();
         self.send(TaskCommand::RegistryCounts { reply }).await?;
+        response.await.map_err(|_| coordinator_closed())
+    }
+
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub async fn audit_invariants_for_test(&self) -> Result<CoordinatorInvariantAudit, TaskError> {
+        let (reply, response) = oneshot::channel();
+        self.send(TaskCommand::InvariantAudit { reply }).await?;
         response.await.map_err(|_| coordinator_closed())
     }
 

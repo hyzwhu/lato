@@ -1,4 +1,7 @@
-// Derived from: Grok Build@bb7f39d5858cbf5e00de639367f59debbdcb0138:crates/codegen/xai-grok-shell/src/session/workflow/host_service.rs
+// Derived from: Grok Build@bb7f39d5858cbf5e00de639367f59debbdcb0138:crates/codegen/xai-workflow/src/engine.rs
+// Derived from: Grok Build@bb7f39d5858cbf5e00de639367f59debbdcb0138:crates/codegen/xai-workflow/src/host.rs
+// License: Apache-2.0
+// Lato changes: generalized scalar workflow accounting into atomic hierarchical multi-dimensional reservations
 
 use crate::{TaskId, TaskUsage};
 use std::collections::HashMap;

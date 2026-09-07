@@ -1,4 +1,5 @@
 // Derived from: Grok Build@bb7f39d5858cbf5e00de639367f59debbdcb0138:crates/codegen/xai-grok-tools/src/implementations/grok_build/task/coordinator.rs
+// Derived from: Grok Build@bb7f39d5858cbf5e00de639367f59debbdcb0138:crates/codegen/xai-grok-tools/src/implementations/grok_build/task/coordinator_state.rs
 // Derived from: Grok Build@bb7f39d5858cbf5e00de639367f59debbdcb0138:crates/codegen/xai-grok-tools/src/implementations/grok_build/task/coordinator/active_message.rs
 // License: Apache-2.0
 // Lato changes: bounded Tokio actor with a single committed root transition path
@@ -1182,6 +1183,10 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
                 );
                 let _ = reply.send(counts);
             }
+            #[cfg(debug_assertions)]
+            TaskCommand::InvariantAudit { reply } => {
+                let _ = reply.send(self.invariant_audit());
+            }
             TaskCommand::ShutdownRoot { root_id, reply } => {
                 let result = self.shutdown_root(&root_id);
                 let _ = reply.send(result);
@@ -1190,6 +1195,333 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
                 self.begin_shutdown(Some(reply)).await;
             }
         }
+    }
+
+    #[cfg(debug_assertions)]
+    fn invariant_audit(&self) -> crate::task::CoordinatorInvariantAudit {
+        use crate::task::CoordinatorInvariantAudit;
+
+        let mut audit = CoordinatorInvariantAudit::default();
+        let mut fail = |message: String| audit.failures.push(message);
+
+        for (task_id, record) in &self.state.tasks {
+            if record.node.parent_id.is_some() {
+                match record.node.status {
+                    TaskStatus::Preparing => audit.preparing += 1,
+                    TaskStatus::Finalizing => audit.finalizing += 1,
+                    status if status.is_running() => audit.running += 1,
+                    _ => {}
+                }
+            }
+            if record.node.status.is_terminal() {
+                audit.terminal_with_open_reservations += usize::from(record.reservation.is_some());
+                audit.terminal_with_live_workspace_leases +=
+                    usize::from(record.workspace_lease.is_some());
+                if !record.spawn_admission_closed {
+                    fail(format!("terminal task {task_id} has open spawn admission"));
+                }
+                if record.result.is_none() {
+                    fail(format!("terminal task {task_id} has no result"));
+                }
+            } else if record.result.is_some() {
+                fail(format!("nonterminal task {task_id} already has a result"));
+            }
+            if record.last_event_sequence == 0 || record.last_event_sequence > self.sequence {
+                fail(format!(
+                    "task {task_id} has invalid event sequence {} at global {}",
+                    record.last_event_sequence, self.sequence
+                ));
+            }
+
+            match &record.node.parent_id {
+                None => {
+                    if &record.node.root_id != task_id {
+                        fail(format!("root task {task_id} does not name itself as root"));
+                    }
+                    if record.depth != 0 {
+                        fail(format!(
+                            "root task {task_id} has nonzero depth {}",
+                            record.depth
+                        ));
+                    }
+                    if !self.state.roots.contains(task_id) {
+                        fail(format!("root task {task_id} is absent from the root index"));
+                    }
+                    if record.reservation.is_some() || record.reservation_parent_id.is_some() {
+                        fail(format!("root task {task_id} carries a parent reservation"));
+                    }
+                }
+                Some(parent_id) => match self.state.tasks.get(parent_id) {
+                    None => fail(format!("task {task_id} has missing parent {parent_id}")),
+                    Some(parent) => {
+                        if record.node.root_id != parent.node.root_id {
+                            fail(format!("task {task_id} crosses its parent's root"));
+                        }
+                        if record.depth != parent.depth.saturating_add(1) {
+                            fail(format!(
+                                "task {task_id} depth {} does not follow parent depth {}",
+                                record.depth, parent.depth
+                            ));
+                        }
+                        if record.reservation.is_some()
+                            && record.reservation_parent_id.as_ref() != Some(parent_id)
+                        {
+                            fail(format!("task {task_id} reservation names the wrong parent"));
+                        }
+                    }
+                },
+            }
+
+            let reserved = record.budget.reserved();
+            let spent = record.budget.spent();
+            let limits = record.budget.limits();
+            macro_rules! within_limit {
+                ($field:ident) => {
+                    if let Some(limit) = limits.$field
+                        && spent.$field.saturating_add(reserved.$field) > limit
+                    {
+                        fail(format!(
+                            "task {task_id} exceeds its {} budget limit",
+                            stringify!($field)
+                        ));
+                    }
+                };
+            }
+            within_limit!(input_tokens);
+            within_limit!(output_tokens);
+            within_limit!(total_tokens);
+            within_limit!(tool_calls);
+            within_limit!(cost_micros);
+            within_limit!(wall_time_ms);
+            within_limit!(retries);
+            within_limit!(child_tasks);
+            within_limit!(worktrees);
+
+            let mut seen = HashSet::new();
+            let mut cursor = Some(task_id);
+            while let Some(candidate) = cursor {
+                if !seen.insert(candidate) {
+                    audit.cycle_count += 1;
+                    break;
+                }
+                cursor = self
+                    .state
+                    .tasks
+                    .get(candidate)
+                    .and_then(|candidate| candidate.node.parent_id.as_ref());
+            }
+        }
+
+        for root_id in &self.state.roots {
+            if self
+                .state
+                .tasks
+                .get(root_id)
+                .is_none_or(|record| record.node.parent_id.is_some())
+            {
+                fail(format!(
+                    "root index contains non-root or missing task {root_id}"
+                ));
+            }
+        }
+
+        let queued: Vec<_> = self.queue.entries_for_audit().collect();
+        let mut queued_ids = HashSet::new();
+        for queued_task in &queued {
+            if !queued_ids.insert(&queued_task.task_id) {
+                fail(format!(
+                    "queue contains duplicate task {}",
+                    queued_task.task_id
+                ));
+            }
+            match self.state.tasks.get(&queued_task.task_id) {
+                Some(record)
+                    if record.node.status == TaskStatus::Queued
+                        && record.node.root_id == queued_task.root_id => {}
+                _ => fail(format!(
+                    "queue entry {} does not match authoritative state",
+                    queued_task.task_id
+                )),
+            }
+        }
+        for (task_id, record) in &self.state.tasks {
+            if record.node.parent_id.is_some()
+                && record.node.status == TaskStatus::Queued
+                && !queued_ids.contains(task_id)
+            {
+                fail(format!(
+                    "queued task {task_id} is absent from the queue index"
+                ));
+            }
+        }
+        if queued.len() > self.config.max_queue {
+            fail(format!("queue length {} exceeds its bound", queued.len()));
+        }
+
+        let indexed_job_count = self.job_aborts.len();
+        if indexed_job_count != self.jobs.len() {
+            fail(format!(
+                "job index count {indexed_job_count} differs from live job count {}",
+                self.jobs.len()
+            ));
+        }
+        for task_id in self.job_aborts.keys() {
+            if !self.state.tasks.contains_key(task_id) {
+                fail(format!("live job refers to missing task {task_id}"));
+            }
+        }
+        for task_id in self.controls.keys() {
+            if self.state.tasks.get(task_id).is_none_or(|record| {
+                record.node.status.is_terminal() || record.generation.is_none()
+            }) {
+                fail(format!("runner control refers to inactive task {task_id}"));
+            }
+        }
+
+        let mut messages_per_task = HashMap::<&TaskId, usize>::new();
+        for (message_id, pending) in &self.active_messages {
+            if *message_id != pending.message_id {
+                fail(format!(
+                    "active-message key {message_id} disagrees with its record"
+                ));
+            }
+            match self.state.tasks.get(&pending.task_id) {
+                Some(record)
+                    if !record.node.status.is_terminal()
+                        && record.generation == Some(pending.generation) => {}
+                _ => fail(format!(
+                    "active message {message_id} refers to an inactive generation"
+                )),
+            }
+            *messages_per_task.entry(&pending.task_id).or_default() += 1;
+        }
+        for (task_id, record) in &self.state.tasks {
+            let indexed = messages_per_task.get(task_id).copied().unwrap_or_default();
+            let lifecycle = record.active_messages.in_flight_for_audit();
+            if indexed != lifecycle {
+                fail(format!(
+                    "task {task_id} active-message count {lifecycle} differs from index {indexed}"
+                ));
+            }
+            if lifecycle > self.config.active_messages_per_task {
+                fail(format!("task {task_id} exceeds its active-message bound"));
+            }
+        }
+        if self.active_messages.len() > self.config.active_message_capacity {
+            fail("global active-message bound is exceeded".into());
+        }
+
+        for task_id in self.cleanup_inflight.iter() {
+            if self.state.tasks.get(task_id).is_none_or(|record| {
+                !record.node.status.is_terminal() || record.workspace_lease.is_none()
+            }) {
+                fail(format!("cleanup index contains invalid task {task_id}"));
+            }
+        }
+        for task_id in self.pending_completions.keys() {
+            if self
+                .state
+                .tasks
+                .get(task_id)
+                .is_none_or(|record| !record.node.status.is_terminal())
+            {
+                fail(format!(
+                    "pending completion refers to nonterminal task {task_id}"
+                ));
+            }
+        }
+        for task_id in self.pending_terminal_outputs.keys() {
+            if self
+                .state
+                .tasks
+                .get(task_id)
+                .is_none_or(|record| record.node.status != TaskStatus::Finalizing)
+            {
+                fail(format!(
+                    "terminal-output wait refers to non-finalizing task {task_id}"
+                ));
+            }
+        }
+        for task_id in self.verification_wait_deadlines.keys() {
+            if self.state.tasks.get(task_id).is_none_or(|record| {
+                !matches!(
+                    record.node.status,
+                    TaskStatus::WaitingForChildren | TaskStatus::WaitingForApproval
+                )
+            }) {
+                fail(format!(
+                    "verification deadline refers to invalid task {task_id}"
+                ));
+            }
+        }
+
+        let waiter_count = self.waiters.values().map(Vec::len).sum::<usize>()
+            + self.foreground_waiters.len()
+            + self.drain_waiters.len();
+        if waiter_count > self.config.max_waiters {
+            fail(format!("waiter count {waiter_count} exceeds its bound"));
+        }
+        for (task_id, waiters) in &self.waiters {
+            if !self.state.tasks.contains_key(task_id) {
+                fail(format!("waiters refer to missing task {task_id}"));
+            }
+            if waiters.len() > self.config.max_waiters_per_task {
+                fail(format!("task {task_id} exceeds its waiter bound"));
+            }
+        }
+        for task_id in self.foreground_waiters.keys() {
+            if !self.state.tasks.contains_key(task_id) {
+                fail(format!(
+                    "foreground waiter refers to missing task {task_id}"
+                ));
+            }
+        }
+
+        let mut completed_ids = HashSet::new();
+        for task_id in &self.completed_order {
+            if !completed_ids.insert(task_id) {
+                fail(format!(
+                    "completion retention contains duplicate task {task_id}"
+                ));
+            }
+            if self
+                .state
+                .tasks
+                .get(task_id)
+                .is_none_or(|record| !record.node.status.is_terminal())
+            {
+                fail(format!(
+                    "completion retention contains invalid task {task_id}"
+                ));
+            }
+        }
+
+        for task_id in self.pending_spawns.keys() {
+            if self.state.tasks.contains_key(task_id) {
+                fail(format!("pending spawn {task_id} is already authoritative"));
+            }
+        }
+        for task_id in self
+            .validation_order
+            .iter()
+            .chain(self.validation_results.keys())
+        {
+            if !self.pending_spawns.contains_key(task_id) {
+                fail(format!(
+                    "validation index refers to missing pending spawn {task_id}"
+                ));
+            }
+        }
+
+        audit.live_runners = audit.preparing + audit.running + audit.finalizing;
+        if audit.cycle_count > 0 {
+            fail(format!(
+                "task tree contains {} cyclic ancestry paths",
+                audit.cycle_count
+            ));
+        }
+        audit.failures.sort();
+        audit
     }
 
     fn register_root(&mut self, request: crate::task::TaskRootRequest) -> Result<(), TaskError> {

@@ -569,4 +569,17 @@ impl Harness {
         .await
         .unwrap_or_else(|_| panic!("task {task_id} did not reach {expected:?}"));
     }
+
+    pub async fn audit(&self) -> lato_runtime::CoordinatorInvariantAudit {
+        let audit = self.handle.audit_invariants_for_test().await.unwrap();
+        assert!(audit.failures.is_empty(), "{:#?}", audit.failures);
+        assert_eq!(
+            audit.live_runners,
+            audit.preparing + audit.running + audit.finalizing
+        );
+        assert_eq!(audit.terminal_with_open_reservations, 0);
+        assert_eq!(audit.terminal_with_live_workspace_leases, 0);
+        assert_eq!(audit.cycle_count, 0);
+        audit
+    }
 }

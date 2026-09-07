@@ -1,13 +1,14 @@
 mod task_support;
 
 use lato_core::{
-    AgentProfile, BudgetLimits, SessionId, TaskErrorCode, TaskId, TaskOwner, ToolCapability, TurnId,
+    AgentProfile, BudgetLimits, SessionId, TaskErrorCode, TaskId, TaskOwner, TaskUsage,
+    ToolCapability, TurnId,
 };
 use lato_runtime::{
-    ApprovalVerificationResume, CoordinatorConfig, MemoryTaskEventSink, ReviewerVerificationResume,
-    SinkShutdown, TaskEventEnvelope, TaskEventPayload, TaskEventSink, TaskRootRequest,
-    VerificationDecision, VerificationOutcome, VerificationRequest, spawn_task_coordinator,
-    spawn_task_coordinator_with_verifier,
+    ActiveMessageOperation, ActiveMessageRequest, ApprovalVerificationResume, CoordinatorConfig,
+    MemoryTaskEventSink, ReviewerVerificationResume, SinkShutdown, TaskEventEnvelope,
+    TaskEventPayload, TaskEventSink, TaskRootRequest, VerificationDecision, VerificationOutcome,
+    VerificationRequest, WaitOutcome, spawn_task_coordinator, spawn_task_coordinator_with_verifier,
 };
 use lato_workspace::MemoryWorkspaceAllocator;
 use std::{
@@ -18,6 +19,197 @@ use std::{
     time::Duration,
 };
 use task_support::{ControlledTaskControl, GatedTaskRunner, Harness};
+
+struct XorShift64(u64);
+
+impl XorShift64 {
+    fn next(&mut self) -> u64 {
+        let mut value = self.0;
+        value ^= value << 13;
+        value ^= value >> 7;
+        value ^= value << 17;
+        self.0 = value;
+        value
+    }
+}
+
+async fn wait_for_clean_terminal(harness: &Harness, task_id: &str) {
+    harness
+        .wait_for_status(task_id, lato_core::TaskStatus::Completed)
+        .await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let clean = harness
+                .handle
+                .inspect_admin(TaskId::from(task_id))
+                .await
+                .is_ok_and(|snapshot| {
+                    snapshot.workspace_lease.is_none() && !snapshot.has_parent_reservation
+                });
+            if clean {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("task {task_id} did not finish resource cleanup"));
+}
+
+#[tokio::test]
+async fn fixed_seed_command_sequence_preserves_all_coordinator_invariants() {
+    const SEED: u64 = 0x5a17_5eed_c001_d00d;
+    let config = CoordinatorConfig {
+        max_global_running: 1,
+        max_running_per_root: 1,
+        max_queue: 4,
+        max_completed: 2,
+        ..CoordinatorConfig::default()
+    };
+    let harness = Harness::new(config).await;
+    let root = harness
+        .register_root_scoped("audit-root", "audit-session", "audit-turn")
+        .await;
+    let mut random = XorShift64(SEED);
+    let first = format!("audit-{:016x}", random.next());
+    let queued = format!("audit-{:016x}", random.next());
+    let mut covered = std::collections::HashSet::new();
+
+    root.spawn(verification_child(&first)).await.unwrap();
+    covered.insert("spawn");
+    harness.runner.wait_until_entered(&first).await;
+    harness
+        .wait_for_status(&first, lato_core::TaskStatus::Running)
+        .await;
+    harness.audit().await;
+
+    let queued_spawn = root.spawn(verification_child(&queued)).await.unwrap();
+    assert!(queued_spawn.is_queued());
+    covered.insert("queue");
+    harness.audit().await;
+
+    let operation = if random.next() & 1 == 0 {
+        ActiveMessageOperation::Queue
+    } else {
+        ActiveMessageOperation::Steer
+    };
+    let message = ActiveMessageRequest::try_new_with_operation(
+        TaskId::from(first.as_str()),
+        format!("audit-message-{}", random.next()),
+        operation,
+    )
+    .unwrap();
+    let _ = root.send_active_message(message).await;
+    covered.insert("message");
+    harness.audit().await;
+
+    let total_tokens = random.next() % 64 + 1;
+    assert!(
+        harness
+            .runner
+            .report_usage(
+                &first,
+                TaskUsage {
+                    input_tokens: total_tokens / 2,
+                    output_tokens: total_tokens - total_tokens / 2,
+                    total_tokens,
+                    ..TaskUsage::default()
+                }
+            )
+            .await
+    );
+    covered.insert("usage");
+    harness.audit().await;
+
+    assert!(matches!(
+        root.wait(TaskId::from(queued.as_str()), Duration::ZERO)
+            .await
+            .unwrap(),
+        WaitOutcome::TimedOut(_)
+    ));
+    covered.insert("wait");
+    harness.audit().await;
+
+    root.cancel_task(TaskId::from(queued.as_str()))
+        .await
+        .unwrap();
+    covered.insert("cancel");
+    harness
+        .wait_for_status(&queued, lato_core::TaskStatus::Cancelled)
+        .await;
+    harness.audit().await;
+
+    harness.runner.finish(&first).await;
+    covered.insert("finish");
+    wait_for_clean_terminal(&harness, &first).await;
+    harness.audit().await;
+
+    for _ in 0..6 {
+        let task_id = format!("audit-{:016x}", random.next());
+        root.spawn(verification_child(&task_id)).await.unwrap();
+        harness.runner.wait_until_entered(&task_id).await;
+        harness
+            .wait_for_status(&task_id, lato_core::TaskStatus::Running)
+            .await;
+
+        match random.next() % 3 {
+            0 => {
+                let message = ActiveMessageRequest::try_new(
+                    TaskId::from(task_id.as_str()),
+                    format!("follow-up-{}", random.next()),
+                )
+                .unwrap();
+                let _ = root.send_active_message(message).await;
+            }
+            1 => {
+                let value = random.next() % 32 + 1;
+                assert!(
+                    harness
+                        .runner
+                        .report_usage(
+                            &task_id,
+                            TaskUsage {
+                                total_tokens: value,
+                                ..TaskUsage::default()
+                            }
+                        )
+                        .await
+                );
+            }
+            _ => {
+                assert!(matches!(
+                    root.wait(TaskId::from(task_id.as_str()), Duration::ZERO)
+                        .await
+                        .unwrap(),
+                    WaitOutcome::TimedOut(_)
+                ));
+            }
+        }
+        harness.audit().await;
+        harness.runner.finish(&task_id).await;
+        wait_for_clean_terminal(&harness, &task_id).await;
+        harness.audit().await;
+    }
+
+    assert!(
+        harness
+            .handle
+            .inspect_admin(TaskId::from(first.as_str()))
+            .await
+            .is_err(),
+        "the fixed sequence must exercise completed-record eviction"
+    );
+    covered.insert("eviction");
+    assert_eq!(
+        covered,
+        std::collections::HashSet::from([
+            "spawn", "queue", "message", "usage", "wait", "cancel", "finish", "eviction"
+        ])
+    );
+    harness.audit().await;
+
+    harness.handle.shutdown().await.unwrap();
+}
 
 #[tokio::test]
 async fn root_registration_is_actor_owned_and_evented() {

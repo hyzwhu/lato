@@ -1,4 +1,4 @@
-// Derived from: Grok Build@bb7f39d5858cbf5e00de639367f59debbdcb0138:crates/codegen/xai-grok-tools/src/implementations/grok_build/task/coordinator.rs
+// Derived from: Grok Build@bb7f39d5858cbf5e00de639367f59debbdcb0138:crates/codegen/xai-grok-tools/src/implementations/grok_build/task/coordinator/queue.rs
 // License: Apache-2.0
 // Lato changes: stable FIFO queue that skips roots without available capacity
 
@@ -31,6 +31,11 @@ impl SpawnQueue {
 
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    #[cfg(debug_assertions)]
+    pub(crate) fn entries_for_audit(&self) -> impl Iterator<Item = &QueuedTask> {
+        self.entries.iter()
     }
 
     pub fn push_back(&mut self, task: QueuedTask) -> Result<(), TaskError> {
