@@ -248,12 +248,10 @@ fn expand_body(
         }
 
         if let Some(after) = rest.strip_prefix("$ARGUMENTS[") {
-            if let Some(end) = after.find(']') {
-                let token_len = "$ARGUMENTS[".len() + end + 1;
-                let argument_index = (end > 0
-                    && after[..end].bytes().all(|byte| byte.is_ascii_digit()))
-                .then(|| after[..end].parse::<usize>().ok())
-                .flatten();
+            let digit_count = after.bytes().take_while(u8::is_ascii_digit).count();
+            if digit_count > 0 && after.as_bytes().get(digit_count) == Some(&b']') {
+                let token_len = "$ARGUMENTS[".len() + digit_count + 1;
+                let argument_index = after[..digit_count].parse::<usize>().ok();
                 if let Some(argument_index) =
                     argument_index.filter(|value| *value < argument_candidate_end)
                 {
@@ -268,9 +266,10 @@ fn expand_body(
                 index += token_len;
                 continue;
             }
-            // An unterminated indexed-looking token is unknown, so preserve
-            // its dollar sign and let the ordinary character path copy the
-            // remainder without treating `$ARGUMENTS` as a full-args token.
+            // A malformed indexed-looking token is unknown. Preserve its
+            // dollar sign and let the ordinary character path copy the rest
+            // without treating `$ARGUMENTS` as a full-args token. Reading only
+            // the adjacent digit run above keeps the overall scan linear.
             push_expanded(&mut expanded, "$")?;
             index += 1;
             continue;

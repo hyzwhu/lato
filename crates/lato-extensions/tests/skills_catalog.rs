@@ -5,8 +5,8 @@ use std::{
 
 use lato_core::SkillInvocationOrigin;
 use lato_extensions::skills::{
-    DiscoveredSkill, MAX_EXPANDED_SKILL_BODY_BYTES, MAX_MODEL_SKILL_LISTING_ENTRIES, SkillCatalog,
-    SkillDiscovery, SkillInvokeError,
+    DiscoveredSkill, MAX_EXPANDED_SKILL_BODY_BYTES, MAX_MODEL_SKILL_LISTING_ENTRIES,
+    MAX_SKILL_FILE_BYTES, SkillCatalog, SkillDiscovery, SkillInvokeError,
 };
 
 fn skill(plugin: &str, name: &str, source_path: PathBuf, body: &str) -> DiscoveredSkill {
@@ -406,6 +406,55 @@ fn shorthand_candidates_follow_grok_multi_digit_and_digit_boundary_rules() {
             .contains("zero|one|twelve||$100|onetail|twelvetail")
     );
     assert!(!invoked.message.contains("**ARGUMENTS:**"));
+}
+
+#[test]
+fn repeated_unterminated_index_tokens_near_file_limit_remain_bounded() {
+    let token = "$ARGUMENTS[";
+    let body = token.repeat((MAX_SKILL_FILE_BYTES - 1) / token.len());
+    let catalog = catalog(vec![skill(
+        "demo",
+        "malformed",
+        "/plugins/demo/malformed/SKILL.md".into(),
+        &body,
+    )]);
+
+    assert!(matches!(
+        catalog.invoke(
+            SkillInvocationOrigin::User,
+            "malformed",
+            Some("argument"),
+            "s"
+        ),
+        Err(SkillInvokeError::ExpansionTooLarge { limit }) if limit == MAX_EXPANDED_SKILL_BODY_BYTES
+    ));
+}
+
+#[test]
+fn body_hash_is_sha256_of_expanded_body_and_changes_with_arguments() {
+    let catalog = catalog(vec![skill(
+        "demo",
+        "hash",
+        "/plugins/demo/hash/SKILL.md".into(),
+        "$ARGUMENTS",
+    )]);
+
+    let alpha = catalog
+        .invoke(SkillInvocationOrigin::User, "hash", Some("alpha"), "s")
+        .unwrap();
+    let beta = catalog
+        .invoke(SkillInvocationOrigin::User, "hash", Some("beta"), "s")
+        .unwrap();
+
+    assert_eq!(
+        alpha.body_hash,
+        "8ed3f6ad685b959ead7022518e1af76cd816f8e8ec7ccdda1ed4018e8f2223f8"
+    );
+    assert_eq!(
+        beta.body_hash,
+        "f44e64e75f3948e9f73f8dfa94721c4ce8cbb4f265c4790c702b2d41cfbf2753"
+    );
+    assert_ne!(alpha.body_hash, beta.body_hash);
 }
 
 #[test]
