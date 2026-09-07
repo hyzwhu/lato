@@ -10,16 +10,30 @@ use std::collections::HashSet;
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CancelTarget {
-    Task(TaskId),
+    Task {
+        task_id: TaskId,
+    },
     Turn {
         session_id: SessionId,
         turn_id: TurnId,
     },
-    Root(TaskId),
+    Root {
+        root_id: TaskId,
+    },
     Workflow {
         run_id: String,
         root_id: Option<TaskId>,
     },
+}
+
+impl CancelTarget {
+    pub fn task(task_id: TaskId) -> Self {
+        Self::Task { task_id }
+    }
+
+    pub fn root(root_id: TaskId) -> Self {
+        Self::Root { root_id }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -42,17 +56,12 @@ pub(crate) fn resolve_cancellation(
     target: &CancelTarget,
 ) -> Result<ResolvedCancellation, TaskError> {
     let task_ids = match target {
-        CancelTarget::Task(task_id) => {
+        CancelTarget::Task { task_id } => {
             if !caller_owns(state, caller, task_id) {
                 return Err(not_found());
             }
-            let target_record = state.tasks.get(task_id).ok_or_else(not_found)?;
-            let is_root = target_record.node.parent_id.is_none();
-            state
-                .descendants_including(task_id)
-                .into_iter()
-                .filter(|candidate| !is_root || candidate != task_id)
-                .collect()
+            state.tasks.get(task_id).ok_or_else(not_found)?;
+            state.descendants_including(task_id)
         }
         CancelTarget::Turn {
             session_id,
@@ -72,7 +81,7 @@ pub(crate) fn resolve_cancellation(
             })
             .map(|(task_id, _)| task_id.clone())
             .collect(),
-        CancelTarget::Root(root_id) => {
+        CancelTarget::Root { root_id } => {
             if !state.roots.contains(root_id) {
                 return Err(not_found());
             }
@@ -80,9 +89,7 @@ pub(crate) fn resolve_cancellation(
                 .tasks
                 .iter()
                 .filter(|(_, record)| {
-                    record.node.parent_id.is_some()
-                        && &record.node.root_id == root_id
-                        && matches!(record.node.owner, TaskOwner::Interactive { .. })
+                    record.node.parent_id.is_some() && &record.node.root_id == root_id
                 })
                 .map(|(task_id, _)| task_id.clone())
                 .collect()
@@ -131,12 +138,12 @@ pub(crate) fn resolve_cancellation(
         .count();
 
     let admission_tasks = match target {
-        CancelTarget::Task(task_id) => vec![task_id.clone()],
+        CancelTarget::Task { task_id } => vec![task_id.clone()],
         _ => Vec::new(),
     };
     let admission_roots = match target {
-        CancelTarget::Task(_) => Vec::new(),
-        CancelTarget::Root(root_id) => vec![root_id.clone()],
+        CancelTarget::Task { .. } => Vec::new(),
+        CancelTarget::Root { root_id } => vec![root_id.clone()],
         CancelTarget::Turn {
             session_id,
             turn_id,
@@ -218,7 +225,7 @@ pub(crate) fn resolve_root_teardown(
 
 pub(crate) fn target_matches_live(state: &CoordinatorState, target: &CancelTarget) -> bool {
     match target {
-        CancelTarget::Root(root_id) => state.tasks.values().any(|record| {
+        CancelTarget::Root { root_id } => state.tasks.values().any(|record| {
             record.node.parent_id.is_some()
                 && &record.node.root_id == root_id
                 && !record.node.status.is_terminal()
@@ -234,7 +241,7 @@ pub(crate) fn target_matches_live(state: &CoordinatorState, target: &CancelTarge
                     TaskOwner::Workflow { run_id: owner_run, .. } if owner_run == run_id
                 )
         }),
-        CancelTarget::Task(_) | CancelTarget::Turn { .. } => false,
+        CancelTarget::Task { .. } | CancelTarget::Turn { .. } => false,
     }
 }
 
@@ -246,8 +253,11 @@ pub(crate) fn target_contains_task(
     let Some(record) = state.tasks.get(task_id) else {
         return false;
     };
+    if record.node.parent_id.is_none() {
+        return false;
+    }
     match target {
-        CancelTarget::Root(root_id) => &record.node.root_id == root_id,
+        CancelTarget::Root { root_id } => &record.node.root_id == root_id,
         CancelTarget::Workflow { run_id, root_id } => {
             root_id
                 .as_ref()
@@ -257,7 +267,7 @@ pub(crate) fn target_contains_task(
                     TaskOwner::Workflow { run_id: owner_run, .. } if owner_run == run_id
                 )
         }
-        CancelTarget::Task(_) | CancelTarget::Turn { .. } => false,
+        CancelTarget::Task { .. } | CancelTarget::Turn { .. } => false,
     }
 }
 

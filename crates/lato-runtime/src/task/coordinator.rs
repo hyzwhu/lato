@@ -194,7 +194,9 @@ pub struct TaskCoordinator<R: TaskRunner, A: WorkspaceAllocator> {
     jobs: FuturesUnordered<BoxFuture<'static, TaskJobExit>>,
     job_aborts: HashMap<TaskId, OwnedAbortHandle>,
     cancel_deadlines: HashMap<TaskId, Instant>,
+    administrative_cancel_pending: HashSet<TaskId>,
     drain_waiters: Vec<DrainWaiter>,
+    abandoned_teardown_roots: HashSet<TaskId>,
     cancellation_batch_active: bool,
     validations: FuturesUnordered<BoxFuture<'static, ProfileValidation>>,
     validation_aborts: HashMap<TaskId, tokio::task::AbortHandle>,
@@ -290,7 +292,9 @@ where
         jobs: FuturesUnordered::new(),
         job_aborts: HashMap::new(),
         cancel_deadlines: HashMap::new(),
+        administrative_cancel_pending: HashSet::new(),
         drain_waiters: Vec::new(),
+        abandoned_teardown_roots: HashSet::new(),
         cancellation_batch_active: false,
         validations: FuturesUnordered::new(),
         validation_aborts: HashMap::new(),
@@ -353,6 +357,7 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
             self.dispatch_progress_polls();
         }
         self.reap_cancelled().await;
+        self.reap_closed_drain_waiters();
         self.expire_drain_waiters(now);
         self.expire_waiters(now);
         self.expire_foreground(now);
@@ -747,7 +752,10 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
 
     pub async fn run(mut self) {
         loop {
+            self.resolve_administrative_cancellations();
+            self.reap_closed_drain_waiters();
             self.resolve_drain_waiters();
+            self.reopen_abandoned_teardown_roots();
             if self.shutdown.as_ref().is_some_and(|shutdown| {
                 self.jobs.is_empty()
                     && self.validations.is_empty()
@@ -1062,7 +1070,7 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
         if wait_for_drain
             && !matches!(
                 target,
-                CancelTarget::Root(_) | CancelTarget::Workflow { .. }
+                CancelTarget::Root { .. } | CancelTarget::Workflow { .. }
             )
         {
             let _ = reply.send(Err(TaskError::new(
@@ -1087,7 +1095,9 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
         }
         let resolved_result = if reopen_on_backstop {
             match &target {
-                CancelTarget::Root(root_id) => resolve_root_teardown(&self.state, &caller, root_id),
+                CancelTarget::Root { root_id } => {
+                    resolve_root_teardown(&self.state, &caller, root_id)
+                }
                 _ => resolve_cancellation(&self.state, &caller, &target),
             }
         } else {
@@ -1145,14 +1155,14 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
         target: &CancelTarget,
     ) -> Result<(), TaskError> {
         match (caller, target) {
-            (InspectCaller::Admin, _) | (InspectCaller::Scoped { .. }, CancelTarget::Task(_)) => {
-                Ok(())
-            }
-            (InspectCaller::Scoped { root_id, task_id }, CancelTarget::Root(target_root))
-                if root_id == target_root && task_id == target_root =>
-            {
-                Ok(())
-            }
+            (InspectCaller::Admin, _)
+            | (InspectCaller::Scoped { .. }, CancelTarget::Task { .. }) => Ok(()),
+            (
+                InspectCaller::Scoped { root_id, task_id },
+                CancelTarget::Root {
+                    root_id: target_root,
+                },
+            ) if root_id == target_root && task_id == target_root => Ok(()),
             _ => Err(not_found()),
         }
     }
@@ -1170,7 +1180,10 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
                 not_found()
             });
         }
-        if !closed && self.root_has_active_drain(root_id) {
+        if !closed
+            && (self.root_has_active_drain(root_id)
+                || self.abandoned_teardown_roots.contains(root_id))
+        {
             return Err(TaskError::new(
                 TaskErrorCode::SpawnAdmissionClosed,
                 "root spawn admission cannot reopen while teardown drain is active",
@@ -1219,7 +1232,7 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
         self.drain_waiters
             .iter()
             .any(|waiter| match &waiter.target {
-                CancelTarget::Root(candidate) => candidate == root_id,
+                CancelTarget::Root { root_id: candidate } => candidate == root_id,
                 CancelTarget::Workflow {
                     root_id: Some(candidate),
                     ..
@@ -1235,7 +1248,7 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
                                 if owner_run == run_id
                         )
                 }),
-                CancelTarget::Task(_) | CancelTarget::Turn { .. } => false,
+                CancelTarget::Task { .. } | CancelTarget::Turn { .. } => false,
             })
     }
 
@@ -1272,10 +1285,71 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
             if self.drain_is_pending(&waiter.target) {
                 pending.push(waiter);
             } else {
-                let _ = waiter.reply.send(Ok(waiter.outcome));
+                let reply_dropped = waiter.reply.send(Ok(waiter.outcome)).is_err();
+                if reply_dropped
+                    && waiter.reopen_on_backstop
+                    && let CancelTarget::Root { root_id } = waiter.target
+                {
+                    self.abandoned_teardown_roots.insert(root_id);
+                }
             }
         }
         self.drain_waiters = pending;
+        self.reopen_abandoned_teardown_roots();
+    }
+
+    fn reap_closed_drain_waiters(&mut self) {
+        let waiters = std::mem::take(&mut self.drain_waiters);
+        let mut pending = Vec::with_capacity(waiters.len());
+        for waiter in waiters {
+            if waiter.reply.is_closed() {
+                if waiter.reopen_on_backstop
+                    && let CancelTarget::Root { root_id } = waiter.target
+                {
+                    self.abandoned_teardown_roots.insert(root_id);
+                }
+            } else {
+                pending.push(waiter);
+            }
+        }
+        self.drain_waiters = pending;
+        self.reopen_abandoned_teardown_roots();
+    }
+
+    fn reopen_abandoned_teardown_roots(&mut self) {
+        let ready: Vec<_> = self
+            .abandoned_teardown_roots
+            .iter()
+            .filter(|root_id| {
+                !self.root_has_active_drain(root_id)
+                    && !self.drain_is_pending(&CancelTarget::root((*root_id).clone()))
+            })
+            .cloned()
+            .collect();
+        for root_id in ready {
+            self.abandoned_teardown_roots.remove(&root_id);
+            self.set_admission_record(&root_id, false);
+        }
+    }
+
+    fn resolve_administrative_cancellations(&mut self) {
+        let ready: Vec<_> = self
+            .administrative_cancel_pending
+            .iter()
+            .filter(|root_id| {
+                self.state
+                    .descendants_including(root_id)
+                    .into_iter()
+                    .filter(|task_id| task_id != *root_id)
+                    .all(|task_id| self.state.tasks[&task_id].node.status.is_terminal())
+            })
+            .cloned()
+            .collect();
+        for root_id in ready {
+            self.administrative_cancel_pending.remove(&root_id);
+            self.cancel_deadlines.remove(&root_id);
+            self.terminalize_cancelled(&root_id);
+        }
     }
 
     fn expire_drain_waiters(&mut self, now: Instant) {
@@ -1314,7 +1388,7 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
                 ),
             )));
             if waiter.reopen_on_backstop
-                && let CancelTarget::Root(root_id) = waiter.target
+                && let CancelTarget::Root { root_id } = waiter.target
             {
                 reopen.insert(root_id);
             }
@@ -2154,6 +2228,12 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
             });
         }
         self.commit_transition(task_id.clone(), TaskEventPayload::CancellationRequested);
+        if self.state.tasks[&task_id].node.parent_id.is_none() {
+            self.cancel_deadlines
+                .insert(task_id.clone(), Instant::now() + self.config.cancel_grace);
+            self.administrative_cancel_pending.insert(task_id);
+            return;
+        }
         self.cancel_deadlines
             .insert(task_id, Instant::now() + self.config.cancel_grace);
     }

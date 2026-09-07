@@ -627,7 +627,7 @@ impl TaskHandle {
     }
 
     pub async fn cancel_task(&self, task_id: TaskId) -> Result<CancelOutcome, TaskError> {
-        self.cancel(CancelTarget::Task(task_id), false, false).await
+        self.cancel(CancelTarget::task(task_id), false, false).await
     }
 
     pub async fn cancel_turn(
@@ -647,7 +647,7 @@ impl TaskHandle {
     }
 
     pub async fn cancel_root(&self, root_id: TaskId) -> Result<CancelOutcome, TaskError> {
-        self.cancel(CancelTarget::Root(root_id), false, false).await
+        self.cancel(CancelTarget::root(root_id), false, false).await
     }
 
     pub async fn cancel_workflow(
@@ -671,7 +671,7 @@ impl TaskHandle {
         &self,
         root_id: TaskId,
     ) -> Result<CancelOutcome, TaskError> {
-        self.cancel(CancelTarget::Root(root_id), true, true).await
+        self.cancel(CancelTarget::root(root_id), true, true).await
     }
 
     async fn cancel(
@@ -911,7 +911,7 @@ impl ScopedTaskHandle {
         let (reply, response) = oneshot::channel();
         self.inner
             .send(TaskCommand::Cancel {
-                target: CancelTarget::Task(task_id),
+                target: CancelTarget::task(task_id),
                 caller: InspectCaller::Scoped {
                     root_id: self.root_id.clone(),
                     task_id: self.task_id.clone(),
@@ -936,7 +936,7 @@ impl ScopedTaskHandle {
         let (reply, response) = oneshot::channel();
         self.inner
             .send(TaskCommand::Cancel {
-                target: CancelTarget::Root(self.root_id.clone()),
+                target: CancelTarget::root(self.root_id.clone()),
                 caller: InspectCaller::Scoped {
                     root_id: self.root_id.clone(),
                     task_id: self.task_id.clone(),

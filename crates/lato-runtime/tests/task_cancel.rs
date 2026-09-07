@@ -5,7 +5,7 @@ use lato_core::{
     TaskScope, TaskStatus, ToolCapability, TurnId,
 };
 use lato_runtime::{
-    CancelOutcome, CoordinatorConfig, NoopTaskEventSink, SpawnMode, SpawnTaskRequest,
+    CancelOutcome, CancelTarget, CoordinatorConfig, NoopTaskEventSink, SpawnMode, SpawnTaskRequest,
     TaskEventPayload, TaskRootRequest, spawn_task_coordinator,
 };
 use lato_workspace::MemoryWorkspaceAllocator;
@@ -30,6 +30,41 @@ fn request(id: &str) -> SpawnTaskRequest {
         mode: SpawnMode::Background,
         cancellation: CancellationToken::new(),
     }
+}
+
+#[test]
+fn cancel_targets_round_trip_with_stable_tagged_shapes() {
+    let targets = [
+        CancelTarget::Task {
+            task_id: TaskId::from("task"),
+        },
+        CancelTarget::Turn {
+            session_id: SessionId::from("session"),
+            turn_id: TurnId::from("turn"),
+        },
+        CancelTarget::Root {
+            root_id: TaskId::from("root"),
+        },
+        CancelTarget::Workflow {
+            run_id: "run".into(),
+            root_id: Some(TaskId::from("root")),
+        },
+    ];
+    for target in targets {
+        let value = serde_json::to_value(&target).unwrap();
+        assert!(value["type"].is_string());
+        assert_eq!(
+            serde_json::from_value::<CancelTarget>(value).unwrap(),
+            target
+        );
+    }
+    assert_eq!(
+        serde_json::to_value(CancelTarget::Task {
+            task_id: TaskId::from("task")
+        })
+        .unwrap(),
+        serde_json::json!({"type": "task", "task_id": "task"})
+    );
 }
 
 async fn wait_terminal(harness: &Harness, id: &str) -> lato_runtime::TaskSnapshot {
@@ -103,6 +138,60 @@ async fn cancelling_parent_cancels_all_descendants_only() {
             .code,
         TaskErrorCode::NotFoundOrNotOwned
     );
+}
+
+#[tokio::test]
+async fn cancelling_root_as_a_task_terminalizes_root_after_its_descendants() {
+    let harness = Harness::new(CoordinatorConfig::default()).await;
+    let root = harness
+        .register_root_scoped("root", "session", "turn")
+        .await;
+    let child = root.spawn(request("child")).await.unwrap().handle;
+    child.spawn(request("grandchild")).await.unwrap();
+    for id in ["child", "grandchild"] {
+        harness.wait_for_status(id, TaskStatus::Running).await;
+    }
+    let mut terminal_order = Vec::new();
+    let mut events = harness.handle.subscribe();
+    assert_eq!(
+        harness
+            .handle
+            .cancel_task(TaskId::from("root"))
+            .await
+            .unwrap(),
+        CancelOutcome {
+            matched: 3,
+            newly_requested: 3,
+            already_terminal: 0,
+        }
+    );
+    for id in ["root", "child", "grandchild"] {
+        assert_eq!(
+            wait_terminal(&harness, id).await.node.status,
+            TaskStatus::Cancelled
+        );
+    }
+    while let Ok(event) = events.try_recv() {
+        if matches!(event.payload, TaskEventPayload::Cancelled) {
+            terminal_order.push(event.task_id);
+        }
+    }
+    let root_position = terminal_order
+        .iter()
+        .position(|task_id| task_id == &TaskId::from("root"))
+        .unwrap();
+    assert!(terminal_order[..root_position].contains(&TaskId::from("child")));
+    assert!(terminal_order[..root_position].contains(&TaskId::from("grandchild")));
+    assert_eq!(terminal_order.len(), 3);
+    for id in ["root", "child", "grandchild"] {
+        assert_eq!(
+            terminal_order
+                .iter()
+                .filter(|task_id| task_id.as_str() == id)
+                .count(),
+            1
+        );
+    }
 }
 
 #[tokio::test]
@@ -299,6 +388,101 @@ async fn turn_and_workflow_cancellation_match_only_their_owner_scope() {
     );
 }
 
+#[tokio::test]
+async fn root_cancellation_includes_workflow_owned_descendants_but_not_the_root_node() {
+    let harness = Harness::new(CoordinatorConfig::default()).await;
+    let workflow = harness
+        .handle
+        .register_root(TaskRootRequest {
+            task_id: TaskId::from("workflow-root"),
+            owner: TaskOwner::Workflow {
+                run_id: "run".into(),
+                session_id: SessionId::from("session"),
+            },
+            profile: AgentProfile::worker(),
+            permissions: vec![ToolCapability::FileRead, ToolCapability::FileWrite],
+            budget: BudgetLimits::unlimited(),
+        })
+        .await
+        .unwrap();
+    workflow.spawn(request("workflow-child")).await.unwrap();
+    harness
+        .wait_for_status("workflow-child", TaskStatus::Running)
+        .await;
+    assert_eq!(
+        harness
+            .handle
+            .cancel_root(TaskId::from("workflow-root"))
+            .await
+            .unwrap()
+            .matched,
+        1
+    );
+    assert_eq!(
+        wait_terminal(&harness, "workflow-child").await.node.status,
+        TaskStatus::Cancelled
+    );
+    assert_eq!(
+        harness
+            .handle
+            .inspect_admin(TaskId::from("workflow-root"))
+            .await
+            .unwrap()
+            .node
+            .status,
+        TaskStatus::Running
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn dropped_teardown_waiter_frees_capacity_and_reopens_after_safe_drain() {
+    let runner = Arc::new(GatedTaskRunner::with_options(false, true, false, false));
+    let harness = Harness::with_runner(
+        CoordinatorConfig {
+            max_waiters: 1,
+            cancel_grace: Duration::from_secs(1),
+            teardown_drain_timeout: Duration::from_secs(5),
+            queued_reap_interval: Duration::from_millis(100),
+            ..CoordinatorConfig::default()
+        },
+        runner,
+    )
+    .await;
+    let root = harness
+        .register_root_scoped("root", "session", "turn")
+        .await;
+    root.spawn(request("child")).await.unwrap();
+    harness.wait_for_status("child", TaskStatus::Running).await;
+
+    let abandoned_handle = harness.handle.clone();
+    let abandoned = tokio::spawn(async move {
+        abandoned_handle
+            .teardown_root_and_drain(TaskId::from("root"))
+            .await
+    });
+    tokio::task::yield_now().await;
+    abandoned.abort();
+    let _ = abandoned.await;
+    tokio::time::advance(Duration::from_millis(100)).await;
+    tokio::task::yield_now().await;
+
+    let next_handle = harness.handle.clone();
+    let next = tokio::spawn(async move {
+        next_handle
+            .teardown_root_and_drain(TaskId::from("root"))
+            .await
+    });
+    tokio::task::yield_now().await;
+    assert!(
+        !next.is_finished(),
+        "replacement drain waiter must be admitted"
+    );
+    tokio::time::advance(Duration::from_millis(900)).await;
+    tokio::task::yield_now().await;
+    assert!(next.await.unwrap().is_ok());
+    assert!(root.spawn(request("after-abandoned-drain")).await.is_ok());
+}
+
 #[tokio::test(start_paused = true)]
 async fn teardown_closes_admission_resolves_all_waiters_and_reopens_only_its_root() {
     let runner = Arc::new(GatedTaskRunner::with_options(false, true, false, false));
@@ -439,10 +623,9 @@ async fn teardown_backstop_is_truthful_and_reopens_only_the_selected_root() {
     );
     tokio::time::advance(Duration::from_secs(2)).await;
     tokio::task::yield_now().await;
-    assert_eq!(
-        teardown.await.unwrap().unwrap_err().code,
-        TaskErrorCode::TimedOut
-    );
+    let error = teardown.await.unwrap().unwrap_err();
+    assert_eq!(error.code, TaskErrorCode::TimedOut);
+    assert!(error.message.contains("1 unfinished task(s)"));
     assert!(root.spawn(request("after-backstop")).await.is_ok());
     assert_eq!(
         foreign
@@ -452,6 +635,54 @@ async fn teardown_backstop_is_truthful_and_reopens_only_the_selected_root() {
             .code,
         TaskErrorCode::SpawnAdmissionClosed
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn workflow_drain_timeout_counts_only_unfinished_descendants() {
+    let runner = Arc::new(GatedTaskRunner::with_options(false, true, false, false));
+    let harness = Harness::with_runner(
+        CoordinatorConfig {
+            cancel_grace: Duration::from_secs(10),
+            teardown_drain_timeout: Duration::from_secs(2),
+            ..CoordinatorConfig::default()
+        },
+        runner,
+    )
+    .await;
+    let workflow = harness
+        .handle
+        .register_root(TaskRootRequest {
+            task_id: TaskId::from("workflow-root"),
+            owner: TaskOwner::Workflow {
+                run_id: "run".into(),
+                session_id: SessionId::from("session"),
+            },
+            profile: AgentProfile::worker(),
+            permissions: vec![ToolCapability::FileRead, ToolCapability::FileWrite],
+            budget: BudgetLimits::unlimited(),
+        })
+        .await
+        .unwrap();
+    workflow
+        .spawn(request("stuck-workflow-child"))
+        .await
+        .unwrap();
+    harness
+        .wait_for_status("stuck-workflow-child", TaskStatus::Running)
+        .await;
+
+    let handle = harness.handle.clone();
+    let drain = tokio::spawn(async move {
+        handle
+            .cancel_workflow("run".into(), Some(TaskId::from("workflow-root")))
+            .await
+    });
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(2)).await;
+    tokio::task::yield_now().await;
+    let error = drain.await.unwrap().unwrap_err();
+    assert_eq!(error.code, TaskErrorCode::TimedOut);
+    assert!(error.message.contains("1 unfinished task(s)"));
 }
 
 #[tokio::test]
