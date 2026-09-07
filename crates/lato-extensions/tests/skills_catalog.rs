@@ -325,6 +325,90 @@ fn appends_arguments_only_when_no_argument_token_is_consumed() {
 }
 
 #[test]
+fn unknown_dollar_tokens_remain_unchanged() {
+    let catalog = catalog(vec![skill(
+        "demo",
+        "inspect",
+        "/plugins/demo/inspect/SKILL.md".into(),
+        "Price: $100, var: ${UNKNOWN}, indexed: $ARGUMENTS[100]",
+    )]);
+
+    let invoked = catalog
+        .invoke(SkillInvocationOrigin::User, "inspect", None, "s")
+        .unwrap();
+
+    assert!(
+        invoked
+            .message
+            .contains("Price: $100, var: ${UNKNOWN}, indexed: $ARGUMENTS[100]")
+    );
+}
+
+#[test]
+fn dollar_amount_does_not_suppress_argument_suffix() {
+    let catalog = catalog(vec![skill(
+        "demo",
+        "inspect",
+        "/plugins/demo/inspect/SKILL.md".into(),
+        "Price: $100 per unit.",
+    )]);
+
+    let invoked = catalog
+        .invoke(
+            SkillInvocationOrigin::User,
+            "inspect",
+            Some("deploy staging"),
+            "s",
+        )
+        .unwrap();
+
+    assert!(
+        invoked
+            .message
+            .contains("Price: $100 per unit.\n\n**ARGUMENTS:** deploy staging")
+    );
+}
+
+#[test]
+fn real_argument_substitution_suppresses_suffix() {
+    let catalog = catalog(vec![skill(
+        "demo",
+        "inspect",
+        "/plugins/demo/inspect/SKILL.md".into(),
+        "Run: $ARGUMENTS (cost: $100)",
+    )]);
+
+    let invoked = catalog
+        .invoke(SkillInvocationOrigin::User, "inspect", Some("deploy"), "s")
+        .unwrap();
+
+    assert!(invoked.message.contains("Run: deploy (cost: $100)"));
+    assert!(!invoked.message.contains("**ARGUMENTS:**"));
+}
+
+#[test]
+fn shorthand_candidates_follow_grok_multi_digit_and_digit_boundary_rules() {
+    let catalog = catalog(vec![skill(
+        "demo",
+        "inspect",
+        "/plugins/demo/inspect/SKILL.md".into(),
+        "$0|$1|$12|$13|$100|$1tail|$12tail",
+    )]);
+    let args = "zero one two three four five six seven eight nine ten eleven twelve";
+
+    let invoked = catalog
+        .invoke(SkillInvocationOrigin::User, "inspect", Some(args), "s")
+        .unwrap();
+
+    assert!(
+        invoked
+            .message
+            .contains("zero|one|twelve||$100|onetail|twelvetail")
+    );
+    assert!(!invoked.message.contains("**ARGUMENTS:**"));
+}
+
+#[test]
 fn rejects_expansion_over_128_kib() {
     let body = "$ARGUMENTS".repeat(MAX_EXPANDED_SKILL_BODY_BYTES / "$ARGUMENTS".len());
     let catalog = catalog(vec![skill(

@@ -220,6 +220,10 @@ fn expand_body(
     let skill_dir = descriptor.skill_dir.to_string_lossy();
     let plugin_root = descriptor.plugin_root.to_string_lossy();
     let body = descriptor.body.as_str();
+    // Match Grok's bounded candidate set: indexes through the current argv
+    // plus a small missing-position window are substitutions. Larger digit
+    // sequences (notably currency such as `$100`) remain ordinary text.
+    let argument_candidate_end = argv.len().max(1).saturating_add(20);
     let mut expanded = String::with_capacity(body.len().min(MAX_EXPANDED_SKILL_BODY_BYTES));
     let mut index = 0;
     let mut consumed_argument_token = false;
@@ -243,20 +247,32 @@ fn expand_body(
             continue;
         }
 
-        if let Some(after) = rest.strip_prefix("$ARGUMENTS[")
-            && let Some(end) = after.find(']')
-            && end > 0
-            && after[..end].bytes().all(|byte| byte.is_ascii_digit())
-        {
-            let argument_index = after[..end].parse::<usize>().ok();
-            push_expanded(
-                &mut expanded,
-                argument_index
-                    .and_then(|value| argv.get(value).copied())
-                    .unwrap_or(""),
-            )?;
-            index += "$ARGUMENTS[".len() + end + 1;
-            consumed_argument_token = true;
+        if let Some(after) = rest.strip_prefix("$ARGUMENTS[") {
+            if let Some(end) = after.find(']') {
+                let token_len = "$ARGUMENTS[".len() + end + 1;
+                let argument_index = (end > 0
+                    && after[..end].bytes().all(|byte| byte.is_ascii_digit()))
+                .then(|| after[..end].parse::<usize>().ok())
+                .flatten();
+                if let Some(argument_index) =
+                    argument_index.filter(|value| *value < argument_candidate_end)
+                {
+                    push_expanded(
+                        &mut expanded,
+                        argv.get(argument_index).copied().unwrap_or(""),
+                    )?;
+                    consumed_argument_token = true;
+                } else {
+                    push_expanded(&mut expanded, &rest[..token_len])?;
+                }
+                index += token_len;
+                continue;
+            }
+            // An unterminated indexed-looking token is unknown, so preserve
+            // its dollar sign and let the ordinary character path copy the
+            // remainder without treating `$ARGUMENTS` as a full-args token.
+            push_expanded(&mut expanded, "$")?;
+            index += 1;
             continue;
         }
         if rest.starts_with("$ARGUMENTS") {
@@ -269,14 +285,18 @@ fn expand_body(
             let digits = after.bytes().take_while(u8::is_ascii_digit).count();
             if digits > 0 {
                 let argument_index = after[..digits].parse::<usize>().ok();
-                push_expanded(
-                    &mut expanded,
-                    argument_index
-                        .and_then(|value| argv.get(value).copied())
-                        .unwrap_or(""),
-                )?;
+                if let Some(argument_index) =
+                    argument_index.filter(|value| *value < argument_candidate_end)
+                {
+                    push_expanded(
+                        &mut expanded,
+                        argv.get(argument_index).copied().unwrap_or(""),
+                    )?;
+                    consumed_argument_token = true;
+                } else {
+                    push_expanded(&mut expanded, &rest[..1 + digits])?;
+                }
                 index += 1 + digits;
-                consumed_argument_token = true;
                 continue;
             }
         }
