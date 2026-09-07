@@ -10,8 +10,10 @@ use lato_ai::{ActiveModelStream, ModelStream, adapt_model_endpoint};
 use lato_core::{
     AgentError, CancelReason, Command, CompactSession, CompactionId, CompactionPolicy,
     CompactionSize, CompactionTrigger, ErrorCategory, EventPayload, JournalError, JournalReplay,
-    Retryability, SessionId, SessionStore, StartBehavior, StartTurn, TurnId, UserInput,
+    PluginSnapshotSummary, Retryability, SessionId, SessionStore, StartBehavior, StartTurn, TurnId,
+    UserInput,
 };
+use lato_extensions::PluginSnapshot;
 use lato_runtime::{
     SessionBootstrap, SessionHandle, TurnDriver, spawn_session, spawn_session_with_store,
 };
@@ -67,6 +69,23 @@ pub struct RuntimeSession {
     updates: mpsc::UnboundedSender<serde_json::Value>,
     active_operation: Mutex<Option<ActiveOperation>>,
     submission_gate: Mutex<()>,
+    plugin_state: Mutex<SessionPluginState>,
+}
+
+struct SessionPluginState {
+    current: Arc<PluginSnapshot>,
+    active_turn: Option<Arc<PluginSnapshot>>,
+    pending: Option<Arc<PluginSnapshot>>,
+}
+
+impl Default for SessionPluginState {
+    fn default() -> Self {
+        Self {
+            current: PluginSnapshot::empty(),
+            active_turn: None,
+            pending: None,
+        }
+    }
 }
 
 pub struct ChildSessionConfig {
@@ -113,6 +132,7 @@ impl RuntimeSession {
             updates: config.updates,
             active_operation: Mutex::new(None),
             submission_gate: Mutex::new(()),
+            plugin_state: Mutex::new(SessionPluginState::default()),
         })
     }
 
@@ -166,6 +186,7 @@ impl RuntimeSession {
             updates,
             active_operation: Mutex::new(None),
             submission_gate: Mutex::new(()),
+            plugin_state: Mutex::new(SessionPluginState::default()),
         }
     }
 
@@ -200,6 +221,7 @@ impl RuntimeSession {
             updates,
             active_operation: Mutex::new(None),
             submission_gate: Mutex::new(()),
+            plugin_state: Mutex::new(SessionPluginState::default()),
         }
     }
 
@@ -323,6 +345,7 @@ impl RuntimeSession {
             updates,
             active_operation: Mutex::new(None),
             submission_gate: Mutex::new(()),
+            plugin_state: Mutex::new(SessionPluginState::default()),
         })
     }
 
@@ -330,13 +353,19 @@ impl RuntimeSession {
         // Locking before subscribing prevents a waiting prompt from consuming
         // another prompt's start event while preserving subscribe-before-submit.
         let gate = self.submission_gate.lock().await;
+        self.begin_plugin_turn().await?;
         let mut events = self.handle.subscribe();
-        self.handle
+        if let Err(error) = self
+            .handle
             .submit(Command::StartTurn(StartTurn {
                 input: UserInput::text(input),
                 behavior: StartBehavior::Reject,
             }))
-            .await?;
+            .await
+        {
+            self.abort_plugin_turn().await;
+            return Err(error);
+        }
 
         let mut observed_turn = None;
         let mut gate = Some(gate);
@@ -437,7 +466,7 @@ impl RuntimeSession {
                 EventPayload::TurnCompleted(output)
                     if event.turn_id.as_ref() == observed_turn.as_ref() =>
                 {
-                    self.clear_active(observed_turn.as_ref()).await;
+                    self.finish_turn(observed_turn.as_ref()).await?;
                     return Ok(RuntimePromptOutcome::Complete {
                         text: output.final_text,
                     });
@@ -445,17 +474,18 @@ impl RuntimeSession {
                 EventPayload::TurnCancelled { reason }
                     if event.turn_id.as_ref() == observed_turn.as_ref() =>
                 {
-                    self.clear_active(observed_turn.as_ref()).await;
+                    self.finish_turn(observed_turn.as_ref()).await?;
                     return Ok(RuntimePromptOutcome::Cancelled { reason });
                 }
                 EventPayload::TurnFailed { error }
                     if event.turn_id.as_ref() == observed_turn.as_ref() =>
                 {
-                    self.clear_active(observed_turn.as_ref()).await;
+                    self.finish_turn(observed_turn.as_ref()).await?;
                     return Err(error);
                 }
                 EventPayload::SessionStopped => {
                     self.clear_active(observed_turn.as_ref()).await;
+                    self.abort_plugin_turn().await;
                     return Err(runtime_stopped());
                 }
                 EventPayload::SessionStarted
@@ -468,9 +498,48 @@ impl RuntimeSession {
                 | EventPayload::CompactionStarted { .. }
                 | EventPayload::CompactionCompleted { .. }
                 | EventPayload::CompactionFailed { .. }
-                | EventPayload::CompactionCancelled { .. } => {}
+                | EventPayload::CompactionCancelled { .. }
+                | EventPayload::PluginSnapshotAdopted { .. } => {}
             }
         }
+    }
+
+    pub async fn stage_plugin_snapshot(
+        &self,
+        snapshot: Arc<PluginSnapshot>,
+    ) -> Result<(), AgentError> {
+        let _gate = self.submission_gate.lock().await;
+        let mut state = self.plugin_state.lock().await;
+        let newest = state
+            .pending
+            .as_ref()
+            .map_or(state.current.generation(), |pending| pending.generation());
+        if snapshot.generation() < newest {
+            return Err(plugin_generation_rollback(newest, snapshot.generation()));
+        }
+        if snapshot.generation() == newest {
+            return Ok(());
+        }
+        if state.active_turn.is_some() || self.active_operation.lock().await.is_some() {
+            state.pending = Some(snapshot);
+            return Ok(());
+        }
+        let previous = Arc::clone(&state.current);
+        drop(state);
+        if let Err(error) = self.adopt_plugin_snapshot(&snapshot).await {
+            self.plugin_state.lock().await.current = previous;
+            return Err(error);
+        }
+        self.plugin_state.lock().await.current = snapshot;
+        Ok(())
+    }
+
+    pub async fn plugin_snapshot(&self) -> Arc<PluginSnapshot> {
+        Arc::clone(&self.plugin_state.lock().await.current)
+    }
+
+    pub async fn active_turn_plugin_snapshot(&self) -> Option<Arc<PluginSnapshot>> {
+        self.plugin_state.lock().await.active_turn.clone()
     }
 
     pub async fn cancel(&self) -> Result<(), AgentError> {
@@ -641,6 +710,47 @@ impl RuntimeSession {
     async fn clear_active(&self, turn_id: Option<&TurnId>) {
         let expected = turn_id.cloned().map(ActiveOperation::Turn);
         self.clear_operation(expected.as_ref()).await;
+    }
+
+    async fn finish_turn(&self, turn_id: Option<&TurnId>) -> Result<(), AgentError> {
+        self.clear_active(turn_id).await;
+        let _gate = self.submission_gate.lock().await;
+        let pending = {
+            let mut state = self.plugin_state.lock().await;
+            state.active_turn = None;
+            state.pending.take()
+        };
+        let Some(pending) = pending else {
+            return Ok(());
+        };
+        if let Err(error) = self.adopt_plugin_snapshot(&pending).await {
+            self.plugin_state.lock().await.pending = Some(pending);
+            return Err(error);
+        }
+        self.plugin_state.lock().await.current = pending;
+        Ok(())
+    }
+
+    async fn begin_plugin_turn(&self) -> Result<(), AgentError> {
+        let mut state = self.plugin_state.lock().await;
+        if state.active_turn.is_some() {
+            return Err(session_busy());
+        }
+        let current = Arc::clone(&state.current);
+        state.active_turn = Some(current);
+        Ok(())
+    }
+
+    async fn abort_plugin_turn(&self) {
+        self.plugin_state.lock().await.active_turn = None;
+    }
+
+    async fn adopt_plugin_snapshot(&self, snapshot: &PluginSnapshot) -> Result<(), AgentError> {
+        self.handle
+            .submit(Command::AdoptPluginSnapshot {
+                summary: snapshot_summary(snapshot),
+            })
+            .await
     }
 
     async fn clear_operation(&self, operation: Option<&ActiveOperation>) {
@@ -822,6 +932,26 @@ fn session_busy() -> AgentError {
         "cannot switch models while the session is active",
         Retryability::Never,
     )
+}
+
+fn plugin_generation_rollback(current: u64, requested: u64) -> AgentError {
+    AgentError::new(
+        "plugin.snapshot_generation_rollback",
+        ErrorCategory::InvalidInput,
+        format!(
+            "cannot replace plugin snapshot generation {current} with older generation {requested}"
+        ),
+        Retryability::Never,
+    )
+}
+
+fn snapshot_summary(snapshot: &PluginSnapshot) -> PluginSnapshotSummary {
+    PluginSnapshotSummary {
+        generation: snapshot.generation(),
+        discovered: snapshot.plugins().len(),
+        active: snapshot.active_plugins().count(),
+        project_trusted: snapshot.project_trusted(),
+    }
 }
 
 fn is_auth_failure(error: &AgentError) -> bool {

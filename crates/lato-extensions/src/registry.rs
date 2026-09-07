@@ -79,6 +79,18 @@ pub struct PluginSnapshot {
 }
 
 impl PluginSnapshot {
+    pub fn empty() -> Arc<Self> {
+        Arc::new(Self {
+            generation: 0,
+            parent_generation: None,
+            built_at_ms: 0,
+            project_trusted: false,
+            cli_plugin_dirs: Arc::from([]),
+            plugins: Arc::from([]),
+            diagnostics: Arc::from([]),
+        })
+    }
+
     pub fn generation(&self) -> u64 {
         self.generation
     }

@@ -281,6 +281,24 @@ impl SessionLoop {
                 )
                 .await
             }
+            Command::AdoptPluginSnapshot { summary } => {
+                if !matches!(self.machine.phase(), SessionPhase::Idle) {
+                    return Err(invalid_state(
+                        "plugin.snapshot_session_busy",
+                        "plugin snapshot adoption requires an idle session",
+                    ));
+                }
+                self.commit(
+                    None,
+                    JournalRecord::PluginSnapshotAdopted {
+                        summary: summary.clone(),
+                    },
+                    JournalDurability::Flush,
+                )
+                .await?;
+                self.emit(None, EventPayload::PluginSnapshotAdopted { summary });
+                Ok(())
+            }
             Command::Shutdown => self.shutdown().await,
         }
     }

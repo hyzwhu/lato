@@ -4,8 +4,8 @@ use lato_core::{
     CompactionTrigger, ContextUsage, EventPayload, EventStore, HistoryProjectionMetadata,
     HistoryProjectionStore, HistoryReplacementReason, JOURNAL_SCHEMA_VERSION, JournalDurability,
     JournalEnvelope, JournalError, JournalRecord, JournalRecordId, JournalReplay, ModelContent,
-    ModelMessage, ModelRole, ProjectionError, SessionId, StartBehavior, StartTurn, TurnOutput,
-    UserInput,
+    ModelMessage, ModelRole, PluginSnapshotSummary, ProjectionError, SessionId, StartBehavior,
+    StartTurn, TurnOutput, UserInput,
 };
 use lato_runtime::{
     AutomaticCompactionOutcome, AutomaticCompactionRequest, CompactionControl, CompactionRequest,
@@ -226,6 +226,47 @@ impl TurnDriver for EchoDriver {
             final_text: request.input.text,
         })
     }
+}
+
+#[tokio::test]
+async fn plugin_snapshot_adoption_is_committed_before_publication() {
+    let sid = SessionId::from("plugin-adoption-order");
+    let store = Arc::new(MemoryEventStore::new());
+    let session = spawn_session_with_store(
+        sid.clone(),
+        Arc::new(EchoDriver),
+        store.clone(),
+        bootstrap(&sid),
+    );
+    let mut events = session.subscribe();
+    let summary = PluginSnapshotSummary {
+        generation: 3,
+        discovered: 2,
+        active: 1,
+        project_trusted: true,
+    };
+    session
+        .submit(Command::AdoptPluginSnapshot {
+            summary: summary.clone(),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        next_event(&mut events).await.payload,
+        EventPayload::SessionStarted
+    ));
+    assert_eq!(
+        next_event(&mut events).await.payload,
+        EventPayload::PluginSnapshotAdopted {
+            summary: summary.clone()
+        }
+    );
+    let replay = store.replay(&sid).await.unwrap();
+    assert_eq!(replay.envelopes.len(), 2);
+    assert_eq!(
+        replay.envelopes[1].record,
+        JournalRecord::PluginSnapshotAdopted { summary }
+    );
 }
 
 struct BlockingDriver;
@@ -684,6 +725,7 @@ fn runtime_event_kind(payload: &EventPayload) -> &'static str {
         EventPayload::CompactionCompleted { .. } => "compaction_completed",
         EventPayload::CompactionFailed { .. } => "compaction_failed",
         EventPayload::CompactionCancelled { .. } => "compaction_cancelled",
+        EventPayload::PluginSnapshotAdopted { .. } => "plugin_snapshot_adopted",
         EventPayload::SessionStopped => "session_stopped",
     }
 }
