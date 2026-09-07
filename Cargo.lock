@@ -1098,6 +1098,7 @@ name = "lato-extensions"
 version = "0.1.0"
 dependencies = [
  "dunce",
+ "lato-core",
  "serde",
  "serde_json",
  "sha2",

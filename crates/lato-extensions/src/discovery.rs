@@ -109,6 +109,8 @@ pub struct DiscoveryConfig {
 pub struct DiscoveryResult {
     pub plugins: Vec<DiscoveredPlugin>,
     pub diagnostics: Vec<DiscoveryDiagnostic>,
+    pub project_trusted: bool,
+    pub cli_plugin_dirs: Vec<PathBuf>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -120,7 +122,12 @@ pub struct DiscoveryDiagnostic {
 }
 
 pub fn discover_plugins(config: &DiscoveryConfig) -> DiscoveryResult {
-    let mut result = DiscoveryResult::default();
+    let mut result = DiscoveryResult {
+        plugins: Vec::new(),
+        diagnostics: Vec::new(),
+        project_trusted: config.project_trusted,
+        cli_plugin_dirs: config.cli_plugin_dirs.clone(),
+    };
     let mut seen = HashSet::new();
     let mut candidates = Vec::new();
 

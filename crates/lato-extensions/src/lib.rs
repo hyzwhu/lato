@@ -1,5 +1,6 @@
 pub mod discovery;
 pub mod manifest;
+pub mod registry;
 pub mod trust;
 
 pub use discovery::{
@@ -9,6 +10,10 @@ pub use discovery::{
 pub use manifest::{
     Author, ManifestError, ManifestLoadResult, PathOrInline, PathOrPaths, PluginManifest,
     load_manifest, name_from_dirname,
+};
+pub use registry::{
+    CapabilityCeiling, LoadedPlugin, PluginComponentKind, PluginConfig, PluginSnapshot,
+    RegistryBuildError, build_snapshot,
 };
 
 pub const MAX_PLUGIN_NAME_LEN: usize = 64;
