@@ -4,8 +4,8 @@
 
 use crate::{
     AutoCompactionSuppression, ContextTracker, HistoryItem, PREFIRE_LEAD_PERCENT,
-    SamplingRecoveryBudget, TWO_PASS_SPLIT_PERCENT, compaction_suppression_reason,
-    fingerprint_prefix, split_for_two_pass,
+    SamplingRecoveryBudget, SessionSkillHandle, TWO_PASS_SPLIT_PERCENT,
+    compaction_suppression_reason, fingerprint_prefix, split_for_two_pass,
 };
 use async_trait::async_trait;
 use lato_ai::{
@@ -18,11 +18,14 @@ use lato_core::{
     PolicyAuditStage, PolicyDecision, Retryability, SessionId, ToolCallId, ToolContext, ToolError,
     ToolName, TurnId, journal_request_hash,
 };
+use lato_extensions::skills::SkillCatalog;
 use lato_runtime::{
     AutomaticCompactionOutcome, AutomaticCompactionRequest, PrefireCompactionRequest,
     TurnEventEmitter, TwoPassCompactionInput,
 };
-use lato_tools::{BuiltinToolEnvironment, ToolRuntime, bound_tool_output, builtin_tool_runtime};
+use lato_tools::{
+    BuiltinToolEnvironment, SkillToolScope, ToolRuntime, bound_tool_output, builtin_tool_runtime,
+};
 use lato_workspace::{FileLocks, SessionTrust};
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 use tokio::sync::mpsc;
@@ -91,6 +94,8 @@ pub struct SessionActor {
     _trust: SessionTrust,
     cwd: PathBuf,
     tool_runtime: Arc<ToolRuntime>,
+    skill_handle: SessionSkillHandle,
+    skill_listing: String,
     session_id: SessionId,
     turn_id: TurnId,
     turn_cancellation: CancellationToken,
@@ -114,14 +119,22 @@ impl SessionActor {
         trust: SessionTrust,
         cwd: PathBuf,
     ) -> Self {
+        let skill_handle = SessionSkillHandle::default();
         let tool_runtime = builtin_tool_runtime(BuiltinToolEnvironment {
             cwd: cwd.clone(),
             locks: locks.clone(),
             trust: trust.clone(),
-            skill_resolver: None,
+            skill_resolver: Some(Arc::new(skill_handle.clone())),
         })
         .expect("static built-in tool descriptors must form a valid runtime");
-        Self::new_with_tool_runtime(stream, locks, trust, cwd, tool_runtime)
+        Self::new_with_tool_runtime_and_skill_handle(
+            stream,
+            locks,
+            trust,
+            cwd,
+            tool_runtime,
+            skill_handle,
+        )
     }
 
     pub fn new_with_tool_runtime(
@@ -130,6 +143,24 @@ impl SessionActor {
         trust: SessionTrust,
         cwd: PathBuf,
         tool_runtime: Arc<ToolRuntime>,
+    ) -> Self {
+        Self::new_with_tool_runtime_and_skill_handle(
+            stream,
+            locks,
+            trust,
+            cwd,
+            tool_runtime,
+            SessionSkillHandle::default(),
+        )
+    }
+
+    pub(crate) fn new_with_tool_runtime_and_skill_handle(
+        stream: Arc<dyn ModelStream>,
+        locks: Arc<FileLocks>,
+        trust: SessionTrust,
+        cwd: PathBuf,
+        tool_runtime: Arc<ToolRuntime>,
+        skill_handle: SessionSkillHandle,
     ) -> Self {
         Self {
             active: false,
@@ -140,6 +171,8 @@ impl SessionActor {
             _trust: trust,
             cwd,
             tool_runtime,
+            skill_handle,
+            skill_listing: String::new(),
             session_id: SessionId::from("local-session"),
             turn_id: TurnId::from("local-turn-0"),
             turn_cancellation: CancellationToken::new(),
@@ -180,6 +213,11 @@ impl SessionActor {
         self.journal_events = events;
     }
 
+    pub async fn bind_turn_skills(&mut self, catalog: Arc<SkillCatalog>) {
+        self.skill_listing = catalog.render_model_listing();
+        self.skill_handle.install(catalog).await;
+    }
+
     pub async fn prompt_with_context(
         &mut self,
         _kind: PromptKind,
@@ -207,6 +245,7 @@ impl SessionActor {
         let mut force_workspace_tool = false;
         let mut repeated_calls: HashMap<String, usize> = HashMap::new();
         let mut recovery_budget = SamplingRecoveryBudget::default();
+        let mut next_skill_scope = None;
         loop {
             if self.cancelled || self.turn_cancellation.is_cancelled() {
                 self.active = false;
@@ -261,9 +300,10 @@ impl SessionActor {
             }
             let (tx, mut rx) = mpsc::channel(16);
             let tool_runtime = self.tool_runtime.clone();
+            let round_skill_scope = next_skill_scope.take();
             let mut context = serde_json::json!({
-                "messages": history_to_messages(&self.history),
-                "tools": tool_runtime.model_definitions(),
+                "messages": messages_with_skill_listing(&self.history, &self.skill_listing),
+                "tools": tool_runtime.model_definitions_scoped(round_skill_scope.as_ref()),
                 "session_id": self.session_id.as_str(),
                 "turn_id": self.turn_id.as_str(),
             });
@@ -314,7 +354,14 @@ impl SessionActor {
                         uncommitted_text.clear();
                         saw_tool = true;
                         match self
-                            .process_tool_call(id, name, arguments, &mut repeated_calls)
+                            .process_tool_call(
+                                id,
+                                name,
+                                arguments,
+                                &mut repeated_calls,
+                                round_skill_scope.as_ref(),
+                                &mut next_skill_scope,
+                            )
                             .await?
                         {
                             ProcessTool::Executed => executed_any_tool = true,
@@ -415,7 +462,14 @@ impl SessionActor {
                     };
                     saw_tool = true;
                     match self
-                        .process_tool_call(id, name, arguments, &mut repeated_calls)
+                        .process_tool_call(
+                            id,
+                            name,
+                            arguments,
+                            &mut repeated_calls,
+                            round_skill_scope.as_ref(),
+                            &mut next_skill_scope,
+                        )
                         .await?
                     {
                         ProcessTool::Executed => executed_any_tool = true,
@@ -727,6 +781,8 @@ impl SessionActor {
         name: String,
         arguments: serde_json::Value,
         repeated_calls: &mut HashMap<String, usize>,
+        round_skill_scope: Option<&SkillToolScope>,
+        next_skill_scope: &mut Option<SkillToolScope>,
     ) -> Result<ProcessTool, String> {
         let fingerprint = format!(
             "{name}:{}",
@@ -747,7 +803,56 @@ impl SessionActor {
             .descriptor_for_wire_name(&name)
             .map(|descriptor| descriptor.name)
             .unwrap_or_else(|| fallback_tool_name(&name));
-        let request_hash = journal_request_hash(journal_name.as_str(), &arguments);
+        let original_request_hash = journal_request_hash(journal_name.as_str(), &arguments);
+        if self.cancelled || self.turn_cancellation.is_cancelled() {
+            self.commit(
+                JournalRecord::ToolCallRequested {
+                    call_id: call_id.clone(),
+                    name: journal_name,
+                    arguments: arguments.clone(),
+                    request_hash: original_request_hash.clone(),
+                },
+                JournalDurability::Flush,
+            )
+            .await?;
+            self.history.push(HistoryItem::ToolCall {
+                id,
+                name,
+                arguments,
+            });
+            let error = ToolError::new(
+                "tool.cancelled",
+                "tool call was cancelled",
+                Retryability::Never,
+            );
+            self.commit(
+                JournalRecord::ToolCallRejected {
+                    call_id,
+                    request_hash: original_request_hash,
+                    error,
+                },
+                JournalDurability::SyncData,
+            )
+            .await?;
+            return Ok(ProcessTool::Cancelled);
+        }
+        let context = ToolContext {
+            session_id: self.session_id.clone(),
+            turn_id: self.turn_id.clone(),
+            call_id: call_id.clone(),
+            cancellation: self.turn_cancellation.clone(),
+            execution_grant: None,
+        };
+        let prepared =
+            tool_runtime.prepare_scoped(context, &name, arguments.clone(), round_skill_scope);
+        // Argument-scoped rules may canonicalize a path before policy. The
+        // journal lifecycle must use that final prepared request hash even
+        // though the provider's original arguments remain in conversation
+        // history.
+        let request_hash = prepared
+            .as_ref()
+            .map(|prepared| prepared.audit().request_hash)
+            .unwrap_or(original_request_hash);
         self.commit(
             JournalRecord::ToolCallRequested {
                 call_id: call_id.clone(),
@@ -767,31 +872,7 @@ impl SessionActor {
         if let Some(cb) = &self.on_after_persist {
             cb();
         }
-        if self.cancelled || self.turn_cancellation.is_cancelled() {
-            let error = ToolError::new(
-                "tool.cancelled",
-                "tool call was cancelled",
-                Retryability::Never,
-            );
-            self.commit(
-                JournalRecord::ToolCallRejected {
-                    call_id,
-                    request_hash,
-                    error,
-                },
-                JournalDurability::SyncData,
-            )
-            .await?;
-            return Ok(ProcessTool::Cancelled);
-        }
-        let context = ToolContext {
-            session_id: self.session_id.clone(),
-            turn_id: self.turn_id.clone(),
-            call_id: call_id.clone(),
-            cancellation: self.turn_cancellation.clone(),
-            execution_grant: None,
-        };
-        let authorization = match tool_runtime.authorize(context, &name, arguments.clone()) {
+        let authorization = match prepared {
             Ok(prepared) => match tool_runtime.decision(&prepared).clone() {
                 PolicyDecision::Allow(grant) => {
                     self.commit(
@@ -884,7 +965,19 @@ impl SessionActor {
                     JournalDurability::SyncData,
                 )
                 .await?;
-                let result = tool_runtime.execute_authorized(prepared, grant).await;
+                let mut result = tool_runtime.execute_authorized(prepared, grant).await;
+                if let Ok(output) = &result
+                    && output
+                        .metadata
+                        .get("kind")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("skill_invocation")
+                {
+                    result = compile_skill_scope(output, tool_runtime.as_ref()).map(|scope| {
+                        *next_skill_scope = scope;
+                        output.clone()
+                    });
+                }
                 self.commit(
                     JournalRecord::ToolCallCompleted {
                         call_id: audit.call_id,
@@ -1055,6 +1148,49 @@ fn history_to_messages(history: &[HistoryItem]) -> serde_json::Value {
         }
     }
     serde_json::Value::Array(out)
+}
+
+fn messages_with_skill_listing(history: &[HistoryItem], listing: &str) -> serde_json::Value {
+    let mut messages = history_to_messages(history);
+    if listing.is_empty() {
+        return messages;
+    }
+    let Some(messages) = messages.as_array_mut() else {
+        return messages;
+    };
+    for message in messages.iter_mut() {
+        if message.get("role").and_then(serde_json::Value::as_str) != Some("system") {
+            continue;
+        }
+        if let Some(content) = message
+            .get_mut("content")
+            .and_then(|content| content.as_str().map(str::to_owned))
+        {
+            message["content"] = serde_json::Value::String(format!("{content}\n\n{listing}"));
+        }
+        break;
+    }
+    serde_json::Value::Array(std::mem::take(messages))
+}
+
+fn compile_skill_scope(
+    output: &lato_core::ToolOutput,
+    runtime: &ToolRuntime,
+) -> Result<Option<SkillToolScope>, ToolError> {
+    let Some(specs) = output.metadata.get("allowedToolSpecs") else {
+        return Ok(None);
+    };
+    if specs.is_null() {
+        return Ok(None);
+    }
+    let specs = serde_json::from_value::<Vec<String>>(specs.clone()).map_err(|error| {
+        ToolError::new(
+            "skill.invalid_allowed_tool",
+            error.to_string(),
+            Retryability::Never,
+        )
+    })?;
+    SkillToolScope::compile(&specs, runtime).map(Some)
 }
 
 fn build_world_state(cwd: &std::path::Path) -> String {

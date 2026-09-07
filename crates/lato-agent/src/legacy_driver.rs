@@ -19,6 +19,7 @@ use lato_core::{
     ModelError, ModelErrorKind, ModelRequest, ModelStopReason, ModelStreamEvent, Retryability,
     SamplingParameters, ToolChoice, TurnOutput, UserInput,
 };
+use lato_extensions::skills::SkillCatalog;
 use lato_runtime::{
     CompactionControl, CompactionRequest, PrefireCompactionRequest, PrefireCompactionResult,
     TurnControl, TurnDriver, TurnEventEmitter, TurnRequest,
@@ -162,6 +163,15 @@ impl LegacyTurnDriver {
 
     pub async fn replace_history(&self, history: Vec<HistoryItem>) {
         *self.state.lock().await.actor.history_mut() = history;
+    }
+
+    pub async fn bind_turn_skills(&self, catalog: Arc<SkillCatalog>) {
+        self.state
+            .lock()
+            .await
+            .actor
+            .bind_turn_skills(catalog)
+            .await;
     }
 
     pub async fn active_model(&self) -> ActiveModelPort {

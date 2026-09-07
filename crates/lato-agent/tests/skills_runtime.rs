@@ -1,0 +1,521 @@
+use std::{collections::VecDeque, fs, path::PathBuf, sync::Arc};
+
+use async_trait::async_trait;
+use lato_agent::{
+    HistoryItem, RuntimePromptOutcome, RuntimeSession, SessionActor, SessionSkillHandle,
+};
+use lato_ai::{ModelStream, StreamPiece};
+use lato_core::{SessionId, ToolCallId, ToolCapability, ToolContext, TurnId};
+use lato_extensions::{
+    CapabilityCeiling, DiscoveryConfig, PluginConfig, PluginSnapshot, build_snapshot,
+    discover_plugins,
+    skills::{SkillCatalog, discover_skills},
+};
+use lato_tools::{
+    BuiltinToolEnvironment, SkillResolver, SkillToolScope, builtin_tool_runtime,
+    builtin_tool_runtime_for_capabilities,
+};
+use lato_workspace::{FileLocks, SessionTrust};
+use tokio::sync::{Mutex, Semaphore, mpsc};
+use tokio_util::sync::CancellationToken;
+
+struct PluginFixture {
+    _temp: tempfile::TempDir,
+    workspace: PathBuf,
+    home: PathBuf,
+    plugin: PathBuf,
+}
+
+impl PluginFixture {
+    fn new(name: &str, description: &str, allowed_tools: &[&str]) -> Self {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let home = temp.path().join("home");
+        let plugin = temp.path().join(name);
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(home.join("plugins")).unwrap();
+        fs::create_dir_all(plugin.join("skills/inspect")).unwrap();
+        fs::write(
+            plugin.join("plugin.json"),
+            format!(r#"{{"name":"{name}","skills":"skills"}}"#),
+        )
+        .unwrap();
+        let tools = allowed_tools
+            .iter()
+            .map(|tool| format!("  - {tool}\n"))
+            .collect::<String>();
+        fs::write(
+            plugin.join("skills/inspect/SKILL.md"),
+            format!(
+                "---\nname: inspect\ndescription: {description}\nallowed-tools:\n{tools}---\nInspect $ARGUMENTS."
+            ),
+        )
+        .unwrap();
+        Self {
+            _temp: temp,
+            workspace,
+            home,
+            plugin,
+        }
+    }
+
+    fn snapshot(&self, generation: u64, trusted: bool, enabled: bool) -> Arc<PluginSnapshot> {
+        let discovery = discover_plugins(&DiscoveryConfig {
+            cwd: self.workspace.clone(),
+            lato_home: self.home.clone(),
+            cli_plugin_dirs: vec![self.plugin.clone()],
+            project_trusted: trusted,
+        });
+        let config = if enabled {
+            PluginConfig::default()
+        } else {
+            PluginConfig {
+                enabled: Vec::new(),
+                disabled: vec![
+                    self.plugin
+                        .file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned(),
+                ],
+            }
+        };
+        build_snapshot(generation, discovery, &config).unwrap()
+    }
+
+    fn untrusted_project_snapshot(&self, generation: u64) -> Arc<PluginSnapshot> {
+        let project_plugin = self.workspace.join(".lato/plugins/demo");
+        fs::create_dir_all(project_plugin.join("skills/inspect")).unwrap();
+        fs::copy(
+            self.plugin.join("plugin.json"),
+            project_plugin.join("plugin.json"),
+        )
+        .unwrap();
+        fs::copy(
+            self.plugin.join("skills/inspect/SKILL.md"),
+            project_plugin.join("skills/inspect/SKILL.md"),
+        )
+        .unwrap();
+        build_snapshot(
+            generation,
+            discover_plugins(&DiscoveryConfig {
+                cwd: self.workspace.clone(),
+                lato_home: self.home.clone(),
+                cli_plugin_dirs: Vec::new(),
+                project_trusted: false,
+            }),
+            &PluginConfig::default(),
+        )
+        .unwrap()
+    }
+}
+
+#[derive(Default)]
+struct RecordingStream {
+    rounds: Mutex<VecDeque<Vec<StreamPiece>>>,
+    contexts: Mutex<Vec<serde_json::Value>>,
+}
+
+impl RecordingStream {
+    fn scripted(rounds: Vec<Vec<StreamPiece>>) -> Self {
+        Self {
+            rounds: Mutex::new(rounds.into()),
+            contexts: Mutex::new(Vec::new()),
+        }
+    }
+
+    async fn contexts(&self) -> Vec<serde_json::Value> {
+        self.contexts.lock().await.clone()
+    }
+}
+
+#[async_trait]
+impl ModelStream for RecordingStream {
+    async fn stream(
+        &self,
+        _prompt_bytes: usize,
+        context: serde_json::Value,
+        tx: mpsc::Sender<StreamPiece>,
+    ) -> Result<(), lato_core::ModelError> {
+        self.contexts.lock().await.push(context);
+        let pieces = self
+            .rounds
+            .lock()
+            .await
+            .pop_front()
+            .unwrap_or_else(|| vec![StreamPiece::Text("done".into())]);
+        for piece in pieces {
+            tx.send(piece)
+                .await
+                .map_err(|_| lato_core::ModelError::cancelled())?;
+        }
+        Ok(())
+    }
+}
+
+fn tool_names(context: &serde_json::Value) -> Vec<&str> {
+    context["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|tool| {
+            tool.pointer("/function/name")
+                .and_then(|name| name.as_str())
+        })
+        .collect()
+}
+
+fn count(haystack: &str, needle: &str) -> usize {
+    haystack.match_indices(needle).count()
+}
+
+fn tool_context() -> ToolContext {
+    ToolContext {
+        session_id: SessionId::from("skill-session"),
+        turn_id: TurnId::from("skill-turn"),
+        call_id: ToolCallId::from("skill-call"),
+        cancellation: CancellationToken::new(),
+        execution_grant: None,
+    }
+}
+
+fn runtime_session(fixture: &PluginFixture, stream: Arc<dyn ModelStream>) -> RuntimeSession {
+    let (updates, _updates_rx) = mpsc::unbounded_channel();
+    RuntimeSession::new(
+        "skills-runtime".into(),
+        stream,
+        Arc::new(FileLocks::new()),
+        SessionTrust::for_headless_prompt(&fixture.workspace),
+        fixture.workspace.clone(),
+        updates,
+        None,
+    )
+}
+
+#[tokio::test]
+async fn session_skill_handle_maps_catalog_errors_to_stable_codes() {
+    let handle = SessionSkillHandle::default();
+    let error = handle
+        .invoke(&tool_context(), "missing", None)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "skill.not_found");
+    assert!(error.message.contains("missing"));
+}
+
+#[tokio::test]
+async fn provider_listing_is_ephemeral_and_appended_once_to_first_system_message() {
+    let fixture = PluginFixture::new("demo", "Review safely.", &["read_file"]);
+    let stream = Arc::new(RecordingStream::scripted(vec![vec![StreamPiece::Text(
+        "done".into(),
+    )]]));
+    let session = runtime_session(&fixture, stream.clone());
+    session
+        .stage_plugin_snapshot(fixture.snapshot(1, true, true))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        session.prompt("inspect".into()).await.unwrap(),
+        RuntimePromptOutcome::Complete {
+            text: "done".into()
+        }
+    );
+    let contexts = stream.contexts().await;
+    let messages = contexts[0]["messages"].as_array().unwrap();
+    let system = messages[0]["content"].as_str().unwrap();
+    assert_eq!(count(system, "<available_skills>"), 1);
+    assert!(system.contains("demo:inspect"));
+    let history = session.history_snapshot().await;
+    assert!(matches!(&history[0], HistoryItem::System(text) if !text.contains("available_skills")));
+    assert!(
+        history
+            .iter()
+            .all(|item| !format!("{item:?}").contains("available_skills"))
+    );
+}
+
+#[tokio::test]
+async fn model_definitions_include_skill_only_when_resolver_is_installed() {
+    let fixture = PluginFixture::new("demo", "Review safely.", &["read_file"]);
+    let stream = Arc::new(RecordingStream::scripted(vec![vec![StreamPiece::Text(
+        "done".into(),
+    )]]));
+    let mut with_resolver = SessionActor::new(
+        stream.clone(),
+        Arc::new(FileLocks::new()),
+        SessionTrust::for_headless_prompt(&fixture.workspace),
+        fixture.workspace.clone(),
+    );
+    with_resolver
+        .prompt(lato_agent::PromptKind::Start, "hello".into())
+        .await
+        .unwrap();
+    assert!(tool_names(&stream.contexts().await[0]).contains(&"skill"));
+
+    let without_stream = Arc::new(RecordingStream::scripted(vec![vec![StreamPiece::Text(
+        "done".into(),
+    )]]));
+    let locks = Arc::new(FileLocks::new());
+    let trust = SessionTrust::for_headless_prompt(&fixture.workspace);
+    let runtime = builtin_tool_runtime(BuiltinToolEnvironment {
+        cwd: fixture.workspace.clone(),
+        locks: locks.clone(),
+        trust: trust.clone(),
+        skill_resolver: None,
+    })
+    .unwrap();
+    let mut without_resolver = SessionActor::new_with_tool_runtime(
+        without_stream.clone(),
+        locks,
+        trust,
+        fixture.workspace.clone(),
+        runtime,
+    );
+    without_resolver
+        .prompt(lato_agent::PromptKind::Start, "hello".into())
+        .await
+        .unwrap();
+    assert!(!tool_names(&without_stream.contexts().await[0]).contains(&"skill"));
+}
+
+#[tokio::test]
+async fn skill_invocation_scopes_next_native_round_definitions_and_execution_then_clears() {
+    let fixture = PluginFixture::new("demo", "Review safely.", &["read_file"]);
+    fs::write(fixture.workspace.join("allowed.txt"), "ok").unwrap();
+    let stream = Arc::new(RecordingStream::scripted(vec![
+        vec![StreamPiece::ToolCall {
+            id: "skill-call".into(),
+            name: "skill".into(),
+            arguments: serde_json::json!({"skill":"demo:inspect", "args":"allowed.txt"}),
+        }],
+        vec![StreamPiece::ToolCall {
+            id: "denied-call".into(),
+            name: "list_dir".into(),
+            arguments: serde_json::json!({"path":"."}),
+        }],
+        vec![StreamPiece::Text("done".into())],
+    ]));
+    let session = runtime_session(&fixture, stream.clone());
+    session
+        .stage_plugin_snapshot(fixture.snapshot(1, true, true))
+        .await
+        .unwrap();
+
+    session.prompt("inspect".into()).await.unwrap();
+    let contexts = stream.contexts().await;
+    assert!(tool_names(&contexts[0]).contains(&"skill"));
+    assert_eq!(tool_names(&contexts[1]), vec!["read_file"]);
+    assert!(tool_names(&contexts[2]).contains(&"list_dir"));
+    let history = session.history_snapshot().await;
+    assert!(history.iter().any(|item| matches!(item, HistoryItem::ToolResult { output, .. } if output.contains("<skill name=\"demo:inspect\"") && output.contains("Inspect allowed.txt."))));
+    assert!(history.iter().any(|item| matches!(item, HistoryItem::ToolResult { output, .. } if output.contains("ERROR [tool.not_allowed_by_skill]"))));
+}
+
+#[tokio::test]
+async fn scoped_text_embedded_tool_call_is_checked_before_scope_clears() {
+    let fixture = PluginFixture::new("demo", "Review safely.", &["read_file"]);
+    let embedded = r#"<tool_call>{"name":"list_dir","arguments":{"path":"."}}</tool_call>"#;
+    let stream = Arc::new(RecordingStream::scripted(vec![
+        vec![StreamPiece::ToolCall {
+            id: "skill-call".into(),
+            name: "skill".into(),
+            arguments: serde_json::json!({"skill":"demo:inspect"}),
+        }],
+        vec![StreamPiece::Text(embedded.into())],
+        vec![StreamPiece::Text("done".into())],
+    ]));
+    let session = runtime_session(&fixture, stream.clone());
+    session
+        .stage_plugin_snapshot(fixture.snapshot(1, true, true))
+        .await
+        .unwrap();
+    session.prompt("inspect".into()).await.unwrap();
+
+    let history = session.history_snapshot().await;
+    assert!(history.iter().any(|item| matches!(item, HistoryItem::ToolResult { output, .. } if output.contains("ERROR [tool.not_allowed_by_skill]"))));
+    let contexts = stream.contexts().await;
+    assert_eq!(tool_names(&contexts[1]), vec!["read_file"]);
+    assert!(tool_names(contexts.last().unwrap()).contains(&"list_dir"));
+}
+
+struct GatedRecordingStream {
+    started: Semaphore,
+    release: Semaphore,
+    contexts: Mutex<Vec<serde_json::Value>>,
+}
+
+impl Default for GatedRecordingStream {
+    fn default() -> Self {
+        Self {
+            started: Semaphore::new(0),
+            release: Semaphore::new(0),
+            contexts: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+#[async_trait]
+impl ModelStream for GatedRecordingStream {
+    async fn stream(
+        &self,
+        _prompt_bytes: usize,
+        context: serde_json::Value,
+        tx: mpsc::Sender<StreamPiece>,
+    ) -> Result<(), lato_core::ModelError> {
+        self.contexts.lock().await.push(context);
+        self.started.add_permits(1);
+        self.release.acquire().await.unwrap().forget();
+        tx.send(StreamPiece::Text("done".into()))
+            .await
+            .map_err(|_| lato_core::ModelError::cancelled())
+    }
+}
+
+#[tokio::test]
+async fn staged_generation_does_not_leak_mid_turn_and_is_used_next_turn() {
+    let old = PluginFixture::new("old", "Old skill.", &["read_file"]);
+    let new = PluginFixture::new("new", "New skill.", &["read_file"]);
+    let stream = Arc::new(GatedRecordingStream::default());
+    let session = Arc::new(runtime_session(&old, stream.clone()));
+    session
+        .stage_plugin_snapshot(old.snapshot(1, true, true))
+        .await
+        .unwrap();
+    fs::write(
+        old.plugin.join("skills/inspect/SKILL.md"),
+        "---\nname: inspect\ndescription: Mutated without reload.\n---\nchanged",
+    )
+    .unwrap();
+    let first = tokio::spawn({
+        let session = session.clone();
+        async move { session.prompt("first".into()).await }
+    });
+    stream.started.acquire().await.unwrap().forget();
+    session
+        .stage_plugin_snapshot(new.snapshot(2, true, true))
+        .await
+        .unwrap();
+    fs::write(
+        new.plugin.join("skills/inspect/SKILL.md"),
+        "---\nname: inspect\ndescription: Mutated after staging.\n---\nchanged",
+    )
+    .unwrap();
+    let first_system = stream.contexts.lock().await[0]["messages"][0]["content"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(first_system.contains("old:inspect"));
+    assert!(first_system.contains("Old skill."));
+    assert!(!first_system.contains("Mutated without reload."));
+    assert!(!first_system.contains("new:inspect"));
+    stream.release.add_permits(1);
+    first.await.unwrap().unwrap();
+
+    let second = tokio::spawn({
+        let session = session.clone();
+        async move { session.prompt("second".into()).await }
+    });
+    stream.started.acquire().await.unwrap().forget();
+    let second_system = stream.contexts.lock().await[1]["messages"][0]["content"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(second_system.contains("new:inspect"));
+    assert!(second_system.contains("New skill."));
+    assert!(!second_system.contains("Mutated after staging."));
+    assert!(!second_system.contains("old:inspect"));
+    stream.release.add_permits(1);
+    second.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn inactive_or_untrusted_plugins_inject_no_skill_text() {
+    for snapshot_kind in ["inactive", "untrusted"] {
+        let fixture = PluginFixture::new("demo", "Secret skill.", &["read_file"]);
+        let stream = Arc::new(RecordingStream::scripted(vec![vec![StreamPiece::Text(
+            "done".into(),
+        )]]));
+        let session = runtime_session(&fixture, stream.clone());
+        let snapshot = match snapshot_kind {
+            "inactive" => fixture.snapshot(1, true, false),
+            "untrusted" => fixture.untrusted_project_snapshot(1),
+            _ => unreachable!(),
+        };
+        session.stage_plugin_snapshot(snapshot).await.unwrap();
+        session.prompt("hello".into()).await.unwrap();
+        let system = stream.contexts().await[0]["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(!system.contains("available_skills"));
+        assert!(!system.contains("Secret skill"));
+    }
+}
+
+#[tokio::test]
+async fn child_catalog_and_runtime_cannot_recover_parent_only_tool() {
+    let fixture = PluginFixture::new("demo", "Run parent command.", &["Bash(git diff:*)"]);
+    let parent = fixture.snapshot(1, true, true);
+    let child = parent.derive_child(&CapabilityCeiling {
+        parent: vec![ToolCapability::FileRead, ToolCapability::ExtensionInvoke],
+        profile: vec![ToolCapability::FileRead, ToolCapability::ExtensionInvoke],
+        workspace: vec![ToolCapability::FileRead, ToolCapability::ExtensionInvoke],
+    });
+    let child_catalog = SkillCatalog::from_discovery(discover_skills(&child));
+    assert!(
+        child_catalog
+            .render_model_listing()
+            .contains("demo:inspect")
+    );
+
+    let handle = SessionSkillHandle::new(child_catalog);
+    let child_runtime = builtin_tool_runtime_for_capabilities(
+        BuiltinToolEnvironment {
+            cwd: fixture.workspace.clone(),
+            locks: Arc::new(FileLocks::new()),
+            trust: SessionTrust::for_headless_prompt(&fixture.workspace),
+            skill_resolver: Some(Arc::new(handle)),
+        },
+        Some(&[ToolCapability::FileRead, ToolCapability::ExtensionInvoke]),
+    )
+    .unwrap();
+    assert!(!child_runtime.model_definitions().iter().any(|definition| {
+        definition
+            .pointer("/function/name")
+            .and_then(|name| name.as_str())
+            == Some("run_terminal_command")
+    }));
+    assert!(child_runtime.model_definitions().iter().any(|definition| {
+        definition
+            .pointer("/function/name")
+            .and_then(|name| name.as_str())
+            == Some("skill")
+    }));
+    let invoked = child_runtime
+        .invoke(
+            tool_context(),
+            "skill",
+            serde_json::json!({"skill":"demo:inspect"}),
+        )
+        .await
+        .unwrap();
+    let specs = serde_json::from_value::<Vec<String>>(invoked.metadata["allowedToolSpecs"].clone())
+        .unwrap();
+    let scope = SkillToolScope::compile(&specs, child_runtime.as_ref()).unwrap();
+    assert!(
+        child_runtime
+            .model_definitions_scoped(Some(&scope))
+            .is_empty()
+    );
+    assert!(
+        child_runtime
+            .prepare_scoped(
+                tool_context(),
+                "run_terminal_command",
+                serde_json::json!({"command":"git diff"}),
+                Some(&scope),
+            )
+            .is_err()
+    );
+}

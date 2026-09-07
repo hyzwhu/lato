@@ -13,7 +13,10 @@ use lato_core::{
     PluginSnapshotSummary, Retryability, SessionId, SessionStore, StartBehavior, StartTurn, TurnId,
     UserInput,
 };
-use lato_extensions::PluginSnapshot;
+use lato_extensions::{
+    PluginSnapshot,
+    skills::{SkillCatalog, discover_skills},
+};
 use lato_runtime::{
     SessionBootstrap, SessionHandle, TurnDriver, spawn_session, spawn_session_with_store,
 };
@@ -74,15 +77,19 @@ pub struct RuntimeSession {
 
 struct SessionPluginState {
     current: Arc<PluginSnapshot>,
+    current_skills: Arc<SkillCatalog>,
     active_turn: Option<Arc<PluginSnapshot>>,
-    pending: Option<Arc<PluginSnapshot>>,
+    active_turn_skills: Option<Arc<SkillCatalog>>,
+    pending: Option<(Arc<PluginSnapshot>, Arc<SkillCatalog>)>,
 }
 
 impl Default for SessionPluginState {
     fn default() -> Self {
         Self {
             current: PluginSnapshot::empty(),
+            current_skills: SkillCatalog::from_discovery(Default::default()),
             active_turn: None,
+            active_turn_skills: None,
             pending: None,
         }
     }
@@ -515,11 +522,14 @@ impl RuntimeSession {
         snapshot: Arc<PluginSnapshot>,
     ) -> Result<(), AgentError> {
         let _gate = self.submission_gate.lock().await;
+        let skills = SkillCatalog::from_discovery(discover_skills(&snapshot));
         let mut state = self.plugin_state.lock().await;
         let newest = state
             .pending
             .as_ref()
-            .map_or(state.current.generation(), |pending| pending.generation());
+            .map_or(state.current.generation(), |(pending, _)| {
+                pending.generation()
+            });
         if snapshot.generation() < newest {
             return Err(plugin_generation_rollback(newest, snapshot.generation()));
         }
@@ -527,7 +537,7 @@ impl RuntimeSession {
             return Ok(());
         }
         if state.active_turn.is_some() || self.active_operation.lock().await.is_some() {
-            state.pending = Some(snapshot);
+            state.pending = Some((snapshot, skills));
             return Ok(());
         }
         let previous = Arc::clone(&state.current);
@@ -536,7 +546,9 @@ impl RuntimeSession {
             self.plugin_state.lock().await.current = previous;
             return Err(error);
         }
-        self.plugin_state.lock().await.current = snapshot;
+        let mut state = self.plugin_state.lock().await;
+        state.current = snapshot;
+        state.current_skills = skills;
         Ok(())
     }
 
@@ -724,16 +736,19 @@ impl RuntimeSession {
         let pending = {
             let mut state = self.plugin_state.lock().await;
             state.active_turn = None;
+            state.active_turn_skills = None;
             state.pending.take()
         };
-        let Some(pending) = pending else {
+        let Some((pending, pending_skills)) = pending else {
             return Ok(());
         };
         if let Err(error) = self.adopt_plugin_snapshot(&pending).await {
-            self.plugin_state.lock().await.pending = Some(pending);
+            self.plugin_state.lock().await.pending = Some((pending, pending_skills));
             return Err(error);
         }
-        self.plugin_state.lock().await.current = pending;
+        let mut state = self.plugin_state.lock().await;
+        state.current = pending;
+        state.current_skills = pending_skills;
         Ok(())
     }
 
@@ -743,12 +758,17 @@ impl RuntimeSession {
             return Err(session_busy());
         }
         let current = Arc::clone(&state.current);
+        let catalog = Arc::clone(&state.current_skills);
+        self.driver.bind_turn_skills(catalog).await;
         state.active_turn = Some(current);
+        state.active_turn_skills = Some(Arc::clone(&state.current_skills));
         Ok(())
     }
 
     async fn abort_plugin_turn(&self) {
-        self.plugin_state.lock().await.active_turn = None;
+        let mut state = self.plugin_state.lock().await;
+        state.active_turn = None;
+        state.active_turn_skills = None;
     }
 
     async fn adopt_plugin_snapshot(&self, snapshot: &PluginSnapshot) -> Result<(), AgentError> {
