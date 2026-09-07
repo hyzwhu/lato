@@ -21,6 +21,13 @@ pub enum JournalDurability {
     SyncData,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillInvocationOrigin {
+    Model,
+    User,
+}
+
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 pub struct JournalEnvelope {
     pub schema_version: u32,

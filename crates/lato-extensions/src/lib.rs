@@ -2,6 +2,7 @@ pub mod discovery;
 pub mod manifest;
 pub mod registry;
 pub mod reload;
+pub mod skills;
 pub mod trust;
 
 pub use discovery::{
