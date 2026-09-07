@@ -75,6 +75,7 @@ async fn acp_prompt_emits_delta_and_returns_the_same_final_text() {
 async fn acp_close_stops_and_removes_the_runtime_session() {
     let (mut host, _) = host();
     let sid = new_session(&mut host).await;
+    assert!(host.task_backend(&sid).is_some());
     host.handle(req(
         2,
         "session/close",
@@ -82,6 +83,7 @@ async fn acp_close_stops_and_removes_the_runtime_session() {
     ))
     .await
     .unwrap();
+    assert!(host.task_backend(&sid).is_none());
     let response = host
         .handle(req(
             3,

@@ -3,8 +3,8 @@
 // Lato changes: ACP model selection targets one runtime session and publishes only committed changes
 
 use crate::{
-    PreparedModelSwitch, RuntimeCompactionOutcome, RuntimePromptOutcome, RuntimeSession,
-    ToolApproval, TranscriptStore, import_legacy_if_needed,
+    ChildSessionRunner, PreparedModelSwitch, ProfileResultVerifier, RuntimeCompactionOutcome,
+    RuntimePromptOutcome, RuntimeSession, ToolApproval, TranscriptStore, import_legacy_if_needed,
 };
 use lato_ai::{
     ActiveModelStream, CATALOG, CredentialStore, CustomHttpModelStream, CustomModel,
@@ -12,13 +12,22 @@ use lato_ai::{
     api_key_login_allowed, custom_model_auth, dialect_implemented, get_auth_refreshing,
     load_models_json, lookup_model, oauth_allowed, phase0_supported, store_oauth,
 };
-use lato_core::{EventStore, JournalReplay, SessionId, SessionStore};
+use lato_core::{
+    AgentProfile, BudgetAmount, BudgetLimits, EventStore, JournalReplay, SessionId, SessionStore,
+    TaskId, TaskOwner, ToolCapability, TurnId, VerificationPolicy, WorkspaceIntent,
+};
 use lato_mcp::{PluginOrigin, PluginPackage, discover_plugin};
 use lato_protocol::{
     JsonRpcReq, METHODS_IMPLEMENTED, PROTOCOL_VERSION, err, err_with_data, is_implemented, ok,
 };
+use lato_runtime::{
+    ChannelBackend, CoordinatorConfig, NoopTaskEventSink, TaskHandle, TaskRootRequest,
+    spawn_subagent_coordinator_with_verifier,
+};
 use lato_store::{FileEventStore, derive_automatic_title};
-use lato_workspace::{ApprovalMode, FileLocks, SessionTrust};
+use lato_workspace::{
+    ApprovalMode, FileLocks, GitWorkspaceAllocator, MemoryWorkspaceAllocator, SessionTrust,
+};
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 pub struct AcpHost {
@@ -36,6 +45,9 @@ pub struct AcpHost {
     custom_models: Vec<CustomModel>,
     plugins: Vec<PluginPackage>,
     tool_approval: Option<Arc<dyn ToolApproval>>,
+    task_handle: TaskHandle,
+    task_backends: HashMap<String, ChannelBackend>,
+    _task_actor: tokio::task::JoinHandle<()>,
 }
 
 impl AcpHost {
@@ -116,6 +128,35 @@ impl AcpHost {
             .and_then(|home| load_models_json(&home.join("models.json")).ok())
             .unwrap_or_default();
         let plugins = discover_plugins(&cwd, lato_home.as_deref(), trust.cwd_trusted());
+        let runner = Arc::new(ChildSessionRunner::new(
+            default_endpoint.stream.clone(),
+            Arc::new(FileLocks::new()),
+            trust.clone(),
+            updates.clone(),
+            tool_approval.clone(),
+        ));
+        let verifier = Arc::new(ProfileResultVerifier);
+        let sink = Arc::new(NoopTaskEventSink);
+        let (task_handle, task_actor) =
+            match GitWorkspaceAllocator::new(&cwd, cwd.join(".lato/worktrees")) {
+                Ok(allocator) => spawn_subagent_coordinator_with_verifier(
+                    CoordinatorConfig::default(),
+                    runner,
+                    Arc::new(allocator),
+                    verifier,
+                    sink,
+                ),
+                Err(_) => spawn_subagent_coordinator_with_verifier(
+                    CoordinatorConfig::default(),
+                    runner,
+                    Arc::new(
+                        MemoryWorkspaceAllocator::new(&cwd)
+                            .expect("an existing host cwd is a valid memory workspace root"),
+                    ),
+                    verifier,
+                    sink,
+                ),
+            };
         Self {
             sessions: HashMap::new(),
             updates,
@@ -131,7 +172,61 @@ impl AcpHost {
             custom_models,
             plugins,
             tool_approval,
+            task_handle,
+            task_backends: HashMap::new(),
+            _task_actor: task_actor,
         }
+    }
+
+    async fn ensure_task_root(&mut self, session_id: &str) -> Result<ChannelBackend, String> {
+        if let Some(backend) = self.task_backends.get(session_id) {
+            return Ok(backend.clone());
+        }
+        let root_id = TaskId::from(format!("task-root-{session_id}"));
+        let root = self
+            .task_handle
+            .register_root(TaskRootRequest {
+                task_id: root_id,
+                owner: TaskOwner::Interactive {
+                    session_id: SessionId::from(session_id),
+                    turn_id: TurnId::from(format!("task-root-turn-{session_id}")),
+                },
+                profile: AgentProfile {
+                    name: "coordinator".into(),
+                    instructions: "Coordinate bounded child tasks.".into(),
+                    capabilities: all_task_capabilities(),
+                    workspace: WorkspaceIntent::IsolatedWorktree,
+                    verification: VerificationPolicy::Accept,
+                    definition_background: false,
+                },
+                permissions: all_task_capabilities(),
+                budget: host_task_budget(),
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+        let backend = ChannelBackend::new(root);
+        self.task_backends
+            .insert(session_id.to_owned(), backend.clone());
+        Ok(backend)
+    }
+
+    pub fn task_backend(&self, session_id: &str) -> Option<ChannelBackend> {
+        self.task_backends.get(session_id).cloned()
+    }
+
+    async fn teardown_task_root(&mut self, session_id: &str) -> Result<(), String> {
+        let Some(backend) = self.task_backends.remove(session_id) else {
+            return Ok(());
+        };
+        backend
+            .scoped_handle()
+            .teardown_root_and_drain()
+            .await
+            .map_err(|error| error.to_string())?;
+        self.task_handle
+            .shutdown_root(backend.scoped_handle().root_id().clone())
+            .await
+            .map_err(|error| error.to_string())
     }
 
     async fn make_runtime_session(
@@ -311,6 +406,10 @@ impl AcpHost {
                     Ok(session) => session,
                     Err(error) => return Some(err(id, -32000, error)),
                 };
+                if let Err(error) = self.ensure_task_root(&sid).await {
+                    let _ = session.shutdown().await;
+                    return Some(err(id, -32000, error));
+                }
                 self.sessions.insert(sid.clone(), session);
                 Some(ok(id, serde_json::json!({"sessionId": sid})))
             }
@@ -542,6 +641,9 @@ impl AcpHost {
                 {
                     return Some(err(id, -32000, "session_busy"));
                 }
+                if let Err(error) = self.teardown_task_root(sid).await {
+                    return Some(err(id, -32000, error));
+                }
                 if let Some(session) = self.sessions.remove(sid)
                     && let Err(error) = session.shutdown().await
                 {
@@ -560,14 +662,16 @@ impl AcpHost {
                 Some(ok(id, serde_json::json!({"deleted": true})))
             }
             "session/close" => {
-                if let Some(sid) = req
+                let sid = req
                     .params
                     .as_ref()
                     .and_then(|p| p.get("sessionId"))
-                    .and_then(|v| v.as_str())
-                    && let Some(session) = self.sessions.remove(sid)
-                {
-                    let _ = session.shutdown().await;
+                    .and_then(|v| v.as_str());
+                if let Some(sid) = sid {
+                    let _ = self.teardown_task_root(sid).await;
+                    if let Some(session) = self.sessions.remove(sid) {
+                        let _ = session.shutdown().await;
+                    }
                 }
                 Some(ok(id, serde_json::json!({"closed": true})))
             }
@@ -604,6 +708,10 @@ impl AcpHost {
                         Ok(session) => session,
                         Err(error) => return Some(err(id, -32000, error)),
                     };
+                    if let Err(error) = self.ensure_task_root(sid).await {
+                        let _ = session.shutdown().await;
+                        return Some(err(id, -32000, error));
+                    }
                     if self.events.is_none()
                         && let Some(store) = &self.transcripts
                         && let Ok(Some(history)) = store.load_optional(sid)
@@ -824,6 +932,32 @@ impl AcpHost {
             _ => Some(ok(id, serde_json::json!({"ok": true}))),
         }
     }
+}
+
+fn all_task_capabilities() -> Vec<ToolCapability> {
+    vec![
+        ToolCapability::FileRead,
+        ToolCapability::FileWrite,
+        ToolCapability::ProcessSpawn,
+        ToolCapability::NetworkRead,
+        ToolCapability::NetworkWrite,
+        ToolCapability::TaskControl,
+        ToolCapability::ExtensionInvoke,
+    ]
+}
+
+fn host_task_budget() -> BudgetLimits {
+    BudgetLimits::limited(BudgetAmount {
+        input_tokens: 10_000_000,
+        output_tokens: 2_000_000,
+        total_tokens: 12_000_000,
+        tool_calls: 100_000,
+        cost_micros: 100_000_000,
+        wall_time_ms: 86_400_000,
+        retries: 1_024,
+        child_tasks: 1_024,
+        worktrees: 128,
+    })
 }
 
 fn discover_plugins(
