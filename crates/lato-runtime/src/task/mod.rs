@@ -3,6 +3,7 @@
 // Lato changes: provider-neutral actor boundary with root registration only
 
 mod admission;
+mod cancel;
 mod coordinator;
 mod protocol;
 mod query;
@@ -12,6 +13,7 @@ mod spawn;
 mod state;
 
 pub use admission::*;
+pub use cancel::*;
 pub use coordinator::{TaskCoordinator, spawn_task_coordinator};
 pub use protocol::*;
 pub use queue::*;

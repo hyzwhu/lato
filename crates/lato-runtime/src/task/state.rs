@@ -133,6 +133,21 @@ impl CoordinatorState {
         false
     }
 
+    pub(crate) fn descendants_including(&self, task_id: &TaskId) -> Vec<TaskId> {
+        let Some(root_id) = self
+            .tasks
+            .get(task_id)
+            .map(|record| record.node.root_id.clone())
+        else {
+            return Vec::new();
+        };
+        self.tasks
+            .keys()
+            .filter(|candidate| self.is_self_or_descendant(&root_id, task_id, candidate))
+            .cloned()
+            .collect()
+    }
+
     pub(crate) fn counts(
         &self,
         dropped_sink_events: u64,
@@ -246,5 +261,16 @@ mod tests {
         let root = TaskId::from("root");
         assert!(state.is_self_or_descendant(&root, &root, &TaskId::from("left-child")));
         assert!(state.is_self_or_descendant(&root, &root, &TaskId::from("right")));
+    }
+
+    #[test]
+    fn descendant_snapshot_is_complete_and_root_isolated() {
+        let state = seeded_tree();
+        let mut descendants = state.descendants_including(&TaskId::from("left"));
+        descendants.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        assert_eq!(
+            descendants,
+            vec![TaskId::from("left"), TaskId::from("left-child")]
+        );
     }
 }

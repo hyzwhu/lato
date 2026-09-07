@@ -3,6 +3,9 @@
 // Lato changes: bounded Tokio actor with a single committed root transition path
 
 use crate::task::admission::{AdmissionDecision, decide};
+use crate::task::cancel::{
+    resolve_cancellation, resolve_root_teardown, target_contains_task, target_matches_live,
+};
 use crate::task::query::{BlockingWaiter, ForegroundWaiter, caller_owns, inspection};
 use crate::task::queue::{QueuedTask, SpawnQueue};
 use crate::task::spawn::{
@@ -10,11 +13,11 @@ use crate::task::spawn::{
 };
 use crate::task::state::{CoordinatorState, RuntimeTaskRecord};
 use crate::task::{
-    CompletionDisposition, CoordinatorConfig, InspectCaller, OutputMetadata, RunnerEvent,
-    ScopedTaskHandle, SinkShutdown, SpawnDisposition, SpawnMode, SpawnTaskRequest,
-    TaskCallbackKind, TaskChildControl, TaskCommand, TaskCommandSender, TaskCompletion,
-    TaskEventEnvelope, TaskEventPayload, TaskEventSink, TaskHandle, TaskReporter, TaskRunRequest,
-    TaskRunner, WaitOutcome, coordinator_closed, root_node,
+    CancelOutcome, CancelTarget, CompletionDisposition, CoordinatorConfig, InspectCaller,
+    OutputMetadata, RunnerEvent, ScopedTaskHandle, SinkShutdown, SpawnDisposition, SpawnMode,
+    SpawnTaskRequest, TaskCallbackKind, TaskChildControl, TaskCommand, TaskCommandSender,
+    TaskCompletion, TaskEventEnvelope, TaskEventPayload, TaskEventSink, TaskHandle, TaskReporter,
+    TaskRunRequest, TaskRunner, WaitOutcome, coordinator_closed, root_node,
 };
 use futures_util::{
     FutureExt, StreamExt,
@@ -100,6 +103,14 @@ struct ShutdownState {
     deadline: Instant,
 }
 
+struct DrainWaiter {
+    target: CancelTarget,
+    outcome: CancelOutcome,
+    reply: oneshot::Sender<Result<CancelOutcome, TaskError>>,
+    deadline: Instant,
+    reopen_on_backstop: bool,
+}
+
 enum CallbackWork<C: TaskChildControl> {
     Cancel {
         task_id: TaskId,
@@ -183,6 +194,8 @@ pub struct TaskCoordinator<R: TaskRunner, A: WorkspaceAllocator> {
     jobs: FuturesUnordered<BoxFuture<'static, TaskJobExit>>,
     job_aborts: HashMap<TaskId, OwnedAbortHandle>,
     cancel_deadlines: HashMap<TaskId, Instant>,
+    drain_waiters: Vec<DrainWaiter>,
+    cancellation_batch_active: bool,
     validations: FuturesUnordered<BoxFuture<'static, ProfileValidation>>,
     validation_aborts: HashMap<TaskId, tokio::task::AbortHandle>,
     pending_spawns: HashMap<TaskId, PendingSpawn>,
@@ -277,6 +290,8 @@ where
         jobs: FuturesUnordered::new(),
         job_aborts: HashMap::new(),
         cancel_deadlines: HashMap::new(),
+        drain_waiters: Vec::new(),
+        cancellation_batch_active: false,
         validations: FuturesUnordered::new(),
         validation_aborts: HashMap::new(),
         pending_spawns: HashMap::new(),
@@ -309,6 +324,9 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
         for candidate in self.cancel_deadlines.values().copied() {
             deadline = deadline.min(candidate);
         }
+        for waiter in &self.drain_waiters {
+            deadline = deadline.min(waiter.deadline);
+        }
         if let Some(shutdown) = &self.shutdown {
             deadline = deadline.min(shutdown.deadline);
         }
@@ -335,6 +353,7 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
             self.dispatch_progress_polls();
         }
         self.reap_cancelled().await;
+        self.expire_drain_waiters(now);
         self.expire_waiters(now);
         self.expire_foreground(now);
     }
@@ -402,8 +421,9 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
             }
             return;
         }
-        let total_waiters: usize =
-            self.waiters.values().map(Vec::len).sum::<usize>() + self.foreground_waiters.len();
+        let total_waiters: usize = self.waiters.values().map(Vec::len).sum::<usize>()
+            + self.foreground_waiters.len()
+            + self.drain_waiters.len();
         let per_task = self.waiters.get(&task_id).map_or(0, Vec::len);
         if total_waiters >= self.config.max_waiters || per_task >= self.config.max_waiters_per_task
         {
@@ -480,8 +500,9 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
             }
             return;
         }
-        let waiter_count =
-            self.foreground_waiters.len() + self.waiters.values().map(Vec::len).sum::<usize>();
+        let waiter_count = self.foreground_waiters.len()
+            + self.waiters.values().map(Vec::len).sum::<usize>()
+            + self.drain_waiters.len();
         if self.foreground_waiters.contains_key(&task_id) || waiter_count >= self.config.max_waiters
         {
             let _ = reply.send(Err(TaskError::new(
@@ -726,6 +747,7 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
 
     pub async fn run(mut self) {
         loop {
+            self.resolve_drain_waiters();
             if self.shutdown.as_ref().is_some_and(|shutdown| {
                 self.jobs.is_empty()
                     && self.validations.is_empty()
@@ -920,6 +942,25 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
                 caller,
                 reply,
             } => self.register_foreground_waiter(task_id, caller, reply),
+            TaskCommand::Cancel {
+                target,
+                caller,
+                wait_for_drain,
+                reopen_on_backstop,
+                reply,
+            } => {
+                self.begin_cancellation(target, caller, wait_for_drain, reopen_on_backstop, reply)
+                    .await;
+            }
+            TaskCommand::SetSpawnAdmission {
+                root_id,
+                caller,
+                closed,
+                reply,
+            } => {
+                let result = self.set_root_spawn_admission(&root_id, &caller, closed);
+                let _ = reply.send(result);
+            }
             TaskCommand::RegistryCounts { reply } => {
                 let _ = reply.send(self.state.counts(
                     self.dropped_sink_events,
@@ -1004,6 +1045,298 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
         root.node.status = lato_core::TaskStatus::Cancelled;
         self.commit_transition(root_id.clone(), TaskEventPayload::RootClosed);
         Ok(())
+    }
+
+    async fn begin_cancellation(
+        &mut self,
+        target: CancelTarget,
+        caller: InspectCaller,
+        wait_for_drain: bool,
+        reopen_on_backstop: bool,
+        reply: oneshot::Sender<Result<CancelOutcome, TaskError>>,
+    ) {
+        if self.shutdown.is_some() {
+            let _ = reply.send(Err(coordinator_closed()));
+            return;
+        }
+        if wait_for_drain
+            && !matches!(
+                target,
+                CancelTarget::Root(_) | CancelTarget::Workflow { .. }
+            )
+        {
+            let _ = reply.send(Err(TaskError::new(
+                TaskErrorCode::RunnerProtocolViolation,
+                "only root and workflow cancellation scopes support drain waiting",
+            )));
+            return;
+        }
+        let waiter_count = self.drain_waiters.len()
+            + self.foreground_waiters.len()
+            + self.waiters.values().map(Vec::len).sum::<usize>();
+        if wait_for_drain && waiter_count >= self.config.max_waiters {
+            let _ = reply.send(Err(TaskError::new(
+                TaskErrorCode::RetentionLimit,
+                "task drain waiter capacity is exhausted",
+            )));
+            return;
+        }
+        if let Err(error) = self.authorize_cancel_target(&caller, &target) {
+            let _ = reply.send(Err(error));
+            return;
+        }
+        let resolved_result = if reopen_on_backstop {
+            match &target {
+                CancelTarget::Root(root_id) => resolve_root_teardown(&self.state, &caller, root_id),
+                _ => resolve_cancellation(&self.state, &caller, &target),
+            }
+        } else {
+            resolve_cancellation(&self.state, &caller, &target)
+        };
+        let resolved = match resolved_result {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                let _ = reply.send(Err(error));
+                return;
+            }
+        };
+
+        // Resolve the entire scope from the authoritative tree before closing
+        // latches or touching a queue/runtime registry.
+        for root_id in &resolved.admission_roots {
+            self.close_admission_record(root_id);
+        }
+        for task_id in &resolved.admission_tasks {
+            self.close_admission_record(task_id);
+        }
+
+        if wait_for_drain {
+            for root_id in &resolved.admission_roots {
+                self.reject_pending_spawns_for_root(root_id);
+            }
+        }
+
+        self.cancellation_batch_active = true;
+        for task_id in resolved.task_ids {
+            self.request_cancel(task_id).await;
+        }
+        self.cancellation_batch_active = false;
+        if self.shutdown.is_none() {
+            self.promote_queue();
+        }
+
+        if wait_for_drain {
+            self.drain_waiters.push(DrainWaiter {
+                target,
+                outcome: resolved.outcome,
+                reply,
+                deadline: Instant::now() + self.config.teardown_drain_timeout,
+                reopen_on_backstop,
+            });
+            self.resolve_drain_waiters();
+        } else {
+            let _ = reply.send(Ok(resolved.outcome));
+        }
+    }
+
+    fn authorize_cancel_target(
+        &self,
+        caller: &InspectCaller,
+        target: &CancelTarget,
+    ) -> Result<(), TaskError> {
+        match (caller, target) {
+            (InspectCaller::Admin, _) | (InspectCaller::Scoped { .. }, CancelTarget::Task(_)) => {
+                Ok(())
+            }
+            (InspectCaller::Scoped { root_id, task_id }, CancelTarget::Root(target_root))
+                if root_id == target_root && task_id == target_root =>
+            {
+                Ok(())
+            }
+            _ => Err(not_found()),
+        }
+    }
+
+    fn set_root_spawn_admission(
+        &mut self,
+        root_id: &TaskId,
+        caller: &InspectCaller,
+        closed: bool,
+    ) -> Result<(), TaskError> {
+        if self.shutdown.is_some() || !self.root_caller_owns(caller, root_id) {
+            return Err(if self.shutdown.is_some() {
+                coordinator_closed()
+            } else {
+                not_found()
+            });
+        }
+        if !closed && self.root_has_active_drain(root_id) {
+            return Err(TaskError::new(
+                TaskErrorCode::SpawnAdmissionClosed,
+                "root spawn admission cannot reopen while teardown drain is active",
+            ));
+        }
+        self.set_admission_record(root_id, closed);
+        Ok(())
+    }
+
+    fn root_caller_owns(&self, caller: &InspectCaller, root_id: &TaskId) -> bool {
+        if !self.state.roots.contains(root_id) {
+            return false;
+        }
+        match caller {
+            InspectCaller::Admin => true,
+            InspectCaller::Scoped {
+                root_id: caller_root,
+                task_id,
+            } => caller_root == root_id && task_id == root_id,
+        }
+    }
+
+    fn close_admission_record(&mut self, task_id: &TaskId) {
+        self.set_admission_record(task_id, true);
+    }
+
+    fn set_admission_record(&mut self, task_id: &TaskId, closed: bool) {
+        let Some(record) = self.state.tasks.get_mut(task_id) else {
+            return;
+        };
+        if record.spawn_admission_closed == closed {
+            return;
+        }
+        record.spawn_admission_closed = closed;
+        self.commit_transition(
+            task_id.clone(),
+            if closed {
+                TaskEventPayload::SpawnAdmissionClosed
+            } else {
+                TaskEventPayload::SpawnAdmissionOpened
+            },
+        );
+    }
+
+    fn root_has_active_drain(&self, root_id: &TaskId) -> bool {
+        self.drain_waiters
+            .iter()
+            .any(|waiter| match &waiter.target {
+                CancelTarget::Root(candidate) => candidate == root_id,
+                CancelTarget::Workflow {
+                    root_id: Some(candidate),
+                    ..
+                } => candidate == root_id,
+                CancelTarget::Workflow {
+                    run_id,
+                    root_id: None,
+                } => self.state.tasks.values().any(|record| {
+                    &record.node.root_id == root_id
+                        && matches!(
+                            &record.node.owner,
+                            lato_core::TaskOwner::Workflow { run_id: owner_run, .. }
+                                if owner_run == run_id
+                        )
+                }),
+                CancelTarget::Task(_) | CancelTarget::Turn { .. } => false,
+            })
+    }
+
+    fn reject_pending_spawns_for_root(&mut self, root_id: &TaskId) {
+        let task_ids: Vec<_> = self
+            .pending_spawns
+            .iter()
+            .filter(|(_, pending)| &pending.root_id == root_id)
+            .map(|(task_id, _)| task_id.clone())
+            .collect();
+        for task_id in task_ids {
+            if let Some(abort) = self.validation_aborts.remove(&task_id) {
+                abort.abort();
+            }
+            self.validation_results.remove(&task_id);
+            self.validation_order
+                .retain(|candidate| candidate != &task_id);
+            if let Some(pending) = self.pending_spawns.remove(&task_id) {
+                Self::reply_spawn_error(
+                    pending.reply,
+                    TaskError::new(
+                        TaskErrorCode::SpawnAdmissionClosed,
+                        "root spawn admission is closed",
+                    ),
+                );
+            }
+        }
+    }
+
+    fn resolve_drain_waiters(&mut self) {
+        let waiters = std::mem::take(&mut self.drain_waiters);
+        let mut pending = Vec::with_capacity(waiters.len());
+        for waiter in waiters {
+            if self.drain_is_pending(&waiter.target) {
+                pending.push(waiter);
+            } else {
+                let _ = waiter.reply.send(Ok(waiter.outcome));
+            }
+        }
+        self.drain_waiters = pending;
+    }
+
+    fn expire_drain_waiters(&mut self, now: Instant) {
+        let waiters = std::mem::take(&mut self.drain_waiters);
+        let mut pending = Vec::with_capacity(waiters.len());
+        let mut reopen = HashSet::new();
+        for waiter in waiters {
+            if waiter.deadline > now {
+                pending.push(waiter);
+                continue;
+            }
+            let mut matching: HashSet<_> = self
+                .state
+                .tasks
+                .keys()
+                .filter(|task_id| target_contains_task(&self.state, &waiter.target, task_id))
+                .filter(|task_id| !self.state.tasks[*task_id].node.status.is_terminal())
+                .cloned()
+                .collect();
+            matching.extend(
+                self.job_aborts
+                    .keys()
+                    .filter(|task_id| target_contains_task(&self.state, &waiter.target, task_id))
+                    .cloned(),
+            );
+            for task_id in &matching {
+                if let Some(abort) = self.job_aborts.get(task_id) {
+                    abort.abort();
+                }
+            }
+            let _ = waiter.reply.send(Err(TaskError::new(
+                TaskErrorCode::TimedOut,
+                format!(
+                    "task teardown drain timed out with {} unfinished task(s)",
+                    matching.len()
+                ),
+            )));
+            if waiter.reopen_on_backstop
+                && let CancelTarget::Root(root_id) = waiter.target
+            {
+                reopen.insert(root_id);
+            }
+        }
+        self.drain_waiters = pending;
+        for root_id in reopen {
+            if !self.root_has_active_drain(&root_id) {
+                self.set_admission_record(&root_id, false);
+            }
+        }
+    }
+
+    fn drain_is_pending(&self, target: &CancelTarget) -> bool {
+        target_matches_live(&self.state, target)
+            || self
+                .job_aborts
+                .keys()
+                .any(|task_id| target_contains_task(&self.state, target, task_id))
+            || self
+                .cleanup_inflight
+                .iter()
+                .any(|task_id| target_contains_task(&self.state, target, task_id))
     }
 
     fn begin_spawn(
@@ -1680,7 +2013,7 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
             });
         }
         self.retain_completed(task_id.clone());
-        if self.shutdown.is_none() {
+        if self.shutdown.is_none() && !self.cancellation_batch_active {
             self.promote_queue();
         }
     }
@@ -1784,18 +2117,34 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
     }
 
     async fn request_cancel(&mut self, task_id: TaskId) {
+        if self
+            .state
+            .tasks
+            .get(&task_id)
+            .is_none_or(|record| record.node.status.is_terminal())
+        {
+            return;
+        }
         let status = self.state.tasks[&task_id].node.status;
+        let cancellation_already_tracked = self.cancel_deadlines.contains_key(&task_id);
         let record = self
             .state
             .tasks
             .get_mut(&task_id)
             .expect("cancel target remains registered");
+        let admission_was_open = !record.spawn_admission_closed;
         record.spawn_admission_closed = true;
         record.cancellation.cancel();
+        if admission_was_open {
+            self.commit_transition(task_id.clone(), TaskEventPayload::SpawnAdmissionClosed);
+        }
         if status == TaskStatus::Queued {
             self.queue
                 .remove_matching(|queued| queued.task_id == task_id);
             self.terminalize_cancelled(&task_id);
+            return;
+        }
+        if cancellation_already_tracked {
             return;
         }
         if let Some(control) = self.controls.get(&task_id) {
@@ -2004,6 +2353,9 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
         }
         self.validation_order.clear();
         self.validation_results.clear();
+        for waiter in self.drain_waiters.drain(..) {
+            let _ = waiter.reply.send(Err(coordinator_closed()));
+        }
 
         let live: Vec<_> = self
             .state

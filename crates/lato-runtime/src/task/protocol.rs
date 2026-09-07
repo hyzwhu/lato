@@ -2,6 +2,7 @@
 // License: Apache-2.0
 // Lato changes: stable provider-neutral task protocol and bounded actor handles
 
+use super::{CancelOutcome, CancelTarget};
 use lato_core::{
     AgentProfile, BudgetAmount, BudgetLimits, ResultContract, SessionId, TaskError, TaskErrorCode,
     TaskId, TaskNode, TaskOwner, TaskResult, TaskScope, TaskStatus, TaskUsage, ToolCapability,
@@ -501,6 +502,19 @@ pub(crate) enum TaskCommand {
         caller: InspectCaller,
         reply: oneshot::Sender<Result<CompletionDisposition, TaskError>>,
     },
+    Cancel {
+        target: CancelTarget,
+        caller: InspectCaller,
+        wait_for_drain: bool,
+        reopen_on_backstop: bool,
+        reply: oneshot::Sender<Result<CancelOutcome, TaskError>>,
+    },
+    SetSpawnAdmission {
+        root_id: TaskId,
+        caller: InspectCaller,
+        closed: bool,
+        reply: oneshot::Sender<Result<(), TaskError>>,
+    },
     RegistryCounts {
         reply: oneshot::Sender<RegistryCounts>,
     },
@@ -610,6 +624,84 @@ impl TaskHandle {
         let (reply, response) = oneshot::channel();
         self.send(TaskCommand::RegistryCounts { reply }).await?;
         response.await.map_err(|_| coordinator_closed())
+    }
+
+    pub async fn cancel_task(&self, task_id: TaskId) -> Result<CancelOutcome, TaskError> {
+        self.cancel(CancelTarget::Task(task_id), false, false).await
+    }
+
+    pub async fn cancel_turn(
+        &self,
+        session_id: SessionId,
+        turn_id: TurnId,
+    ) -> Result<CancelOutcome, TaskError> {
+        self.cancel(
+            CancelTarget::Turn {
+                session_id,
+                turn_id,
+            },
+            false,
+            false,
+        )
+        .await
+    }
+
+    pub async fn cancel_root(&self, root_id: TaskId) -> Result<CancelOutcome, TaskError> {
+        self.cancel(CancelTarget::Root(root_id), false, false).await
+    }
+
+    pub async fn cancel_workflow(
+        &self,
+        run_id: String,
+        root_id: Option<TaskId>,
+    ) -> Result<CancelOutcome, TaskError> {
+        self.cancel(CancelTarget::Workflow { run_id, root_id }, true, false)
+            .await
+    }
+
+    pub async fn close_spawn_admission(&self, root_id: TaskId) -> Result<(), TaskError> {
+        self.set_spawn_admission(root_id, true).await
+    }
+
+    pub async fn open_spawn_admission(&self, root_id: TaskId) -> Result<(), TaskError> {
+        self.set_spawn_admission(root_id, false).await
+    }
+
+    pub async fn teardown_root_and_drain(
+        &self,
+        root_id: TaskId,
+    ) -> Result<CancelOutcome, TaskError> {
+        self.cancel(CancelTarget::Root(root_id), true, true).await
+    }
+
+    async fn cancel(
+        &self,
+        target: CancelTarget,
+        wait_for_drain: bool,
+        reopen_on_backstop: bool,
+    ) -> Result<CancelOutcome, TaskError> {
+        let (reply, response) = oneshot::channel();
+        self.send(TaskCommand::Cancel {
+            target,
+            caller: InspectCaller::Admin,
+            wait_for_drain,
+            reopen_on_backstop,
+            reply,
+        })
+        .await?;
+        response.await.map_err(|_| coordinator_closed())?
+    }
+
+    async fn set_spawn_admission(&self, root_id: TaskId, closed: bool) -> Result<(), TaskError> {
+        let (reply, response) = oneshot::channel();
+        self.send(TaskCommand::SetSpawnAdmission {
+            root_id,
+            caller: InspectCaller::Admin,
+            closed,
+            reply,
+        })
+        .await?;
+        response.await.map_err(|_| coordinator_closed())?
     }
 
     pub async fn shutdown_root(&self, root_id: TaskId) -> Result<(), TaskError> {
@@ -809,6 +901,64 @@ impl ScopedTaskHandle {
                     root_id: self.root_id.clone(),
                     task_id: self.task_id.clone(),
                 },
+                reply,
+            })
+            .await?;
+        response.await.map_err(|_| coordinator_closed())?
+    }
+
+    pub async fn cancel_task(&self, task_id: TaskId) -> Result<CancelOutcome, TaskError> {
+        let (reply, response) = oneshot::channel();
+        self.inner
+            .send(TaskCommand::Cancel {
+                target: CancelTarget::Task(task_id),
+                caller: InspectCaller::Scoped {
+                    root_id: self.root_id.clone(),
+                    task_id: self.task_id.clone(),
+                },
+                wait_for_drain: false,
+                reopen_on_backstop: false,
+                reply,
+            })
+            .await?;
+        response.await.map_err(|_| coordinator_closed())?
+    }
+
+    pub async fn close_spawn_admission(&self) -> Result<(), TaskError> {
+        self.set_spawn_admission(true).await
+    }
+
+    pub async fn open_spawn_admission(&self) -> Result<(), TaskError> {
+        self.set_spawn_admission(false).await
+    }
+
+    pub async fn teardown_root_and_drain(&self) -> Result<CancelOutcome, TaskError> {
+        let (reply, response) = oneshot::channel();
+        self.inner
+            .send(TaskCommand::Cancel {
+                target: CancelTarget::Root(self.root_id.clone()),
+                caller: InspectCaller::Scoped {
+                    root_id: self.root_id.clone(),
+                    task_id: self.task_id.clone(),
+                },
+                wait_for_drain: true,
+                reopen_on_backstop: true,
+                reply,
+            })
+            .await?;
+        response.await.map_err(|_| coordinator_closed())?
+    }
+
+    async fn set_spawn_admission(&self, closed: bool) -> Result<(), TaskError> {
+        let (reply, response) = oneshot::channel();
+        self.inner
+            .send(TaskCommand::SetSpawnAdmission {
+                root_id: self.root_id.clone(),
+                caller: InspectCaller::Scoped {
+                    root_id: self.root_id.clone(),
+                    task_id: self.task_id.clone(),
+                },
+                closed,
                 reply,
             })
             .await?;
