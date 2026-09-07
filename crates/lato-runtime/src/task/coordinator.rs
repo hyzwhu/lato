@@ -86,7 +86,7 @@ enum TaskJobExit {
     Aborted(TaskId, JobPhase),
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum JobPhase {
     Preparing,
     Running,
@@ -94,18 +94,82 @@ enum JobPhase {
     Cleanup,
 }
 
-enum OwnedAbortHandle {
+enum AbortAuthority {
     Future(FutureAbortHandle),
     Tokio(tokio::task::AbortHandle),
 }
 
+struct OwnedAbortHandle {
+    authority: AbortAuthority,
+    #[cfg_attr(not(debug_assertions), allow(dead_code))]
+    phase: JobPhase,
+    #[cfg_attr(not(debug_assertions), allow(dead_code))]
+    generation: Option<u64>,
+}
+
 impl OwnedAbortHandle {
-    fn abort(&self) {
-        match self {
-            Self::Future(handle) => handle.abort(),
-            Self::Tokio(handle) => handle.abort(),
+    fn future(handle: FutureAbortHandle, phase: JobPhase, generation: Option<u64>) -> Self {
+        Self {
+            authority: AbortAuthority::Future(handle),
+            phase,
+            generation,
         }
     }
+
+    fn tokio(handle: tokio::task::AbortHandle, phase: JobPhase, generation: Option<u64>) -> Self {
+        Self {
+            authority: AbortAuthority::Tokio(handle),
+            phase,
+            generation,
+        }
+    }
+
+    fn abort(&self) {
+        match &self.authority {
+            AbortAuthority::Future(handle) => handle.abort(),
+            AbortAuthority::Tokio(handle) => handle.abort(),
+        }
+    }
+}
+
+#[cfg(debug_assertions)]
+fn job_registry_compatibility_failure(
+    task_id: &TaskId,
+    status: TaskStatus,
+    record_generation: Option<u64>,
+    has_workspace_lease: bool,
+    phase: JobPhase,
+    job_generation: Option<u64>,
+    cleanup_inflight: bool,
+) -> Option<String> {
+    let compatible = match phase {
+        JobPhase::Preparing => {
+            status == TaskStatus::Preparing
+                && record_generation.is_none()
+                && job_generation.is_none()
+        }
+        JobPhase::Running => {
+            matches!(status, TaskStatus::Preparing | TaskStatus::Running)
+                && record_generation.is_some()
+                && job_generation == record_generation
+        }
+        JobPhase::Verifying => {
+            status == TaskStatus::Verifying
+                && record_generation.is_some()
+                && job_generation == record_generation
+        }
+        JobPhase::Cleanup => {
+            status.is_terminal()
+                && has_workspace_lease
+                && job_generation.is_none()
+                && cleanup_inflight
+        }
+    };
+    (!compatible).then(|| {
+        format!(
+            "live {phase:?} job {task_id} is incompatible with {status:?} generation {record_generation:?}"
+        )
+    })
 }
 
 struct ShutdownState {
@@ -1201,15 +1265,20 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
     fn invariant_audit(&self) -> crate::task::CoordinatorInvariantAudit {
         use crate::task::CoordinatorInvariantAudit;
 
-        let mut audit = CoordinatorInvariantAudit::default();
+        let (cycle_count, failures) = self.state.audit_tree_invariants();
+        let mut audit = CoordinatorInvariantAudit {
+            failures,
+            cycle_count,
+            ..CoordinatorInvariantAudit::default()
+        };
         let mut fail = |message: String| audit.failures.push(message);
 
         for (task_id, record) in &self.state.tasks {
             if record.node.parent_id.is_some() {
                 match record.node.status {
                     TaskStatus::Preparing => audit.preparing += 1,
+                    TaskStatus::Running => audit.running += 1,
                     TaskStatus::Finalizing => audit.finalizing += 1,
-                    status if status.is_running() => audit.running += 1,
                     _ => {}
                 }
             }
@@ -1296,20 +1365,6 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
             within_limit!(retries);
             within_limit!(child_tasks);
             within_limit!(worktrees);
-
-            let mut seen = HashSet::new();
-            let mut cursor = Some(task_id);
-            while let Some(candidate) = cursor {
-                if !seen.insert(candidate) {
-                    audit.cycle_count += 1;
-                    break;
-                }
-                cursor = self
-                    .state
-                    .tasks
-                    .get(candidate)
-                    .and_then(|candidate| candidate.node.parent_id.as_ref());
-            }
         }
 
         for root_id in &self.state.roots {
@@ -1365,16 +1420,105 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
                 self.jobs.len()
             ));
         }
-        for task_id in self.job_aborts.keys() {
-            if !self.state.tasks.contains_key(task_id) {
-                fail(format!("live job refers to missing task {task_id}"));
+        let mut actual_live_runner_ids = HashSet::new();
+        for (task_id, job) in &self.job_aborts {
+            let Some(record) = self.state.tasks.get(task_id) else {
+                fail(format!(
+                    "live {:?} job refers to missing task {task_id}",
+                    job.phase
+                ));
+                continue;
+            };
+            if !self.state.tasks.contains_key(&record.node.root_id) {
+                fail(format!(
+                    "live {:?} job {task_id} has a missing root",
+                    job.phase
+                ));
+            }
+            if let Some(failure) = job_registry_compatibility_failure(
+                task_id,
+                record.node.status,
+                record.generation,
+                record.workspace_lease.is_some(),
+                job.phase,
+                job.generation,
+                self.cleanup_inflight.contains(task_id),
+            ) {
+                fail(failure);
+            }
+            if matches!(job.phase, JobPhase::Preparing | JobPhase::Running) {
+                actual_live_runner_ids.insert(task_id.clone());
             }
         }
         for task_id in self.controls.keys() {
-            if self.state.tasks.get(task_id).is_none_or(|record| {
-                record.node.status.is_terminal() || record.generation.is_none()
-            }) {
-                fail(format!("runner control refers to inactive task {task_id}"));
+            let Some(record) = self.state.tasks.get(task_id) else {
+                fail(format!("runner control refers to missing task {task_id}"));
+                continue;
+            };
+            let compatible_status = matches!(
+                record.node.status,
+                TaskStatus::Running
+                    | TaskStatus::Finalizing
+                    | TaskStatus::Verifying
+                    | TaskStatus::WaitingForChildren
+                    | TaskStatus::WaitingForApproval
+            );
+            if !compatible_status || record.generation.is_none() {
+                fail(format!(
+                    "runner control {task_id} is incompatible with {:?} generation {:?}",
+                    record.node.status, record.generation
+                ));
+            }
+            if !self.state.tasks.contains_key(&record.node.root_id) {
+                fail(format!("runner control {task_id} has a missing root"));
+            }
+            if record.node.status == TaskStatus::Finalizing {
+                actual_live_runner_ids.insert(task_id.clone());
+            }
+        }
+        for (task_id, record) in &self.state.tasks {
+            if record.node.parent_id.is_none() {
+                continue;
+            }
+            let job = self.job_aborts.get(task_id);
+            let has_control = self.controls.contains_key(task_id);
+            let valid = match record.node.status {
+                TaskStatus::Queued => {
+                    job.is_none()
+                        && !has_control
+                        && record.generation.is_none()
+                        && record.workspace_lease.is_none()
+                }
+                TaskStatus::Preparing if record.generation.is_none() => {
+                    job.is_some_and(|job| job.phase == JobPhase::Preparing) && !has_control
+                }
+                TaskStatus::Preparing => {
+                    job.is_some_and(|job| {
+                        job.phase == JobPhase::Running && job.generation == record.generation
+                    }) && !has_control
+                }
+                TaskStatus::Running => {
+                    job.is_some_and(|job| {
+                        job.phase == JobPhase::Running && job.generation == record.generation
+                    }) && has_control
+                }
+                TaskStatus::Finalizing => job.is_none() && has_control,
+                TaskStatus::Verifying => {
+                    job.is_some_and(|job| {
+                        job.phase == JobPhase::Verifying && job.generation == record.generation
+                    }) && has_control
+                }
+                TaskStatus::WaitingForChildren | TaskStatus::WaitingForApproval => {
+                    job.is_none() && has_control
+                }
+                status if status.is_terminal() => !has_control,
+                _ => false,
+            };
+            if !valid {
+                fail(format!(
+                    "task {task_id} lifecycle {:?} has inconsistent job/control registries",
+                    record.node.status
+                ));
             }
         }
 
@@ -1513,7 +1657,7 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
             }
         }
 
-        audit.live_runners = audit.preparing + audit.running + audit.finalizing;
+        audit.live_runners = actual_live_runner_ids.len();
         if audit.cycle_count > 0 {
             fail(format!(
                 "task tree contains {} cyclic ancestry paths",
@@ -2360,7 +2504,7 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
                 ),
             }
         };
-        self.push_job(job_task_id, JobPhase::Preparing, future);
+        self.push_job(job_task_id, JobPhase::Preparing, None, future);
     }
 
     fn launch_runner(&mut self, task_id: TaskId) -> Result<(), TaskError> {
@@ -2422,7 +2566,7 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
             };
             TaskJobExit::Completed(task_id, generation, output)
         };
-        self.push_job(job_task_id, JobPhase::Running, future);
+        self.push_job(job_task_id, JobPhase::Running, Some(generation), future);
         Ok(())
     }
 
@@ -2430,11 +2574,14 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
         &mut self,
         task_id: TaskId,
         phase: JobPhase,
+        generation: Option<u64>,
         future: impl std::future::Future<Output = TaskJobExit> + Send + 'static,
     ) {
         let (abort, registration) = FutureAbortHandle::new_pair();
-        self.job_aborts
-            .insert(task_id.clone(), OwnedAbortHandle::Future(abort));
+        self.job_aborts.insert(
+            task_id.clone(),
+            OwnedAbortHandle::future(abort, phase, generation),
+        );
         self.jobs.push(Box::pin(async move {
             match Abortable::new(future, registration).await {
                 Ok(exit) => exit,
@@ -2949,7 +3096,11 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
         });
         self.job_aborts.insert(
             task_id.clone(),
-            OwnedAbortHandle::Tokio(verification_task.abort_handle()),
+            OwnedAbortHandle::tokio(
+                verification_task.abort_handle(),
+                JobPhase::Verifying,
+                Some(generation),
+            ),
         );
         self.jobs.push(Box::pin(async move {
             match verification_task.await {
@@ -3280,7 +3431,7 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
         });
         self.job_aborts.insert(
             task_id.clone(),
-            OwnedAbortHandle::Tokio(cleanup_task.abort_handle()),
+            OwnedAbortHandle::tokio(cleanup_task.abort_handle(), JobPhase::Cleanup, None),
         );
         self.jobs.push(Box::pin(async move {
             match cleanup_task.await {
@@ -4558,5 +4709,28 @@ fn truncate_utf8(value: &mut String, max_bytes: usize) -> OutputMetadata {
         source_bytes,
         retained_bytes: value.len(),
         truncated: true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invariant_audit_rejects_stale_job_generation_without_mutation_api() {
+        let task_id = TaskId::from("stale-runner");
+        let failure = job_registry_compatibility_failure(
+            &task_id,
+            TaskStatus::Running,
+            Some(7),
+            false,
+            JobPhase::Running,
+            Some(6),
+            false,
+        )
+        .expect("a stale runner generation must fail the registry audit");
+
+        assert!(failure.contains("stale-runner"));
+        assert!(failure.contains("incompatible"));
     }
 }

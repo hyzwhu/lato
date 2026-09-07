@@ -5,10 +5,11 @@ use lato_core::{
     ToolCapability, TurnId,
 };
 use lato_runtime::{
-    ActiveMessageOperation, ActiveMessageRequest, ApprovalVerificationResume, CoordinatorConfig,
-    MemoryTaskEventSink, ReviewerVerificationResume, SinkShutdown, TaskEventEnvelope,
-    TaskEventPayload, TaskEventSink, TaskRootRequest, VerificationDecision, VerificationOutcome,
-    VerificationRequest, WaitOutcome, spawn_task_coordinator, spawn_task_coordinator_with_verifier,
+    ActiveMessageOperation, ActiveMessageOutcome, ActiveMessageRequest, ApprovalVerificationResume,
+    CoordinatorConfig, MemoryTaskEventSink, ReviewerVerificationResume, SinkShutdown,
+    TaskEventEnvelope, TaskEventPayload, TaskEventSink, TaskRootRequest, VerificationDecision,
+    VerificationOutcome, VerificationRequest, WaitOutcome, spawn_task_coordinator,
+    spawn_task_coordinator_with_verifier,
 };
 use lato_workspace::MemoryWorkspaceAllocator;
 use std::{
@@ -31,6 +32,19 @@ impl XorShift64 {
         self.0 = value;
         value
     }
+}
+
+#[derive(Default)]
+struct SequenceCoverage {
+    spawns: usize,
+    queued_spawns: usize,
+    queue_messages_accepted: usize,
+    steer_messages_accepted: usize,
+    usage_reports_accepted: usize,
+    randomized_waits_timed_out: usize,
+    cancellations_requested: usize,
+    finishes_observed: usize,
+    evictions_observed: usize,
 }
 
 async fn wait_for_clean_terminal(harness: &Harness, task_id: &str) {
@@ -73,10 +87,10 @@ async fn fixed_seed_command_sequence_preserves_all_coordinator_invariants() {
     let mut random = XorShift64(SEED);
     let first = format!("audit-{:016x}", random.next());
     let queued = format!("audit-{:016x}", random.next());
-    let mut covered = std::collections::HashSet::new();
+    let mut coverage = SequenceCoverage::default();
 
     root.spawn(verification_child(&first)).await.unwrap();
-    covered.insert("spawn");
+    coverage.spawns += 1;
     harness.runner.wait_until_entered(&first).await;
     harness
         .wait_for_status(&first, lato_core::TaskStatus::Running)
@@ -85,23 +99,35 @@ async fn fixed_seed_command_sequence_preserves_all_coordinator_invariants() {
 
     let queued_spawn = root.spawn(verification_child(&queued)).await.unwrap();
     assert!(queued_spawn.is_queued());
-    covered.insert("queue");
+    coverage.spawns += 1;
+    coverage.queued_spawns += 1;
     harness.audit().await;
 
-    let operation = if random.next() & 1 == 0 {
-        ActiveMessageOperation::Queue
+    let operations = if random.next() & 1 == 0 {
+        [ActiveMessageOperation::Queue, ActiveMessageOperation::Steer]
     } else {
-        ActiveMessageOperation::Steer
+        [ActiveMessageOperation::Steer, ActiveMessageOperation::Queue]
     };
-    let message = ActiveMessageRequest::try_new_with_operation(
-        TaskId::from(first.as_str()),
-        format!("audit-message-{}", random.next()),
-        operation,
-    )
-    .unwrap();
-    let _ = root.send_active_message(message).await;
-    covered.insert("message");
-    harness.audit().await;
+    for operation in operations {
+        let message = ActiveMessageRequest::try_new_with_operation(
+            TaskId::from(first.as_str()),
+            format!("audit-message-{}", random.next()),
+            operation,
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                root.send_active_message(message).await,
+                ActiveMessageOutcome::Accepted { .. }
+            ),
+            "{operation:?} must be committed by the accepting test control"
+        );
+        match operation {
+            ActiveMessageOperation::Queue => coverage.queue_messages_accepted += 1,
+            ActiveMessageOperation::Steer => coverage.steer_messages_accepted += 1,
+        }
+        harness.audit().await;
+    }
 
     let total_tokens = random.next() % 64 + 1;
     assert!(
@@ -118,7 +144,7 @@ async fn fixed_seed_command_sequence_preserves_all_coordinator_invariants() {
             )
             .await
     );
-    covered.insert("usage");
+    coverage.usage_reports_accepted += 1;
     harness.audit().await;
 
     assert!(matches!(
@@ -127,26 +153,29 @@ async fn fixed_seed_command_sequence_preserves_all_coordinator_invariants() {
             .unwrap(),
         WaitOutcome::TimedOut(_)
     ));
-    covered.insert("wait");
     harness.audit().await;
 
-    root.cancel_task(TaskId::from(queued.as_str()))
+    let cancellation = root
+        .cancel_task(TaskId::from(queued.as_str()))
         .await
         .unwrap();
-    covered.insert("cancel");
+    assert_eq!(cancellation.matched, 1);
+    assert_eq!(cancellation.newly_requested, 1);
+    coverage.cancellations_requested += cancellation.newly_requested;
     harness
         .wait_for_status(&queued, lato_core::TaskStatus::Cancelled)
         .await;
     harness.audit().await;
 
     harness.runner.finish(&first).await;
-    covered.insert("finish");
     wait_for_clean_terminal(&harness, &first).await;
+    coverage.finishes_observed += 1;
     harness.audit().await;
 
-    for _ in 0..6 {
+    for _ in 0..12 {
         let task_id = format!("audit-{:016x}", random.next());
         root.spawn(verification_child(&task_id)).await.unwrap();
+        coverage.spawns += 1;
         harness.runner.wait_until_entered(&task_id).await;
         harness
             .wait_for_status(&task_id, lato_core::TaskStatus::Running)
@@ -159,7 +188,11 @@ async fn fixed_seed_command_sequence_preserves_all_coordinator_invariants() {
                     format!("follow-up-{}", random.next()),
                 )
                 .unwrap();
-                let _ = root.send_active_message(message).await;
+                assert!(matches!(
+                    root.send_active_message(message).await,
+                    ActiveMessageOutcome::Accepted { .. }
+                ));
+                coverage.queue_messages_accepted += 1;
             }
             1 => {
                 let value = random.next() % 32 + 1;
@@ -175,6 +208,7 @@ async fn fixed_seed_command_sequence_preserves_all_coordinator_invariants() {
                         )
                         .await
                 );
+                coverage.usage_reports_accepted += 1;
             }
             _ => {
                 assert!(matches!(
@@ -183,11 +217,13 @@ async fn fixed_seed_command_sequence_preserves_all_coordinator_invariants() {
                         .unwrap(),
                     WaitOutcome::TimedOut(_)
                 ));
+                coverage.randomized_waits_timed_out += 1;
             }
         }
         harness.audit().await;
         harness.runner.finish(&task_id).await;
         wait_for_clean_terminal(&harness, &task_id).await;
+        coverage.finishes_observed += 1;
         harness.audit().await;
     }
 
@@ -199,13 +235,19 @@ async fn fixed_seed_command_sequence_preserves_all_coordinator_invariants() {
             .is_err(),
         "the fixed sequence must exercise completed-record eviction"
     );
-    covered.insert("eviction");
-    assert_eq!(
-        covered,
-        std::collections::HashSet::from([
-            "spawn", "queue", "message", "usage", "wait", "cancel", "finish", "eviction"
-        ])
+    coverage.evictions_observed += 1;
+    assert!(coverage.spawns >= 14);
+    assert!(coverage.queued_spawns >= 1);
+    assert!(coverage.queue_messages_accepted >= 1);
+    assert!(coverage.steer_messages_accepted >= 1);
+    assert!(coverage.usage_reports_accepted >= 1);
+    assert!(
+        coverage.randomized_waits_timed_out >= 1,
+        "fixed seed must execute the randomized wait branch"
     );
+    assert!(coverage.cancellations_requested >= 1);
+    assert!(coverage.finishes_observed >= 13);
+    assert!(coverage.evictions_observed >= 1);
     harness.audit().await;
 
     harness.handle.shutdown().await.unwrap();

@@ -47,6 +47,56 @@ pub(crate) struct CoordinatorState {
 }
 
 impl CoordinatorState {
+    #[cfg(debug_assertions)]
+    pub(crate) fn audit_tree_invariants(&self) -> (usize, Vec<String>) {
+        let mut failures = Vec::new();
+        let mut cycle_count = 0;
+        for (task_id, record) in &self.tasks {
+            match &record.node.parent_id {
+                None => {
+                    if &record.node.root_id != task_id {
+                        failures.push(format!("root task {task_id} does not name itself as root"));
+                    }
+                    if !self.roots.contains(task_id) {
+                        failures.push(format!("root task {task_id} is absent from the root index"));
+                    }
+                }
+                Some(parent_id) => match self.tasks.get(parent_id) {
+                    None => failures.push(format!("task {task_id} has missing parent {parent_id}")),
+                    Some(parent) if record.node.root_id != parent.node.root_id => {
+                        failures.push(format!("task {task_id} crosses its parent's root"));
+                    }
+                    Some(_) => {}
+                },
+            }
+
+            let mut seen = HashSet::new();
+            let mut cursor = Some(task_id);
+            while let Some(candidate) = cursor {
+                if !seen.insert(candidate) {
+                    cycle_count += 1;
+                    break;
+                }
+                cursor = self
+                    .tasks
+                    .get(candidate)
+                    .and_then(|candidate| candidate.node.parent_id.as_ref());
+            }
+        }
+        for root_id in &self.roots {
+            if self
+                .tasks
+                .get(root_id)
+                .is_none_or(|record| record.node.parent_id.is_some())
+            {
+                failures.push(format!(
+                    "root index contains non-root or missing task {root_id}"
+                ));
+            }
+        }
+        (cycle_count, failures)
+    }
+
     pub(crate) fn contains(&self, task_id: &TaskId) -> bool {
         self.tasks.contains_key(task_id)
     }
@@ -292,6 +342,37 @@ mod tests {
         assert_eq!(
             descendants,
             vec![TaskId::from("left"), TaskId::from("left-child")]
+        );
+    }
+
+    #[test]
+    fn invariant_audit_detects_corrupt_tree_indexes_without_public_mutation() {
+        let mut state = seeded_tree();
+        state.roots.insert(TaskId::from("root"));
+        state.roots.insert(TaskId::from("other-root"));
+        state
+            .tasks
+            .get_mut(&TaskId::from("left"))
+            .unwrap()
+            .node
+            .parent_id = Some(TaskId::from("left-child"));
+        state
+            .tasks
+            .get_mut(&TaskId::from("right"))
+            .unwrap()
+            .node
+            .parent_id = Some(TaskId::from("missing-parent"));
+
+        let (cycle_count, failures) = state.audit_tree_invariants();
+        assert!(
+            cycle_count >= 2,
+            "both cyclic ancestry paths must be detected"
+        );
+        assert!(
+            failures
+                .iter()
+                .any(|failure| failure.contains("missing parent missing-parent")),
+            "missing-parent corruption was not reported: {failures:#?}"
         );
     }
 }

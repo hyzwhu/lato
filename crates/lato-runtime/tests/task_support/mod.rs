@@ -50,9 +50,13 @@ impl TaskChildControl for ControlledTaskControl {
 
     fn send_active_message(
         &self,
-        _delivery: lato_runtime::ActiveMessageDelivery,
+        delivery: lato_runtime::ActiveMessageDelivery,
     ) -> futures_util::future::BoxFuture<'static, lato_runtime::ActiveMessageAdmission> {
-        Box::pin(ready(lato_runtime::ActiveMessageAdmission::Rejected))
+        Box::pin(ready(if delivery.commit_admission(|| ()).is_some() {
+            lato_runtime::ActiveMessageAdmission::Admitted
+        } else {
+            lato_runtime::ActiveMessageAdmission::Rejected
+        }))
     }
 
     fn cancel(&self) {
@@ -215,12 +219,16 @@ impl GatedTaskRunner {
     }
 
     pub async fn wait_until_entered(&self, task_id: &str) {
-        loop {
-            if self.entered.lock().await.contains(&TaskId::from(task_id)) {
-                return;
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if self.entered.lock().await.contains(&TaskId::from(task_id)) {
+                    return;
+                }
+                self.changed.notified().await;
             }
-            self.changed.notified().await;
-        }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("runner did not enter task {task_id} within 2 seconds"));
     }
 
     pub async fn allow_start(&self, task_id: &str) {
@@ -571,7 +579,13 @@ impl Harness {
     }
 
     pub async fn audit(&self) -> lato_runtime::CoordinatorInvariantAudit {
-        let audit = self.handle.audit_invariants_for_test().await.unwrap();
+        let audit = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            self.handle.audit_invariants_for_test(),
+        )
+        .await
+        .expect("coordinator invariant audit did not respond within 2 seconds")
+        .unwrap();
         assert!(audit.failures.is_empty(), "{:#?}", audit.failures);
         assert_eq!(
             audit.live_runners,
