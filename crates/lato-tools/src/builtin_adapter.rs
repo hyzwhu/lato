@@ -78,7 +78,13 @@ impl Tool for LegacyDispatchTool {
                 ) {
                     self.environment.trust.allow_once();
                 }
-                invoke_compat_run_terminal(&self.environment, grant, &arguments).await
+                invoke_compat_run_terminal(
+                    &self.environment,
+                    grant,
+                    &arguments,
+                    context.cancellation.clone(),
+                )
+                .await
             }
             _ => {
                 if matches!(
@@ -191,6 +197,7 @@ async fn invoke_compat_run_terminal(
     environment: &BuiltinToolEnvironment,
     grant: &ExecutionGrant,
     arguments: &Value,
+    cancellation: tokio_util::sync::CancellationToken,
 ) -> Result<String, String> {
     let cmd = arguments
         .get("cmd")
@@ -198,7 +205,13 @@ async fn invoke_compat_run_terminal(
         .and_then(Value::as_str)
         .ok_or("missing command")?;
     require_compat_mutating_approval(&environment.trust)?;
-    crate::run_terminal_command_with_obligation(cmd, &environment.cwd, &grant.sandbox).await
+    crate::run_terminal_command_with_obligation_cancellable(
+        cmd,
+        &environment.cwd,
+        &grant.sandbox,
+        cancellation,
+    )
+    .await
 }
 
 fn validate_write_obligation(obligation: &SandboxObligation, path: &Path) -> Result<(), String> {
@@ -428,7 +441,7 @@ fn metadata(name: &str) -> Result<ToolMetadata, BuiltinAdapterError> {
             SideEffect::ExternalMutation,
             ToolConcurrency::Serial,
             ToolIdempotency::NonIdempotent,
-            ToolCancellation::Unsupported,
+            ToolCancellation::KillProcess,
         ),
         "web_fetch" => (
             vec![ToolCapability::NetworkRead],
@@ -454,7 +467,9 @@ fn metadata(name: &str) -> Result<ToolMetadata, BuiltinAdapterError> {
 }
 
 fn classify_legacy_error(message: String) -> ToolError {
-    let code = if message.starts_with("missing ") {
+    let code = if message == "tool cancelled" {
+        "tool.cancelled"
+    } else if message.starts_with("missing ") {
         "tool.invalid_arguments"
     } else if let Some(code) = sandbox_error_code(&message) {
         code

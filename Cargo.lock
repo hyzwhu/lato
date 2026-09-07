@@ -1159,6 +1159,7 @@ dependencies = [
  "lato-policy",
  "lato-runtime",
  "lato-workspace",
+ "libc",
  "regex",
  "reqwest",
  "semver",
