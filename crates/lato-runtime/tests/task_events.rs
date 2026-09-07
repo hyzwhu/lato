@@ -253,6 +253,50 @@ async fn fixed_seed_command_sequence_preserves_all_coordinator_invariants() {
     harness.handle.shutdown().await.unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_entry_waiters_do_not_miss_runner_notifications() {
+    const ROUNDS: usize = 32;
+    const WAITERS: usize = 32;
+    let harness = Harness::new(CoordinatorConfig {
+        max_children_per_parent: ROUNDS,
+        ..CoordinatorConfig::default()
+    })
+    .await;
+    let root = harness
+        .register_root_scoped("entry-race-root", "entry-race-session", "entry-race-turn")
+        .await;
+
+    for round in 0..ROUNDS {
+        let task_id = format!("entry-race-{round}");
+        let barrier = Arc::new(tokio::sync::Barrier::new(WAITERS + 1));
+        let mut waiters = Vec::with_capacity(WAITERS);
+        for _ in 0..WAITERS {
+            let runner = Arc::clone(&harness.runner);
+            let barrier = Arc::clone(&barrier);
+            let task_id = task_id.clone();
+            waiters.push(tokio::spawn(async move {
+                barrier.wait().await;
+                runner.wait_until_entered(&task_id).await;
+            }));
+        }
+
+        barrier.wait().await;
+        root.spawn(verification_child(&task_id)).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            for waiter in waiters {
+                waiter.await.expect("entry waiter task panicked");
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("concurrent entry waiters stalled for {task_id}"));
+        harness.runner.finish(&task_id).await;
+        wait_for_clean_terminal(&harness, &task_id).await;
+    }
+
+    harness.audit().await;
+    harness.handle.shutdown().await.unwrap();
+}
+
 #[tokio::test]
 async fn root_registration_is_actor_owned_and_evented() {
     let mut harness = Harness::new(CoordinatorConfig::default()).await;

@@ -221,10 +221,13 @@ impl GatedTaskRunner {
     pub async fn wait_until_entered(&self, task_id: &str) {
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
+                let notified = self.changed.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
                 if self.entered.lock().await.contains(&TaskId::from(task_id)) {
                     return;
                 }
-                self.changed.notified().await;
+                notified.await;
             }
         })
         .await
