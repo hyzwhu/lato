@@ -502,6 +502,9 @@ struct DataRunner {
     load_gate: Notify,
     loaded_output: Option<String>,
     block_first_poll: bool,
+    fail_run: bool,
+    block_completion: bool,
+    completion_calls: AtomicUsize,
 }
 
 impl Default for DataRunner {
@@ -513,6 +516,9 @@ impl Default for DataRunner {
             load_gate: Notify::new(),
             loaded_output: None,
             block_first_poll: false,
+            fail_run: false,
+            block_completion: false,
+            completion_calls: AtomicUsize::new(0),
         }
     }
 }
@@ -568,9 +574,14 @@ impl TaskRunner for DataRunner {
             gate.notified().await;
         }
         TaskRunOutput::from(TaskResult {
-            success: true,
+            success: !self.fail_run,
             output: "abcdefgh".into(),
-            error: None,
+            error: self.fail_run.then(|| {
+                TaskError::new(
+                    lato_core::TaskErrorCode::RunnerInitialization,
+                    "configured test failure",
+                )
+            }),
             usage: TaskUsage {
                 total_tokens: 42,
                 tool_calls: 3,
@@ -601,7 +612,12 @@ impl TaskRunner for DataRunner {
         ))
     }
 
-    fn on_completed(&self, _completion: lato_runtime::TaskCompletion) {}
+    fn on_completed(&self, _completion: lato_runtime::TaskCompletion) {
+        self.completion_calls.fetch_add(1, Ordering::AcqRel);
+        if self.block_completion {
+            std::thread::sleep(Duration::from_secs(2));
+        }
+    }
 }
 
 #[tokio::test]
@@ -1338,4 +1354,329 @@ async fn arbitrary_blocking_progress_poll_never_blocks_the_actor() {
         .expect("synchronous control polling must run outside the actor")
         .unwrap();
     runner.finish.notify_one();
+}
+
+async fn next_terminal_event(
+    receiver: &mut tokio::sync::broadcast::Receiver<lato_runtime::TaskEventEnvelope>,
+    task_id: &str,
+) -> lato_runtime::TaskEventEnvelope {
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let event = receiver.recv().await.unwrap();
+            if event.task_id == TaskId::from(task_id)
+                && matches!(
+                    event.payload,
+                    lato_runtime::TaskEventPayload::Completed { .. }
+                        | lato_runtime::TaskEventPayload::Failed { .. }
+                        | lato_runtime::TaskEventPayload::Cancelled
+                        | lato_runtime::TaskEventPayload::AdmissionRejected { .. }
+                )
+            {
+                break event;
+            }
+        }
+    })
+    .await
+    .expect("terminal event must arrive")
+}
+
+async fn assert_event_observes_complete_terminal_snapshot(
+    handle: &lato_runtime::TaskHandle,
+    event: lato_runtime::TaskEventEnvelope,
+) {
+    let snapshot = handle.inspect_admin(event.task_id).await.unwrap();
+    assert!(snapshot.node.status.is_terminal());
+    let result = snapshot.result.expect("terminal result is authoritative");
+    assert_eq!(snapshot.usage, result.usage);
+    assert!(snapshot.completion_disposition.is_some());
+    assert!(snapshot.event_sequence >= event.sequence);
+}
+
+#[tokio::test]
+async fn every_terminal_event_publishes_a_complete_atomic_snapshot() {
+    async fn registered(
+        runner: Arc<DataRunner>,
+        config: CoordinatorConfig,
+    ) -> (
+        TempDir,
+        lato_runtime::TaskHandle,
+        lato_runtime::ScopedTaskHandle,
+    ) {
+        let workspace = TempDir::new().unwrap();
+        let allocator = Arc::new(MemoryWorkspaceAllocator::new(workspace.path()).unwrap());
+        let (handle, _actor) = spawn_task_coordinator(
+            config,
+            runner,
+            allocator,
+            Arc::new(lato_runtime::NoopTaskEventSink),
+        );
+        let root = handle
+            .register_root(lato_runtime::TaskRootRequest {
+                task_id: TaskId::from("root"),
+                owner: lato_core::TaskOwner::Interactive {
+                    session_id: lato_core::SessionId::from("session"),
+                    turn_id: lato_core::TurnId::from("turn"),
+                },
+                profile: AgentProfile::worker(),
+                permissions: AgentProfile::worker().capabilities,
+                budget: BudgetLimits::unlimited(),
+            })
+            .await
+            .unwrap();
+        (workspace, handle, root)
+    }
+
+    let completed_runner = Arc::new(DataRunner::default());
+    let (_workspace, handle, root) =
+        registered(completed_runner.clone(), CoordinatorConfig::default()).await;
+    let mut events = handle.subscribe();
+    root.spawn(request("completed", SpawnMode::Background))
+        .await
+        .unwrap();
+    while !handle
+        .inspect_admin(TaskId::from("completed"))
+        .await
+        .is_ok_and(|snapshot| snapshot.node.status == TaskStatus::Running)
+    {
+        tokio::task::yield_now().await;
+    }
+    completed_runner.finish("completed").await;
+    let event = next_terminal_event(&mut events, "completed").await;
+    assert_event_observes_complete_terminal_snapshot(&handle, event).await;
+
+    let failed_runner = Arc::new(DataRunner {
+        fail_run: true,
+        ..DataRunner::default()
+    });
+    let (_workspace, handle, root) =
+        registered(failed_runner.clone(), CoordinatorConfig::default()).await;
+    let mut events = handle.subscribe();
+    root.spawn(request("failed", SpawnMode::Background))
+        .await
+        .unwrap();
+    while !handle
+        .inspect_admin(TaskId::from("failed"))
+        .await
+        .is_ok_and(|snapshot| snapshot.node.status == TaskStatus::Running)
+    {
+        tokio::task::yield_now().await;
+    }
+    failed_runner.finish("failed").await;
+    let event = next_terminal_event(&mut events, "failed").await;
+    assert_event_observes_complete_terminal_snapshot(&handle, event).await;
+
+    let cancelled_runner = Arc::new(DataRunner::default());
+    let (_workspace, handle, root) = registered(
+        cancelled_runner,
+        CoordinatorConfig {
+            queued_reap_interval: Duration::from_millis(5),
+            cancel_grace: Duration::from_millis(5),
+            ..CoordinatorConfig::default()
+        },
+    )
+    .await;
+    let mut events = handle.subscribe();
+    let token = CancellationToken::new();
+    let mut cancelled = request("cancelled", SpawnMode::Background);
+    cancelled.cancellation = token.clone();
+    root.spawn(cancelled).await.unwrap();
+    while !handle
+        .inspect_admin(TaskId::from("cancelled"))
+        .await
+        .is_ok_and(|snapshot| snapshot.node.status == TaskStatus::Running)
+    {
+        tokio::task::yield_now().await;
+    }
+    token.cancel();
+    let event = next_terminal_event(&mut events, "cancelled").await;
+    assert_event_observes_complete_terminal_snapshot(&handle, event).await;
+
+    let rejected_runner = Arc::new(DataRunner::default());
+    let (_workspace, handle, root) = registered(
+        rejected_runner,
+        CoordinatorConfig {
+            max_global_running: 1,
+            max_running_per_root: 1,
+            admission_behavior: lato_runtime::LimitBehavior::Reject,
+            ..CoordinatorConfig::default()
+        },
+    )
+    .await;
+    root.spawn(request("blocker", SpawnMode::Background))
+        .await
+        .unwrap();
+    while !handle
+        .inspect_admin(TaskId::from("blocker"))
+        .await
+        .is_ok_and(|snapshot| snapshot.node.status == TaskStatus::Running)
+    {
+        tokio::task::yield_now().await;
+    }
+    let mut events = handle.subscribe();
+    assert!(
+        root.spawn(request("rejected", SpawnMode::Background))
+            .await
+            .is_err()
+    );
+    let event = next_terminal_event(&mut events, "rejected").await;
+    assert_event_observes_complete_terminal_snapshot(&handle, event).await;
+}
+
+#[tokio::test]
+async fn sequential_output_loads_leave_no_retained_supervisor_bookkeeping() {
+    let workspace = TempDir::new().unwrap();
+    let runner = Arc::new(DataRunner::default());
+    let allocator = Arc::new(MemoryWorkspaceAllocator::new(workspace.path()).unwrap());
+    let (handle, _actor) = spawn_task_coordinator(
+        CoordinatorConfig {
+            max_output_loads: 2,
+            ..CoordinatorConfig::default()
+        },
+        runner.clone(),
+        allocator,
+        Arc::new(lato_runtime::NoopTaskEventSink),
+    );
+    let root = handle
+        .register_root(lato_runtime::TaskRootRequest {
+            task_id: TaskId::from("root"),
+            owner: lato_core::TaskOwner::Interactive {
+                session_id: lato_core::SessionId::from("session"),
+                turn_id: lato_core::TurnId::from("turn"),
+            },
+            profile: AgentProfile::worker(),
+            permissions: AgentProfile::worker().capabilities,
+            budget: BudgetLimits::unlimited(),
+        })
+        .await
+        .unwrap();
+    root.spawn(request("child", SpawnMode::Background))
+        .await
+        .unwrap();
+    while !handle
+        .inspect_admin(TaskId::from("child"))
+        .await
+        .is_ok_and(|snapshot| snapshot.node.status == TaskStatus::Running)
+    {
+        tokio::task::yield_now().await;
+    }
+    runner.finish("child").await;
+    while !handle
+        .inspect_admin(TaskId::from("child"))
+        .await
+        .is_ok_and(|snapshot| snapshot.node.status == TaskStatus::Completed)
+    {
+        tokio::task::yield_now().await;
+    }
+    for _ in 0..200 {
+        handle
+            .inspect_detailed_admin(TaskId::from("child"))
+            .await
+            .unwrap();
+        assert!(
+            handle
+                .registry_counts()
+                .await
+                .unwrap()
+                .output_load_supervisors
+                <= 2
+        );
+    }
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while handle
+            .registry_counts()
+            .await
+            .unwrap()
+            .output_load_supervisors
+            != 0
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("completed supervisors must be reaped continuously");
+}
+
+#[derive(Default)]
+struct SlowSink {
+    calls: AtomicUsize,
+}
+
+impl lato_runtime::TaskEventSink for SlowSink {
+    fn on_event(&self, _event: lato_runtime::TaskEventEnvelope) {
+        self.calls.fetch_add(1, Ordering::AcqRel);
+        std::thread::sleep(Duration::from_secs(2));
+    }
+}
+
+#[tokio::test]
+async fn shutdown_uses_one_deadline_for_blocked_callback_output_and_sink() {
+    let workspace = TempDir::new().unwrap();
+    let runner = Arc::new(DataRunner {
+        block_first_poll: true,
+        block_completion: true,
+        ..DataRunner::default()
+    });
+    let sink = Arc::new(SlowSink::default());
+    let allocator = Arc::new(MemoryWorkspaceAllocator::new(workspace.path()).unwrap());
+    let (handle, _actor) = spawn_task_coordinator(
+        CoordinatorConfig {
+            output_load_timeout: Duration::from_secs(5),
+            teardown_drain_timeout: Duration::from_millis(40),
+            ..CoordinatorConfig::default()
+        },
+        runner.clone(),
+        allocator,
+        sink.clone(),
+    );
+    let root = handle
+        .register_root(lato_runtime::TaskRootRequest {
+            task_id: TaskId::from("root"),
+            owner: lato_core::TaskOwner::Interactive {
+                session_id: lato_core::SessionId::from("session"),
+                turn_id: lato_core::TurnId::from("turn"),
+            },
+            profile: AgentProfile::worker(),
+            permissions: AgentProfile::worker().capabilities,
+            budget: BudgetLimits::unlimited(),
+        })
+        .await
+        .unwrap();
+    root.spawn(request("child", SpawnMode::Background))
+        .await
+        .unwrap();
+    while !handle
+        .inspect_admin(TaskId::from("child"))
+        .await
+        .is_ok_and(|snapshot| snapshot.node.status == TaskStatus::Running)
+    {
+        tokio::task::yield_now().await;
+    }
+    runner.finish("child").await;
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while runner.completion_calls.load(Ordering::Acquire) == 0
+            || sink.calls.load(Ordering::Acquire) == 0
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let loading_handle = handle.clone();
+    let loading = tokio::spawn(async move {
+        loading_handle
+            .inspect_detailed_admin(TaskId::from("child"))
+            .await
+    });
+    while runner.load_calls.load(Ordering::Acquire) == 0 {
+        tokio::task::yield_now().await;
+    }
+    let started = std::time::Instant::now();
+    let outcome = handle.shutdown().await.unwrap();
+    let elapsed = started.elapsed();
+    assert_eq!(outcome, lato_runtime::SinkShutdown::TimedOutDetached);
+    assert!(
+        elapsed < Duration::from_millis(100),
+        "three blocked drains shared one 40ms deadline, elapsed={elapsed:?}"
+    );
+    assert!(loading.await.unwrap().is_err());
 }

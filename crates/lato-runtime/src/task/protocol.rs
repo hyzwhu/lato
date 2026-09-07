@@ -285,6 +285,7 @@ pub struct RegistryCounts {
     pub dropped_sink_events: u64,
     pub dropped_callback_work: u64,
     pub callback_execution_failures: u64,
+    pub output_load_supervisors: usize,
 }
 
 /// Result of draining coordinator-owned work, callbacks, and the event sink.

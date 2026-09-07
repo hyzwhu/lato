@@ -27,7 +27,10 @@ use lato_core::{
 use lato_workspace::{WorkspaceAllocator, WorkspaceRequest};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 use tokio::{
     sync::{broadcast, mpsc, oneshot},
@@ -196,6 +199,7 @@ pub struct TaskCoordinator<R: TaskRunner, A: WorkspaceAllocator> {
     output_load_drained: Option<oneshot::Receiver<()>>,
     output_load_worker: Option<std::thread::JoinHandle<()>>,
     output_loads_inflight: usize,
+    output_load_supervisors: Arc<AtomicUsize>,
     shutdown: Option<ShutdownState>,
     weak_handle: TaskHandle,
     sequence: u64,
@@ -235,12 +239,14 @@ where
     let (output_load_tx, output_load_rx) = std::sync::mpsc::sync_channel(config.max_output_loads);
     let (output_load_event_tx, output_load_event_rx) = mpsc::unbounded_channel();
     let (output_load_drained_tx, output_load_drained) = oneshot::channel();
+    let output_load_supervisors = Arc::new(AtomicUsize::new(0));
     let output_load_worker = spawn_output_load_dispatcher(
         Arc::clone(&runner),
         output_load_rx,
         output_load_event_tx,
         output_load_drained_tx,
         tokio::runtime::Handle::current(),
+        Arc::clone(&output_load_supervisors),
     );
     let next_queue_reap = Instant::now() + config.queued_reap_interval;
     let next_progress_poll = Instant::now() + config.progress_poll_interval;
@@ -287,6 +293,7 @@ where
         output_load_drained: Some(output_load_drained),
         output_load_worker: Some(output_load_worker),
         output_loads_inflight: 0,
+        output_load_supervisors,
         shutdown: None,
         weak_handle,
         sequence: 0,
@@ -724,8 +731,13 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
                     && self.validations.is_empty()
                     && (self.output_loads_inflight == 0 || shutdown.deadline <= Instant::now())
             }) {
-                let callbacks_drained = self.shutdown_callbacks().await;
-                let output_loads_drained = self.shutdown_output_loads().await;
+                let shutdown_deadline = self
+                    .shutdown
+                    .as_ref()
+                    .expect("shutdown finalization requires shutdown state")
+                    .deadline;
+                let callbacks_drained = self.shutdown_callbacks(shutdown_deadline).await;
+                let output_loads_drained = self.shutdown_output_loads(shutdown_deadline).await;
                 while let Ok(event) = self.output_load_event_rx.try_recv() {
                     match event {
                         OutputLoadEvent::Reply { reply, result } => {
@@ -740,7 +752,7 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
                 while let Ok(outcome) = self.callback_rx.try_recv() {
                     self.handle_callback_outcome(outcome);
                 }
-                let sink_outcome = self.shutdown_sink().await;
+                let sink_outcome = self.shutdown_sink(shutdown_deadline).await;
                 let unreleased_leases = self
                     .state
                     .tasks
@@ -913,6 +925,7 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
                     self.dropped_sink_events,
                     self.dropped_callback_work,
                     self.callback_execution_failures,
+                    self.output_load_supervisors.load(Ordering::Acquire),
                 ));
             }
             TaskCommand::ShutdownRoot { root_id, reply } => {
@@ -1333,12 +1346,6 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
                 enqueued_at: Instant::now(),
             },
         );
-        self.commit_transition(
-            task_id.clone(),
-            TaskEventPayload::AdmissionRejected {
-                error: error.clone(),
-            },
-        );
         let result = lato_core::TaskResult {
             success: false,
             output: String::new(),
@@ -1347,7 +1354,15 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
             duration_ms: 0,
             output_ref: None,
         };
-        self.finish_terminal_record(&task_id, result, None);
+        self.commit_terminal(
+            &task_id,
+            TaskStatus::Failed,
+            result,
+            TaskEventPayload::AdmissionRejected {
+                error: error.clone(),
+            },
+            None,
+        );
         Err(error)
     }
 
@@ -1506,16 +1521,14 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
             .max_output_bytes;
         let metadata = truncate_utf8(&mut output.result.output, cap);
         self.state.tasks.get_mut(&task_id).unwrap().output_metadata = Some(metadata);
-        if output.result.success {
-            self.set_status(&task_id, TaskStatus::Completed);
-            self.commit_transition(
-                task_id.clone(),
+        let (terminal_status, terminal_event) = if output.result.success {
+            (
+                TaskStatus::Completed,
                 TaskEventPayload::Completed {
                     result: output.result.clone(),
                 },
-            );
+            )
         } else {
-            self.set_status(&task_id, TaskStatus::Failed);
             let error = output.result.error.clone().unwrap_or_else(|| {
                 TaskError::new(
                     TaskErrorCode::RunnerProtocolViolation,
@@ -1523,13 +1536,19 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
                 )
             });
             output.result.error = Some(error.clone());
-            self.commit_transition(task_id.clone(), TaskEventPayload::Failed { error });
-        }
+            (TaskStatus::Failed, TaskEventPayload::Failed { error })
+        };
         let completion = TaskCompletion {
             task_id: task_id.clone(),
             result: output.result.clone(),
         };
-        self.finish_terminal_record(&task_id, output.result, Some(completion));
+        self.commit_terminal(
+            &task_id,
+            terminal_status,
+            output.result,
+            terminal_event,
+            Some(completion),
+        );
     }
 
     async fn fail_task(&mut self, task_id: TaskId, error: TaskError) {
@@ -1544,7 +1563,6 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
         if status.is_terminal() {
             return;
         }
-        self.set_status(&task_id, TaskStatus::Failed);
         let result = lato_core::TaskResult {
             success: false,
             output: String::new(),
@@ -1553,31 +1571,49 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
             duration_ms: 0,
             output_ref: None,
         };
-        self.commit_transition(task_id.clone(), TaskEventPayload::Failed { error });
-        self.finish_terminal_record(&task_id, result, None);
+        self.commit_terminal(
+            &task_id,
+            TaskStatus::Failed,
+            result,
+            TaskEventPayload::Failed { error },
+            None,
+        );
     }
 
-    fn finish_terminal_record(
+    fn commit_terminal(
         &mut self,
         task_id: &TaskId,
+        status: TaskStatus,
         result: lato_core::TaskResult,
+        event: TaskEventPayload,
         completion: Option<TaskCompletion>,
-    ) {
-        let record = self
+    ) -> bool {
+        let current = self
             .state
             .tasks
-            .get_mut(task_id)
+            .get(task_id)
             .expect("terminal task remains registered");
-        if record.result.is_some() {
-            return;
+        if current.result.is_some() {
+            return false;
         }
+        if !current.node.status.is_terminal() {
+            self.set_status(task_id, status);
+        } else {
+            debug_assert_eq!(current.node.status, status);
+        }
+        let record = self.state.tasks.get_mut(task_id).unwrap();
         record.usage = result.usage.clone();
         record.result = Some(result);
         if let Some(completion) = completion {
             self.pending_completions.insert(task_id.clone(), completion);
         }
         self.resolve_terminal_observers(task_id);
+        // The terminal event is the publication barrier: every authoritative
+        // terminal field and successful observer-delivery disposition is
+        // already visible to an immediate follow-up inspection.
+        self.commit_transition(task_id.clone(), event);
         self.cleanup_terminal(task_id);
+        true
     }
 
     fn cleanup_terminal(&mut self, task_id: &TaskId) {
@@ -1911,10 +1947,14 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
         {
             return;
         }
-        self.set_status(task_id, TaskStatus::Cancelled);
         let result = self.cancelled_result(task_id);
-        self.commit_transition(task_id.clone(), TaskEventPayload::Cancelled);
-        self.finish_terminal_record(task_id, result, None);
+        self.commit_terminal(
+            task_id,
+            TaskStatus::Cancelled,
+            result,
+            TaskEventPayload::Cancelled,
+            None,
+        );
     }
 
     fn finish_failed_lease_cleanup(&mut self, task_id: &TaskId, error: TaskError) {
@@ -2136,13 +2176,13 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
         }
     }
 
-    async fn shutdown_callbacks(&mut self) -> bool {
+    async fn shutdown_callbacks(&mut self, deadline: Instant) -> bool {
         self.callback_tx.take();
         let Some(drained) = self.callback_drained.take() else {
             return true;
         };
         if !matches!(
-            tokio::time::timeout(self.config.teardown_drain_timeout, drained).await,
+            tokio::time::timeout(deadline.saturating_duration_since(Instant::now()), drained).await,
             Ok(Ok(()))
         ) {
             self.callback_worker.take();
@@ -2154,13 +2194,13 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
         true
     }
 
-    async fn shutdown_output_loads(&mut self) -> bool {
+    async fn shutdown_output_loads(&mut self, deadline: Instant) -> bool {
         self.output_load_tx.take();
         let Some(drained) = self.output_load_drained.take() else {
             return true;
         };
         if !matches!(
-            tokio::time::timeout(self.config.teardown_drain_timeout, drained).await,
+            tokio::time::timeout(deadline.saturating_duration_since(Instant::now()), drained).await,
             Ok(Ok(()))
         ) {
             self.output_load_worker.take();
@@ -2172,13 +2212,13 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
         true
     }
 
-    async fn shutdown_sink(&mut self) -> SinkShutdown {
+    async fn shutdown_sink(&mut self, deadline: Instant) -> SinkShutdown {
         self.sink_tx.take();
         let Some(drained) = self.sink_drained.take() else {
             return SinkShutdown::Drained;
         };
         if !matches!(
-            tokio::time::timeout(self.config.teardown_drain_timeout, drained).await,
+            tokio::time::timeout(deadline.saturating_duration_since(Instant::now()), drained).await,
             Ok(Ok(()))
         ) {
             self.sink_worker.take();
@@ -2234,85 +2274,130 @@ fn spawn_output_load_dispatcher<R: TaskRunner>(
     event_tx: mpsc::UnboundedSender<OutputLoadEvent>,
     drained: oneshot::Sender<()>,
     runtime: tokio::runtime::Handle,
+    active_supervisors: Arc<AtomicUsize>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("lato-task-output-loads".into())
         .spawn(move || {
-            let mut supervisors = Vec::new();
-            while let Ok(work) = work_rx.recv() {
-                let runner = Arc::clone(&runner);
-                let event_tx = event_tx.clone();
-                let runtime = runtime.clone();
-                supervisors.push(std::thread::spawn(move || {
-                    let (value_tx, value_rx) = std::sync::mpsc::sync_channel(1);
-                    let output_ref = work.output_ref.clone();
-                    // The execution thread is intentionally disposable. A
-                    // malicious first poll may block forever, while this
-                    // supervisor still enforces the public deadline.
-                    let _execution = std::thread::spawn(move || {
-                        let loaded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            runtime.block_on(runner.load_persisted_output(&output_ref))
-                        }));
-                        let _ = value_tx.send(loaded);
-                    });
-                    let response = match value_rx.recv_timeout(work.timeout) {
-                        Ok(Ok(Ok(value))) => Some(Ok(value)),
-                        Ok(Ok(Err(error))) => Some(Err(error)),
-                        Ok(Err(_)) => Some(Err(TaskError::new(
-                            TaskErrorCode::RunnerPanic,
-                            "task runner panicked while loading persisted output",
-                        ))),
-                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                            Some(Err(TaskError::new(
-                                TaskErrorCode::RunnerPanic,
-                                "persisted output worker disconnected",
-                            )))
-                        }
-                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
-                    };
-                    if response.is_none() {
-                        let _ = event_tx.send(OutputLoadEvent::Reply {
-                            reply: work.reply,
-                            result: Box::new(Err(TaskError::new(
-                                TaskErrorCode::RunnerProtocolViolation,
-                                "persisted task output load timed out",
-                            ))),
-                        });
-                        // Preserve the bounded worker slot until the blocking
-                        // execution really exits. Otherwise repeated timeouts
-                        // could accumulate an unbounded number of stuck OS
-                        // threads behind a nominal integer capacity.
-                        let _ = value_rx.recv();
-                        let _ = event_tx.send(OutputLoadEvent::SlotReleased);
-                        return;
-                    }
-                    let response = response.expect("non-timeout response is present");
-                    let mut inspection = work.inspection;
-                    let reply = match response {
-                        Ok(Some(mut output)) => {
-                            let metadata = truncate_utf8(&mut output, work.max_bytes);
-                            if let Some(task_result) = inspection.snapshot.result.as_mut() {
-                                task_result.output = output;
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let mut supervisors = HashMap::<usize, std::thread::JoinHandle<()>>::new();
+            let mut next_supervisor_id = 0usize;
+            let mut disconnected = false;
+            while !disconnected {
+                reap_output_supervisors(&mut supervisors, &done_rx, &event_tx, &active_supervisors);
+                match work_rx.recv_timeout(std::time::Duration::from_millis(1)) {
+                    Ok(work) => {
+                        reap_output_supervisors(
+                            &mut supervisors,
+                            &done_rx,
+                            &event_tx,
+                            &active_supervisors,
+                        );
+                        let supervisor_id = next_supervisor_id;
+                        next_supervisor_id = next_supervisor_id.wrapping_add(1);
+                        let runner = Arc::clone(&runner);
+                        let event_tx = event_tx.clone();
+                        let runtime = runtime.clone();
+                        let done_tx = done_tx.clone();
+                        let supervisor = std::thread::spawn(move || {
+                            let (value_tx, value_rx) = std::sync::mpsc::sync_channel(1);
+                            let output_ref = work.output_ref.clone();
+                            let execution = std::thread::spawn(move || {
+                                let loaded =
+                                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                        runtime.block_on(runner.load_persisted_output(&output_ref))
+                                    }));
+                                let _ = value_tx.send(loaded);
+                            });
+                            let response = match value_rx.recv_timeout(work.timeout) {
+                                Ok(Ok(Ok(value))) => Some(Ok(value)),
+                                Ok(Ok(Err(error))) => Some(Err(error)),
+                                Ok(Err(_)) => Some(Err(TaskError::new(
+                                    TaskErrorCode::RunnerPanic,
+                                    "task runner panicked while loading persisted output",
+                                ))),
+                                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                                    Some(Err(TaskError::new(
+                                        TaskErrorCode::RunnerPanic,
+                                        "persisted output worker disconnected",
+                                    )))
+                                }
+                                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
+                            };
+                            if response.is_none() {
+                                let _ = event_tx.send(OutputLoadEvent::Reply {
+                                    reply: work.reply,
+                                    result: Box::new(Err(TaskError::new(
+                                        TaskErrorCode::RunnerProtocolViolation,
+                                        "persisted task output load timed out",
+                                    ))),
+                                });
+                                // Preserve the bounded worker slot until the blocking
+                                // execution really exits. Otherwise repeated timeouts
+                                // could accumulate an unbounded number of stuck OS
+                                // threads behind a nominal integer capacity.
+                                let _ = value_rx.recv();
+                                let _ = execution.join();
+                                let _ = done_tx.send(supervisor_id);
+                                return;
                             }
-                            inspection.snapshot.output_metadata = Some(metadata);
-                            Ok(inspection)
-                        }
-                        Ok(None) => Ok(inspection),
-                        Err(error) => Err(error),
-                    };
-                    let _ = event_tx.send(OutputLoadEvent::Reply {
-                        reply: work.reply,
-                        result: Box::new(reply),
-                    });
-                    let _ = event_tx.send(OutputLoadEvent::SlotReleased);
-                }));
+                            let response = response.expect("non-timeout response is present");
+                            let mut inspection = work.inspection;
+                            let reply = match response {
+                                Ok(Some(mut output)) => {
+                                    let metadata = truncate_utf8(&mut output, work.max_bytes);
+                                    if let Some(task_result) = inspection.snapshot.result.as_mut() {
+                                        task_result.output = output;
+                                    }
+                                    inspection.snapshot.output_metadata = Some(metadata);
+                                    Ok(inspection)
+                                }
+                                Ok(None) => Ok(inspection),
+                                Err(error) => Err(error),
+                            };
+                            let _ = event_tx.send(OutputLoadEvent::Reply {
+                                reply: work.reply,
+                                result: Box::new(reply),
+                            });
+                            let _ = execution.join();
+                            let _ = done_tx.send(supervisor_id);
+                        });
+                        supervisors.insert(supervisor_id, supervisor);
+                        active_supervisors.store(supervisors.len(), Ordering::Release);
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        disconnected = true;
+                    }
+                }
             }
-            for supervisor in supervisors {
-                let _ = supervisor.join();
+            while !supervisors.is_empty() {
+                if let Ok(supervisor_id) = done_rx.recv()
+                    && let Some(supervisor) = supervisors.remove(&supervisor_id)
+                {
+                    let _ = supervisor.join();
+                    active_supervisors.store(supervisors.len(), Ordering::Release);
+                    let _ = event_tx.send(OutputLoadEvent::SlotReleased);
+                }
             }
             let _ = drained.send(());
         })
         .expect("task output-load dispatcher thread must start")
+}
+
+fn reap_output_supervisors(
+    supervisors: &mut HashMap<usize, std::thread::JoinHandle<()>>,
+    done_rx: &std::sync::mpsc::Receiver<usize>,
+    event_tx: &mpsc::UnboundedSender<OutputLoadEvent>,
+    active_supervisors: &AtomicUsize,
+) {
+    while let Ok(supervisor_id) = done_rx.try_recv() {
+        if let Some(supervisor) = supervisors.remove(&supervisor_id) {
+            let _ = supervisor.join();
+            active_supervisors.store(supervisors.len(), Ordering::Release);
+            let _ = event_tx.send(OutputLoadEvent::SlotReleased);
+        }
+    }
 }
 
 fn spawn_sink_dispatcher(

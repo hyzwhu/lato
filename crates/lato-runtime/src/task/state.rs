@@ -138,6 +138,7 @@ impl CoordinatorState {
         dropped_sink_events: u64,
         dropped_callback_work: u64,
         callback_execution_failures: u64,
+        output_load_supervisors: usize,
     ) -> RegistryCounts {
         let mut counts = RegistryCounts {
             roots: self.roots.len(),
@@ -145,6 +146,7 @@ impl CoordinatorState {
             dropped_sink_events,
             dropped_callback_work,
             callback_execution_failures,
+            output_load_supervisors,
             ..RegistryCounts::default()
         };
         for record in self.tasks.values() {
