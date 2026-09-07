@@ -1,4 +1,4 @@
-use crate::{ToolCall, create_subagent_worktree, dispatch, search_replace, v1_tool_definitions};
+use crate::{ToolCall, connected_builtin_definitions, dispatch, search_replace};
 use async_trait::async_trait;
 use lato_core::{
     ExecutionGrant, Retryability, SandboxObligation, SandboxProfile, SideEffect, Tool,
@@ -70,15 +70,6 @@ impl Tool for LegacyDispatchTool {
                     self.environment.trust.allow_once();
                 }
                 invoke_compat_search_replace(&self.environment, grant, &arguments).await
-            }
-            "spawn_subagent" => {
-                if matches!(
-                    self.descriptor.side_effect,
-                    SideEffect::WorkspaceMutation | SideEffect::ExternalMutation
-                ) {
-                    self.environment.trust.allow_once();
-                }
-                invoke_compat_spawn_subagent(&self.environment, grant, &arguments).await
             }
             "run_terminal_command" => {
                 if matches!(
@@ -194,24 +185,6 @@ async fn invoke_compat_search_replace(
     search_replace(&environment.locks, &path, old, new)
         .await
         .map(|_| "ok".into())
-}
-
-async fn invoke_compat_spawn_subagent(
-    environment: &BuiltinToolEnvironment,
-    grant: &ExecutionGrant,
-    arguments: &Value,
-) -> Result<String, String> {
-    let session_id = arguments
-        .get("session_id")
-        .or_else(|| arguments.get("sessionId"))
-        .and_then(Value::as_str)
-        .ok_or("missing session_id")?;
-    let root = environment.cwd.join(".lato/worktrees");
-    let path = root.join(session_id);
-    validate_write_obligation(&grant.sandbox, &path)?;
-    require_compat_mutating_approval(&environment.trust)?;
-    let worktree = create_subagent_worktree(&environment.cwd, &root, session_id).await?;
-    Ok(serde_json::json!({"worktree": worktree.path, "branch": worktree.branch}).to_string())
 }
 
 async fn invoke_compat_run_terminal(
@@ -341,11 +314,7 @@ fn require_compat_mutating_approval(trust: &SessionTrust) -> Result<(), String> 
 pub fn builtin_tools(
     environment: BuiltinToolEnvironment,
 ) -> Result<Vec<Arc<dyn Tool>>, BuiltinAdapterError> {
-    let definitions = v1_tool_definitions();
-    let definitions = definitions
-        .as_array()
-        .ok_or_else(|| BuiltinAdapterError::InvalidDefinition("root must be an array".into()))?;
-    let mut definitions = definitions.clone();
+    let mut definitions = connected_builtin_definitions();
     if !definitions.iter().any(|definition| {
         definition.pointer("/function/name").and_then(Value::as_str) == Some("write_file")
     }) {
@@ -467,13 +436,6 @@ fn metadata(name: &str) -> Result<ToolMetadata, BuiltinAdapterError> {
             ToolConcurrency::Parallel,
             ToolIdempotency::Idempotent,
             ToolCancellation::Cooperative,
-        ),
-        "spawn_subagent" => (
-            vec![ToolCapability::TaskControl, ToolCapability::FileWrite],
-            SideEffect::WorkspaceMutation,
-            ToolConcurrency::Serial,
-            ToolIdempotency::NonIdempotent,
-            ToolCancellation::Unsupported,
         ),
         "todo_write" => (
             vec![ToolCapability::TaskControl],

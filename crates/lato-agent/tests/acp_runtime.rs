@@ -96,6 +96,46 @@ async fn acp_close_stops_and_removes_the_runtime_session() {
 }
 
 #[tokio::test]
+async fn task_lifecycle_is_exposed_as_additive_acp_events() {
+    let (mut host, mut updates) = host();
+    let sid = new_session(&mut host).await;
+    let registered = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            let update = updates.recv().await.unwrap();
+            if update["method"] == "lato/task/event"
+                && update["params"]["session_id"] == sid
+                && update["params"]["payload"]["type"] == "root_registered"
+            {
+                return update;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(registered["params"]["task_id"], format!("task-root-{sid}"));
+
+    host.handle(req(
+        2,
+        "session/close",
+        serde_json::json!({"sessionId": sid}),
+    ))
+    .await
+    .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            let update = updates.recv().await.unwrap();
+            if update["method"] == "lato/task/event"
+                && update["params"]["payload"]["type"] == "root_closed"
+            {
+                return;
+            }
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn idle_cancel_is_idempotent_and_session_remains_usable() {
     let (mut host, _) = host();
     let sid = new_session(&mut host).await;

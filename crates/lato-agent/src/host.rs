@@ -48,6 +48,8 @@ pub struct AcpHost {
     task_handle: TaskHandle,
     task_backends: HashMap<String, ChannelBackend>,
     _task_actor: tokio::task::JoinHandle<()>,
+    _task_events: tokio::task::JoinHandle<()>,
+    _worktree_recovery: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl AcpHost {
@@ -137,15 +139,40 @@ impl AcpHost {
         ));
         let verifier = Arc::new(ProfileResultVerifier);
         let sink = Arc::new(NoopTaskEventSink);
+        let mut worktree_recovery = None;
         let (task_handle, task_actor) =
             match GitWorkspaceAllocator::new(&cwd, cwd.join(".lato/worktrees")) {
-                Ok(allocator) => spawn_subagent_coordinator_with_verifier(
-                    CoordinatorConfig::default(),
-                    runner,
-                    Arc::new(allocator),
-                    verifier,
-                    sink,
-                ),
+                Ok(allocator) => {
+                    let allocator = Arc::new(allocator);
+                    let recovery_allocator = Arc::clone(&allocator);
+                    let recovery_updates = updates.clone();
+                    worktree_recovery = Some(tokio::spawn(async move {
+                        match recovery_allocator.recover_stale().await {
+                            Ok(0) => {}
+                            Ok(recovered) => {
+                                let _ = recovery_updates.send(serde_json::json!({
+                                    "jsonrpc": "2.0",
+                                    "method": "lato/task/worktree_recovery",
+                                    "params": {"recovered": recovered},
+                                }));
+                            }
+                            Err(error) => {
+                                let _ = recovery_updates.send(serde_json::json!({
+                                    "jsonrpc": "2.0",
+                                    "method": "lato/task/worktree_recovery",
+                                    "params": {"error": error},
+                                }));
+                            }
+                        }
+                    }));
+                    spawn_subagent_coordinator_with_verifier(
+                        CoordinatorConfig::default(),
+                        runner,
+                        allocator,
+                        verifier,
+                        sink,
+                    )
+                }
                 Err(_) => spawn_subagent_coordinator_with_verifier(
                     CoordinatorConfig::default(),
                     runner,
@@ -157,6 +184,23 @@ impl AcpHost {
                     sink,
                 ),
             };
+        let mut task_events = task_handle.subscribe();
+        let task_updates = updates.clone();
+        let task_event_relay = tokio::spawn(async move {
+            loop {
+                match task_events.recv().await {
+                    Ok(event) => {
+                        let _ = task_updates.send(serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "method": "lato/task/event",
+                            "params": event,
+                        }));
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
         Self {
             sessions: HashMap::new(),
             updates,
@@ -175,6 +219,8 @@ impl AcpHost {
             task_handle,
             task_backends: HashMap::new(),
             _task_actor: task_actor,
+            _task_events: task_event_relay,
+            _worktree_recovery: worktree_recovery,
         }
     }
 
@@ -234,6 +280,21 @@ impl AcpHost {
         sid: &str,
         replay: Option<JournalReplay>,
     ) -> Result<Arc<RuntimeSession>, String> {
+        let backend = self.ensure_task_root(sid).await?;
+        let tool_runtime = match lato_tools::builtin_tool_runtime_with_subagents(
+            lato_tools::BuiltinToolEnvironment {
+                cwd: self.cwd.clone(),
+                locks: self.locks.clone(),
+                trust: self.trust.clone(),
+            },
+            backend.into_resource(),
+        ) {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                let _ = self.teardown_task_root(sid).await;
+                return Err(error.to_string());
+            }
+        };
         if let Some(events) = self.events.clone() {
             let replay = match replay {
                 Some(replay) => replay,
@@ -250,7 +311,7 @@ impl AcpHost {
                     .map_err(|error| format!("model.unavailable_on_resume: {error}"))?,
                 None => self.default_endpoint.clone(),
             };
-            return RuntimeSession::new_with_store_and_endpoint(
+            let session = RuntimeSession::new_with_store_endpoint_and_tool_runtime(
                 sid.to_string(),
                 endpoint,
                 self.locks.clone(),
@@ -260,20 +321,29 @@ impl AcpHost {
                 self.tool_approval.clone(),
                 store,
                 replay,
+                tool_runtime,
             )
-            .await
-            .map(Arc::new)
-            .map_err(|error| error.to_string());
+            .await;
+            return match session {
+                Ok(session) => Ok(Arc::new(session)),
+                Err(error) => {
+                    let _ = self.teardown_task_root(sid).await;
+                    Err(error.to_string())
+                }
+            };
         }
-        Ok(Arc::new(RuntimeSession::new_with_endpoint(
-            sid.to_string(),
-            self.default_endpoint.clone(),
-            self.locks.clone(),
-            self.trust.clone(),
-            self.cwd.clone(),
-            self.updates.clone(),
-            self.tool_approval.clone(),
-        )))
+        Ok(Arc::new(
+            RuntimeSession::new_with_endpoint_and_tool_runtime(
+                sid.to_string(),
+                self.default_endpoint.clone(),
+                self.locks.clone(),
+                self.trust.clone(),
+                self.cwd.clone(),
+                self.updates.clone(),
+                self.tool_approval.clone(),
+                tool_runtime,
+            ),
+        ))
     }
 
     async fn make_new_runtime_session(&mut self, sid: &str) -> Result<Arc<RuntimeSession>, String> {
@@ -406,10 +476,6 @@ impl AcpHost {
                     Ok(session) => session,
                     Err(error) => return Some(err(id, -32000, error)),
                 };
-                if let Err(error) = self.ensure_task_root(&sid).await {
-                    let _ = session.shutdown().await;
-                    return Some(err(id, -32000, error));
-                }
                 self.sessions.insert(sid.clone(), session);
                 Some(ok(id, serde_json::json!({"sessionId": sid})))
             }
@@ -451,9 +517,14 @@ impl AcpHost {
                     .as_ref()
                     .and_then(|p| p.get("sessionId"))
                     .and_then(|v| v.as_str())
-                    && let Some(session) = self.sessions.get(sid).cloned()
                 {
-                    let _ = session.cancel().await;
+                    if let Some(session) = self.sessions.get(sid).cloned() {
+                        let _ = session.cancel().await;
+                    }
+                    if let Some(backend) = self.task_backends.get(sid).cloned() {
+                        let _ = backend.scoped_handle().teardown_root_and_drain().await;
+                        let _ = backend.scoped_handle().open_spawn_admission().await;
+                    }
                 }
                 Some(ok(id, serde_json::json!({"status":"cancelled"})))
             }
@@ -708,10 +779,6 @@ impl AcpHost {
                         Ok(session) => session,
                         Err(error) => return Some(err(id, -32000, error)),
                     };
-                    if let Err(error) = self.ensure_task_root(sid).await {
-                        let _ = session.shutdown().await;
-                        return Some(err(id, -32000, error));
-                    }
                     if self.events.is_none()
                         && let Some(store) = &self.transcripts
                         && let Ok(Some(history)) = store.load_optional(sid)

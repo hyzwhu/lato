@@ -170,6 +170,40 @@ impl RuntimeSession {
     }
 
     #[allow(clippy::too_many_arguments)]
+    pub fn new_with_endpoint_and_tool_runtime(
+        session_id: String,
+        endpoint: ActiveModelStream,
+        locks: Arc<FileLocks>,
+        trust: SessionTrust,
+        cwd: PathBuf,
+        updates: mpsc::UnboundedSender<serde_json::Value>,
+        approval: Option<Arc<dyn ToolApproval>>,
+        tool_runtime: Arc<lato_tools::ToolRuntime>,
+    ) -> Self {
+        let session_id = SessionId::from(session_id);
+        let driver = Arc::new(LegacyTurnDriver::new_with_endpoint_and_tool_runtime(
+            session_id.to_string(),
+            endpoint,
+            locks,
+            trust,
+            cwd,
+            updates.clone(),
+            approval,
+            tool_runtime,
+        ));
+        let runtime_driver: Arc<dyn TurnDriver> = driver.clone();
+        let handle = spawn_session(session_id.clone(), runtime_driver);
+        Self {
+            session_id,
+            handle,
+            driver,
+            updates,
+            active_operation: Mutex::new(None),
+            submission_gate: Mutex::new(()),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub async fn new_with_store(
         session_id: String,
         stream: Arc<dyn ModelStream>,
@@ -207,13 +241,54 @@ impl RuntimeSession {
         store: Arc<dyn SessionStore>,
         replay: JournalReplay,
     ) -> Result<Self, AgentError> {
+        let tool_runtime = lato_tools::builtin_tool_runtime(lato_tools::BuiltinToolEnvironment {
+            cwd: cwd.clone(),
+            locks: locks.clone(),
+            trust: trust.clone(),
+        })
+        .map_err(|error| {
+            AgentError::new(
+                "tool.runtime_initialization",
+                ErrorCategory::Tool,
+                error.to_string(),
+                Retryability::Never,
+            )
+        })?;
+        Self::new_with_store_endpoint_and_tool_runtime(
+            session_id,
+            endpoint,
+            locks,
+            trust,
+            cwd,
+            updates,
+            approval,
+            store,
+            replay,
+            tool_runtime,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn new_with_store_endpoint_and_tool_runtime(
+        session_id: String,
+        endpoint: ActiveModelStream,
+        locks: Arc<FileLocks>,
+        trust: SessionTrust,
+        cwd: PathBuf,
+        updates: mpsc::UnboundedSender<serde_json::Value>,
+        approval: Option<Arc<dyn ToolApproval>>,
+        store: Arc<dyn SessionStore>,
+        replay: JournalReplay,
+        tool_runtime: Arc<lato_tools::ToolRuntime>,
+    ) -> Result<Self, AgentError> {
         if let Some(unresolved) = replay.projection.unresolved_tools.first() {
             return Err(journal_error(JournalError::IncompleteSideEffect {
                 call_id: unresolved.call_id.clone(),
             }));
         }
         let session_id = SessionId::from(session_id);
-        let driver = Arc::new(LegacyTurnDriver::new_with_endpoint(
+        let driver = Arc::new(LegacyTurnDriver::new_with_endpoint_and_tool_runtime(
             session_id.to_string(),
             endpoint,
             locks,
@@ -221,6 +296,7 @@ impl RuntimeSession {
             cwd,
             updates.clone(),
             approval,
+            tool_runtime,
         ));
         let mut history =
             model_messages_to_history(&replay.projection.messages).map_err(journal_error)?;

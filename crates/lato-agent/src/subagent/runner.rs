@@ -13,9 +13,10 @@ use lato_core::{
     AgentProfile, BudgetAmount, TaskError, TaskErrorCode, TaskProgress, TaskResult, TaskUsage,
 };
 use lato_runtime::{
-    StartedTask, TaskCompletion, TaskReporter, TaskRunOutput, TaskRunRequest, TaskRunner,
+    ChannelBackend, StartedTask, TaskCompletion, TaskReporter, TaskRunOutput, TaskRunRequest,
+    TaskRunner,
 };
-use lato_tools::{BuiltinToolEnvironment, builtin_tool_runtime_for_capabilities};
+use lato_tools::{BuiltinToolEnvironment, builtin_tool_runtime_for_capabilities_with_subagents};
 use lato_workspace::{FileLocks, SandboxProfile, SessionTrust, WorkspaceMode};
 use std::{
     sync::{Arc, Mutex},
@@ -84,13 +85,14 @@ impl ChildSessionRunner {
         reporter: TaskReporter<ChildSessionControl>,
     ) -> Result<(String, TaskUsage), TaskError> {
         let trust = self.child_trust(&request);
-        let tool_runtime = builtin_tool_runtime_for_capabilities(
+        let tool_runtime = builtin_tool_runtime_for_capabilities_with_subagents(
             BuiltinToolEnvironment {
                 cwd: request.workspace_lease.root.clone(),
                 locks: Arc::clone(&self.locks),
                 trust: trust.clone(),
             },
             Some(&request.node.permissions),
+            ChannelBackend::new(request.scoped_handle.clone()).into_resource(),
         )
         .map_err(|error| task_error(TaskErrorCode::RunnerInitialization, error))?;
 
@@ -112,6 +114,7 @@ impl ChildSessionRunner {
             .constraints(vec![
                 "Use only the tools and workspace access exposed to this child session.".into(),
                 "Return only evidence and artifacts produced within this delegated task.".into(),
+                result_contract_instruction(&request.node.profile),
             ])
             .references(references)
             .workspace_root(request.workspace_lease.root.clone())
@@ -199,6 +202,15 @@ impl ChildSessionRunner {
             return Err(task_error(TaskErrorCode::RunnerProtocolViolation, error));
         }
         outcome.map(|text| (text, TaskUsage::default()))
+    }
+}
+
+fn result_contract_instruction(profile: &AgentProfile) -> String {
+    match profile.name.as_str() {
+        "explorer" => "Return exactly one JSON object: {\"answer\":string,\"evidence\":[{\"id\":string,\"summary\":string,\"location\":string}],\"citations\":[string]}. Every citation must name an evidence id.".into(),
+        "worker" => "Return exactly one JSON object: {\"summary\":string,\"changed_files\":[relative_path],\"tests\":[{\"command\":string,\"passed\":boolean,\"summary\":string}],\"artifacts\":[relative_path]}.".into(),
+        "reviewer" => "Return exactly one JSON object: {\"summary\":string,\"findings\":[{\"severity\":\"critical\"|\"major\"|\"minor\",\"message\":string,\"evidence\":string,\"file\":relative_path|null,\"line\":positive_integer|null}]} .".into(),
+        _ => "Return one bounded JSON object matching the declared result contract.".into(),
     }
 }
 

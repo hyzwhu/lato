@@ -8,7 +8,7 @@ pub mod read;
 pub mod registry;
 pub mod runtime;
 pub mod shell;
-pub mod subagent;
+pub mod task;
 pub mod todo;
 pub mod web;
 
@@ -22,6 +22,6 @@ pub use read::*;
 pub use registry::*;
 pub use runtime::*;
 pub use shell::*;
-pub use subagent::*;
+pub use task::*;
 pub use todo::*;
 pub use web::*;

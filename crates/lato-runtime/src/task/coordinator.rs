@@ -3111,6 +3111,7 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
                 .expect("verification output is stored before launch")
                 .result
                 .clone(),
+            workspace_lease: record.workspace_lease.clone(),
         };
         let verifier = Arc::clone(&self.verifier);
         let timeout = self.config.verification_timeout;

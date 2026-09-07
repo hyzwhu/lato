@@ -1,6 +1,6 @@
 use crate::{
     BuiltinAdapterError, BuiltinToolEnvironment, CatalogError, RegistrationOutcome, ToolCatalog,
-    builtin_tools,
+    builtin_tools, task_tools,
 };
 use lato_core::{
     ApprovalFingerprint, ApprovalRequest, EnvironmentPolicy, ExecutionGrant, NetworkPolicy,
@@ -441,12 +441,35 @@ impl ToolRuntime {
 pub fn builtin_tool_runtime(
     environment: BuiltinToolEnvironment,
 ) -> Result<Arc<ToolRuntime>, RuntimeBuildError> {
-    builtin_tool_runtime_for_capabilities(environment, None)
+    build_builtin_tool_runtime(environment, None, None)
 }
 
 pub fn builtin_tool_runtime_for_capabilities(
     environment: BuiltinToolEnvironment,
     capabilities: Option<&[lato_core::ToolCapability]>,
+) -> Result<Arc<ToolRuntime>, RuntimeBuildError> {
+    build_builtin_tool_runtime(environment, capabilities, None)
+}
+
+pub fn builtin_tool_runtime_with_subagents(
+    environment: BuiltinToolEnvironment,
+    backend: lato_runtime::SubagentBackendResource,
+) -> Result<Arc<ToolRuntime>, RuntimeBuildError> {
+    build_builtin_tool_runtime(environment, None, Some(backend))
+}
+
+pub fn builtin_tool_runtime_for_capabilities_with_subagents(
+    environment: BuiltinToolEnvironment,
+    capabilities: Option<&[lato_core::ToolCapability]>,
+    backend: lato_runtime::SubagentBackendResource,
+) -> Result<Arc<ToolRuntime>, RuntimeBuildError> {
+    build_builtin_tool_runtime(environment, capabilities, Some(backend))
+}
+
+fn build_builtin_tool_runtime(
+    environment: BuiltinToolEnvironment,
+    capabilities: Option<&[lato_core::ToolCapability]>,
+    backend: Option<lato_runtime::SubagentBackendResource>,
 ) -> Result<Arc<ToolRuntime>, RuntimeBuildError> {
     let scope = PolicyScope {
         workspace_root: environment.cwd.clone(),
@@ -475,6 +498,19 @@ pub fn builtin_tool_runtime_for_capabilities(
                 .all(|capability| allowed.contains(capability))
         }) {
             builder.register(tool)?;
+        }
+    }
+    if let Some(backend) = backend {
+        for tool in task_tools(backend) {
+            let descriptor = tool.descriptor();
+            if capabilities.is_none_or(|allowed| {
+                descriptor
+                    .capabilities
+                    .iter()
+                    .all(|capability| allowed.contains(capability))
+            }) {
+                builder.register(tool)?;
+            }
         }
     }
     Ok(Arc::new(builder.build()?))

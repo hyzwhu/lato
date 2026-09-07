@@ -62,7 +62,7 @@ fn verify_worker(request: &VerificationRequest) -> Result<(), String> {
         return Err("worker summary must not be empty".into());
     }
     for path in output.changed_files.iter().chain(&output.artifacts) {
-        validate_relative_workspace_path(path, "worker output")?;
+        validate_workspace_evidence_path(path, "worker output", request)?;
     }
     if output
         .tests
@@ -91,7 +91,7 @@ fn verify_reviewer(request: &VerificationRequest) -> Result<(), String> {
             return Err("reviewer finding with a line must name a file".into());
         }
         if let Some(file) = finding.file {
-            validate_relative_workspace_path(&file, "reviewer finding")?;
+            validate_workspace_evidence_path(&file, "reviewer finding", request)?;
         }
     }
     Ok(())
@@ -111,6 +111,32 @@ fn validate_relative_workspace_path(path: &Path, label: &str) -> Result<(), Stri
     {
         return Err(format!(
             "{label} path `{}` must stay relative to the leased workspace",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn validate_workspace_evidence_path(
+    path: &Path,
+    label: &str,
+    request: &VerificationRequest,
+) -> Result<(), String> {
+    validate_relative_workspace_path(path, label)?;
+    let Some(lease) = &request.workspace_lease else {
+        return Ok(());
+    };
+    let root = std::fs::canonicalize(&lease.root)
+        .map_err(|error| format!("{label} workspace cannot be resolved: {error}"))?;
+    let evidence = std::fs::canonicalize(lease.root.join(path)).map_err(|error| {
+        format!(
+            "{label} path `{}` does not resolve to a produced artifact: {error}",
+            path.display()
+        )
+    })?;
+    if !evidence.starts_with(&root) {
+        return Err(format!(
+            "{label} path `{}` escapes the leased workspace",
             path.display()
         ));
     }

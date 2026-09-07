@@ -56,22 +56,41 @@ pub fn phase0_tool_definitions() -> serde_json::Value {
 }
 
 pub fn v1_tool_definitions() -> serde_json::Value {
+    let mut definitions = connected_builtin_definitions();
+    definitions.extend(crate::task_tool_definitions());
+    serde_json::Value::Array(definitions)
+}
+
+pub(crate) fn connected_builtin_definitions() -> Vec<serde_json::Value> {
     let mut definitions = phase0_tool_definitions()
         .as_array()
         .cloned()
         .unwrap_or_default();
-    definitions.extend([
-        serde_json::json!({"type":"function","function":{"name":"web_fetch","description":"Fetch a public HTTP(S) URL with SSRF protection","parameters":{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}}}),
-        serde_json::json!({"type":"function","function":{"name":"spawn_subagent","description":"Create an isolated git worktree for a subagent","parameters":{"type":"object","properties":{"session_id":{"type":"string"}},"required":["session_id"]}}}),
-    ]);
-    serde_json::Value::Array(definitions)
+    definitions.push(serde_json::json!({"type":"function","function":{"name":"web_fetch","description":"Fetch a public HTTP(S) URL with SSRF protection","parameters":{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}}}));
+    definitions
 }
 
 pub fn v1_specs() -> Vec<ToolSpec> {
     let mut specs = phase0_specs();
     specs.extend([
         ToolSpec {
-            id: "Lato:spawn_subagent",
+            id: "Lato:spawn",
+            kind: ToolKind::Other,
+        },
+        ToolSpec {
+            id: "Lato:send",
+            kind: ToolKind::Other,
+        },
+        ToolSpec {
+            id: "Lato:wait",
+            kind: ToolKind::Other,
+        },
+        ToolSpec {
+            id: "Lato:cancel",
+            kind: ToolKind::Other,
+        },
+        ToolSpec {
+            id: "Lato:inspect",
             kind: ToolKind::Other,
         },
         ToolSpec {
@@ -123,7 +142,10 @@ mod tests {
             .filter_map(|tool| tool.pointer("/function/name").and_then(|v| v.as_str()))
             .collect();
         assert!(names.contains(&"web_fetch"));
-        assert!(names.contains(&"spawn_subagent"));
+        for name in ["spawn", "send", "wait", "cancel", "inspect"] {
+            assert!(names.contains(&name));
+        }
+        assert!(!names.contains(&"spawn_subagent"));
         assert!(!names.contains(&"search_tool"));
     }
 }

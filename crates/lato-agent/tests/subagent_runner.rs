@@ -4,14 +4,17 @@ use lato_agent::{
 };
 use lato_ai::{FakeModelStream, StreamPiece};
 use lato_core::{
-    AgentProfile, BudgetAmount, BudgetLimits, ResultContract, SessionId, TaskId, TaskOwner,
-    TaskScope, ToolCapability, TurnId, VerificationPolicy, WorkspaceIntent,
+    AgentProfile, BudgetAmount, BudgetLimits, LeaseId, ResultContract, SessionId, TaskId,
+    TaskOwner, TaskScope, ToolCallId, ToolCapability, ToolContext, TurnId, VerificationPolicy,
+    WorkspaceIntent,
 };
 use lato_runtime::{
-    CoordinatorConfig, NoopTaskEventSink, SpawnMode, SpawnTaskRequest, TaskRootRequest,
-    WaitOutcome, spawn_subagent_coordinator_with_verifier,
+    ChannelBackend, CoordinatorConfig, NoopTaskEventSink, TaskRootRequest,
+    spawn_subagent_coordinator_with_verifier,
 };
-use lato_tools::{BuiltinToolEnvironment, builtin_tool_runtime};
+use lato_tools::{
+    BuiltinToolEnvironment, builtin_tool_runtime, builtin_tool_runtime_with_subagents,
+};
 use lato_workspace::{FileLocks, SessionTrust};
 use std::{sync::Arc, time::Duration};
 use tokio::sync::mpsc;
@@ -185,34 +188,71 @@ async fn real_runner_executes_a_child_runtime_and_returns_to_coordinator() {
         })
         .await
         .unwrap();
-    root.spawn(SpawnTaskRequest {
-        task_id: TaskId::from("child"),
-        scope: TaskScope {
-            objective: "inspect".into(),
-            context_refs: vec!["README.md".into()],
+    let runtime = builtin_tool_runtime_with_subagents(
+        BuiltinToolEnvironment {
+            cwd: repo.path().to_path_buf(),
+            locks: Arc::new(FileLocks::new()),
+            trust: SessionTrust::for_headless_prompt(repo.path()),
         },
-        profile: AgentProfile::explorer(),
-        requested_capabilities: None,
-        budget: BudgetLimits::unlimited(),
-        result_contract: ResultContract {
-            schema: None,
-            max_output_bytes: 1_024,
-        },
-        mode: SpawnMode::Background,
-        cancellation: CancellationToken::new(),
-    })
-    .await
+        ChannelBackend::new(root).into_resource(),
+    )
     .unwrap();
-
-    let outcome = root
-        .wait(TaskId::from("child"), Duration::from_secs(3))
+    let definitions = runtime.model_definitions();
+    let names = definitions
+        .iter()
+        .filter_map(|definition| {
+            definition
+                .pointer("/function/name")
+                .and_then(|name| name.as_str())
+        })
+        .collect::<Vec<_>>();
+    for name in ["spawn", "send", "wait", "cancel", "inspect"] {
+        assert!(names.contains(&name));
+    }
+    assert!(!names.contains(&"spawn_subagent"));
+    let context = || ToolContext {
+        session_id: SessionId::from("parent-session"),
+        turn_id: TurnId::from("parent-turn"),
+        call_id: ToolCallId::from("task-tool-call"),
+        cancellation: CancellationToken::new(),
+        execution_grant: None,
+    };
+    let spawned = runtime
+        .invoke(
+            context(),
+            "spawn",
+            serde_json::json!({
+                "task_id": "child",
+                "profile": "explorer",
+                "task": "inspect",
+                "context_refs": ["README.md"],
+                "background": true
+            }),
+        )
         .await
         .unwrap();
-    let WaitOutcome::Finished(snapshot) = outcome else {
-        panic!("child task did not finish: {outcome:?}");
-    };
-    assert_eq!(snapshot.node.status, lato_core::TaskStatus::Completed);
-    assert!(snapshot.result.unwrap().output.contains("README exists"));
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&spawned.content).unwrap()["task_id"],
+        "child"
+    );
+
+    let waited = runtime
+        .invoke(
+            context(),
+            "wait",
+            serde_json::json!({"task_id":"child", "timeout_ms":3_000}),
+        )
+        .await
+        .unwrap();
+    let waited: serde_json::Value = serde_json::from_str(&waited.content).unwrap();
+    assert_eq!(waited["wait"], "finished");
+    assert_eq!(waited["snapshot"]["task"]["status"], "completed");
+    assert!(
+        waited["snapshot"]["result"]["output"]
+            .as_str()
+            .unwrap()
+            .contains("README exists")
+    );
     handle.shutdown().await.unwrap();
     actor.await.unwrap();
 }
@@ -242,7 +282,7 @@ async fn profile_verifier_accepts_structured_outputs_and_rejects_escaped_paths()
 
     let escaped = lato_agent::WorkerOutput {
         changed_files: vec!["../outside".into()],
-        ..worker
+        ..worker.clone()
     };
     let outcome = lato_agent::ProfileResultVerifier
         .verify(verification_request(
@@ -251,6 +291,27 @@ async fn profile_verifier_accepts_structured_outputs_and_rejects_escaped_paths()
         ))
         .await;
     assert!(matches!(outcome, VerificationOutcome::Failed(_)));
+
+    let workspace = tempfile::tempdir().unwrap();
+    let missing = lato_agent::WorkerOutput {
+        changed_files: vec!["missing.rs".into()],
+        ..worker
+    };
+    let mut request = verification_request(
+        AgentProfile::worker(),
+        serde_json::to_string(&missing).unwrap(),
+    );
+    request.workspace_lease = Some(lato_workspace::WorkspaceLease::new(
+        LeaseId::from("verification-lease"),
+        TaskId::from("verify"),
+        lato_workspace::WorkspaceMode::IsolatedWorktree,
+        workspace.path().to_path_buf(),
+        None,
+    ));
+    assert!(matches!(
+        lato_agent::ProfileResultVerifier.verify(request).await,
+        VerificationOutcome::Failed(_)
+    ));
 
     fn verification_request(profile: AgentProfile, output: String) -> VerificationRequest {
         VerificationRequest {
@@ -283,6 +344,7 @@ async fn profile_verifier_accepts_structured_outputs_and_rejects_escaped_paths()
                 duration_ms: 0,
                 output_ref: None,
             },
+            workspace_lease: None,
         }
     }
 }
