@@ -16,14 +16,14 @@ use crate::task::state::{CoordinatorState, RuntimeTaskRecord};
 use crate::task::{
     ActiveMessage, ActiveMessageAdmission, ActiveMessageAdmissionLease, ActiveMessageCompletion,
     ActiveMessageCompletionKind, ActiveMessageOutcome, ActiveMessageRejectionObservation,
-    ActiveMessageRequest, ActiveMessageRetirementProof, CancelOutcome, CancelTarget,
-    CompletionDisposition, CoordinatorConfig, InspectCaller, OutputMetadata, RunnerEvent,
-    ScopedTaskHandle, SinkShutdown, SpawnDisposition, SpawnMode, SpawnTaskRequest,
-    TaskCallbackKind, TaskChildControl, TaskCommand, TaskCommandSender, TaskCompletion,
-    TaskEventEnvelope, TaskEventPayload, TaskEventSink, TaskHandle, TaskReporter, TaskRunOutput,
-    TaskRunRequest, TaskRunner, TaskVerifier, VerificationDecision, VerificationOutcome,
-    VerificationRequest, VerificationResume, VerificationWait, WaitOutcome, coordinator_closed,
-    root_node,
+    ActiveMessageRequest, ActiveMessageRetirementProof, ApprovalVerificationResume, CancelOutcome,
+    CancelTarget, CompletionDisposition, CoordinatorConfig, InspectCaller, OutputMetadata,
+    ReviewerVerificationResume, RunnerEvent, ScopedTaskHandle, SinkShutdown, SpawnDisposition,
+    SpawnMode, SpawnTaskRequest, TaskCallbackKind, TaskChildControl, TaskCommand,
+    TaskCommandSender, TaskCompletion, TaskEventEnvelope, TaskEventPayload, TaskEventSink,
+    TaskHandle, TaskReporter, TaskRunOutput, TaskRunRequest, TaskRunner, TaskVerifier,
+    VerificationDecision, VerificationOutcome, VerificationRequest, VerificationWait, WaitOutcome,
+    coordinator_closed, root_node,
 };
 use futures_util::{
     FutureExt, StreamExt,
@@ -205,6 +205,7 @@ enum OutputLoadEvent {
     Reply {
         reply: oneshot::Sender<Result<crate::task::TaskInspection, TaskError>>,
         result: Box<Result<crate::task::TaskInspection, TaskError>>,
+        release_slot: bool,
     },
     SlotReleased,
 }
@@ -259,6 +260,7 @@ pub struct TaskCoordinator<R: TaskRunner, A: WorkspaceAllocator> {
     cleanup_inflight: HashSet<TaskId>,
     pending_completions: HashMap<TaskId, TaskCompletion>,
     pending_terminal_outputs: HashMap<TaskId, PendingTerminalOutput>,
+    verification_wait_deadlines: HashMap<TaskId, Instant>,
     waiters: HashMap<TaskId, Vec<BlockingWaiter>>,
     foreground_waiters: HashMap<TaskId, ForegroundWaiter>,
     completed_order: VecDeque<TaskId>,
@@ -355,6 +357,7 @@ where
     );
     let next_queue_reap = Instant::now() + config.queued_reap_interval;
     let next_progress_poll = Instant::now() + config.progress_poll_interval;
+    let initial_runner_generation = config.initial_runner_generation;
     let coordinator = TaskCoordinator {
         queue: SpawnQueue::new(config.max_queue),
         config,
@@ -405,6 +408,7 @@ where
         cleanup_inflight: HashSet::new(),
         pending_completions: HashMap::new(),
         pending_terminal_outputs: HashMap::new(),
+        verification_wait_deadlines: HashMap::new(),
         waiters: HashMap::new(),
         foreground_waiters: HashMap::new(),
         completed_order: VecDeque::new(),
@@ -419,7 +423,7 @@ where
         weak_handle,
         sequence: 0,
         next_message_id: 0,
-        next_generation: 0,
+        next_generation: initial_runner_generation,
     };
     let actor = tokio::spawn(coordinator.run());
     (handle, actor)
@@ -434,6 +438,22 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
         }
         for pending in self.pending_terminal_outputs.values() {
             deadline = deadline.min(pending.deadline);
+        }
+        for candidate in self.verification_wait_deadlines.values().copied() {
+            deadline = deadline.min(candidate);
+        }
+        for record in self.state.tasks.values().filter(|record| {
+            record.node.parent_id.is_some()
+                && !record.node.status.is_terminal()
+                && record.budget_failure.is_none()
+        }) {
+            if let Some(limit) = record.budget.limits().wall_time_ms
+                && let Some(candidate) = record
+                    .enqueued_at
+                    .checked_add(std::time::Duration::from_millis(limit.saturating_add(1)))
+            {
+                deadline = deadline.min(candidate);
+            }
         }
         for waiter in &self.drain_waiters {
             deadline = deadline.min(waiter.deadline);
@@ -467,6 +487,8 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
             self.dispatch_progress_polls();
         }
         self.reap_cancelled().await;
+        self.charge_wall_time(now).await;
+        self.expire_verification_waits(now);
         self.reap_terminalization_deadlines().await;
         self.reap_closed_drain_waiters();
         self.expire_drain_waiters(now);
@@ -899,7 +921,15 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
                 let output_loads_drained = self.shutdown_output_loads(shutdown_deadline).await;
                 while let Ok(event) = self.output_load_event_rx.try_recv() {
                     match event {
-                        OutputLoadEvent::Reply { reply, result } => {
+                        OutputLoadEvent::Reply {
+                            reply,
+                            result,
+                            release_slot,
+                        } => {
+                            if release_slot {
+                                self.output_loads_inflight =
+                                    self.output_loads_inflight.saturating_sub(1);
+                            }
                             let _ = reply.send(*result);
                         }
                         OutputLoadEvent::SlotReleased => {
@@ -987,7 +1017,15 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
                 event = self.output_load_event_rx.recv(), if self.output_loads_inflight > 0 => {
                     if let Some(event) = event {
                         match event {
-                            OutputLoadEvent::Reply { reply, result } => {
+                            OutputLoadEvent::Reply {
+                                reply,
+                                result,
+                                release_slot,
+                            } => {
+                                if release_slot {
+                                    self.output_loads_inflight =
+                                        self.output_loads_inflight.saturating_sub(1);
+                                }
                                 let _ = reply.send(*result);
                             }
                             OutputLoadEvent::SlotReleased => {
@@ -1116,13 +1154,21 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
                 let result = self.set_root_spawn_admission(&root_id, &caller, closed);
                 let _ = reply.send(result);
             }
-            TaskCommand::ResumeVerification {
+            TaskCommand::ResumeReviewerVerification {
                 task_id,
                 caller,
                 resume,
                 reply,
             } => {
-                let result = self.resume_verification(&task_id, &caller, resume);
+                let result = self.resume_reviewer_verification(&task_id, &caller, resume);
+                let _ = reply.send(result);
+            }
+            TaskCommand::ResumeApprovalVerification {
+                task_id,
+                resume,
+                reply,
+            } => {
+                let result = self.resume_approval_verification(&task_id, resume);
                 let _ = reply.send(result);
             }
             TaskCommand::RegistryCounts { reply } => {
@@ -1187,6 +1233,7 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
                 verification_wait: None,
                 budget_failure: None,
                 budget_settled: false,
+                charged_wall_time_ms: 0,
             },
         );
         self.commit_transition(task_id, TaskEventPayload::RootRegistered);
@@ -1840,6 +1887,7 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
                 verification_wait: None,
                 budget_failure: None,
                 budget_settled: false,
+                charged_wall_time_ms: 0,
             },
         );
         self.commit_transition(task_id.clone(), TaskEventPayload::SpawnAccepted);
@@ -1928,13 +1976,14 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
                 verification_wait: None,
                 budget_failure: None,
                 budget_settled: false,
+                charged_wall_time_ms: 0,
             },
         );
         let result = lato_core::TaskResult {
             success: false,
             output: String::new(),
             error: Some(error.clone()),
-            usage: Default::default(),
+            usage: self.state.tasks[&task_id].usage.clone(),
             duration_ms: 0,
             output_ref: None,
         };
@@ -1982,11 +2031,13 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
         self.push_job(job_task_id, JobPhase::Preparing, future);
     }
 
-    fn launch_runner(&mut self, task_id: TaskId) {
-        self.next_generation = self
-            .next_generation
-            .checked_add(1)
-            .expect("active task generation overflow");
+    fn launch_runner(&mut self, task_id: TaskId) -> Result<(), TaskError> {
+        self.next_generation = self.next_generation.checked_add(1).ok_or_else(|| {
+            TaskError::new(
+                TaskErrorCode::RunnerInitialization,
+                "task runner generation sequence is exhausted",
+            )
+        })?;
         let generation = self.next_generation;
         self.state
             .tasks
@@ -2040,6 +2091,7 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
             TaskJobExit::Completed(task_id, generation, output)
         };
         self.push_job(job_task_id, JobPhase::Running, future);
+        Ok(())
     }
 
     fn push_job(
@@ -2418,7 +2470,12 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
         }
     }
 
-    async fn complete_task(&mut self, task_id: TaskId, output: crate::task::TaskRunOutput) {
+    async fn complete_task(
+        &mut self,
+        task_id: TaskId,
+        generation: u64,
+        mut output: crate::task::TaskRunOutput,
+    ) {
         let Some(status) = self
             .state
             .tasks
@@ -2441,6 +2498,15 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
             .await;
             return;
         }
+        let authoritative = max_usage(&self.state.tasks[&task_id].usage, &output.result.usage);
+        self.handle_cumulative_usage(task_id.clone(), generation, authoritative.clone())
+            .await;
+        self.charge_wall_time(Instant::now()).await;
+        if self.state.tasks[&task_id].budget_failure.is_some() {
+            self.terminalize_cancelled(&task_id);
+            return;
+        }
+        output.result.usage = authoritative;
         self.set_status(&task_id, TaskStatus::Finalizing);
         let clean = self.state.tasks.get_mut(&task_id).and_then(|record| {
             record.spawn_admission_closed = true;
@@ -2632,6 +2698,10 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
                     .unwrap()
                     .verification_wait = Some(VerificationWait::Child(reviewer_task_id.clone()));
                 self.set_status(&task_id, TaskStatus::WaitingForChildren);
+                self.verification_wait_deadlines.insert(
+                    task_id.clone(),
+                    Instant::now() + self.config.external_verification_wait_timeout,
+                );
                 self.commit_transition(
                     task_id,
                     TaskEventPayload::VerificationWaitingForChild { reviewer_task_id },
@@ -2644,6 +2714,10 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
                     .unwrap()
                     .verification_wait = Some(VerificationWait::Approval(approval_id.clone()));
                 self.set_status(&task_id, TaskStatus::WaitingForApproval);
+                self.verification_wait_deadlines.insert(
+                    task_id.clone(),
+                    Instant::now() + self.config.external_verification_wait_timeout,
+                );
                 self.commit_transition(
                     task_id,
                     TaskEventPayload::VerificationWaitingForApproval { approval_id },
@@ -2652,31 +2726,60 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
         }
     }
 
-    fn resume_verification(
+    fn resume_reviewer_verification(
         &mut self,
         task_id: &TaskId,
         caller: &InspectCaller,
-        resume: VerificationResume,
+        resume: ReviewerVerificationResume,
     ) -> Result<(), TaskError> {
-        if !caller_owns(&self.state, caller, task_id) {
-            return Err(not_found());
-        }
         let record = self.state.tasks.get(task_id).ok_or_else(not_found)?;
-        let decision = match (&record.verification_wait, resume) {
-            (
-                Some(VerificationWait::Child(expected)),
-                VerificationResume::Child {
-                    reviewer_task_id,
-                    decision,
-                },
-            ) if expected == &reviewer_task_id => decision,
-            (
-                Some(VerificationWait::Approval(expected)),
-                VerificationResume::Approval {
-                    approval_id,
-                    decision,
-                },
-            ) if expected == &approval_id => decision,
+        let decision = match (&record.verification_wait, resume.reviewer_task_id) {
+            (Some(VerificationWait::Child(expected)), reviewer_task_id)
+                if expected == &reviewer_task_id =>
+            {
+                let InspectCaller::Scoped {
+                    root_id: caller_root,
+                    task_id: caller_task,
+                } = caller
+                else {
+                    return Err(not_found());
+                };
+                if caller_task != &reviewer_task_id || caller_root != &record.node.root_id {
+                    return Err(not_found());
+                }
+                let reviewer = self
+                    .state
+                    .tasks
+                    .get(&reviewer_task_id)
+                    .ok_or_else(not_found)?;
+                if reviewer.node.root_id != record.node.root_id
+                    || reviewer.node.parent_id.as_ref() != Some(task_id)
+                    || !reviewer.node.status.is_terminal()
+                {
+                    return Err(TaskError::new(
+                        TaskErrorCode::VerificationPending,
+                        "the authoritative reviewer has not completed",
+                    ));
+                }
+                let reviewer_result = reviewer.result.as_ref().ok_or_else(|| {
+                    TaskError::new(
+                        TaskErrorCode::VerificationPending,
+                        "the authoritative reviewer has no terminal decision",
+                    )
+                })?;
+                if reviewer_result.success {
+                    VerificationDecision::Passed
+                } else {
+                    VerificationDecision::Failed(reviewer_result.error.clone().unwrap_or_else(
+                        || {
+                            TaskError::new(
+                                TaskErrorCode::VerificationFailed,
+                                "the authoritative reviewer rejected the task output",
+                            )
+                        },
+                    ))
+                }
+            }
             _ => {
                 return Err(TaskError::new(
                     TaskErrorCode::VerificationPending,
@@ -2684,12 +2787,42 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
                 ));
             }
         };
+        self.verification_wait_deadlines.remove(task_id);
         self.state.tasks.get_mut(task_id).unwrap().verification_wait = None;
         self.set_status(task_id, TaskStatus::Verifying);
         self.commit_transition(task_id.clone(), TaskEventPayload::VerificationResumed);
         self.finish_verification(
             task_id.clone(),
             match decision {
+                VerificationDecision::Passed => VerificationOutcome::Passed,
+                VerificationDecision::Failed(error) => VerificationOutcome::Failed(error),
+            },
+        );
+        Ok(())
+    }
+
+    fn resume_approval_verification(
+        &mut self,
+        task_id: &TaskId,
+        resume: ApprovalVerificationResume,
+    ) -> Result<(), TaskError> {
+        let record = self.state.tasks.get(task_id).ok_or_else(not_found)?;
+        if !matches!(
+            &record.verification_wait,
+            Some(VerificationWait::Approval(expected)) if expected == &resume.approval_id
+        ) {
+            return Err(TaskError::new(
+                TaskErrorCode::VerificationPending,
+                "approval resume does not match the pending root-bound identifier",
+            ));
+        }
+        self.verification_wait_deadlines.remove(task_id);
+        self.state.tasks.get_mut(task_id).unwrap().verification_wait = None;
+        self.set_status(task_id, TaskStatus::Verifying);
+        self.commit_transition(task_id.clone(), TaskEventPayload::VerificationResumed);
+        self.finish_verification(
+            task_id.clone(),
+            match resume.decision {
                 VerificationDecision::Passed => VerificationOutcome::Passed,
                 VerificationDecision::Failed(error) => VerificationOutcome::Failed(error),
             },
@@ -2713,7 +2846,7 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
             success: false,
             output: String::new(),
             error: Some(error.clone()),
-            usage: Default::default(),
+            usage: self.state.tasks[&task_id].usage.clone(),
             duration_ms: 0,
             output_ref: None,
         };
@@ -2732,7 +2865,7 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
         status: TaskStatus,
         result: lato_core::TaskResult,
         event: TaskEventPayload,
-        completion: Option<TaskCompletion>,
+        _completion: Option<TaskCompletion>,
     ) -> bool {
         let current = self
             .state
@@ -2742,21 +2875,30 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
         if current.result.is_some() {
             return false;
         }
+        let current_status = current.node.status;
+        let runner_derived = current.generation.is_some();
         self.cancel_deadlines.remove(task_id);
+        self.verification_wait_deadlines.remove(task_id);
         self.cancellation_won.remove(task_id);
         self.pending_terminal_outputs.remove(task_id);
-        if !current.node.status.is_terminal() {
+        if !current_status.is_terminal() {
             self.set_status(task_id, status);
         } else {
-            debug_assert_eq!(current.node.status, status);
+            debug_assert_eq!(current_status, status);
         }
+        let callback_result = result.clone();
         let record = self.state.tasks.get_mut(task_id).unwrap();
         record.usage = result.usage.clone();
         record.result = Some(result);
         record.verification_output = None;
         record.verification_wait = None;
-        if let Some(completion) = completion {
-            self.pending_completions.insert(task_id.clone(), completion);
+        if runner_derived {
+            self.pending_completions
+                .entry(task_id.clone())
+                .or_insert(TaskCompletion {
+                    task_id: task_id.clone(),
+                    result: callback_result,
+                });
         }
         self.resolve_terminal_observers(task_id);
         // The terminal event is the publication barrier: every authoritative
@@ -3026,6 +3168,11 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
             | TaskJobExit::Aborted(task_id, _) => task_id.clone(),
         };
         self.job_aborts.remove(&task_id);
+        if matches!(&exit, TaskJobExit::Completed(_, _, _)) {
+            while let Ok(event) = self.internal_rx.try_recv() {
+                self.handle_runner_event(event).await;
+            }
+        }
         match &exit {
             TaskJobExit::LeaseReleased(_, lease_id) => {
                 self.cleanup_inflight.remove(&task_id);
@@ -3090,8 +3237,8 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
             );
             if cancellation_requested {
                 self.terminalize_cancelled(&task_id);
-            } else {
-                self.launch_runner(task_id);
+            } else if let Err(error) = self.launch_runner(task_id.clone()) {
+                self.fail_task(task_id, error).await;
             }
             return;
         }
@@ -3102,7 +3249,7 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
                 TaskJobExit::WorkspaceAllocated(_, _) => unreachable!("handled above"),
                 TaskJobExit::Completed(_, generation, output) => {
                     if self.generation_is_current(&task_id, generation) {
-                        self.complete_task(task_id, output).await;
+                        self.complete_task(task_id, generation, output).await;
                     }
                 }
                 TaskJobExit::VerificationFinished(_, generation, outcome) => {
@@ -3396,16 +3543,103 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
         let Some(dimension) = exhausted else {
             return;
         };
-        let error = budget_exhausted_error(dimension);
-        self.state
+        self.trigger_budget_exhaustion(task_id, dimension).await;
+    }
+
+    async fn charge_wall_time(&mut self, now: Instant) {
+        let task_ids: Vec<_> = self
+            .state
             .tasks
-            .get_mut(&task_id)
-            .expect("budget target remains registered")
-            .budget_failure = Some(error.clone());
+            .iter()
+            .filter(|(_, record)| {
+                record.node.parent_id.is_some()
+                    && !record.node.status.is_terminal()
+                    && record.budget_failure.is_none()
+            })
+            .map(|(task_id, _)| task_id.clone())
+            .collect();
+        for task_id in task_ids {
+            let (elapsed, previous, limit) = {
+                let record = &self.state.tasks[&task_id];
+                (
+                    now.saturating_duration_since(record.enqueued_at)
+                        .as_millis()
+                        .try_into()
+                        .unwrap_or(u64::MAX),
+                    record.charged_wall_time_ms,
+                    record.budget.limits().wall_time_ms,
+                )
+            };
+            let accepted = limit.map_or(elapsed, |limit| elapsed.min(limit));
+            if accepted > previous {
+                let record = self.state.tasks.get_mut(&task_id).unwrap();
+                let previous_amount = BudgetAmount {
+                    wall_time_ms: previous,
+                    ..BudgetAmount::ZERO
+                };
+                let next_amount = BudgetAmount {
+                    wall_time_ms: accepted,
+                    ..BudgetAmount::ZERO
+                };
+                if record
+                    .budget
+                    .apply_cumulative_usage(previous_amount, next_amount)
+                    .is_ok()
+                {
+                    record.charged_wall_time_ms = accepted;
+                }
+            }
+            if limit.is_some_and(|limit| elapsed > limit) {
+                self.trigger_budget_exhaustion(task_id, BudgetDimension::WallTimeMs)
+                    .await;
+            }
+        }
+    }
+
+    async fn trigger_budget_exhaustion(&mut self, task_id: TaskId, dimension: BudgetDimension) {
+        if self.state.tasks.get(&task_id).is_none_or(|record| {
+            record.node.status.is_terminal() || record.budget_failure.is_some()
+        }) {
+            return;
+        }
+        let error = budget_exhausted_error(dimension);
+        self.state.tasks.get_mut(&task_id).unwrap().budget_failure = Some(error.clone());
         self.commit_transition(task_id.clone(), TaskEventPayload::BudgetExhausted { error });
         let descendants = self.state.descendants_including(&task_id);
         for descendant in descendants {
             self.request_cancel(descendant).await;
+        }
+    }
+
+    fn expire_verification_waits(&mut self, now: Instant) {
+        let expired: Vec<_> = self
+            .verification_wait_deadlines
+            .iter()
+            .filter(|(_, deadline)| **deadline <= now)
+            .map(|(task_id, _)| task_id.clone())
+            .collect();
+        for task_id in expired {
+            self.verification_wait_deadlines.remove(&task_id);
+            if self.state.tasks.get(&task_id).is_some_and(|record| {
+                matches!(
+                    record.node.status,
+                    TaskStatus::WaitingForChildren | TaskStatus::WaitingForApproval
+                )
+            }) {
+                self.state
+                    .tasks
+                    .get_mut(&task_id)
+                    .unwrap()
+                    .verification_wait = None;
+                self.set_status(&task_id, TaskStatus::Verifying);
+                self.finish_verification(
+                    task_id,
+                    VerificationOutcome::Failed(TaskError::new(
+                        TaskErrorCode::VerificationFailed,
+                        "external task verification timed out",
+                    )),
+                );
+            }
         }
     }
 
@@ -3707,22 +3941,20 @@ fn spawn_output_load_dispatcher<R: TaskRunner>(
             let mut next_supervisor_id = 0usize;
             let mut disconnected = false;
             while !disconnected {
-                reap_output_supervisors(&mut supervisors, &done_rx, &event_tx, &active_supervisors);
+                reap_output_supervisors(&mut supervisors, &done_rx);
                 match work_rx.recv_timeout(std::time::Duration::from_millis(1)) {
                     Ok(work) => {
-                        reap_output_supervisors(
-                            &mut supervisors,
-                            &done_rx,
-                            &event_tx,
-                            &active_supervisors,
-                        );
+                        reap_output_supervisors(&mut supervisors, &done_rx);
                         let supervisor_id = next_supervisor_id;
                         next_supervisor_id = next_supervisor_id.wrapping_add(1);
                         let runner = Arc::clone(&runner);
                         let event_tx = event_tx.clone();
                         let runtime = runtime.clone();
                         let done_tx = done_tx.clone();
+                        active_supervisors.fetch_add(1, Ordering::AcqRel);
+                        let active_supervisors = Arc::clone(&active_supervisors);
                         let supervisor = std::thread::spawn(move || {
+                            let _active_guard = AtomicCountGuard(active_supervisors);
                             let (value_tx, value_rx) = std::sync::mpsc::sync_channel(1);
                             let output_ref = work.output_ref.clone();
                             let execution = std::thread::spawn(move || {
@@ -3754,6 +3986,7 @@ fn spawn_output_load_dispatcher<R: TaskRunner>(
                                         TaskErrorCode::RunnerProtocolViolation,
                                         "persisted task output load timed out",
                                     ))),
+                                    release_slot: false,
                                 });
                                 // Preserve the bounded worker slot until the blocking
                                 // execution really exits. Otherwise repeated timeouts
@@ -3761,6 +3994,7 @@ fn spawn_output_load_dispatcher<R: TaskRunner>(
                                 // threads behind a nominal integer capacity.
                                 let _ = value_rx.recv();
                                 let _ = execution.join();
+                                let _ = event_tx.send(OutputLoadEvent::SlotReleased);
                                 let _ = done_tx.send(supervisor_id);
                                 return;
                             }
@@ -3778,15 +4012,18 @@ fn spawn_output_load_dispatcher<R: TaskRunner>(
                                 Ok(None) => Ok(inspection),
                                 Err(error) => Err(error),
                             };
+                            let _ = execution.join();
+                            // Release actor-owned capacity before waking the
+                            // requester so a sequential follow-up cannot race
+                            // stale bookkeeping.
                             let _ = event_tx.send(OutputLoadEvent::Reply {
                                 reply: work.reply,
                                 result: Box::new(reply),
+                                release_slot: true,
                             });
-                            let _ = execution.join();
                             let _ = done_tx.send(supervisor_id);
                         });
                         supervisors.insert(supervisor_id, supervisor);
-                        active_supervisors.store(supervisors.len(), Ordering::Release);
                     }
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
@@ -3799,8 +4036,6 @@ fn spawn_output_load_dispatcher<R: TaskRunner>(
                     && let Some(supervisor) = supervisors.remove(&supervisor_id)
                 {
                     let _ = supervisor.join();
-                    active_supervisors.store(supervisors.len(), Ordering::Release);
-                    let _ = event_tx.send(OutputLoadEvent::SlotReleased);
                 }
             }
             let _ = drained.send(());
@@ -3811,15 +4046,19 @@ fn spawn_output_load_dispatcher<R: TaskRunner>(
 fn reap_output_supervisors(
     supervisors: &mut HashMap<usize, std::thread::JoinHandle<()>>,
     done_rx: &std::sync::mpsc::Receiver<usize>,
-    event_tx: &mpsc::UnboundedSender<OutputLoadEvent>,
-    active_supervisors: &AtomicUsize,
 ) {
     while let Ok(supervisor_id) = done_rx.try_recv() {
         if let Some(supervisor) = supervisors.remove(&supervisor_id) {
             let _ = supervisor.join();
-            active_supervisors.store(supervisors.len(), Ordering::Release);
-            let _ = event_tx.send(OutputLoadEvent::SlotReleased);
         }
+    }
+}
+
+struct AtomicCountGuard(Arc<AtomicUsize>);
+
+impl Drop for AtomicCountGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -3898,6 +4137,17 @@ fn usage_regressed(previous: &TaskUsage, next: &TaskUsage) -> bool {
         || next.retries < previous.retries
 }
 
+fn max_usage(left: &TaskUsage, right: &TaskUsage) -> TaskUsage {
+    TaskUsage {
+        input_tokens: left.input_tokens.max(right.input_tokens),
+        output_tokens: left.output_tokens.max(right.output_tokens),
+        total_tokens: left.total_tokens.max(right.total_tokens),
+        tool_calls: left.tool_calls.max(right.tool_calls),
+        cost_micros: left.cost_micros.max(right.cost_micros),
+        retries: left.retries.max(right.retries),
+    }
+}
+
 fn min_budget(left: BudgetAmount, right: BudgetAmount) -> BudgetAmount {
     BudgetAmount {
         input_tokens: left.input_tokens.min(right.input_tokens),
@@ -3949,9 +4199,8 @@ fn budget_exhausted_error(dimension: BudgetDimension) -> TaskError {
         BudgetDimension::ToolCalls => TaskErrorCode::BudgetExceededToolCalls,
         BudgetDimension::CostMicros => TaskErrorCode::BudgetExceededCostMicros,
         BudgetDimension::Retries => TaskErrorCode::BudgetExceededRetries,
-        BudgetDimension::WallTimeMs | BudgetDimension::ChildTasks | BudgetDimension::Worktrees => {
-            TaskErrorCode::BudgetExceeded
-        }
+        BudgetDimension::WallTimeMs => TaskErrorCode::BudgetExceededWallTimeMs,
+        BudgetDimension::ChildTasks | BudgetDimension::Worktrees => TaskErrorCode::BudgetExceeded,
     };
     TaskError::new(code, format!("task budget exhausted in {dimension}"))
 }

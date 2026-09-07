@@ -37,6 +37,7 @@ pub(crate) struct RuntimeTaskRecord {
     pub(crate) verification_wait: Option<crate::task::VerificationWait>,
     pub(crate) budget_failure: Option<lato_core::TaskError>,
     pub(crate) budget_settled: bool,
+    pub(crate) charged_wall_time_ms: u64,
 }
 
 #[derive(Default)]
@@ -243,6 +244,7 @@ mod tests {
             verification_wait: None,
             budget_failure: None,
             budget_settled: false,
+            charged_wall_time_ms: 0,
         }
     }
 

@@ -57,6 +57,9 @@ pub struct CoordinatorConfig {
     pub queued_reap_interval: Duration,
     pub profile_validation_timeout: Duration,
     pub verification_timeout: Duration,
+    pub external_verification_wait_timeout: Duration,
+    /// Testable seed for the opaque runner-generation sequence.
+    pub initial_runner_generation: u64,
     pub admission_behavior: LimitBehavior,
 }
 
@@ -91,6 +94,8 @@ impl Default for CoordinatorConfig {
             queued_reap_interval: Duration::from_millis(250),
             profile_validation_timeout: Duration::from_secs(5),
             verification_timeout: Duration::from_secs(30),
+            external_verification_wait_timeout: Duration::from_secs(3_600),
+            initial_runner_generation: 0,
             admission_behavior: LimitBehavior::Queue,
         }
     }
@@ -176,6 +181,10 @@ impl CoordinatorConfig {
         assert!(
             !self.verification_timeout.is_zero(),
             "verification timeout must be positive"
+        );
+        assert!(
+            !self.external_verification_wait_timeout.is_zero(),
+            "external verification wait timeout must be positive"
         );
     }
 }
@@ -559,10 +568,15 @@ pub(crate) enum TaskCommand {
         closed: bool,
         reply: oneshot::Sender<Result<(), TaskError>>,
     },
-    ResumeVerification {
+    ResumeReviewerVerification {
         task_id: TaskId,
         caller: InspectCaller,
-        resume: super::VerificationResume,
+        resume: super::ReviewerVerificationResume,
+        reply: oneshot::Sender<Result<(), TaskError>>,
+    },
+    ResumeApprovalVerification {
+        task_id: TaskId,
+        resume: super::ApprovalVerificationResume,
         reply: oneshot::Sender<Result<(), TaskError>>,
     },
     RegistryCounts {
@@ -728,15 +742,14 @@ impl TaskHandle {
         self.set_spawn_admission(root_id, false).await
     }
 
-    pub async fn resume_verification_admin(
+    pub async fn resume_approval_verification(
         &self,
         task_id: TaskId,
-        resume: super::VerificationResume,
+        resume: super::ApprovalVerificationResume,
     ) -> Result<(), TaskError> {
         let (reply, response) = oneshot::channel();
-        self.send(TaskCommand::ResumeVerification {
+        self.send(TaskCommand::ResumeApprovalVerification {
             task_id,
-            caller: InspectCaller::Admin,
             resume,
             reply,
         })
@@ -1066,14 +1079,14 @@ impl ScopedTaskHandle {
         self.set_spawn_admission(false).await
     }
 
-    pub async fn resume_verification(
+    pub async fn resume_reviewer_verification(
         &self,
         task_id: TaskId,
-        resume: super::VerificationResume,
+        resume: super::ReviewerVerificationResume,
     ) -> Result<(), TaskError> {
         let (reply, response) = oneshot::channel();
         self.inner
-            .send(TaskCommand::ResumeVerification {
+            .send(TaskCommand::ResumeReviewerVerification {
                 task_id,
                 caller: InspectCaller::Scoped {
                     root_id: self.root_id.clone(),

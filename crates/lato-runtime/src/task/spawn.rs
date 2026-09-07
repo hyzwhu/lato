@@ -369,6 +369,7 @@ mod tests {
             verification_wait: None,
             budget_failure: None,
             budget_settled: false,
+            charged_wall_time_ms: 0,
         }
     }
 

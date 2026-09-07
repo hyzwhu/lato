@@ -24,15 +24,14 @@ pub enum VerificationDecision {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum VerificationResume {
-    Child {
-        reviewer_task_id: TaskId,
-        decision: VerificationDecision,
-    },
-    Approval {
-        approval_id: String,
-        decision: VerificationDecision,
-    },
+pub struct ReviewerVerificationResume {
+    pub reviewer_task_id: TaskId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ApprovalVerificationResume {
+    pub approval_id: String,
+    pub decision: VerificationDecision,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

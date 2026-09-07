@@ -4,9 +4,10 @@ use lato_core::{
     AgentProfile, BudgetLimits, SessionId, TaskErrorCode, TaskId, TaskOwner, ToolCapability, TurnId,
 };
 use lato_runtime::{
-    CoordinatorConfig, MemoryTaskEventSink, SinkShutdown, TaskEventEnvelope, TaskEventPayload,
-    TaskEventSink, TaskRootRequest, VerificationDecision, VerificationOutcome, VerificationRequest,
-    VerificationResume, spawn_task_coordinator, spawn_task_coordinator_with_verifier,
+    ApprovalVerificationResume, CoordinatorConfig, MemoryTaskEventSink, ReviewerVerificationResume,
+    SinkShutdown, TaskEventEnvelope, TaskEventPayload, TaskEventSink, TaskRootRequest,
+    VerificationDecision, VerificationOutcome, VerificationRequest, spawn_task_coordinator,
+    spawn_task_coordinator_with_verifier,
 };
 use lato_workspace::MemoryWorkspaceAllocator;
 use std::{
@@ -16,8 +17,7 @@ use std::{
     },
     time::Duration,
 };
-use task_support::ControlledTaskControl;
-use task_support::Harness;
+use task_support::{ControlledTaskControl, GatedTaskRunner, Harness};
 
 #[tokio::test]
 async fn root_registration_is_actor_owned_and_evented() {
@@ -604,16 +604,18 @@ async fn verification_events_precede_completed_publication() {
 }
 
 #[tokio::test]
-async fn waiting_verification_resume_requires_scope_kind_and_exact_id() {
+async fn waiting_reviewer_verification_rejects_self_foreign_and_wrong_ids() {
     let reviewer = TaskId::from("expected-reviewer");
     let (handle, root, _sink, actor, _workspace) =
         verifier_harness(VerificationOutcome::WaitingForChild {
             reviewer_task_id: reviewer.clone(),
         })
         .await;
-    root.spawn(verification_child("waiting-child"))
+    let subject = root
+        .spawn(verification_child("waiting-child"))
         .await
-        .unwrap();
+        .unwrap()
+        .handle;
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             if handle
@@ -645,11 +647,10 @@ async fn waiting_verification_resume_requires_scope_kind_and_exact_id() {
         .await
         .unwrap();
     let foreign_error = foreign
-        .resume_verification(
+        .resume_reviewer_verification(
             TaskId::from("waiting-child"),
-            VerificationResume::Child {
+            ReviewerVerificationResume {
                 reviewer_task_id: reviewer.clone(),
-                decision: VerificationDecision::Passed,
             },
         )
         .await
@@ -657,34 +658,28 @@ async fn waiting_verification_resume_requires_scope_kind_and_exact_id() {
     assert_eq!(foreign_error.code, TaskErrorCode::NotFoundOrNotOwned);
 
     let wrong = root
-        .resume_verification(
+        .resume_reviewer_verification(
             TaskId::from("waiting-child"),
-            VerificationResume::Child {
+            ReviewerVerificationResume {
                 reviewer_task_id: TaskId::from("wrong-reviewer"),
-                decision: VerificationDecision::Passed,
             },
         )
         .await
         .unwrap_err();
     assert_eq!(wrong.code, TaskErrorCode::VerificationPending);
-    root.resume_verification(
-        TaskId::from("waiting-child"),
-        VerificationResume::Child {
-            reviewer_task_id: reviewer,
-            decision: VerificationDecision::Passed,
-        },
-    )
-    .await
-    .unwrap();
-    assert_eq!(
-        handle
-            .inspect_admin(TaskId::from("waiting-child"))
-            .await
-            .unwrap()
-            .node
-            .status,
-        lato_core::TaskStatus::Completed
-    );
+    let self_error = subject
+        .resume_reviewer_verification(
+            TaskId::from("waiting-child"),
+            ReviewerVerificationResume {
+                reviewer_task_id: reviewer,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(self_error.code, TaskErrorCode::NotFoundOrNotOwned);
+    root.cancel_task(TaskId::from("waiting-child"))
+        .await
+        .unwrap();
     handle.shutdown().await.unwrap();
     actor.await.unwrap();
 }
@@ -736,6 +731,70 @@ async fn verifier_panic_is_contained_as_a_verification_failure() {
         TaskErrorCode::VerificationFailed
     );
     assert_eq!(handle.registry_counts().await.unwrap().roots, 1);
+    handle.shutdown().await.unwrap();
+    actor.await.unwrap();
+}
+
+#[tokio::test]
+async fn verification_failure_invokes_one_truthful_completion_callback() {
+    let workspace = tempfile::tempdir().unwrap();
+    let runner = Arc::new(GatedTaskRunner::new(false));
+    let (handle, actor) = spawn_task_coordinator_with_verifier(
+        CoordinatorConfig::default(),
+        runner.clone(),
+        Arc::new(MemoryWorkspaceAllocator::new(workspace.path()).unwrap()),
+        Arc::new(StaticVerifier(VerificationOutcome::Failed(
+            lato_core::TaskError::new(TaskErrorCode::VerificationFailed, "injected failure"),
+        ))),
+        Arc::new(lato_runtime::NoopTaskEventSink),
+    );
+    let root = handle
+        .register_root(TaskRootRequest {
+            task_id: TaskId::from("callback-root"),
+            owner: TaskOwner::Interactive {
+                session_id: SessionId::from("callback-session"),
+                turn_id: TurnId::from("callback-turn"),
+            },
+            profile: AgentProfile::worker(),
+            permissions: AgentProfile::worker().capabilities,
+            budget: BudgetLimits::unlimited(),
+        })
+        .await
+        .unwrap();
+    root.spawn(verification_child("callback-child"))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while handle
+            .inspect_admin(TaskId::from("callback-child"))
+            .await
+            .is_ok_and(|snapshot| snapshot.node.status != lato_core::TaskStatus::Running)
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    runner.finish("callback-child").await;
+    let outcome = root
+        .wait(TaskId::from("callback-child"), Duration::from_secs(2))
+        .await
+        .unwrap();
+    assert!(matches!(outcome, lato_runtime::WaitOutcome::Finished(_)));
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while runner.completion_callbacks() == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let callbacks = runner.completion_results();
+    assert_eq!(callbacks.len(), 1);
+    assert_eq!(callbacks[0].task_id, TaskId::from("callback-child"));
+    assert_eq!(
+        callbacks[0].result.error.as_ref().unwrap().code,
+        TaskErrorCode::VerificationFailed
+    );
     handle.shutdown().await.unwrap();
     actor.await.unwrap();
 }
@@ -818,6 +877,426 @@ async fn blocked_verifier_times_out_without_blocking_the_actor() {
         TaskErrorCode::VerificationFailed
     );
     assert!(dropped.load(Ordering::Acquire));
+    handle.shutdown().await.unwrap();
+    actor.await.unwrap();
+}
+
+#[tokio::test]
+async fn approval_resume_is_admin_only_and_requires_the_exact_root_bound_id() {
+    let (handle, root, _sink, actor, _workspace) =
+        verifier_harness(VerificationOutcome::WaitingForApproval {
+            approval_id: "approval-1".into(),
+        })
+        .await;
+    root.spawn(verification_child("approval-child"))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while handle
+            .inspect_admin(TaskId::from("approval-child"))
+            .await
+            .is_ok_and(|snapshot| snapshot.node.status != lato_core::TaskStatus::WaitingForApproval)
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let wrong = handle
+        .resume_approval_verification(
+            TaskId::from("approval-child"),
+            ApprovalVerificationResume {
+                approval_id: "forged".into(),
+                decision: VerificationDecision::Passed,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(wrong.code, TaskErrorCode::VerificationPending);
+    handle
+        .resume_approval_verification(
+            TaskId::from("approval-child"),
+            ApprovalVerificationResume {
+                approval_id: "approval-1".into(),
+                decision: VerificationDecision::Passed,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        handle
+            .inspect_admin(TaskId::from("approval-child"))
+            .await
+            .unwrap()
+            .node
+            .status,
+        lato_core::TaskStatus::Completed
+    );
+    handle.shutdown().await.unwrap();
+    actor.await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn external_verification_wait_timeout_releases_capacity_to_the_queue() {
+    let config = CoordinatorConfig {
+        max_global_running: 1,
+        max_running_per_root: 1,
+        external_verification_wait_timeout: Duration::from_millis(50),
+        ..CoordinatorConfig::default()
+    };
+    let (handle, root, _sink, actor, _workspace) = verifier_harness_with(
+        config,
+        Arc::new(StaticVerifier(VerificationOutcome::WaitingForApproval {
+            approval_id: "approval".into(),
+        })),
+    )
+    .await;
+    root.spawn(verification_child("waiting-slot"))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while handle
+            .inspect_admin(TaskId::from("waiting-slot"))
+            .await
+            .is_ok_and(|snapshot| snapshot.node.status != lato_core::TaskStatus::WaitingForApproval)
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        root.spawn(verification_child("queued-after-wait"))
+            .await
+            .unwrap()
+            .is_queued()
+    );
+    tokio::time::advance(Duration::from_millis(50)).await;
+    let outcome = root
+        .wait(TaskId::from("waiting-slot"), Duration::from_secs(2))
+        .await
+        .unwrap();
+    let lato_runtime::WaitOutcome::Finished(snapshot) = outcome else {
+        panic!("external wait timeout must terminate");
+    };
+    assert_eq!(snapshot.node.status, lato_core::TaskStatus::Failed);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while handle
+            .inspect_admin(TaskId::from("queued-after-wait"))
+            .await
+            .is_ok_and(|snapshot| snapshot.node.status == lato_core::TaskStatus::Queued)
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    handle.shutdown().await.unwrap();
+    actor.await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn wall_time_budget_continues_through_external_verification_wait() {
+    let config = CoordinatorConfig {
+        external_verification_wait_timeout: Duration::from_secs(5),
+        ..CoordinatorConfig::default()
+    };
+    let (handle, root, _sink, actor, _workspace) = verifier_harness_with(
+        config,
+        Arc::new(StaticVerifier(VerificationOutcome::WaitingForApproval {
+            approval_id: "approval".into(),
+        })),
+    )
+    .await;
+    let mut child = verification_child("waiting-wall");
+    child.budget.wall_time_ms = Some(50);
+    root.spawn(child).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while handle
+            .inspect_admin(TaskId::from("waiting-wall"))
+            .await
+            .is_ok_and(|snapshot| snapshot.node.status != lato_core::TaskStatus::WaitingForApproval)
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    tokio::time::advance(Duration::from_millis(51)).await;
+    let lato_runtime::WaitOutcome::Finished(snapshot) = root
+        .wait(TaskId::from("waiting-wall"), Duration::from_secs(2))
+        .await
+        .unwrap()
+    else {
+        panic!("waiting task must exhaust its wall-time budget");
+    };
+    assert_eq!(snapshot.node.status, lato_core::TaskStatus::Failed);
+    assert_eq!(snapshot.budget_spent.wall_time_ms, 50);
+    assert_eq!(
+        snapshot.result.unwrap().error.unwrap().code,
+        TaskErrorCode::BudgetExceededWallTimeMs
+    );
+    handle.shutdown().await.unwrap();
+    actor.await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn wall_time_budget_continues_during_programmatic_verification() {
+    let dropped = Arc::new(AtomicBool::new(false));
+    let config = CoordinatorConfig {
+        verification_timeout: Duration::from_secs(5),
+        cancel_grace: Duration::from_millis(10),
+        ..CoordinatorConfig::default()
+    };
+    let (handle, root, _sink, actor, _workspace) = verifier_harness_with(
+        config,
+        Arc::new(PendingVerifier {
+            dropped: dropped.clone(),
+        }),
+    )
+    .await;
+    let mut child = verification_child("verifying-wall");
+    child.budget.wall_time_ms = Some(50);
+    root.spawn(child).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while handle
+            .inspect_admin(TaskId::from("verifying-wall"))
+            .await
+            .is_ok_and(|snapshot| snapshot.node.status != lato_core::TaskStatus::Verifying)
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    tokio::time::advance(Duration::from_millis(51)).await;
+    let lato_runtime::WaitOutcome::Finished(snapshot) = root
+        .wait(TaskId::from("verifying-wall"), Duration::from_secs(2))
+        .await
+        .unwrap()
+    else {
+        panic!("verifying task must exhaust its wall-time budget");
+    };
+    assert_eq!(snapshot.node.status, lato_core::TaskStatus::Failed);
+    assert_eq!(snapshot.budget_spent.wall_time_ms, 50);
+    assert_eq!(
+        snapshot.result.unwrap().error.unwrap().code,
+        TaskErrorCode::BudgetExceededWallTimeMs
+    );
+    assert!(dropped.load(Ordering::Acquire));
+    handle.shutdown().await.unwrap();
+    actor.await.unwrap();
+}
+
+struct ReviewerVerifier;
+
+#[async_trait::async_trait]
+impl lato_runtime::TaskVerifier for ReviewerVerifier {
+    async fn verify(&self, request: VerificationRequest) -> VerificationOutcome {
+        if request.node.id == TaskId::from("subject") {
+            VerificationOutcome::WaitingForChild {
+                reviewer_task_id: TaskId::from("reviewer"),
+            }
+        } else {
+            VerificationOutcome::Passed
+        }
+    }
+}
+
+struct ReviewSpawningRunner {
+    reviewer_handle: tokio::sync::Mutex<Option<lato_runtime::ScopedTaskHandle>>,
+    descendant_handle: tokio::sync::Mutex<Option<lato_runtime::ScopedTaskHandle>>,
+    reviewer_gate: tokio::sync::Notify,
+}
+
+#[async_trait::async_trait]
+impl lato_runtime::TaskRunner for ReviewSpawningRunner {
+    type Control = ControlledTaskControl;
+
+    async fn run(
+        &self,
+        request: lato_runtime::TaskRunRequest,
+        reporter: lato_runtime::TaskReporter<Self::Control>,
+    ) -> lato_runtime::TaskRunOutput {
+        let task_id = request.node.id.clone();
+        if !reporter
+            .started(lato_runtime::StartedTask::new(
+                Arc::new(ControlledTaskControl::new()),
+                request.cancellation,
+            ))
+            .await
+        {
+            return lato_runtime::TaskRunOutput::from(lato_core::TaskResult {
+                success: false,
+                output: String::new(),
+                error: Some(lato_core::TaskError::new(
+                    TaskErrorCode::Cancelled,
+                    "startup cancelled",
+                )),
+                usage: Default::default(),
+                duration_ms: 0,
+                output_ref: None,
+            });
+        }
+        if task_id == TaskId::from("subject") {
+            let reviewer = request
+                .scoped_handle
+                .spawn(verification_child("reviewer"))
+                .await
+                .unwrap()
+                .handle;
+            *self.reviewer_handle.lock().await = Some(reviewer);
+            while self.descendant_handle.lock().await.is_none() {
+                tokio::task::yield_now().await;
+            }
+        } else if task_id == TaskId::from("reviewer") {
+            let descendant = request
+                .scoped_handle
+                .spawn(verification_child("reviewer-descendant"))
+                .await
+                .unwrap()
+                .handle;
+            *self.descendant_handle.lock().await = Some(descendant);
+            self.reviewer_gate.notified().await;
+        }
+        lato_runtime::TaskRunOutput::from(lato_core::TaskResult {
+            success: true,
+            output: "reviewed".into(),
+            error: None,
+            usage: Default::default(),
+            duration_ms: 0,
+            output_ref: None,
+        })
+    }
+
+    async fn validate_profile(&self, _profile: &AgentProfile) -> Result<(), lato_core::TaskError> {
+        Ok(())
+    }
+
+    fn on_completed(&self, _completion: lato_runtime::TaskCompletion) {}
+}
+
+#[tokio::test]
+async fn reviewer_resume_requires_the_exact_completed_direct_child() {
+    let workspace = tempfile::tempdir().unwrap();
+    let runner = Arc::new(ReviewSpawningRunner {
+        reviewer_handle: tokio::sync::Mutex::new(None),
+        descendant_handle: tokio::sync::Mutex::new(None),
+        reviewer_gate: tokio::sync::Notify::new(),
+    });
+    let (handle, actor) = spawn_task_coordinator_with_verifier(
+        CoordinatorConfig::default(),
+        runner.clone(),
+        Arc::new(MemoryWorkspaceAllocator::new(workspace.path()).unwrap()),
+        Arc::new(ReviewerVerifier),
+        Arc::new(lato_runtime::NoopTaskEventSink),
+    );
+    let root = handle
+        .register_root(TaskRootRequest {
+            task_id: TaskId::from("root"),
+            owner: TaskOwner::Interactive {
+                session_id: SessionId::from("session"),
+                turn_id: TurnId::from("turn"),
+            },
+            profile: AgentProfile::worker(),
+            permissions: AgentProfile::worker().capabilities,
+            budget: BudgetLimits::unlimited(),
+        })
+        .await
+        .unwrap();
+    root.spawn(verification_child("subject")).await.unwrap();
+    let reviewer = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(handle) = runner.reviewer_handle.lock().await.clone() {
+                break handle;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while handle
+            .inspect_admin(TaskId::from("subject"))
+            .await
+            .is_ok_and(|snapshot| snapshot.node.status != lato_core::TaskStatus::WaitingForChildren)
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let unfinished = reviewer
+        .resume_reviewer_verification(
+            TaskId::from("subject"),
+            ReviewerVerificationResume {
+                reviewer_task_id: TaskId::from("reviewer"),
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(unfinished.code, TaskErrorCode::VerificationPending);
+
+    let sibling = root
+        .spawn(verification_child("sibling"))
+        .await
+        .unwrap()
+        .handle;
+    let sibling_error = sibling
+        .resume_reviewer_verification(
+            TaskId::from("subject"),
+            ReviewerVerificationResume {
+                reviewer_task_id: TaskId::from("reviewer"),
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(sibling_error.code, TaskErrorCode::NotFoundOrNotOwned);
+
+    let descendant = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(handle) = runner.descendant_handle.lock().await.clone() {
+                break handle;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let descendant_error = descendant
+        .resume_reviewer_verification(
+            TaskId::from("subject"),
+            ReviewerVerificationResume {
+                reviewer_task_id: TaskId::from("reviewer"),
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(descendant_error.code, TaskErrorCode::NotFoundOrNotOwned);
+
+    runner.reviewer_gate.notify_one();
+    let _ = reviewer
+        .wait(TaskId::from("reviewer"), Duration::from_secs(2))
+        .await
+        .unwrap();
+    reviewer
+        .resume_reviewer_verification(
+            TaskId::from("subject"),
+            ReviewerVerificationResume {
+                reviewer_task_id: TaskId::from("reviewer"),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        handle
+            .inspect_admin(TaskId::from("subject"))
+            .await
+            .unwrap()
+            .node
+            .status,
+        lato_core::TaskStatus::Completed
+    );
     handle.shutdown().await.unwrap();
     actor.await.unwrap();
 }

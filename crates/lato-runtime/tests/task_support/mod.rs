@@ -103,9 +103,12 @@ pub struct GatedTaskRunner {
     gates: Mutex<HashMap<TaskId, Arc<Notify>>>,
     finish_gates: Mutex<HashMap<TaskId, Arc<Notify>>>,
     reporters: Mutex<HashMap<TaskId, TaskReporter<ControlledTaskControl>>>,
+    final_usage: Mutex<HashMap<TaskId, lato_core::TaskUsage>>,
+    final_errors: Mutex<HashMap<TaskId, TaskError>>,
     changed: Notify,
     active_runs: Arc<AtomicUsize>,
     completion_callbacks: AtomicUsize,
+    completion_results: StdMutex<Vec<lato_runtime::TaskCompletion>>,
     cancel_blocker: Option<Arc<CallbackBlocker>>,
     completion_blocker: Option<Arc<CallbackBlocker>>,
 }
@@ -136,9 +139,12 @@ impl GatedTaskRunner {
             gates: Mutex::new(HashMap::new()),
             finish_gates: Mutex::new(HashMap::new()),
             reporters: Mutex::new(HashMap::new()),
+            final_usage: Mutex::new(HashMap::new()),
+            final_errors: Mutex::new(HashMap::new()),
             changed: Notify::new(),
             active_runs: Arc::new(AtomicUsize::new(0)),
             completion_callbacks: AtomicUsize::new(0),
+            completion_results: StdMutex::new(Vec::new()),
             cancel_blocker: None,
             completion_blocker: None,
         }
@@ -256,6 +262,27 @@ impl GatedTaskRunner {
         self.completion_callbacks.load(Ordering::Acquire)
     }
 
+    pub fn completion_results(&self) -> Vec<lato_runtime::TaskCompletion> {
+        self.completion_results
+            .lock()
+            .expect("completion results poisoned")
+            .clone()
+    }
+
+    pub async fn set_final_usage(&self, task_id: &str, usage: lato_core::TaskUsage) {
+        self.final_usage
+            .lock()
+            .await
+            .insert(TaskId::from(task_id), usage);
+    }
+
+    pub async fn set_final_error(&self, task_id: &str, error: TaskError) {
+        self.final_errors
+            .lock()
+            .await
+            .insert(TaskId::from(task_id), error);
+    }
+
     pub async fn wait_until_validation_entered(&self) {
         while !self.validation_entered.load(Ordering::Acquire) {
             tokio::task::yield_now().await;
@@ -361,11 +388,17 @@ impl TaskRunner for GatedTaskRunner {
                 }
             }
         }
+        let error = self.final_errors.lock().await.remove(&request.node.id);
         TaskRunOutput::from(TaskResult {
-            success: true,
+            success: error.is_none(),
             output: String::new(),
-            error: None,
-            usage: Default::default(),
+            error,
+            usage: self
+                .final_usage
+                .lock()
+                .await
+                .remove(&request.node.id)
+                .unwrap_or_default(),
             duration_ms: 0,
             output_ref: None,
         })
@@ -387,7 +420,7 @@ impl TaskRunner for GatedTaskRunner {
         Ok(())
     }
 
-    fn on_completed(&self, _completion: lato_runtime::TaskCompletion) {
+    fn on_completed(&self, completion: lato_runtime::TaskCompletion) {
         if let Some(blocker) = &self.completion_blocker {
             blocker.block();
         }
@@ -395,6 +428,10 @@ impl TaskRunner for GatedTaskRunner {
             !self.panic_on_completed,
             "injected completion callback panic"
         );
+        self.completion_results
+            .lock()
+            .expect("completion results poisoned")
+            .push(completion);
         self.completion_callbacks.fetch_add(1, Ordering::AcqRel);
     }
 }

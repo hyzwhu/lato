@@ -1,11 +1,15 @@
 mod task_support;
 
 use lato_core::{
-    AgentProfile, BudgetLimits, ResultContract, TaskErrorCode, TaskId, TaskScope, TaskStatus,
-    TaskUsage,
+    AgentProfile, BudgetLimits, ResultContract, SessionId, TaskError, TaskErrorCode, TaskId,
+    TaskOwner, TaskScope, TaskStatus, TaskUsage, TurnId,
 };
-use lato_runtime::{CoordinatorConfig, SpawnMode, SpawnTaskRequest, TaskEventPayload, WaitOutcome};
-use std::time::Duration;
+use lato_runtime::{
+    CoordinatorConfig, SpawnMode, SpawnTaskRequest, TaskEventPayload, TaskRootRequest, WaitOutcome,
+    spawn_task_coordinator,
+};
+use lato_workspace::{WorkspaceAllocator, WorkspaceLease, WorkspaceRequest};
+use std::{future::pending, sync::Arc, time::Duration};
 use task_support::Harness;
 use tokio_util::sync::CancellationToken;
 
@@ -60,6 +64,16 @@ async fn wait_until_settled(harness: &Harness, task_id: &str) {
     .expect("task reservation did not settle");
 }
 
+async fn wait_for_completion_callback(harness: &Harness) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while harness.runner.completion_callbacks() == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("completion callback was not delivered");
+}
+
 #[tokio::test]
 async fn cumulative_usage_is_monotone_and_budget_exhaustion_settles_once() {
     let harness = Harness::new(CoordinatorConfig::default()).await;
@@ -110,6 +124,84 @@ async fn cumulative_usage_is_monotone_and_budget_exhaustion_settles_once() {
     assert_eq!(
         after_late.result.unwrap().error.unwrap().code,
         TaskErrorCode::BudgetExceededTotalTokens
+    );
+
+    wait_for_completion_callback(&harness).await;
+    let completions = harness.runner.completion_results();
+    assert_eq!(completions.len(), 1);
+    assert_eq!(completions[0].task_id, TaskId::from("child"));
+    assert_eq!(completions[0].result.usage.total_tokens, 80);
+    assert_eq!(
+        completions[0].result.error.as_ref().unwrap().code,
+        TaskErrorCode::BudgetExceededTotalTokens
+    );
+}
+
+#[tokio::test]
+async fn runner_failure_invokes_one_truthful_completion_callback() {
+    let harness = Harness::new(CoordinatorConfig::default()).await;
+    let root = harness
+        .register_root_scoped_with_budget("root", BudgetLimits::unlimited())
+        .await;
+    root.spawn(request("failed-child", None)).await.unwrap();
+    harness
+        .wait_for_status("failed-child", TaskStatus::Running)
+        .await;
+    harness
+        .runner
+        .set_final_error(
+            "failed-child",
+            lato_core::TaskError::new(
+                TaskErrorCode::RunnerProtocolViolation,
+                "injected runner failure",
+            ),
+        )
+        .await;
+    harness.runner.finish("failed-child").await;
+    let outcome = root
+        .wait(TaskId::from("failed-child"), Duration::from_secs(2))
+        .await
+        .unwrap();
+    let WaitOutcome::Finished(snapshot) = outcome else {
+        panic!("runner failure must terminate");
+    };
+    assert_eq!(snapshot.node.status, TaskStatus::Failed);
+    wait_for_completion_callback(&harness).await;
+    let completions = harness.runner.completion_results();
+    assert_eq!(completions.len(), 1);
+    assert_eq!(
+        completions[0].result.error.as_ref().unwrap().code,
+        TaskErrorCode::RunnerProtocolViolation
+    );
+}
+
+#[tokio::test]
+async fn running_cancellation_invokes_one_truthful_completion_callback() {
+    let harness = Harness::new(CoordinatorConfig::default()).await;
+    let root = harness
+        .register_root_scoped_with_budget("root", BudgetLimits::unlimited())
+        .await;
+    root.spawn(request("cancelled-child", None)).await.unwrap();
+    harness
+        .wait_for_status("cancelled-child", TaskStatus::Running)
+        .await;
+    root.cancel_task(TaskId::from("cancelled-child"))
+        .await
+        .unwrap();
+    let outcome = root
+        .wait(TaskId::from("cancelled-child"), Duration::from_secs(2))
+        .await
+        .unwrap();
+    let WaitOutcome::Finished(snapshot) = outcome else {
+        panic!("cancelled runner must terminate");
+    };
+    assert_eq!(snapshot.node.status, TaskStatus::Cancelled);
+    wait_for_completion_callback(&harness).await;
+    let completions = harness.runner.completion_results();
+    assert_eq!(completions.len(), 1);
+    assert_eq!(
+        completions[0].result.error.as_ref().unwrap().code,
+        TaskErrorCode::Cancelled
     );
 }
 
@@ -258,4 +350,274 @@ async fn reused_task_id_ignores_late_usage_from_an_older_generation() {
             .total_tokens,
         0
     );
+}
+
+#[tokio::test]
+async fn final_result_usage_is_the_authoritative_budget_fence() {
+    let harness = Harness::new(CoordinatorConfig::default()).await;
+    let root = harness
+        .register_root_scoped_with_budget("root", budget(Some(100)))
+        .await;
+    root.spawn(request("child", Some(80))).await.unwrap();
+    harness.wait_for_status("child", TaskStatus::Running).await;
+    harness.runner.set_final_usage("child", usage(81)).await;
+    harness.runner.finish("child").await;
+
+    let WaitOutcome::Finished(snapshot) = root
+        .wait(TaskId::from("child"), Duration::from_secs(2))
+        .await
+        .unwrap()
+    else {
+        panic!("final budget fence must terminate");
+    };
+    assert_eq!(snapshot.node.status, TaskStatus::Failed);
+    assert_eq!(snapshot.usage.total_tokens, 80);
+    assert_eq!(
+        snapshot.result.unwrap().error.unwrap().code,
+        TaskErrorCode::BudgetExceededTotalTokens
+    );
+}
+
+#[tokio::test]
+async fn queued_final_report_cannot_lose_to_runner_return_at_the_hard_limit() {
+    let harness = Harness::new(CoordinatorConfig::default()).await;
+    let root = harness
+        .register_root_scoped_with_budget("root", budget(Some(100)))
+        .await;
+    root.spawn(request("race", Some(80))).await.unwrap();
+    harness.wait_for_status("race", TaskStatus::Running).await;
+    let reporter = harness.runner.reporter("race").await;
+    reporter.report_usage(usage(81)).await;
+    harness.runner.set_final_usage("race", usage(50)).await;
+    harness.runner.finish("race").await;
+
+    let WaitOutcome::Finished(snapshot) = root
+        .wait(TaskId::from("race"), Duration::from_secs(2))
+        .await
+        .unwrap()
+    else {
+        panic!("usage/return race must terminate");
+    };
+    assert_eq!(snapshot.node.status, TaskStatus::Failed);
+    assert_eq!(snapshot.usage.total_tokens, 80);
+    assert_eq!(
+        snapshot.result.unwrap().error.unwrap().code,
+        TaskErrorCode::BudgetExceededTotalTokens
+    );
+}
+
+#[tokio::test]
+async fn regressed_final_usage_keeps_the_highest_processed_cumulative_value() {
+    let harness = Harness::new(CoordinatorConfig::default()).await;
+    let root = harness
+        .register_root_scoped_with_budget("root", budget(Some(100)))
+        .await;
+    root.spawn(request("child", Some(80))).await.unwrap();
+    harness.wait_for_status("child", TaskStatus::Running).await;
+    harness.runner.report_usage("child", usage(60)).await;
+    harness.runner.set_final_usage("child", usage(50)).await;
+    harness.runner.finish("child").await;
+
+    let WaitOutcome::Finished(snapshot) = root
+        .wait(TaskId::from("child"), Duration::from_secs(2))
+        .await
+        .unwrap()
+    else {
+        panic!("completed task must terminate");
+    };
+    assert_eq!(snapshot.node.status, TaskStatus::Completed);
+    assert_eq!(snapshot.usage.total_tokens, 60);
+    assert_eq!(snapshot.result.unwrap().usage.total_tokens, 60);
+}
+
+#[tokio::test(start_paused = true)]
+async fn wall_time_budget_starts_at_enqueue_and_caps_before_failure() {
+    let config = CoordinatorConfig {
+        queued_reap_interval: Duration::from_millis(10),
+        ..CoordinatorConfig::default()
+    };
+    let harness = Harness::new(config).await;
+    let root = harness
+        .register_root_scoped_with_budget("root", BudgetLimits::unlimited())
+        .await;
+    let mut child = request("child", None);
+    child.budget.wall_time_ms = Some(100);
+    root.spawn(child).await.unwrap();
+    harness.wait_for_status("child", TaskStatus::Running).await;
+
+    tokio::time::advance(Duration::from_millis(101)).await;
+    let WaitOutcome::Finished(snapshot) = root
+        .wait(TaskId::from("child"), Duration::from_secs(2))
+        .await
+        .unwrap()
+    else {
+        panic!("wall-time exhaustion must terminate");
+    };
+    assert_eq!(snapshot.node.status, TaskStatus::Failed);
+    assert_eq!(snapshot.budget_spent.wall_time_ms, 100);
+    assert_eq!(
+        snapshot.result.unwrap().error.unwrap().code,
+        TaskErrorCode::BudgetExceededWallTimeMs
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn wall_time_exhaustion_wins_a_simultaneous_successful_return() {
+    let harness = Harness::new(CoordinatorConfig::default()).await;
+    let root = harness
+        .register_root_scoped_with_budget("root", BudgetLimits::unlimited())
+        .await;
+    let mut child = request("race", None);
+    child.budget.wall_time_ms = Some(50);
+    root.spawn(child).await.unwrap();
+    harness.wait_for_status("race", TaskStatus::Running).await;
+
+    tokio::time::advance(Duration::from_millis(51)).await;
+    harness.runner.finish("race").await;
+    let WaitOutcome::Finished(snapshot) = root
+        .wait(TaskId::from("race"), Duration::from_secs(2))
+        .await
+        .unwrap()
+    else {
+        panic!("completion race must terminate");
+    };
+    assert_eq!(snapshot.node.status, TaskStatus::Failed);
+    assert_eq!(snapshot.budget_spent.wall_time_ms, 50);
+    assert_eq!(
+        snapshot.result.unwrap().error.unwrap().code,
+        TaskErrorCode::BudgetExceededWallTimeMs
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn queued_time_is_charged_to_the_wall_time_budget() {
+    let config = CoordinatorConfig {
+        max_global_running: 1,
+        max_running_per_root: 1,
+        queued_reap_interval: Duration::from_millis(10),
+        ..CoordinatorConfig::default()
+    };
+    let harness = Harness::new(config).await;
+    let root = harness
+        .register_root_scoped_with_budget("root", BudgetLimits::unlimited())
+        .await;
+    root.spawn(request("blocker", None)).await.unwrap();
+    harness
+        .wait_for_status("blocker", TaskStatus::Running)
+        .await;
+    let mut queued = request("queued", None);
+    queued.budget.wall_time_ms = Some(50);
+    assert!(root.spawn(queued).await.unwrap().is_queued());
+
+    tokio::time::advance(Duration::from_millis(51)).await;
+    let WaitOutcome::Finished(snapshot) = root
+        .wait(TaskId::from("queued"), Duration::from_secs(2))
+        .await
+        .unwrap()
+    else {
+        panic!("queued wall-time exhaustion must terminate");
+    };
+    assert_eq!(snapshot.node.status, TaskStatus::Failed);
+    assert_eq!(snapshot.budget_spent.wall_time_ms, 50);
+    assert_eq!(
+        snapshot.result.unwrap().error.unwrap().code,
+        TaskErrorCode::BudgetExceededWallTimeMs
+    );
+}
+
+struct PendingWorkspaceAllocator;
+
+#[async_trait::async_trait]
+impl WorkspaceAllocator for PendingWorkspaceAllocator {
+    async fn allocate(&self, _request: WorkspaceRequest) -> Result<WorkspaceLease, TaskError> {
+        pending().await
+    }
+
+    async fn release(&self, _lease: &WorkspaceLease) -> Result<(), TaskError> {
+        unreachable!("pending allocation never creates a lease")
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn preparing_time_is_charged_to_the_wall_time_budget() {
+    let runner = Arc::new(task_support::GatedTaskRunner::new(false));
+    let (handle, actor) = spawn_task_coordinator(
+        CoordinatorConfig {
+            cancel_grace: Duration::from_millis(10),
+            ..CoordinatorConfig::default()
+        },
+        runner,
+        Arc::new(PendingWorkspaceAllocator),
+        Arc::new(lato_runtime::NoopTaskEventSink),
+    );
+    let root = handle
+        .register_root(TaskRootRequest {
+            task_id: TaskId::from("root"),
+            owner: TaskOwner::Interactive {
+                session_id: SessionId::from("session"),
+                turn_id: TurnId::from("turn"),
+            },
+            profile: AgentProfile::worker(),
+            permissions: AgentProfile::worker().capabilities,
+            budget: BudgetLimits::unlimited(),
+        })
+        .await
+        .unwrap();
+    let mut child = request("preparing", None);
+    child.budget.wall_time_ms = Some(50);
+    root.spawn(child).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while handle
+            .inspect_admin(TaskId::from("preparing"))
+            .await
+            .is_ok_and(|snapshot| snapshot.node.status != TaskStatus::Preparing)
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    tokio::time::advance(Duration::from_millis(51)).await;
+    tokio::time::advance(Duration::from_millis(11)).await;
+    let WaitOutcome::Finished(snapshot) = root
+        .wait(TaskId::from("preparing"), Duration::from_secs(2))
+        .await
+        .unwrap()
+    else {
+        panic!("preparing task must exhaust its wall-time budget");
+    };
+    assert_eq!(snapshot.node.status, TaskStatus::Failed);
+    assert_eq!(snapshot.budget_spent.wall_time_ms, 50);
+    assert_eq!(
+        snapshot.result.unwrap().error.unwrap().code,
+        TaskErrorCode::BudgetExceededWallTimeMs
+    );
+    handle.shutdown().await.unwrap();
+    actor.await.unwrap();
+}
+
+#[tokio::test]
+async fn runner_generation_overflow_fails_closed_without_panicking_the_actor() {
+    let config = CoordinatorConfig {
+        initial_runner_generation: u64::MAX,
+        ..CoordinatorConfig::default()
+    };
+    let harness = Harness::new(config).await;
+    let root = harness
+        .register_root_scoped_with_budget("root", BudgetLimits::unlimited())
+        .await;
+    root.spawn(request("child", None)).await.unwrap();
+    let WaitOutcome::Finished(snapshot) = root
+        .wait(TaskId::from("child"), Duration::from_secs(2))
+        .await
+        .unwrap()
+    else {
+        panic!("generation exhaustion must terminate");
+    };
+    assert_eq!(snapshot.node.status, TaskStatus::Failed);
+    assert_eq!(
+        snapshot.result.unwrap().error.unwrap().code,
+        TaskErrorCode::RunnerInitialization
+    );
+    assert_eq!(harness.handle.registry_counts().await.unwrap().roots, 1);
 }

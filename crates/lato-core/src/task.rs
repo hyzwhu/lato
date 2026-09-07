@@ -284,6 +284,8 @@ pub enum TaskErrorCode {
     BudgetExceededCostMicros,
     #[serde(rename = "task.budget_exceeded.retries")]
     BudgetExceededRetries,
+    #[serde(rename = "task.budget_exceeded.wall_time_ms")]
+    BudgetExceededWallTimeMs,
     #[serde(rename = "task.capability_expansion")]
     CapabilityExpansion,
     #[serde(rename = "task.invalid_profile")]
@@ -346,6 +348,7 @@ impl TaskErrorCode {
             Self::BudgetExceededToolCalls => "task.budget_exceeded.tool_calls",
             Self::BudgetExceededCostMicros => "task.budget_exceeded.cost_micros",
             Self::BudgetExceededRetries => "task.budget_exceeded.retries",
+            Self::BudgetExceededWallTimeMs => "task.budget_exceeded.wall_time_ms",
             Self::CapabilityExpansion => "task.capability_expansion",
             Self::InvalidProfile => "task.invalid_profile",
             Self::SpawnAdmissionClosed => "task.spawn_admission_closed",
@@ -395,6 +398,7 @@ impl TaskErrorCode {
             | Self::BudgetExceededToolCalls
             | Self::BudgetExceededCostMicros
             | Self::BudgetExceededRetries
+            | Self::BudgetExceededWallTimeMs
             | Self::CapabilityExpansion
             | Self::InvalidProfile
             | Self::SpawnAdmissionClosed
