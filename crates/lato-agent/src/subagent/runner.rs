@@ -162,11 +162,15 @@ impl ChildSessionRunner {
             ));
         }
 
-        let relay = tokio::spawn(relay_child_events(
+        let usage = Arc::new(Mutex::new(TaskUsage::default()));
+        let (relay_stop, relay_stop_rx) = tokio::sync::oneshot::channel();
+        let mut relay = tokio::spawn(relay_child_events(
             child_updates_rx,
             self.updates.clone(),
             reporter.clone(),
             progress,
+            Arc::clone(&usage),
+            relay_stop_rx,
         ));
         let message_session = Arc::clone(&session);
         let message_dispatch = tokio::spawn(async move {
@@ -196,12 +200,22 @@ impl ChildSessionRunner {
         let shutdown = session.cancel_and_join(self.shutdown_timeout).await;
         message_dispatch.abort();
         let _ = message_dispatch.await;
-        relay.abort();
-        let _ = relay.await;
+        let _ = relay_stop.send(());
+        if tokio::time::timeout(Duration::from_millis(250), &mut relay)
+            .await
+            .is_err()
+        {
+            relay.abort();
+            let _ = relay.await;
+        }
         if let Err(error) = shutdown {
             return Err(task_error(TaskErrorCode::RunnerProtocolViolation, error));
         }
-        outcome.map(|text| (text, TaskUsage::default()))
+        let usage = usage
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        outcome.map(|text| (text, usage))
     }
 }
 

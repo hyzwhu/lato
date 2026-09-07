@@ -248,6 +248,12 @@ async fn real_runner_executes_a_child_runtime_and_returns_to_coordinator() {
     assert_eq!(waited["wait"], "finished");
     assert_eq!(waited["snapshot"]["task"]["status"], "completed");
     assert!(
+        waited["snapshot"]["usage"]["output_tokens"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    assert!(
         waited["snapshot"]["result"]["output"]
             .as_str()
             .unwrap()
