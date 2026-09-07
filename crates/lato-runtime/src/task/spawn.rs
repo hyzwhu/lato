@@ -360,6 +360,7 @@ mod tests {
             usage: Default::default(),
             result: None,
             completion_disposition: None,
+            output_metadata: None,
             spawn_mode: None,
             enqueued_at: tokio::time::Instant::now(),
         }

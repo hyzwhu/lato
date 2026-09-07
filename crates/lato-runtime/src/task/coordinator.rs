@@ -10,11 +10,11 @@ use crate::task::spawn::{
 };
 use crate::task::state::{CoordinatorState, RuntimeTaskRecord};
 use crate::task::{
-    CompletionDisposition, CoordinatorConfig, InspectCaller, RunnerEvent, ScopedTaskHandle,
-    SinkShutdown, SpawnDisposition, SpawnMode, SpawnTaskRequest, TaskCallbackKind,
-    TaskChildControl, TaskCommand, TaskCommandSender, TaskCompletion, TaskEventEnvelope,
-    TaskEventPayload, TaskEventSink, TaskHandle, TaskReporter, TaskRunRequest, TaskRunner,
-    WaitOutcome, coordinator_closed, root_node,
+    CompletionDisposition, CoordinatorConfig, InspectCaller, OutputMetadata, RunnerEvent,
+    ScopedTaskHandle, SinkShutdown, SpawnDisposition, SpawnMode, SpawnTaskRequest,
+    TaskCallbackKind, TaskChildControl, TaskCommand, TaskCommandSender, TaskCompletion,
+    TaskEventEnvelope, TaskEventPayload, TaskEventSink, TaskHandle, TaskReporter, TaskRunRequest,
+    TaskRunner, WaitOutcome, coordinator_closed, root_node,
 };
 use futures_util::{
     FutureExt, StreamExt,
@@ -39,8 +39,22 @@ struct PendingSpawn {
     root_id: TaskId,
     parent_id: TaskId,
     request: SpawnTaskRequest,
-    reply: oneshot::Sender<Result<SpawnDisposition, TaskError>>,
+    reply: PendingSpawnReply,
     enqueued_at: Instant,
+}
+
+enum PendingSpawnReply {
+    Spawn(oneshot::Sender<Result<SpawnDisposition, TaskError>>),
+    SpawnAndWait(oneshot::Sender<Result<CompletionDisposition, TaskError>>),
+}
+
+impl PendingSpawnReply {
+    fn is_closed(&self) -> bool {
+        match self {
+            Self::Spawn(reply) => reply.is_closed(),
+            Self::SpawnAndWait(reply) => reply.is_closed(),
+        }
+    }
 }
 
 struct ProfileValidation {
@@ -92,12 +106,18 @@ enum CallbackWork<C: TaskChildControl> {
         task_id: TaskId,
         completion: TaskCompletion,
     },
+    Progress {
+        task_id: TaskId,
+        control: Arc<C>,
+    },
 }
 
 impl<C: TaskChildControl> CallbackWork<C> {
     fn task_id(&self) -> &TaskId {
         match self {
-            Self::Cancel { task_id, .. } | Self::Completed { task_id, .. } => task_id,
+            Self::Cancel { task_id, .. }
+            | Self::Completed { task_id, .. }
+            | Self::Progress { task_id, .. } => task_id,
         }
     }
 
@@ -105,6 +125,7 @@ impl<C: TaskChildControl> CallbackWork<C> {
         match self {
             Self::Cancel { .. } => TaskCallbackKind::Cancel,
             Self::Completed { .. } => TaskCallbackKind::Completed,
+            Self::Progress { .. } => TaskCallbackKind::Progress,
         }
     }
 }
@@ -113,6 +134,23 @@ struct CallbackOutcome {
     task_id: TaskId,
     kind: TaskCallbackKind,
     error: Option<TaskError>,
+    progress: Option<lato_core::TaskProgress>,
+}
+
+struct OutputLoadWork {
+    output_ref: String,
+    inspection: crate::task::TaskInspection,
+    reply: oneshot::Sender<Result<crate::task::TaskInspection, TaskError>>,
+    timeout: std::time::Duration,
+    max_bytes: usize,
+}
+
+enum OutputLoadEvent {
+    Reply {
+        reply: oneshot::Sender<Result<crate::task::TaskInspection, TaskError>>,
+        result: Box<Result<crate::task::TaskInspection, TaskError>>,
+    },
+    SlotReleased,
 }
 
 pub struct TaskCoordinator<R: TaskRunner, A: WorkspaceAllocator> {
@@ -134,6 +172,8 @@ pub struct TaskCoordinator<R: TaskRunner, A: WorkspaceAllocator> {
     callback_worker: Option<std::thread::JoinHandle<()>>,
     dropped_callback_work: u64,
     callback_execution_failures: u64,
+    progress_poll_inflight: HashSet<TaskId>,
+    next_progress_poll: Instant,
     state: CoordinatorState,
     queue: SpawnQueue,
     controls: HashMap<TaskId, crate::task::TaskControl<R::Control>>,
@@ -151,7 +191,11 @@ pub struct TaskCoordinator<R: TaskRunner, A: WorkspaceAllocator> {
     foreground_waiters: HashMap<TaskId, ForegroundWaiter>,
     completed_order: VecDeque<TaskId>,
     next_queue_reap: Instant,
-    inspection_loads: FuturesUnordered<BoxFuture<'static, ()>>,
+    output_load_tx: Option<std::sync::mpsc::SyncSender<OutputLoadWork>>,
+    output_load_event_rx: mpsc::UnboundedReceiver<OutputLoadEvent>,
+    output_load_drained: Option<oneshot::Receiver<()>>,
+    output_load_worker: Option<std::thread::JoinHandle<()>>,
+    output_loads_inflight: usize,
     shutdown: Option<ShutdownState>,
     weak_handle: TaskHandle,
     sequence: u64,
@@ -188,7 +232,18 @@ where
         callback_result_tx,
         callback_drained_tx,
     );
+    let (output_load_tx, output_load_rx) = std::sync::mpsc::sync_channel(config.max_output_loads);
+    let (output_load_event_tx, output_load_event_rx) = mpsc::unbounded_channel();
+    let (output_load_drained_tx, output_load_drained) = oneshot::channel();
+    let output_load_worker = spawn_output_load_dispatcher(
+        Arc::clone(&runner),
+        output_load_rx,
+        output_load_event_tx,
+        output_load_drained_tx,
+        tokio::runtime::Handle::current(),
+    );
     let next_queue_reap = Instant::now() + config.queued_reap_interval;
+    let next_progress_poll = Instant::now() + config.progress_poll_interval;
     let coordinator = TaskCoordinator {
         queue: SpawnQueue::new(config.max_queue),
         config,
@@ -209,6 +264,8 @@ where
         callback_worker: Some(callback_worker),
         dropped_callback_work: 0,
         callback_execution_failures: 0,
+        progress_poll_inflight: HashSet::new(),
+        next_progress_poll,
         state: CoordinatorState::default(),
         controls: HashMap::new(),
         jobs: FuturesUnordered::new(),
@@ -225,7 +282,11 @@ where
         foreground_waiters: HashMap::new(),
         completed_order: VecDeque::new(),
         next_queue_reap,
-        inspection_loads: FuturesUnordered::new(),
+        output_load_tx: Some(output_load_tx),
+        output_load_event_rx,
+        output_load_drained: Some(output_load_drained),
+        output_load_worker: Some(output_load_worker),
+        output_loads_inflight: 0,
         shutdown: None,
         weak_handle,
         sequence: 0,
@@ -237,6 +298,7 @@ where
 impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
     fn next_deadline(&self) -> Instant {
         let mut deadline = self.next_queue_reap;
+        deadline = deadline.min(self.next_progress_poll);
         for candidate in self.cancel_deadlines.values().copied() {
             deadline = deadline.min(candidate);
         }
@@ -261,15 +323,40 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
         if self.next_queue_reap <= now {
             self.next_queue_reap = now + self.config.queued_reap_interval;
         }
+        if self.next_progress_poll <= now {
+            self.next_progress_poll = now + self.config.progress_poll_interval;
+            self.dispatch_progress_polls();
+        }
         self.reap_cancelled().await;
         self.expire_waiters(now);
         self.expire_foreground(now);
-        if self
-            .shutdown
-            .as_ref()
-            .is_some_and(|shutdown| shutdown.deadline <= now)
-        {
-            self.inspection_loads = FuturesUnordered::new();
+    }
+
+    fn dispatch_progress_polls(&mut self) {
+        let available = self
+            .config
+            .progress_poll_capacity
+            .saturating_sub(self.progress_poll_inflight.len());
+        let candidates: Vec<_> = self
+            .controls
+            .iter()
+            .filter(|(task_id, _)| {
+                !self.progress_poll_inflight.contains(*task_id)
+                    && self.state.tasks.get(*task_id).is_some_and(|record| {
+                        record.node.status.is_running() && !record.node.status.is_terminal()
+                    })
+            })
+            .take(available)
+            .map(|(task_id, control)| (task_id.clone(), Arc::clone(control.child())))
+            .collect();
+        for (task_id, control) in candidates {
+            self.progress_poll_inflight.insert(task_id.clone());
+            if !self.dispatch_callback(CallbackWork::Progress {
+                task_id: task_id.clone(),
+                control,
+            }) {
+                self.progress_poll_inflight.remove(&task_id);
+            }
         }
     }
 
@@ -348,10 +435,35 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
             .tasks
             .get(&task_id)
             .expect("authorized foreground target remains registered");
+        let mode = record.spawn_mode.unwrap_or(SpawnMode::Background);
+        if mode == SpawnMode::Background {
+            let disposition = CompletionDisposition {
+                backgrounded: true,
+                ..record.completion_disposition.unwrap_or_default()
+            };
+            let workflow_owned = matches!(record.node.owner, lato_core::TaskOwner::Workflow { .. });
+            let live = !record.node.status.is_terminal();
+            if reply.send(Ok(disposition)).is_err()
+                && workflow_owned
+                && live
+                && let Some(record) = self.state.tasks.get(&task_id)
+            {
+                record.cancellation.cancel();
+            }
+            return;
+        }
+        let deadline = (mode == SpawnMode::Foreground)
+            .then(|| record.enqueued_at + self.config.foreground_budget);
         if record.node.status.is_terminal() {
             let mut disposition = record.completion_disposition.unwrap_or_default();
-            disposition.foreground_delivered = true;
-            disposition.should_surface = false;
+            if deadline.is_some_and(|deadline| deadline <= Instant::now()) {
+                disposition.backgrounded = true;
+                disposition.should_surface =
+                    !disposition.waiter_delivered && !disposition.explicitly_killed;
+            } else {
+                disposition.foreground_delivered = true;
+                disposition.should_surface = false;
+            }
             if reply.send(Ok(disposition)).is_ok() {
                 self.state
                     .tasks
@@ -359,15 +471,6 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
                     .expect("terminal foreground target remains registered")
                     .completion_disposition = Some(disposition);
             }
-            return;
-        }
-        let mode = record.spawn_mode.unwrap_or(SpawnMode::Background);
-        if mode == SpawnMode::Background {
-            let disposition = CompletionDisposition {
-                backgrounded: true,
-                ..record.completion_disposition.unwrap_or_default()
-            };
-            let _ = reply.send(Ok(disposition));
             return;
         }
         let waiter_count =
@@ -380,8 +483,6 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
             )));
             return;
         }
-        let deadline = (mode == SpawnMode::Foreground)
-            .then(|| record.enqueued_at + self.config.foreground_budget);
         self.foreground_waiters
             .insert(task_id.clone(), ForegroundWaiter { deadline, reply });
         if deadline.is_some_and(|deadline| deadline <= Instant::now()) {
@@ -460,32 +561,48 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
         let mut disposition = self.state.tasks[task_id]
             .completion_disposition
             .unwrap_or_default();
-        if let Some(waiter) = self.foreground_waiters.remove(task_id)
-            && waiter
-                .reply
-                .send(Ok(CompletionDisposition {
+        if let Some(waiter) = self.foreground_waiters.remove(task_id) {
+            let expired = waiter
+                .deadline
+                .is_some_and(|deadline| deadline <= Instant::now());
+            let candidate = if expired {
+                CompletionDisposition {
+                    backgrounded: true,
+                    should_surface: !disposition.waiter_delivered && !disposition.explicitly_killed,
+                    ..disposition
+                }
+            } else {
+                CompletionDisposition {
                     foreground_delivered: true,
                     should_surface: false,
                     ..disposition
-                }))
-                .is_ok()
-        {
-            disposition.foreground_delivered = true;
+                }
+            };
+            if waiter.reply.send(Ok(candidate)).is_ok() {
+                disposition = candidate;
+            }
         }
 
         let mut waiter_delivered = false;
         if let Some(waiters) = self.waiters.remove(task_id) {
-            let snapshot = self
-                .state
-                .inspection(task_id)
-                .expect("terminal waiter target remains registered");
             for waiter in waiters {
+                let candidate = CompletionDisposition {
+                    waiter_delivered: true,
+                    should_surface: false,
+                    ..disposition
+                };
+                let mut snapshot = self
+                    .state
+                    .inspection(task_id)
+                    .expect("terminal waiter target remains registered");
+                snapshot.completion_disposition = Some(candidate);
                 if waiter
                     .reply
-                    .send(Ok(WaitOutcome::Finished(snapshot.clone())))
+                    .send(Ok(WaitOutcome::Finished(snapshot)))
                     .is_ok()
                 {
                     waiter_delivered = true;
+                    disposition = candidate;
                 }
             }
         }
@@ -556,7 +673,7 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
         result: Result<crate::task::TaskInspection, TaskError>,
         reply: oneshot::Sender<Result<crate::task::TaskInspection, TaskError>>,
     ) {
-        let Ok(mut result) = result else {
+        let Ok(result) = result else {
             let _ = reply.send(result);
             return;
         };
@@ -569,54 +686,57 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
             let _ = reply.send(Ok(result));
             return;
         };
-        let runner = Arc::clone(&self.runner);
         let timeout = self.config.output_load_timeout;
-        if self.inspection_loads.len() >= self.config.max_output_loads {
+        if self.output_loads_inflight >= self.config.max_output_loads {
             let _ = reply.send(Err(TaskError::new(
                 TaskErrorCode::RetentionLimit,
                 "persisted output load capacity is exhausted",
             )));
             return;
         }
-        self.inspection_loads.push(Box::pin(async move {
-            let load = std::panic::AssertUnwindSafe(runner.load_persisted_output(&output_ref))
-                .catch_unwind();
-            let loaded = match tokio::time::timeout(timeout, load).await {
-                Ok(Ok(value)) => value,
-                Ok(Err(_)) => Err(TaskError::new(
-                    TaskErrorCode::RunnerPanic,
-                    "task runner panicked while loading persisted output",
-                )),
-                Err(_) => Err(TaskError::new(
-                    TaskErrorCode::RunnerProtocolViolation,
-                    "persisted task output load timed out",
-                )),
-            };
-            match loaded {
-                Ok(Some(output)) => {
-                    if let Some(task_result) = result.snapshot.result.as_mut() {
-                        task_result.output = output;
-                    }
-                    let _ = reply.send(Ok(result));
-                }
-                Ok(None) => {
-                    let _ = reply.send(Ok(result));
-                }
-                Err(error) => {
-                    let _ = reply.send(Err(error));
-                }
+        let work = OutputLoadWork {
+            output_ref,
+            inspection: result,
+            reply,
+            timeout,
+            max_bytes: self.config.max_loaded_output_bytes,
+        };
+        let send_result = match self.output_load_tx.as_ref() {
+            Some(sender) => sender.try_send(work),
+            None => Err(std::sync::mpsc::TrySendError::Disconnected(work)),
+        };
+        match send_result {
+            Ok(()) => self.output_loads_inflight += 1,
+            Err(std::sync::mpsc::TrySendError::Full(work))
+            | Err(std::sync::mpsc::TrySendError::Disconnected(work)) => {
+                let _ = work.reply.send(Err(TaskError::new(
+                    TaskErrorCode::RetentionLimit,
+                    "persisted output load dispatcher is unavailable",
+                )));
             }
-        }));
+        }
     }
 
     pub async fn run(mut self) {
         loop {
-            if self.shutdown.is_some()
-                && self.jobs.is_empty()
-                && self.validations.is_empty()
-                && self.inspection_loads.is_empty()
-            {
+            if self.shutdown.as_ref().is_some_and(|shutdown| {
+                self.jobs.is_empty()
+                    && self.validations.is_empty()
+                    && (self.output_loads_inflight == 0 || shutdown.deadline <= Instant::now())
+            }) {
                 let callbacks_drained = self.shutdown_callbacks().await;
+                let output_loads_drained = self.shutdown_output_loads().await;
+                while let Ok(event) = self.output_load_event_rx.try_recv() {
+                    match event {
+                        OutputLoadEvent::Reply { reply, result } => {
+                            let _ = reply.send(*result);
+                        }
+                        OutputLoadEvent::SlotReleased => {
+                            self.output_loads_inflight =
+                                self.output_loads_inflight.saturating_sub(1);
+                        }
+                    }
+                }
                 while let Ok(outcome) = self.callback_rx.try_recv() {
                     self.handle_callback_outcome(outcome);
                 }
@@ -628,7 +748,10 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
                     .filter(|record| record.workspace_lease.is_some())
                     .count();
                 let outcome = if unreleased_leases == 0 {
-                    if callbacks_drained && sink_outcome == SinkShutdown::Drained {
+                    if callbacks_drained
+                        && output_loads_drained
+                        && sink_outcome == SinkShutdown::Drained
+                    {
                         SinkShutdown::Drained
                     } else {
                         SinkShutdown::TimedOutDetached
@@ -679,7 +802,18 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
                         self.handle_callback_outcome(callback);
                     }
                 }
-                _ = self.inspection_loads.next(), if !self.inspection_loads.is_empty() => {}
+                event = self.output_load_event_rx.recv(), if self.output_loads_inflight > 0 => {
+                    if let Some(event) = event {
+                        match event {
+                            OutputLoadEvent::Reply { reply, result } => {
+                                let _ = reply.send(*result);
+                            }
+                            OutputLoadEvent::SlotReleased => {
+                                self.output_loads_inflight = self.output_loads_inflight.saturating_sub(1);
+                            }
+                        }
+                    }
+                }
                 _ = tokio::time::sleep_until(deadline) => self.process_deadlines().await,
             }
         }
@@ -702,7 +836,28 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
                 enqueued_at,
                 reply,
             } => {
-                self.begin_spawn(root_id, parent_id, *request, enqueued_at, reply);
+                self.begin_spawn(
+                    root_id,
+                    parent_id,
+                    *request,
+                    enqueued_at,
+                    PendingSpawnReply::Spawn(reply),
+                );
+            }
+            TaskCommand::SpawnAndWait {
+                root_id,
+                parent_id,
+                request,
+                enqueued_at,
+                reply,
+            } => {
+                self.begin_spawn(
+                    root_id,
+                    parent_id,
+                    *request,
+                    enqueued_at,
+                    PendingSpawnReply::SpawnAndWait(reply),
+                );
             }
             TaskCommand::Inspect {
                 task_id: target_task_id,
@@ -802,6 +957,7 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
                 usage: Default::default(),
                 result: None,
                 completion_disposition: None,
+                output_metadata: None,
                 spawn_mode: None,
                 enqueued_at: Instant::now(),
             },
@@ -843,10 +999,10 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
         parent_id: TaskId,
         request: SpawnTaskRequest,
         enqueued_at: Instant,
-        reply: oneshot::Sender<Result<SpawnDisposition, TaskError>>,
+        reply: PendingSpawnReply,
     ) {
         if self.shutdown.is_some() {
-            let _ = reply.send(Err(coordinator_closed()));
+            Self::reply_spawn_error(reply, coordinator_closed());
             return;
         }
         let pending_duplicate = self.pending_spawns.contains_key(&request.task_id);
@@ -869,7 +1025,7 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
         ) {
             Ok(structure) => structure,
             Err(error) => {
-                let _ = reply.send(Err(error));
+                Self::reply_spawn_error(reply, error);
                 return;
             }
         };
@@ -879,8 +1035,8 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
             self.state.running_count_for_root(&root_id),
             self.queue.len(),
         ) {
-            let _ =
-                reply.send(self.retain_admission_rejection(parent_id, request, structure, error));
+            let result = self.retain_admission_rejection(parent_id, request, structure, error);
+            Self::reply_pending_spawn(self, reply, result);
             return;
         }
         let task_id = request.task_id.clone();
@@ -964,11 +1120,56 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
                 pending.enqueued_at,
                 validation,
             );
-            if let Err(Ok(disposition)) = pending.reply.send(result)
-                && workflow_owned
-                && let Some(record) = self.state.tasks.get(&disposition.task_id)
-            {
-                record.cancellation.cancel();
+            Self::reply_pending_spawn(self, pending.reply, result);
+        }
+    }
+
+    fn reply_spawn_error(reply: PendingSpawnReply, error: TaskError) {
+        match reply {
+            PendingSpawnReply::Spawn(reply) => {
+                let _ = reply.send(Err(error));
+            }
+            PendingSpawnReply::SpawnAndWait(reply) => {
+                let _ = reply.send(Err(error));
+            }
+        }
+    }
+
+    fn reply_pending_spawn(
+        coordinator: &mut Self,
+        reply: PendingSpawnReply,
+        result: Result<SpawnDisposition, TaskError>,
+    ) {
+        match (reply, result) {
+            (PendingSpawnReply::Spawn(reply), result) => {
+                let workflow_owned = result.as_ref().is_ok_and(|disposition| {
+                    matches!(
+                        coordinator.state.tasks[&disposition.task_id].node.owner,
+                        lato_core::TaskOwner::Workflow { .. }
+                    )
+                });
+                if let Err(Ok(disposition)) = reply.send(result)
+                    && workflow_owned
+                    && let Some(record) = coordinator.state.tasks.get(&disposition.task_id)
+                {
+                    record.cancellation.cancel();
+                }
+            }
+            (PendingSpawnReply::SpawnAndWait(reply), Ok(disposition)) => {
+                // Spawn visibility and foreground ownership are committed by one
+                // actor command. There is no interval in which workflow work can
+                // exist without a cancel-on-drop observer.
+                coordinator.register_foreground_waiter(
+                    disposition.task_id.clone(),
+                    InspectCaller::Scoped {
+                        root_id: disposition.handle.root_id().clone(),
+                        task_id: disposition.handle.task_id().clone(),
+                    },
+                    reply,
+                );
+            }
+            (PendingSpawnReply::SpawnAndWait(reply), Err(error)) => {
+                let _ = reply.send(Err(error));
             }
         }
     }
@@ -1041,6 +1242,7 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
                 usage: Default::default(),
                 result: None,
                 completion_disposition: None,
+                output_metadata: None,
                 spawn_mode: Some(if request.profile.definition_background {
                     SpawnMode::Background
                 } else {
@@ -1121,18 +1323,12 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
                 last_event_sequence: 0,
                 progress: Default::default(),
                 usage: Default::default(),
-                result: Some(lato_core::TaskResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(error.clone()),
-                    usage: Default::default(),
-                    duration_ms: 0,
-                    output_ref: None,
-                }),
+                result: None,
                 completion_disposition: Some(CompletionDisposition {
                     should_surface: true,
                     ..CompletionDisposition::default()
                 }),
+                output_metadata: None,
                 spawn_mode: Some(request.mode),
                 enqueued_at: Instant::now(),
             },
@@ -1143,8 +1339,15 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
                 error: error.clone(),
             },
         );
-        self.resolve_terminal_observers(&task_id);
-        self.retain_completed(task_id.clone());
+        let result = lato_core::TaskResult {
+            success: false,
+            output: String::new(),
+            error: Some(error.clone()),
+            usage: Default::default(),
+            duration_ms: 0,
+            output_ref: None,
+        };
+        self.finish_terminal_record(&task_id, result, None);
         Err(error)
     }
 
@@ -1297,23 +1500,12 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
         if output.result.output_ref.is_none() {
             output.result.output_ref = output.external_snapshot_ref.take();
         }
-        if output.result.output_ref.is_some() {
-            let cap = self.state.tasks[&task_id]
-                .node
-                .result_contract
-                .max_output_bytes;
-            truncate_utf8(&mut output.result.output, cap);
-        }
-        self.state
-            .tasks
-            .get_mut(&task_id)
-            .expect("completed task remains registered")
-            .result = Some(output.result.clone());
-        self.state
-            .tasks
-            .get_mut(&task_id)
-            .expect("completed task remains registered")
-            .usage = output.result.usage.clone();
+        let cap = self.state.tasks[&task_id]
+            .node
+            .result_contract
+            .max_output_bytes;
+        let metadata = truncate_utf8(&mut output.result.output, cap);
+        self.state.tasks.get_mut(&task_id).unwrap().output_metadata = Some(metadata);
         if output.result.success {
             self.set_status(&task_id, TaskStatus::Completed);
             self.commit_transition(
@@ -1330,15 +1522,14 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
                     "runner failed without error",
                 )
             });
+            output.result.error = Some(error.clone());
             self.commit_transition(task_id.clone(), TaskEventPayload::Failed { error });
         }
         let completion = TaskCompletion {
             task_id: task_id.clone(),
-            result: output.result,
+            result: output.result.clone(),
         };
-        self.pending_completions.insert(task_id.clone(), completion);
-        self.resolve_terminal_observers(&task_id);
-        self.cleanup_terminal(&task_id).await;
+        self.finish_terminal_record(&task_id, output.result, Some(completion));
     }
 
     async fn fail_task(&mut self, task_id: TaskId, error: TaskError) {
@@ -1354,24 +1545,42 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
             return;
         }
         self.set_status(&task_id, TaskStatus::Failed);
-        self.state
-            .tasks
-            .get_mut(&task_id)
-            .expect("failed task remains registered")
-            .result = Some(lato_core::TaskResult {
+        let result = lato_core::TaskResult {
             success: false,
             output: String::new(),
             error: Some(error.clone()),
             usage: Default::default(),
             duration_ms: 0,
             output_ref: None,
-        });
+        };
         self.commit_transition(task_id.clone(), TaskEventPayload::Failed { error });
-        self.resolve_terminal_observers(&task_id);
-        self.cleanup_terminal(&task_id).await;
+        self.finish_terminal_record(&task_id, result, None);
     }
 
-    async fn cleanup_terminal(&mut self, task_id: &TaskId) {
+    fn finish_terminal_record(
+        &mut self,
+        task_id: &TaskId,
+        result: lato_core::TaskResult,
+        completion: Option<TaskCompletion>,
+    ) {
+        let record = self
+            .state
+            .tasks
+            .get_mut(task_id)
+            .expect("terminal task remains registered");
+        if record.result.is_some() {
+            return;
+        }
+        record.usage = result.usage.clone();
+        record.result = Some(result);
+        if let Some(completion) = completion {
+            self.pending_completions.insert(task_id.clone(), completion);
+        }
+        self.resolve_terminal_observers(task_id);
+        self.cleanup_terminal(task_id);
+    }
+
+    fn cleanup_terminal(&mut self, task_id: &TaskId) {
         self.controls.remove(task_id);
         if self.cleanup_inflight.contains(task_id) {
             return;
@@ -1472,9 +1681,7 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
             if self.state.tasks.get(&queued.task_id).is_some_and(|record| {
                 record.node.status == TaskStatus::Queued && record.cancellation.is_cancelled()
             }) {
-                self.set_status(&queued.task_id, TaskStatus::Cancelled);
-                self.commit_transition(queued.task_id.clone(), TaskEventPayload::Cancelled);
-                self.release_reservation(&queued.task_id);
+                self.terminalize_cancelled(&queued.task_id);
             }
         }
         let mut global = self.state.running_count();
@@ -1552,11 +1759,7 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
         if status == TaskStatus::Queued {
             self.queue
                 .remove_matching(|queued| queued.task_id == task_id);
-            self.set_status(&task_id, TaskStatus::Cancelled);
-            self.record_cancelled_result(&task_id);
-            self.commit_transition(task_id.clone(), TaskEventPayload::Cancelled);
-            self.resolve_terminal_observers(&task_id);
-            self.cleanup_terminal(&task_id).await;
+            self.terminalize_cancelled(&task_id);
             return;
         }
         if let Some(control) = self.controls.get(&task_id) {
@@ -1643,22 +1846,14 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
                 TaskEventPayload::WorkspaceLeaseAllocated { lease_id },
             );
             if cancellation_requested {
-                self.set_status(&task_id, TaskStatus::Cancelled);
-                self.record_cancelled_result(&task_id);
-                self.commit_transition(task_id.clone(), TaskEventPayload::Cancelled);
-                self.resolve_terminal_observers(&task_id);
-                self.cleanup_terminal(&task_id).await;
+                self.terminalize_cancelled(&task_id);
             } else {
                 self.launch_runner(task_id);
             }
             return;
         }
         if cancellation_requested {
-            self.set_status(&task_id, TaskStatus::Cancelled);
-            self.record_cancelled_result(&task_id);
-            self.commit_transition(task_id.clone(), TaskEventPayload::Cancelled);
-            self.resolve_terminal_observers(&task_id);
-            self.cleanup_terminal(&task_id).await;
+            self.terminalize_cancelled(&task_id);
         } else {
             match exit {
                 TaskJobExit::WorkspaceAllocated(_, _) => unreachable!("handled above"),
@@ -1683,13 +1878,13 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
         }
     }
 
-    fn record_cancelled_result(&mut self, task_id: &TaskId) {
+    fn cancelled_result(&mut self, task_id: &TaskId) -> lato_core::TaskResult {
         let record = self
             .state
             .tasks
             .get_mut(task_id)
             .expect("cancelled task remains registered");
-        record.result = Some(lato_core::TaskResult {
+        let result = lato_core::TaskResult {
             success: false,
             output: String::new(),
             error: Some(TaskError::new(
@@ -1699,11 +1894,27 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
             usage: Default::default(),
             duration_ms: 0,
             output_ref: None,
-        });
+        };
         let mut disposition = record.completion_disposition.unwrap_or_default();
         disposition.explicitly_killed = true;
         disposition.should_surface = false;
         record.completion_disposition = Some(disposition);
+        result
+    }
+
+    fn terminalize_cancelled(&mut self, task_id: &TaskId) {
+        if self
+            .state
+            .tasks
+            .get(task_id)
+            .is_none_or(|record| record.node.status.is_terminal())
+        {
+            return;
+        }
+        self.set_status(task_id, TaskStatus::Cancelled);
+        let result = self.cancelled_result(task_id);
+        self.commit_transition(task_id.clone(), TaskEventPayload::Cancelled);
+        self.finish_terminal_record(task_id, result, None);
     }
 
     fn finish_failed_lease_cleanup(&mut self, task_id: &TaskId, error: TaskError) {
@@ -1749,7 +1960,7 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
             abort.abort();
         }
         for (_, pending) in self.pending_spawns.drain() {
-            let _ = pending.reply.send(Err(coordinator_closed()));
+            Self::reply_spawn_error(pending.reply, coordinator_closed());
         }
         self.validation_order.clear();
         self.validation_results.clear();
@@ -1780,7 +1991,7 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
             .map(|(task_id, _)| task_id.clone())
             .collect();
         for task_id in retry_cleanup {
-            self.cleanup_terminal(&task_id).await;
+            self.cleanup_terminal(&task_id);
         }
     }
 
@@ -1818,8 +2029,10 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
                 if let Some(record) = self.state.tasks.get_mut(&task_id)
                     && !record.node.status.is_terminal()
                     && progress.completed_units >= record.progress.completed_units
+                    && progress != record.progress
                 {
-                    record.progress = progress;
+                    record.progress = progress.clone();
+                    self.commit_transition(task_id, TaskEventPayload::ProgressUpdated { progress });
                 }
             }
         }
@@ -1852,7 +2065,7 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
         envelope
     }
 
-    fn dispatch_callback(&mut self, work: CallbackWork<R::Control>) {
+    fn dispatch_callback(&mut self, work: CallbackWork<R::Control>) -> bool {
         let task_id = work.task_id().clone();
         let kind = work.kind();
         let result = match self.callback_tx.as_ref() {
@@ -1873,10 +2086,16 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
                 kind,
                 TaskError::new(TaskErrorCode::RunnerProtocolViolation, reason),
             );
+            false
+        } else {
+            true
         }
     }
 
     fn handle_callback_outcome(&mut self, outcome: CallbackOutcome) {
+        if outcome.kind == TaskCallbackKind::Progress {
+            self.progress_poll_inflight.remove(&outcome.task_id);
+        }
         if let Some(error) = outcome.error {
             self.callback_execution_failures = self.callback_execution_failures.saturating_add(1);
             if self.state.tasks.contains_key(&outcome.task_id) {
@@ -1888,6 +2107,17 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
                     },
                 );
             }
+        } else if let Some(progress) = outcome.progress
+            && let Some(record) = self.state.tasks.get_mut(&outcome.task_id)
+            && !record.node.status.is_terminal()
+            && progress.completed_units >= record.progress.completed_units
+            && progress != record.progress
+        {
+            record.progress = progress.clone();
+            self.commit_transition(
+                outcome.task_id,
+                TaskEventPayload::ProgressUpdated { progress },
+            );
         }
     }
 
@@ -1924,6 +2154,24 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
         true
     }
 
+    async fn shutdown_output_loads(&mut self) -> bool {
+        self.output_load_tx.take();
+        let Some(drained) = self.output_load_drained.take() else {
+            return true;
+        };
+        if !matches!(
+            tokio::time::timeout(self.config.teardown_drain_timeout, drained).await,
+            Ok(Ok(()))
+        ) {
+            self.output_load_worker.take();
+            return false;
+        }
+        if let Some(worker) = self.output_load_worker.take() {
+            let _ = worker.join();
+        }
+        true
+    }
+
     async fn shutdown_sink(&mut self) -> SinkShutdown {
         self.sink_tx.take();
         let Some(drained) = self.sink_drained.take() else {
@@ -1955,9 +2203,13 @@ fn spawn_callback_dispatcher<R: TaskRunner>(
             while let Ok(work) = callback_rx.recv() {
                 let task_id = work.task_id().clone();
                 let kind = work.kind();
+                let mut progress = None;
                 let callback = || match work {
                     CallbackWork::Cancel { control, .. } => control.cancel(),
                     CallbackWork::Completed { completion, .. } => runner.on_completed(completion),
+                    CallbackWork::Progress { control, .. } => {
+                        progress = Some(control.progress());
+                    }
                 };
                 let error = std::panic::catch_unwind(std::panic::AssertUnwindSafe(callback))
                     .err()
@@ -1968,11 +2220,99 @@ fn spawn_callback_dispatcher<R: TaskRunner>(
                     task_id,
                     kind,
                     error,
+                    progress,
                 });
             }
             let _ = drained.send(());
         })
         .expect("task callback dispatcher thread must start")
+}
+
+fn spawn_output_load_dispatcher<R: TaskRunner>(
+    runner: Arc<R>,
+    work_rx: std::sync::mpsc::Receiver<OutputLoadWork>,
+    event_tx: mpsc::UnboundedSender<OutputLoadEvent>,
+    drained: oneshot::Sender<()>,
+    runtime: tokio::runtime::Handle,
+) -> std::thread::JoinHandle<()> {
+    std::thread::Builder::new()
+        .name("lato-task-output-loads".into())
+        .spawn(move || {
+            let mut supervisors = Vec::new();
+            while let Ok(work) = work_rx.recv() {
+                let runner = Arc::clone(&runner);
+                let event_tx = event_tx.clone();
+                let runtime = runtime.clone();
+                supervisors.push(std::thread::spawn(move || {
+                    let (value_tx, value_rx) = std::sync::mpsc::sync_channel(1);
+                    let output_ref = work.output_ref.clone();
+                    // The execution thread is intentionally disposable. A
+                    // malicious first poll may block forever, while this
+                    // supervisor still enforces the public deadline.
+                    let _execution = std::thread::spawn(move || {
+                        let loaded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            runtime.block_on(runner.load_persisted_output(&output_ref))
+                        }));
+                        let _ = value_tx.send(loaded);
+                    });
+                    let response = match value_rx.recv_timeout(work.timeout) {
+                        Ok(Ok(Ok(value))) => Some(Ok(value)),
+                        Ok(Ok(Err(error))) => Some(Err(error)),
+                        Ok(Err(_)) => Some(Err(TaskError::new(
+                            TaskErrorCode::RunnerPanic,
+                            "task runner panicked while loading persisted output",
+                        ))),
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                            Some(Err(TaskError::new(
+                                TaskErrorCode::RunnerPanic,
+                                "persisted output worker disconnected",
+                            )))
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
+                    };
+                    if response.is_none() {
+                        let _ = event_tx.send(OutputLoadEvent::Reply {
+                            reply: work.reply,
+                            result: Box::new(Err(TaskError::new(
+                                TaskErrorCode::RunnerProtocolViolation,
+                                "persisted task output load timed out",
+                            ))),
+                        });
+                        // Preserve the bounded worker slot until the blocking
+                        // execution really exits. Otherwise repeated timeouts
+                        // could accumulate an unbounded number of stuck OS
+                        // threads behind a nominal integer capacity.
+                        let _ = value_rx.recv();
+                        let _ = event_tx.send(OutputLoadEvent::SlotReleased);
+                        return;
+                    }
+                    let response = response.expect("non-timeout response is present");
+                    let mut inspection = work.inspection;
+                    let reply = match response {
+                        Ok(Some(mut output)) => {
+                            let metadata = truncate_utf8(&mut output, work.max_bytes);
+                            if let Some(task_result) = inspection.snapshot.result.as_mut() {
+                                task_result.output = output;
+                            }
+                            inspection.snapshot.output_metadata = Some(metadata);
+                            Ok(inspection)
+                        }
+                        Ok(None) => Ok(inspection),
+                        Err(error) => Err(error),
+                    };
+                    let _ = event_tx.send(OutputLoadEvent::Reply {
+                        reply: work.reply,
+                        result: Box::new(reply),
+                    });
+                    let _ = event_tx.send(OutputLoadEvent::SlotReleased);
+                }));
+            }
+            for supervisor in supervisors {
+                let _ = supervisor.join();
+            }
+            let _ = drained.send(());
+        })
+        .expect("task output-load dispatcher thread must start")
 }
 
 fn spawn_sink_dispatcher(
@@ -2005,13 +2345,23 @@ fn not_found() -> TaskError {
     )
 }
 
-fn truncate_utf8(value: &mut String, max_bytes: usize) {
-    if value.len() <= max_bytes {
-        return;
+fn truncate_utf8(value: &mut String, max_bytes: usize) -> OutputMetadata {
+    let source_bytes = value.len();
+    if source_bytes <= max_bytes {
+        return OutputMetadata {
+            source_bytes,
+            retained_bytes: source_bytes,
+            truncated: false,
+        };
     }
     let mut boundary = max_bytes;
     while boundary > 0 && !value.is_char_boundary(boundary) {
         boundary -= 1;
     }
     value.truncate(boundary);
+    OutputMetadata {
+        source_bytes,
+        retained_bytes: value.len(),
+        truncated: true,
+    }
 }

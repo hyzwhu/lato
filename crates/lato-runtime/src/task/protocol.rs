@@ -37,7 +37,10 @@ pub struct CoordinatorConfig {
     pub max_waiters: usize,
     pub max_waiters_per_task: usize,
     pub max_output_loads: usize,
+    pub max_loaded_output_bytes: usize,
     pub output_load_timeout: Duration,
+    pub progress_poll_capacity: usize,
+    pub progress_poll_interval: Duration,
     pub foreground_budget: Duration,
     pub waiter_timeout_cap: Duration,
     pub cancel_grace: Duration,
@@ -65,7 +68,10 @@ impl Default for CoordinatorConfig {
             max_waiters: 1_024,
             max_waiters_per_task: 64,
             max_output_loads: 64,
+            max_loaded_output_bytes: 1_048_576,
             output_load_timeout: Duration::from_secs(5),
+            progress_poll_capacity: 64,
+            progress_poll_interval: Duration::from_millis(250),
             foreground_budget: Duration::from_secs(45),
             waiter_timeout_cap: Duration::from_secs(3_600),
             cancel_grace: Duration::from_secs(5),
@@ -119,8 +125,20 @@ impl CoordinatorConfig {
             "output-load capacity must be positive"
         );
         assert!(
+            self.max_loaded_output_bytes > 0,
+            "loaded-output byte capacity must be positive"
+        );
+        assert!(
             !self.output_load_timeout.is_zero(),
             "output-load timeout must be positive"
+        );
+        assert!(
+            self.progress_poll_capacity > 0,
+            "progress-poll capacity must be positive"
+        );
+        assert!(
+            !self.progress_poll_interval.is_zero(),
+            "progress-poll interval must be positive"
         );
         assert!(
             !self.queued_reap_interval.is_zero(),
@@ -212,6 +230,15 @@ pub struct TaskSnapshot {
     pub usage: TaskUsage,
     pub result: Option<TaskResult>,
     pub completion_disposition: Option<CompletionDisposition>,
+    pub output_metadata: Option<OutputMetadata>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct OutputMetadata {
+    /// Bytes observed before the coordinator's UTF-8-safe cap was applied.
+    pub source_bytes: usize,
+    pub retained_bytes: usize,
+    pub truncated: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -282,6 +309,7 @@ pub enum SinkShutdown {
 pub enum TaskCallbackKind {
     Cancel,
     Completed,
+    Progress,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -341,6 +369,9 @@ pub enum TaskEventPayload {
     },
     UsageUpdated {
         usage: TaskUsage,
+    },
+    ProgressUpdated {
+        progress: lato_core::TaskProgress,
     },
     BudgetExhausted {
         error: TaskError,
@@ -436,6 +467,13 @@ pub(crate) enum TaskCommand {
         request: Box<SpawnTaskRequest>,
         enqueued_at: tokio::time::Instant,
         reply: oneshot::Sender<Result<SpawnDisposition, TaskError>>,
+    },
+    SpawnAndWait {
+        root_id: TaskId,
+        parent_id: TaskId,
+        request: Box<SpawnTaskRequest>,
+        enqueued_at: tokio::time::Instant,
+        reply: oneshot::Sender<Result<CompletionDisposition, TaskError>>,
     },
     Inspect {
         task_id: TaskId,
@@ -688,8 +726,17 @@ impl ScopedTaskHandle {
         &self,
         request: SpawnTaskRequest,
     ) -> Result<CompletionDisposition, TaskError> {
-        let disposition = self.spawn(request).await?;
-        disposition.handle.wait_foreground().await
+        let (reply, response) = oneshot::channel();
+        self.inner
+            .send(TaskCommand::SpawnAndWait {
+                root_id: self.root_id.clone(),
+                parent_id: self.task_id.clone(),
+                request: Box::new(request),
+                enqueued_at: tokio::time::Instant::now(),
+                reply,
+            })
+            .await?;
+        response.await.map_err(|_| coordinator_closed())?
     }
 
     pub async fn inspect(&self, task_id: TaskId) -> Result<TaskSnapshot, TaskError> {
