@@ -8,7 +8,9 @@ use lato_runtime::{
     CoordinatorConfig, SpawnMode, SpawnTaskRequest, TaskEventPayload, TaskRootRequest, WaitOutcome,
     spawn_task_coordinator,
 };
-use lato_workspace::{WorkspaceAllocator, WorkspaceLease, WorkspaceRequest};
+use lato_workspace::{
+    MemoryWorkspaceAllocator, WorkspaceAllocator, WorkspaceLease, WorkspaceRequest,
+};
 use std::{future::pending, sync::Arc, time::Duration};
 use task_support::Harness;
 use tokio_util::sync::CancellationToken;
@@ -85,7 +87,7 @@ async fn cumulative_usage_is_monotone_and_budget_exhaustion_settles_once() {
 
     assert!(harness.runner.report_usage("child", usage(40)).await);
     assert!(harness.runner.report_usage("child", usage(60)).await);
-    assert!(harness.runner.report_usage("child", usage(50)).await);
+    assert!(!harness.runner.report_usage("child", usage(50)).await);
     assert!(harness.runner.report_usage("child", usage(81)).await);
 
     let terminal = root
@@ -113,7 +115,7 @@ async fn cumulative_usage_is_monotone_and_budget_exhaustion_settles_once() {
         80
     );
 
-    assert!(harness.runner.report_usage("child", usage(90)).await);
+    assert!(!harness.runner.report_usage("child", usage(90)).await);
     tokio::task::yield_now().await;
     let after_late = harness
         .handle
@@ -338,7 +340,7 @@ async fn reused_task_id_ignores_late_usage_from_an_older_generation() {
 
     root.spawn(request("reused", Some(20))).await.unwrap();
     harness.wait_for_status("reused", TaskStatus::Running).await;
-    stale.report_usage(usage(19)).await;
+    assert!(!stale.report_usage(usage(19)).await);
     tokio::task::yield_now().await;
     assert_eq!(
         harness
@@ -376,6 +378,102 @@ async fn final_result_usage_is_the_authoritative_budget_fence() {
         snapshot.result.unwrap().error.unwrap().code,
         TaskErrorCode::BudgetExceededTotalTokens
     );
+}
+
+struct AwaitedFinalUsageRunner;
+
+#[async_trait::async_trait]
+impl lato_runtime::TaskRunner for AwaitedFinalUsageRunner {
+    type Control = task_support::ControlledTaskControl;
+
+    async fn run(
+        &self,
+        request: lato_runtime::TaskRunRequest,
+        reporter: lato_runtime::TaskReporter<Self::Control>,
+    ) -> lato_runtime::TaskRunOutput {
+        assert!(
+            reporter
+                .started(lato_runtime::StartedTask::new(
+                    Arc::new(task_support::ControlledTaskControl::new()),
+                    request.cancellation,
+                ))
+                .await
+        );
+        assert!(reporter.report_usage(usage(81)).await);
+        lato_runtime::TaskRunOutput::from(lato_core::TaskResult {
+            success: true,
+            output: "stale final usage".into(),
+            error: None,
+            usage: TaskUsage::default(),
+            duration_ms: 0,
+            output_ref: None,
+        })
+    }
+
+    async fn validate_profile(&self, _profile: &AgentProfile) -> Result<(), TaskError> {
+        Ok(())
+    }
+
+    fn on_completed(&self, _completion: lato_runtime::TaskCompletion) {}
+}
+
+#[tokio::test]
+async fn awaited_final_report_is_committed_before_the_runner_can_return() {
+    let workspace = tempfile::tempdir().unwrap();
+    let (handle, actor) = spawn_task_coordinator(
+        CoordinatorConfig::default(),
+        Arc::new(AwaitedFinalUsageRunner),
+        Arc::new(MemoryWorkspaceAllocator::new(workspace.path()).unwrap()),
+        Arc::new(lato_runtime::NoopTaskEventSink),
+    );
+    let root = handle
+        .register_root(TaskRootRequest {
+            task_id: TaskId::from("root"),
+            owner: TaskOwner::Interactive {
+                session_id: SessionId::from("session"),
+                turn_id: TurnId::from("turn"),
+            },
+            profile: AgentProfile::worker(),
+            permissions: AgentProfile::worker().capabilities,
+            budget: budget(Some(100)),
+        })
+        .await
+        .unwrap();
+    root.spawn(request("reported-final", Some(80)))
+        .await
+        .unwrap();
+    let WaitOutcome::Finished(snapshot) = root
+        .wait(TaskId::from("reported-final"), Duration::from_secs(2))
+        .await
+        .unwrap()
+    else {
+        panic!("reported final usage must terminate");
+    };
+    assert_eq!(snapshot.node.status, TaskStatus::Failed);
+    assert_eq!(snapshot.usage.total_tokens, 80);
+    assert_eq!(
+        snapshot.result.unwrap().error.unwrap().code,
+        TaskErrorCode::BudgetExceededTotalTokens
+    );
+    wait_until_settled_handle(&handle, "reported-final").await;
+    let root_snapshot = handle.inspect_admin(TaskId::from("root")).await.unwrap();
+    assert_eq!(root_snapshot.budget_spent.total_tokens, 80);
+    handle.shutdown().await.unwrap();
+    actor.await.unwrap();
+}
+
+async fn wait_until_settled_handle(handle: &lato_runtime::TaskHandle, task_id: &str) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while handle
+            .inspect_admin(TaskId::from(task_id))
+            .await
+            .is_ok_and(|snapshot| snapshot.has_parent_reservation)
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("task reservation did not settle");
 }
 
 #[tokio::test]

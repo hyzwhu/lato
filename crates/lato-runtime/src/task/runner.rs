@@ -102,6 +102,7 @@ pub(crate) enum RunnerEvent<C: TaskChildControl> {
         task_id: TaskId,
         generation: u64,
         usage: TaskUsage,
+        acknowledgement: oneshot::Sender<bool>,
     },
     Progress {
         task_id: TaskId,
@@ -159,14 +160,21 @@ impl<C: TaskChildControl> TaskReporter<C> {
     }
 
     pub async fn report_usage(&self, usage: TaskUsage) -> bool {
-        self.event_tx
+        let (acknowledgement, response) = oneshot::channel();
+        if self
+            .event_tx
             .send(RunnerEvent::Usage {
                 task_id: self.task_id.clone(),
                 generation: self.generation,
                 usage,
+                acknowledgement,
             })
             .await
-            .is_ok()
+            .is_err()
+        {
+            return false;
+        }
+        response.await.unwrap_or(false)
     }
 
     pub async fn report_progress(&self, progress: TaskProgress) -> bool {
@@ -212,4 +220,45 @@ pub trait TaskRunner: Send + Sync + 'static {
     /// This callback runs on the coordinator's bounded, panic-contained
     /// callback dispatcher rather than on the actor or async executor thread.
     fn on_completed(&self, completion: TaskCompletion);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures_util::future::ready;
+
+    struct TestControl;
+
+    impl TaskChildControl for TestControl {
+        fn progress(&self) -> TaskProgress {
+            TaskProgress::default()
+        }
+
+        fn send_active_message(
+            &self,
+            _delivery: ActiveMessageDelivery,
+        ) -> BoxFuture<'static, ActiveMessageAdmission> {
+            Box::pin(ready(ActiveMessageAdmission::Rejected))
+        }
+
+        fn cancel(&self) {}
+    }
+
+    #[tokio::test]
+    async fn usage_report_returns_false_when_the_actor_channel_is_closed() {
+        let (event_tx, event_rx) = mpsc::channel(1);
+        drop(event_rx);
+        let reporter = TaskReporter::<TestControl>::new(TaskId::from("closed"), 1, event_tx);
+        assert!(!reporter.report_usage(TaskUsage::default()).await);
+    }
+
+    #[tokio::test]
+    async fn usage_report_returns_false_when_actor_drops_the_acknowledgement() {
+        let (event_tx, mut event_rx) = mpsc::channel(1);
+        let reporter = TaskReporter::<TestControl>::new(TaskId::from("dropped"), 1, event_tx);
+        let report = tokio::spawn(async move { reporter.report_usage(TaskUsage::default()).await });
+        let event = event_rx.recv().await.expect("usage event is enqueued");
+        drop(event);
+        assert!(!report.await.unwrap());
+    }
 }

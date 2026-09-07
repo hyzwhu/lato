@@ -2732,60 +2732,55 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
         caller: &InspectCaller,
         resume: ReviewerVerificationResume,
     ) -> Result<(), TaskError> {
+        let InspectCaller::Scoped {
+            root_id: caller_root,
+            task_id: caller_task,
+        } = caller
+        else {
+            return Err(not_found());
+        };
+        if caller_task != &resume.reviewer_task_id {
+            return Err(not_found());
+        }
+        let reviewer = self.state.tasks.get(caller_task).ok_or_else(not_found)?;
+        if &reviewer.node.root_id != caller_root {
+            return Err(not_found());
+        }
         let record = self.state.tasks.get(task_id).ok_or_else(not_found)?;
-        let decision = match (&record.verification_wait, resume.reviewer_task_id) {
-            (Some(VerificationWait::Child(expected)), reviewer_task_id)
-                if expected == &reviewer_task_id =>
-            {
-                let InspectCaller::Scoped {
-                    root_id: caller_root,
-                    task_id: caller_task,
-                } = caller
-                else {
-                    return Err(not_found());
-                };
-                if caller_task != &reviewer_task_id || caller_root != &record.node.root_id {
-                    return Err(not_found());
-                }
-                let reviewer = self
-                    .state
-                    .tasks
-                    .get(&reviewer_task_id)
-                    .ok_or_else(not_found)?;
-                if reviewer.node.root_id != record.node.root_id
-                    || reviewer.node.parent_id.as_ref() != Some(task_id)
-                    || !reviewer.node.status.is_terminal()
-                {
-                    return Err(TaskError::new(
-                        TaskErrorCode::VerificationPending,
-                        "the authoritative reviewer has not completed",
-                    ));
-                }
-                let reviewer_result = reviewer.result.as_ref().ok_or_else(|| {
-                    TaskError::new(
-                        TaskErrorCode::VerificationPending,
-                        "the authoritative reviewer has no terminal decision",
-                    )
-                })?;
-                if reviewer_result.success {
-                    VerificationDecision::Passed
-                } else {
-                    VerificationDecision::Failed(reviewer_result.error.clone().unwrap_or_else(
-                        || {
-                            TaskError::new(
-                                TaskErrorCode::VerificationFailed,
-                                "the authoritative reviewer rejected the task output",
-                            )
-                        },
-                    ))
-                }
-            }
-            _ => {
-                return Err(TaskError::new(
-                    TaskErrorCode::VerificationPending,
-                    "verification resume does not match the pending task and identifier",
-                ));
-            }
+        if &record.node.root_id != caller_root || reviewer.node.parent_id.as_ref() != Some(task_id)
+        {
+            return Err(not_found());
+        }
+        if !matches!(
+            &record.verification_wait,
+            Some(VerificationWait::Child(expected)) if expected == caller_task
+        ) {
+            return Err(TaskError::new(
+                TaskErrorCode::VerificationPending,
+                "verification resume does not match the pending task and identifier",
+            ));
+        }
+        if !reviewer.node.status.is_terminal() {
+            return Err(TaskError::new(
+                TaskErrorCode::VerificationPending,
+                "the authoritative reviewer has not completed",
+            ));
+        }
+        let reviewer_result = reviewer.result.as_ref().ok_or_else(|| {
+            TaskError::new(
+                TaskErrorCode::VerificationPending,
+                "the authoritative reviewer has no terminal decision",
+            )
+        })?;
+        let decision = if reviewer_result.success {
+            VerificationDecision::Passed
+        } else {
+            VerificationDecision::Failed(reviewer_result.error.clone().unwrap_or_else(|| {
+                TaskError::new(
+                    TaskErrorCode::VerificationFailed,
+                    "the authoritative reviewer rejected the task output",
+                )
+            }))
         };
         self.verification_wait_deadlines.remove(task_id);
         self.state.tasks.get_mut(task_id).unwrap().verification_wait = None;
@@ -3477,9 +3472,12 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
                 task_id,
                 generation,
                 usage,
+                acknowledgement,
             } => {
-                self.handle_cumulative_usage(task_id, generation, usage)
+                let accepted = self
+                    .handle_cumulative_usage(task_id, generation, usage)
                     .await;
+                let _ = acknowledgement.send(accepted);
             }
             RunnerEvent::Progress {
                 task_id,
@@ -3505,9 +3503,14 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
         })
     }
 
-    async fn handle_cumulative_usage(&mut self, task_id: TaskId, generation: u64, next: TaskUsage) {
+    async fn handle_cumulative_usage(
+        &mut self,
+        task_id: TaskId,
+        generation: u64,
+        next: TaskUsage,
+    ) -> bool {
         if !self.generation_is_current(&task_id, generation) {
-            return;
+            return false;
         }
         let (previous, remaining, already_exhausted) = {
             let record = &self.state.tasks[&task_id];
@@ -3518,7 +3521,7 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
             )
         };
         if usage_regressed(&previous, &next) || already_exhausted {
-            return;
+            return false;
         }
         let (accepted, exhausted) = cap_cumulative_usage(&previous, next, &remaining);
         if accepted != previous {
@@ -3532,7 +3535,7 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
                 .apply_cumulative_usage((&previous).into(), (&accepted).into())
                 .is_err()
             {
-                return;
+                return false;
             }
             record.usage = accepted.clone();
             self.commit_transition(
@@ -3540,10 +3543,10 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
                 TaskEventPayload::UsageUpdated { usage: accepted },
             );
         }
-        let Some(dimension) = exhausted else {
-            return;
-        };
-        self.trigger_budget_exhaustion(task_id, dimension).await;
+        if let Some(dimension) = exhausted {
+            self.trigger_budget_exhaustion(task_id, dimension).await;
+        }
+        true
     }
 
     async fn charge_wall_time(&mut self, now: Instant) {

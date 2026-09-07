@@ -656,6 +656,26 @@ async fn waiting_reviewer_verification_rejects_self_foreign_and_wrong_ids() {
         .await
         .unwrap_err();
     assert_eq!(foreign_error.code, TaskErrorCode::NotFoundOrNotOwned);
+    let foreign_unknown = foreign
+        .resume_reviewer_verification(
+            TaskId::from("unknown-child"),
+            ReviewerVerificationResume {
+                reviewer_task_id: reviewer.clone(),
+            },
+        )
+        .await
+        .unwrap_err();
+    let foreign_wrong_id = foreign
+        .resume_reviewer_verification(
+            TaskId::from("waiting-child"),
+            ReviewerVerificationResume {
+                reviewer_task_id: TaskId::from("wrong-reviewer"),
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(foreign_unknown, foreign_error);
+    assert_eq!(foreign_wrong_id, foreign_error);
 
     let wrong = root
         .resume_reviewer_verification(
@@ -666,7 +686,7 @@ async fn waiting_reviewer_verification_rejects_self_foreign_and_wrong_ids() {
         )
         .await
         .unwrap_err();
-    assert_eq!(wrong.code, TaskErrorCode::VerificationPending);
+    assert_eq!(wrong.code, TaskErrorCode::NotFoundOrNotOwned);
     let self_error = subject
         .resume_reviewer_verification(
             TaskId::from("waiting-child"),
