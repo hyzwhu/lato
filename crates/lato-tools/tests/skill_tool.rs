@@ -747,6 +747,132 @@ fn web_fetch_domain_rules_match_exact_hosts_and_subdomains_only() {
     assert_eq!(error.code, "tool.not_allowed_by_skill");
 }
 
+struct RelativePathReadReplacement;
+
+#[async_trait]
+impl lato_core::Tool for RelativePathReadReplacement {
+    fn descriptor(&self) -> lato_core::ToolDescriptor {
+        let name = lato_core::ToolName::parse("builtin:read_file").unwrap();
+        lato_core::ToolDescriptor {
+            name: name.clone(),
+            version: semver::Version::new(1, 0, 0),
+            description: "test replacement requiring a relative path".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "pattern": "^allowed/.*$"}
+                },
+                "required": ["path"],
+                "additionalProperties": false
+            }),
+            capabilities: vec![ToolCapability::FileRead],
+            side_effect: SideEffect::None,
+            concurrency: lato_core::ToolConcurrency::Parallel,
+            idempotency: lato_core::ToolIdempotency::Idempotent,
+            timeout_ms: 1_000,
+            max_output_bytes: 1_024,
+            cancellation: lato_core::ToolCancellation::Cooperative,
+            source: lato_core::ToolSource {
+                layer: lato_core::ToolLayer::SessionOverride,
+                id: "test.relative-path-read".into(),
+                replacement: Some(lato_core::ToolReplacement {
+                    target: name,
+                    compatible_major: 1,
+                }),
+            },
+        }
+    }
+
+    async fn invoke(
+        &self,
+        _context: ToolContext,
+        _arguments: serde_json::Value,
+    ) -> Result<lato_core::ToolOutput, ToolError> {
+        unreachable!("post-scope schema validation must reject the rewritten path")
+    }
+}
+
+#[test]
+fn scoped_rewritten_arguments_are_revalidated_before_policy() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("allowed")).unwrap();
+    std::fs::write(root.path().join("allowed/file.txt"), "inside").unwrap();
+    let sink = Arc::new(CountingPolicySink::default());
+    let policy = Arc::new(PolicyEngine::with_sink(
+        Arc::new(ApprovalLedger::new(Duration::from_secs(60))),
+        sink.clone(),
+    ));
+    let mut builder = ToolRuntimeBuilder::new(
+        policy,
+        PolicyScope {
+            workspace_root: root.path().to_path_buf(),
+            mode: PolicyMode::Always,
+            project_trusted: true,
+            sandbox_profile: SandboxProfile::Off,
+        },
+    );
+    builder
+        .register_builtin_tools(environment(
+            root.path(),
+            SessionTrust::for_headless_prompt(root.path()),
+            None,
+        ))
+        .unwrap();
+    builder
+        .register(Arc::new(RelativePathReadReplacement))
+        .unwrap();
+    let runtime = builder.build().unwrap();
+    let scope = SkillToolScope::compile(&["Read(allowed/**)".into()], &runtime).unwrap();
+
+    let error = runtime
+        .prepare_scoped(
+            context("rewritten-schema-failure"),
+            "read_file",
+            json!({"path":"allowed/file.txt"}),
+            Some(&scope),
+        )
+        .err()
+        .unwrap();
+    assert_eq!(error.code, "tool.invalid_arguments");
+    assert_eq!(sink.0.load(Ordering::Acquire), 0);
+
+    runtime
+        .prepare(
+            context("ordinary-relative-path"),
+            "read_file",
+            json!({"path":"allowed/file.txt"}),
+        )
+        .unwrap();
+    assert!(sink.0.load(Ordering::Acquire) > 0);
+}
+
+#[tokio::test]
+async fn standard_descriptor_accepts_and_executes_a_scoped_rewritten_path() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("allowed")).unwrap();
+    std::fs::write(root.path().join("allowed/file.txt"), "inside").unwrap();
+    let runtime = builtin_tool_runtime(environment(
+        root.path(),
+        SessionTrust::for_headless_prompt(root.path()),
+        None,
+    ))
+    .unwrap();
+    let scope = SkillToolScope::compile(&["Read(allowed/**)".into()], runtime.as_ref()).unwrap();
+    let prepared = runtime
+        .prepare_scoped(
+            context("rewritten-schema-success"),
+            "read_file",
+            json!({"path":"allowed/file.txt"}),
+            Some(&scope),
+        )
+        .unwrap();
+    let output = runtime
+        .execute_without_approval_for_test(prepared)
+        .await
+        .unwrap();
+    assert_eq!(output.content, "inside");
+}
+
 #[derive(Default)]
 struct CountingPolicySink(AtomicUsize);
 

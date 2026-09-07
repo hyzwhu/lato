@@ -255,16 +255,7 @@ impl ToolRuntime {
                 Retryability::Never,
             )
         })?;
-        let Some(validator) = self.validators.get(&canonical_name) else {
-            return Err(not_found(wire_name));
-        };
-        if let Err(error) = validator.validate(&arguments) {
-            return Err(ToolError::new(
-                "tool.invalid_arguments",
-                error.to_string(),
-                Retryability::Never,
-            ));
-        }
+        self.validate_arguments(&canonical_name, &arguments, wire_name)?;
         Ok(ValidatedToolCall {
             wire_name: wire_name.to_owned(),
             canonical_name,
@@ -291,13 +282,17 @@ impl ToolRuntime {
         let canonical = validated.canonical_name;
         let original_arguments = validated.arguments;
         let arguments = match scope {
-            Some(scope) => scope
-                .canonicalize_call(
-                    canonical.local_name(),
-                    &original_arguments,
-                    &self.scope.workspace_root,
-                )
-                .ok_or_else(|| not_allowed_by_skill(wire_name))?,
+            Some(scope) => {
+                let arguments = scope
+                    .canonicalize_call(
+                        canonical.local_name(),
+                        &original_arguments,
+                        &self.scope.workspace_root,
+                    )
+                    .ok_or_else(|| not_allowed_by_skill(wire_name))?;
+                self.validate_arguments(&canonical, &arguments, wire_name)?;
+                arguments
+            }
             None => original_arguments.clone(),
         };
         let Some(descriptor) = self.catalog.descriptor(&canonical).cloned() else {
@@ -564,6 +559,24 @@ impl ToolRuntime {
         } else {
             self.wire_names.get(normalized).cloned()
         }
+    }
+
+    fn validate_arguments(
+        &self,
+        canonical_name: &ToolName,
+        arguments: &Value,
+        wire_name: &str,
+    ) -> Result<(), ToolError> {
+        let Some(validator) = self.validators.get(canonical_name) else {
+            return Err(not_found(wire_name));
+        };
+        validator.validate(arguments).map_err(|error| {
+            ToolError::new(
+                "tool.invalid_arguments",
+                error.to_string(),
+                Retryability::Never,
+            )
+        })
     }
 }
 

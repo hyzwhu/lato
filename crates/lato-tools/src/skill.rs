@@ -536,9 +536,19 @@ fn resolve_scoped_path(path: &str, cwd: &Path, allow_missing: bool) -> Option<Re
     } else {
         normalize_lexically(&lexical_cwd.join(raw))
     };
-    if !lexical.starts_with(&lexical_cwd) {
+    let lexical_forms = if lexical.starts_with(&lexical_cwd) {
+        path_forms(&lexical, &lexical_cwd)
+    } else if lexical.starts_with(&resolved_cwd) {
+        let relative = lexical.strip_prefix(&resolved_cwd).ok()?;
+        path_forms(&lexical, &resolved_cwd)
+            .into_iter()
+            .chain(std::iter::once(path_match_string(
+                &lexical_cwd.join(relative),
+            )))
+            .collect()
+    } else {
         return None;
-    }
+    };
 
     let resolved = match std::fs::symlink_metadata(&lexical) {
         Ok(_) => std::fs::canonicalize(&lexical).ok()?,
@@ -553,7 +563,7 @@ fn resolve_scoped_path(path: &str, cwd: &Path, allow_missing: bool) -> Option<Re
     let relative = resolved.strip_prefix(&resolved_cwd).ok()?;
     Some(ResolvedScopedPath {
         resolved: resolved.clone(),
-        lexical_forms: path_forms(&lexical, &lexical_cwd),
+        lexical_forms,
         resolved_forms: path_forms(&resolved, &resolved_cwd)
             .into_iter()
             .chain(std::iter::once(path_match_string(
