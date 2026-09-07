@@ -10,7 +10,13 @@ use lato_core::{
 };
 use lato_workspace::WorkspaceLease;
 use std::time::{SystemTime, UNIX_EPOCH};
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, broadcast, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
@@ -297,6 +303,8 @@ pub struct RegistryCounts {
     pub total: usize,
     pub dropped_sink_events: u64,
     pub dropped_callback_work: u64,
+    #[serde(default)]
+    pub dropped_active_message_rejections: u64,
     pub callback_execution_failures: u64,
     pub output_load_supervisors: usize,
 }
@@ -517,7 +525,7 @@ pub(crate) enum TaskCommand {
     SendActiveMessage {
         request: ActiveMessageRequest,
         caller: InspectCaller,
-        permit: Option<OwnedSemaphorePermit>,
+        permit: OwnedSemaphorePermit,
         reply: oneshot::Sender<ActiveMessageOutcome>,
     },
     Cancel {
@@ -545,9 +553,16 @@ pub(crate) enum TaskCommand {
     },
 }
 
+#[derive(Clone)]
 pub(crate) enum InspectCaller {
     Admin,
     Scoped { root_id: TaskId, task_id: TaskId },
+}
+
+pub(crate) struct ActiveMessageRejectionObservation {
+    pub(crate) target: TaskId,
+    pub(crate) caller: InspectCaller,
+    pub(crate) outcome: ActiveMessageOutcome,
 }
 
 #[derive(Clone)]
@@ -555,6 +570,9 @@ pub struct TaskHandle {
     pub(crate) command_tx: TaskCommandSender,
     pub(crate) event_tx: broadcast::Sender<TaskEventEnvelope>,
     pub(crate) active_message_slots: Arc<Semaphore>,
+    pub(crate) active_message_rejection_tx: mpsc::Sender<ActiveMessageRejectionObservation>,
+    pub(crate) dropped_active_message_rejections: Arc<AtomicU64>,
+    pub(crate) active_message_capacity: usize,
 }
 
 #[derive(Clone)]
@@ -758,6 +776,9 @@ impl TaskHandle {
             command_tx: TaskCommandSender::Weak(command_tx),
             event_tx: self.event_tx.clone(),
             active_message_slots: Arc::clone(&self.active_message_slots),
+            active_message_rejection_tx: self.active_message_rejection_tx.clone(),
+            dropped_active_message_rejections: Arc::clone(&self.dropped_active_message_rejections),
+            active_message_capacity: self.active_message_capacity,
         }
     }
 
@@ -770,6 +791,9 @@ impl TaskHandle {
             command_tx: TaskCommandSender::Strong(command_tx),
             event_tx: self.event_tx.clone(),
             active_message_slots: Arc::clone(&self.active_message_slots),
+            active_message_rejection_tx: self.active_message_rejection_tx.clone(),
+            dropped_active_message_rejections: Arc::clone(&self.dropped_active_message_rejections),
+            active_message_capacity: self.active_message_capacity,
         })
     }
 }
@@ -929,9 +953,32 @@ impl ScopedTaskHandle {
     }
 
     pub async fn send_active_message(&self, request: ActiveMessageRequest) -> ActiveMessageOutcome {
-        let permit = Arc::clone(&self.inner.active_message_slots)
-            .try_acquire_owned()
-            .ok();
+        let permit = match Arc::clone(&self.inner.active_message_slots).try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                let outcome = ActiveMessageOutcome::Saturated {
+                    max_in_flight: self.inner.active_message_capacity,
+                };
+                if self
+                    .inner
+                    .active_message_rejection_tx
+                    .try_send(ActiveMessageRejectionObservation {
+                        target: request.task_id().clone(),
+                        caller: InspectCaller::Scoped {
+                            root_id: self.root_id.clone(),
+                            task_id: self.task_id.clone(),
+                        },
+                        outcome: outcome.clone(),
+                    })
+                    .is_err()
+                {
+                    self.inner
+                        .dropped_active_message_rejections
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                return outcome;
+            }
+        };
         let (reply, response) = oneshot::channel();
         if self
             .inner

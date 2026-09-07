@@ -13,10 +13,13 @@ use lato_runtime::{
 use lato_workspace::MemoryWorkspaceAllocator;
 use std::{
     collections::HashMap,
+    future::Future,
+    pin::Pin,
     sync::{
         Arc, Condvar, Mutex as StdMutex,
         atomic::{AtomicBool, Ordering},
     },
+    task::{Context, Poll},
     time::Duration,
 };
 use tempfile::TempDir;
@@ -41,6 +44,27 @@ enum FactoryBehavior {
     PanicOpen,
     PanicClaimed,
     Block,
+    DropPanic,
+}
+
+struct DropPanicsFuture {
+    response: oneshot::Receiver<ActiveMessageAdmission>,
+}
+
+impl Future for DropPanicsFuture {
+    type Output = ActiveMessageAdmission;
+
+    fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        Pin::new(&mut self.response)
+            .poll(context)
+            .map(|result| result.unwrap_or(ActiveMessageAdmission::ChannelClosed))
+    }
+}
+
+impl Drop for DropPanicsFuture {
+    fn drop(&mut self) {
+        panic!("runner active-message future drop panic");
+    }
 }
 
 #[derive(Default)]
@@ -87,6 +111,7 @@ impl TaskChildControl for MessageControl {
                 unreachable!()
             }
             FactoryBehavior::Block => self.constructor_gate.block(),
+            FactoryBehavior::DropPanic => return Box::pin(DropPanicsFuture { response }),
         }
         Box::pin(async move {
             response
@@ -456,6 +481,78 @@ async fn per_task_and_global_admission_are_independently_bounded() {
         second.await.unwrap(),
         ActiveMessageOutcome::NotActiveOrFinalizing
     );
+}
+
+#[tokio::test]
+async fn global_saturation_flood_never_enters_or_pressures_the_command_channel() {
+    let harness = Harness::new(CoordinatorConfig {
+        command_capacity: 1,
+        active_message_capacity: 1,
+        active_messages_per_task: 1,
+        cancel_grace: Duration::from_millis(5),
+        ..CoordinatorConfig::default()
+    })
+    .await;
+    let root = harness.root("root", "session").await;
+    harness.spawn(&root, "child").await;
+    harness.wait_running("child").await;
+    let mut events = harness.handle.subscribe();
+    let held_send = tokio::spawn({
+        let root = root.clone();
+        async move {
+            root.send_active_message(
+                ActiveMessageRequest::try_new(TaskId::from("child"), "held").unwrap(),
+            )
+            .await
+        }
+    });
+    let held = harness.admission().await;
+    for index in 0..256 {
+        assert_eq!(
+            root.send_active_message(
+                ActiveMessageRequest::try_new(TaskId::from("child"), format!("saturated-{index}"),)
+                    .unwrap(),
+            )
+            .await,
+            ActiveMessageOutcome::Saturated { max_in_flight: 1 }
+        );
+    }
+    assert_eq!(
+        harness
+            .handle
+            .registry_counts()
+            .await
+            .unwrap()
+            .dropped_active_message_rejections,
+        255
+    );
+    tokio::time::timeout(
+        Duration::from_millis(100),
+        root.cancel_task(TaskId::from("child")),
+    )
+    .await
+    .expect("saturation flood delayed cancellation through the command channel")
+    .unwrap();
+    assert_eq!(
+        held_send.await.unwrap(),
+        ActiveMessageOutcome::NotAcceptedBeforeDeadline
+    );
+    drop(held.release);
+    let event = tokio::time::timeout(Duration::from_millis(100), async {
+        loop {
+            let event = next_message_event(&mut events).await;
+            if matches!(
+                event.payload,
+                lato_runtime::TaskEventPayload::ActiveMessageRejected { ref error, .. }
+                    if error.code == TaskErrorCode::MessageLimit
+            ) {
+                break event;
+            }
+        }
+    })
+    .await
+    .expect("bounded saturation observation was not evented");
+    assert_eq!(event.task_id, TaskId::from("child"));
 }
 
 #[tokio::test(start_paused = true)]
@@ -844,6 +941,101 @@ async fn finalization_timeout_is_uncertain_and_cleans_both_capacity_counters() {
     );
 }
 
+#[tokio::test(start_paused = true)]
+async fn finalization_deadline_retires_open_message_and_reuses_global_capacity_immediately() {
+    let harness = Harness::new(CoordinatorConfig {
+        active_message_capacity: 1,
+        active_messages_per_task: 1,
+        active_message_admission_timeout: Duration::from_secs(10),
+        active_message_finalization_timeout: Duration::from_secs(1),
+        max_global_running: 2,
+        max_running_per_root: 2,
+        ..CoordinatorConfig::default()
+    })
+    .await;
+    let root = harness.root("root", "session").await;
+    harness.spawn(&root, "first").await;
+    harness.spawn(&root, "second").await;
+    harness.wait_running("first").await;
+    harness.wait_running("second").await;
+    let mut events = harness.handle.subscribe();
+    let first_send = tokio::spawn({
+        let root = root.clone();
+        async move {
+            root.send_active_message(
+                ActiveMessageRequest::try_new(TaskId::from("first"), "held").unwrap(),
+            )
+            .await
+        }
+    });
+    let held = harness.admission().await;
+    harness.finish("first").await;
+    loop {
+        if harness
+            .handle
+            .inspect_admin(TaskId::from("first"))
+            .await
+            .unwrap()
+            .node
+            .status
+            == lato_core::TaskStatus::Finalizing
+        {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    tokio::time::advance(Duration::from_secs(1)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(
+        first_send.await.unwrap(),
+        ActiveMessageOutcome::NotAcceptedBeforeDeadline
+    );
+    let lato_runtime::WaitOutcome::Finished(first_snapshot) = harness
+        .handle
+        .wait_admin(TaskId::from("first"), Duration::from_secs(1))
+        .await
+        .unwrap()
+    else {
+        panic!("proof-revoked finalization did not finish")
+    };
+    assert!(first_snapshot.result.unwrap().success);
+
+    let second_send = tokio::spawn({
+        let root = root.clone();
+        async move {
+            root.send_active_message(
+                ActiveMessageRequest::try_new(TaskId::from("second"), "next").unwrap(),
+            )
+            .await
+        }
+    });
+    let second = tokio::time::timeout(Duration::from_millis(50), harness.admission())
+        .await
+        .expect("retired message kept the only global worker or permit occupied");
+    second
+        .release
+        .send(ActiveMessageAdmission::Rejected)
+        .unwrap();
+    assert_eq!(
+        second_send.await.unwrap(),
+        ActiveMessageOutcome::NotActiveOrFinalizing
+    );
+    drop(held.release);
+    tokio::task::yield_now().await;
+    let first_outcomes = std::iter::from_fn(|| events.try_recv().ok())
+        .filter(|event| event.task_id == TaskId::from("first"))
+        .filter(|event| {
+            matches!(
+                event.payload,
+                lato_runtime::TaskEventPayload::ActiveMessageAccepted { .. }
+                    | lato_runtime::TaskEventPayload::ActiveMessageRejected { .. }
+                    | lato_runtime::TaskEventPayload::ActiveMessageUncertain { .. }
+            )
+        })
+        .count();
+    assert_eq!(first_outcomes, 1);
+}
+
 #[tokio::test]
 async fn blocking_constructor_never_blocks_actor_cancel_or_bounded_shutdown() {
     let harness = Harness::with_behavior(
@@ -858,6 +1050,7 @@ async fn blocking_constructor_never_blocks_actor_cancel_or_bounded_shutdown() {
     let root = harness.root("root", "session").await;
     harness.spawn(&root, "child").await;
     harness.wait_running("child").await;
+    let mut events = harness.handle.subscribe();
     let send = tokio::spawn({
         let root = root.clone();
         async move {
@@ -890,11 +1083,20 @@ async fn blocking_constructor_never_blocks_actor_cancel_or_bounded_shutdown() {
         .await
         .expect("shutdown exceeded its global bound")
         .unwrap();
-    assert_eq!(shutdown, lato_runtime::SinkShutdown::TimedOutDetached);
-    assert!(matches!(
-        send.await.unwrap(),
-        ActiveMessageOutcome::NotAcceptedBeforeDeadline | ActiveMessageOutcome::ChannelClosed
-    ));
+    assert!(!matches!(shutdown, lato_runtime::SinkShutdown::Drained));
+    assert_eq!(send.await.unwrap(), ActiveMessageOutcome::ChannelClosed);
+    let message_events = std::iter::from_fn(|| events.try_recv().ok())
+        .filter(|event| event.task_id == TaskId::from("child"))
+        .filter(|event| {
+            matches!(
+                event.payload,
+                lato_runtime::TaskEventPayload::ActiveMessageAccepted { .. }
+                    | lato_runtime::TaskEventPayload::ActiveMessageRejected { .. }
+                    | lato_runtime::TaskEventPayload::ActiveMessageUncertain { .. }
+            )
+        })
+        .count();
+    assert_eq!(message_events, 1);
     harness.runner.constructor_gate.release();
 }
 
@@ -931,6 +1133,149 @@ async fn constructor_panic_uses_lease_proof_and_keeps_terminalization_truthful()
         };
         assert_eq!(snapshot.result.unwrap().success, clean);
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn future_drop_panic_is_contained_for_ready_timeout_and_cancel_paths() {
+    let harness = Harness::with_behavior(
+        CoordinatorConfig {
+            active_message_admission_timeout: Duration::from_secs(1),
+            max_global_running: 3,
+            max_running_per_root: 3,
+            ..CoordinatorConfig::default()
+        },
+        FactoryBehavior::DropPanic,
+    )
+    .await;
+    let root = harness.root("root", "session").await;
+    for id in ["ready", "timeout", "cancel"] {
+        harness.spawn(&root, id).await;
+        harness.wait_running(id).await;
+    }
+
+    let ready_send = tokio::spawn({
+        let root = root.clone();
+        async move {
+            root.send_active_message(
+                ActiveMessageRequest::try_new(TaskId::from("ready"), "ready").unwrap(),
+            )
+            .await
+        }
+    });
+    let ready = harness.admission().await;
+    assert!(ready.delivery.commit_admission(|| ()).is_some());
+    ready
+        .release
+        .send(ActiveMessageAdmission::Admitted)
+        .unwrap();
+    assert!(matches!(
+        ready_send.await.unwrap(),
+        ActiveMessageOutcome::Accepted { .. }
+    ));
+
+    let timeout_send = tokio::spawn({
+        let root = root.clone();
+        async move {
+            root.send_active_message(
+                ActiveMessageRequest::try_new(TaskId::from("timeout"), "timeout").unwrap(),
+            )
+            .await
+        }
+    });
+    let timeout_call = harness.admission().await;
+    tokio::time::advance(Duration::from_secs(1)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(
+        timeout_send.await.unwrap(),
+        ActiveMessageOutcome::NotAcceptedBeforeDeadline
+    );
+    drop(timeout_call.release);
+
+    let cancel_send = tokio::spawn({
+        let root = root.clone();
+        async move {
+            root.send_active_message(
+                ActiveMessageRequest::try_new(TaskId::from("cancel"), "cancel").unwrap(),
+            )
+            .await
+        }
+    });
+    let cancel_call = harness.admission().await;
+    root.cancel_task(TaskId::from("cancel")).await.unwrap();
+    assert_eq!(
+        cancel_send.await.unwrap(),
+        ActiveMessageOutcome::NotAcceptedBeforeDeadline
+    );
+    drop(cancel_call.release);
+    tokio::time::timeout(Duration::from_millis(100), harness.handle.registry_counts())
+        .await
+        .expect("drop panic killed or wedged the actor")
+        .unwrap();
+}
+
+#[tokio::test]
+async fn future_drop_panic_is_contained_when_reply_drops_and_during_shutdown() {
+    let harness = Harness::with_behavior(
+        CoordinatorConfig {
+            cancel_grace: Duration::from_millis(5),
+            teardown_drain_timeout: Duration::from_millis(100),
+            ..CoordinatorConfig::default()
+        },
+        FactoryBehavior::DropPanic,
+    )
+    .await;
+    let root = harness.root("root", "session").await;
+    harness.spawn(&root, "dropped-reply").await;
+    harness.spawn(&root, "shutdown").await;
+    harness.wait_running("dropped-reply").await;
+    harness.wait_running("shutdown").await;
+    let mut events = harness.handle.subscribe();
+
+    let dropped_reply = tokio::spawn({
+        let root = root.clone();
+        async move {
+            root.send_active_message(
+                ActiveMessageRequest::try_new(TaskId::from("dropped-reply"), "drop").unwrap(),
+            )
+            .await
+        }
+    });
+    let dropped_call = harness.admission().await;
+    dropped_reply.abort();
+    dropped_call
+        .release
+        .send(ActiveMessageAdmission::Rejected)
+        .unwrap();
+    let dropped_event =
+        tokio::time::timeout(Duration::from_millis(100), next_message_event(&mut events))
+            .await
+            .expect("drop-panicking future did not produce its plain completion event");
+    assert_eq!(dropped_event.task_id, TaskId::from("dropped-reply"));
+    tokio::time::timeout(Duration::from_millis(100), harness.handle.registry_counts())
+        .await
+        .expect("failed response delivery dropped a runner future on the actor")
+        .unwrap();
+
+    let shutdown_send = tokio::spawn({
+        let root = root.clone();
+        async move {
+            root.send_active_message(
+                ActiveMessageRequest::try_new(TaskId::from("shutdown"), "shutdown").unwrap(),
+            )
+            .await
+        }
+    });
+    let shutdown_call = harness.admission().await;
+    let outcome = tokio::time::timeout(Duration::from_millis(250), harness.handle.shutdown())
+        .await
+        .expect("drop panic wedged shutdown")
+        .unwrap();
+    assert!(!matches!(outcome, lato_runtime::SinkShutdown::Drained) || shutdown_send.is_finished());
+    assert_eq!(
+        shutdown_send.await.unwrap(),
+        ActiveMessageOutcome::NotAcceptedBeforeDeadline
+    );
+    drop(shutdown_call.release);
 }
 
 #[tokio::test(start_paused = true)]
@@ -1008,10 +1353,12 @@ async fn reused_id_ignores_stale_generation_completion_and_has_fresh_counters() 
     harness.spawn(&root, "reused").await;
     harness.wait_running("reused").await;
 
-    old_call
-        .release
-        .send(ActiveMessageAdmission::Rejected)
-        .unwrap();
+    assert!(
+        old_call
+            .release
+            .send(ActiveMessageAdmission::Rejected)
+            .is_err()
+    );
     assert_eq!(
         old_send.await.unwrap(),
         ActiveMessageOutcome::AdmissionUncertain

@@ -157,6 +157,7 @@ impl CoordinatorState {
         &self,
         dropped_sink_events: u64,
         dropped_callback_work: u64,
+        dropped_active_message_rejections: u64,
         callback_execution_failures: u64,
         output_load_supervisors: usize,
     ) -> RegistryCounts {
@@ -165,6 +166,7 @@ impl CoordinatorState {
             total: self.tasks.len(),
             dropped_sink_events,
             dropped_callback_work,
+            dropped_active_message_rejections,
             callback_execution_failures,
             output_load_supervisors,
             ..RegistryCounts::default()
