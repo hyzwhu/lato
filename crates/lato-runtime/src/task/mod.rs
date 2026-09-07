@@ -4,6 +4,7 @@
 
 mod active_message;
 mod admission;
+mod backend;
 mod cancel;
 mod coordinator;
 mod protocol;
@@ -16,6 +17,7 @@ mod verification;
 
 pub use active_message::*;
 pub use admission::*;
+pub use backend::*;
 pub use cancel::*;
 pub use coordinator::{
     TaskCoordinator, spawn_task_coordinator, spawn_task_coordinator_with_verifier,
