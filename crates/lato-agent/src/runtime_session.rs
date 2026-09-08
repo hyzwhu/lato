@@ -455,6 +455,24 @@ impl RuntimeSession {
 
     pub async fn prompt(&self, input: String) -> Result<RuntimePromptOutcome, AgentError> {
         self.ensure_observation_open()?;
+        self.prompt_after_outer_observation_check(input).await
+    }
+
+    #[cfg(test)]
+    async fn prompt_after_outer_check_signal(
+        &self,
+        input: String,
+        passed_outer_check: tokio::sync::oneshot::Sender<()>,
+    ) -> Result<RuntimePromptOutcome, AgentError> {
+        self.ensure_observation_open()?;
+        let _ = passed_outer_check.send(());
+        self.prompt_after_outer_observation_check(input).await
+    }
+
+    async fn prompt_after_outer_observation_check(
+        &self,
+        input: String,
+    ) -> Result<RuntimePromptOutcome, AgentError> {
         // Locking before subscribing prevents a waiting prompt from consuming
         // another prompt's start event while preserving subscribe-before-submit.
         let gate = self.submission_gate.lock().await;
@@ -1275,11 +1293,16 @@ mod tests {
             None,
         ));
         let gate = session.submission_gate.lock().await;
+        let (passed_outer_check, outer_check_passed) = tokio::sync::oneshot::channel();
         let queued = tokio::spawn({
             let session = Arc::clone(&session);
-            async move { session.prompt("queued".into()).await }
+            async move {
+                session
+                    .prompt_after_outer_check_signal("queued".into(), passed_outer_check)
+                    .await
+            }
         });
-        tokio::task::yield_now().await;
+        outer_check_passed.await.unwrap();
 
         let pending =
             build_snapshot(2, DiscoveryResult::default(), &PluginConfig::default()).unwrap();
