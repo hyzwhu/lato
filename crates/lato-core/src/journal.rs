@@ -28,9 +28,49 @@ pub enum SkillInvocationOrigin {
     User,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HookAuditPhase {
+    DispatchStarted,
+    Completed,
+    Failed,
+    TimedOut,
+    ArgumentsRewritten,
+    OutputReplaced,
+    StopContinuation,
+    StopCapped,
+    GenerationAdopted,
+    GenerationRetired,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HookAuditOutcome {
+    Started,
+    Applied,
+    Skipped,
+    FailedOpen,
+    Blocked,
+    Cancelled,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ExtensionAuditRecord {
+    Hook {
+        generation: u64,
+        hook_id: String,
+        event: String,
+        phase: HookAuditPhase,
+        outcome: HookAuditOutcome,
+        duration_ms: Option<u64>,
+        effective_timeout_ms: u64,
+        input_hash: String,
+        output_hash: Option<String>,
+        replaced_prior_hook_id: Option<String>,
+        truncated: bool,
+        redacted_reason: Option<String>,
+    },
     SkillCatalogMaterialized {
         generation: u64,
         visible_count: u64,

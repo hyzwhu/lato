@@ -177,8 +177,40 @@ their previous generation until a subsequent `lato/plugins/reload` (or
 session restart) advances them, so consumers can rely on a follow-up reload
 to converge.
 
-Hooks and MCP descriptors are cataloged but are not executed yet; hook runtime
-support is Phase 6B2 and MCP remains Phase 6C.
+### Plugin hooks
+
+Trusted, enabled plugins may declare `hooks/hooks.json` or an inline `hooks`
+object. Phase 6B supports `SessionStart`, `SessionEnd`, `UserPromptSubmit`,
+`PreToolUse`, `PostToolUse`, `Stop`, `PreCompact`, and `PostCompact`, including
+case/separator compatibility aliases. A canonical configuration is:
+
+```json
+{"hooks":{"PreToolUse":[{"matcher":"read_file|search","hooks":[{"type":"command","command":"./check","timeout":5},{"type":"http","url":"https://hooks.example.invalid/check"}]}]}}
+```
+
+Handlers execute sequentially in stable plugin/group order. Missing, empty, or
+`*` matchers match all; simple `a|b` forms are exact alternatives and other
+forms are regular expressions. Command hooks receive bounded JSON on stdin,
+authentic `LATO_*` identity variables, a one-MiB combined output limit, and
+process-tree cleanup on timeout or cancellation. HTTP hooks accept HTTPS only,
+disable redirects, resolve and reject private/link-local/CGNAT/unspecified
+destinations, and intentionally allow loopback for trusted local hooks. As in
+the pinned upstream baseline, DNS is checked before the request; connection-time
+address pinning is not yet provided.
+
+Failures and timeouts fail open; healthy explicit block decisions are enforced.
+Defaults are 5s for observers and `PreToolUse`, 30s for `UserPromptSubmit`, 600s
+for `PostToolUse`/`Stop`, and 1500ms for `SessionEnd` (explicit SessionEnd values
+cap at 60s). `PreToolUse` may replace the complete argument object, but never
+the resolved tool name. Every replacement is passed through schema validation,
+PolicyEngine, approval, scope, and sandbox planning again; a hook `allow` grants
+no authority. Stop continuation is capped at eight. Reloads apply at turn
+boundaries, child sessions materialize hooks only after capability narrowing,
+and lifecycle/compaction observer mutations are ignored. Audit records store
+hashes and bounded metadata rather than prompt, arguments, output, environment,
+or URL credentials.
+
+MCP execution remains Phase 6C.
 
 ## Doctor
 

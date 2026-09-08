@@ -63,8 +63,11 @@ pub async fn run_command_hook(
     if payload.len() > MAX_PAYLOAD_BYTES {
         return Err(HookRunError::PayloadTooLarge);
     }
-    let command = spec.command.as_deref().ok_or(HookRunError::InvalidConfiguration)?;
-    let mut process = build_command(command, &spec.source_dir);
+    let command = spec
+        .command
+        .as_deref()
+        .ok_or(HookRunError::InvalidConfiguration)?;
+    let mut process = build_command(command, &spec.source_dir)?;
     process
         .current_dir(context.workspace_root)
         .stdin(Stdio::piped())
@@ -92,8 +95,16 @@ pub async fn run_command_hook(
     let stderr = child.stderr.take().ok_or(HookRunError::Io)?;
     let counter = Arc::new(AtomicUsize::new(0));
     let overflow = Arc::new(AtomicBool::new(false));
-    let stdout_task = tokio::spawn(read_bounded(stdout, Arc::clone(&counter), Arc::clone(&overflow)));
-    let stderr_task = tokio::spawn(read_bounded(stderr, Arc::clone(&counter), Arc::clone(&overflow)));
+    let stdout_task = tokio::spawn(read_bounded(
+        stdout,
+        Arc::clone(&counter),
+        Arc::clone(&overflow),
+    ));
+    let stderr_task = tokio::spawn(read_bounded(
+        stderr,
+        Arc::clone(&counter),
+        Arc::clone(&overflow),
+    ));
     let mut stdin = child.stdin.take().ok_or(HookRunError::Io)?;
     let stdin_task = tokio::spawn(async move {
         stdin.write_all(&payload).await?;
@@ -112,37 +123,61 @@ pub async fn run_command_hook(
         }
         status = child.wait() => status.map_err(|_| HookRunError::Io)?,
     };
-    stdin_task.await.map_err(|_| HookRunError::Io)?.map_err(|_| HookRunError::Io)?;
-    let stdout = stdout_task.await.map_err(|_| HookRunError::Io)?.map_err(|_| HookRunError::Io)?;
-    let stderr = stderr_task.await.map_err(|_| HookRunError::Io)?.map_err(|_| HookRunError::Io)?;
+    stdin_task
+        .await
+        .map_err(|_| HookRunError::Io)?
+        .map_err(|_| HookRunError::Io)?;
+    let stdout = stdout_task
+        .await
+        .map_err(|_| HookRunError::Io)?
+        .map_err(|_| HookRunError::Io)?;
+    let stderr = stderr_task
+        .await
+        .map_err(|_| HookRunError::Io)?
+        .map_err(|_| HookRunError::Io)?;
     if overflow.load(Ordering::Relaxed) {
         return Err(HookRunError::OutputOverflow);
     }
     Ok(RawHookRun {
         stdout: String::from_utf8_lossy(&stdout).into_owned(),
-        stderr_preview: String::from_utf8_lossy(&stderr).chars().take(4096).collect(),
+        stderr_preview: String::from_utf8_lossy(&stderr)
+            .chars()
+            .take(4096)
+            .collect(),
         exit_code: status.code(),
         elapsed: started.elapsed(),
         truncated: false,
     })
 }
 
-fn build_command(command: &str, source_dir: &Path) -> Command {
+fn build_command(command: &str, source_dir: &Path) -> Result<Command, HookRunError> {
     if is_simple_path(command) {
         let path = PathBuf::from(command);
-        Command::new(if path.is_absolute() { path } else { source_dir.join(path) })
+        let path = if path.is_absolute() {
+            path
+        } else {
+            source_dir.join(path)
+        };
+        let canonical_source =
+            dunce::canonicalize(source_dir).map_err(|_| HookRunError::InvalidConfiguration)?;
+        let canonical_path =
+            dunce::canonicalize(path).map_err(|_| HookRunError::InvalidConfiguration)?;
+        if !canonical_path.starts_with(&canonical_source) || !canonical_path.is_file() {
+            return Err(HookRunError::InvalidConfiguration);
+        }
+        Ok(Command::new(canonical_path))
     } else {
         #[cfg(windows)]
         {
             let mut process = Command::new("cmd");
             process.args(["/C", command]);
-            process
+            Ok(process)
         }
         #[cfg(not(windows))]
         {
             let mut process = Command::new("/bin/sh");
             process.args(["-c", command]);
-            process
+            Ok(process)
         }
     }
 }
@@ -182,7 +217,10 @@ async fn terminate_tree(child: &mut Child) {
         unsafe {
             libc::kill(-(pid as i32), libc::SIGTERM);
         }
-        if time::timeout(Duration::from_millis(500), child.wait()).await.is_ok() {
+        if time::timeout(Duration::from_millis(500), child.wait())
+            .await
+            .is_ok()
+        {
             return;
         }
         unsafe {

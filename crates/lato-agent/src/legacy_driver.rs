@@ -218,7 +218,11 @@ impl LegacyTurnDriver {
     }
 
     pub async fn bind_turn_hooks(&self, registry: Arc<HookRegistry>) {
-        self.state.lock().await.actor.bind_turn_hook_registry(registry);
+        self.state
+            .lock()
+            .await
+            .actor
+            .bind_turn_hook_registry(registry);
     }
 
     pub async fn observe_hook(
@@ -226,7 +230,12 @@ impl LegacyTurnDriver {
         event: lato_extensions::hooks::HookEventName,
         payload: serde_json::Value,
     ) -> Vec<lato_extensions::hooks::HookRunRecord> {
-        self.state.lock().await.actor.observe_bound_hook(event, payload).await
+        self.state
+            .lock()
+            .await
+            .actor
+            .observe_bound_hook(event, payload)
+            .await
     }
 
     pub async fn active_model(&self) -> ActiveModelPort {

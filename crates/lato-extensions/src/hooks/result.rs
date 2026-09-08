@@ -24,15 +24,29 @@ pub struct ParsedHookResult {
 
 impl Default for ParsedHookResult {
     fn default() -> Self {
-        Self { decision: ParsedDecision::Allow, reason: None, updated_input: None, additional_context: None, updated_tool_output: None, continue_: None, stop_reason: None, system_message: None }
+        Self {
+            decision: ParsedDecision::Allow,
+            reason: None,
+            updated_input: None,
+            additional_context: None,
+            updated_tool_output: None,
+            continue_: None,
+            stop_reason: None,
+            system_message: None,
+        }
     }
 }
 
-pub fn parse_hook_result(event: HookEventName, stdout: &str, exit_code: Option<i32>) -> Result<ParsedHookResult, HookResultError> {
+pub fn parse_hook_result(
+    event: HookEventName,
+    stdout: &str,
+    exit_code: Option<i32>,
+) -> Result<ParsedHookResult, HookResultError> {
     let mut result = if stdout.trim().is_empty() {
         ParsedHookResult::default()
     } else {
-        let value: Value = serde_json::from_str(stdout).map_err(|_| HookResultError::MalformedJson)?;
+        let value: Value =
+            serde_json::from_str(stdout).map_err(|_| HookResultError::MalformedJson)?;
         parse_value(event, &value)
     };
     if exit_code == Some(2) && result.decision == ParsedDecision::Allow {
@@ -44,20 +58,43 @@ pub fn parse_hook_result(event: HookEventName, stdout: &str, exit_code: Option<i
 
 fn parse_value(event: HookEventName, value: &Value) -> ParsedHookResult {
     let nested = value.get("hookSpecificOutput").and_then(Value::as_object);
-    let nested_decision = nested.and_then(|nested| nested.get("permissionDecision")).and_then(Value::as_str);
+    let nested_decision = nested
+        .and_then(|nested| nested.get("permissionDecision"))
+        .and_then(Value::as_str);
     let top_decision = value.get("decision").and_then(Value::as_str);
     let decision = parse_decision(nested_decision.or(top_decision));
-    let nested_reason = nested.and_then(|nested| nested.get("permissionDecisionReason")).and_then(Value::as_str);
-    let reason = nested_reason.or_else(|| value.get("reason").and_then(Value::as_str)).map(|value| bounded_chars(value, MAX_REASON_CHARS));
+    let nested_reason = nested
+        .and_then(|nested| nested.get("permissionDecisionReason"))
+        .and_then(Value::as_str);
+    let reason = nested_reason
+        .or_else(|| value.get("reason").and_then(Value::as_str))
+        .map(|value| bounded_chars(value, MAX_REASON_CHARS));
     let mut result = ParsedHookResult {
         decision,
         reason,
-        updated_input: nested.and_then(|nested| nested.get("updatedInput")).filter(|value| value.is_object()).cloned(),
-        additional_context: nested.and_then(|nested| nested.get("additionalContext")).and_then(Value::as_str).map(|value| bounded_chars(value, MAX_FEEDBACK_CHARS)),
-        updated_tool_output: nested.and_then(|nested| nested.get("updatedToolOutput")).filter(|value| serde_json::to_vec(value).is_ok_and(|bytes| bytes.len() <= MAX_REPLACEMENT_CHARS)).cloned(),
+        updated_input: nested
+            .and_then(|nested| nested.get("updatedInput"))
+            .filter(|value| value.is_object())
+            .cloned(),
+        additional_context: nested
+            .and_then(|nested| nested.get("additionalContext"))
+            .and_then(Value::as_str)
+            .map(|value| bounded_chars(value, MAX_FEEDBACK_CHARS)),
+        updated_tool_output: nested
+            .and_then(|nested| nested.get("updatedToolOutput"))
+            .filter(|value| {
+                serde_json::to_vec(value).is_ok_and(|bytes| bytes.len() <= MAX_REPLACEMENT_CHARS)
+            })
+            .cloned(),
         continue_: value.get("continue").and_then(Value::as_bool),
-        stop_reason: value.get("stopReason").and_then(Value::as_str).map(|value| bounded_chars(value, MAX_REASON_CHARS)),
-        system_message: value.get("systemMessage").and_then(Value::as_str).map(|value| bounded_chars(value, MAX_FEEDBACK_CHARS)),
+        stop_reason: value
+            .get("stopReason")
+            .and_then(Value::as_str)
+            .map(|value| bounded_chars(value, MAX_REASON_CHARS)),
+        system_message: value
+            .get("systemMessage")
+            .and_then(Value::as_str)
+            .map(|value| bounded_chars(value, MAX_FEEDBACK_CHARS)),
     };
     match event.mode() {
         super::HookMode::Observe => {

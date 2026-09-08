@@ -1080,7 +1080,9 @@ impl RuntimeSession {
         let current = Arc::clone(&state.current);
         let catalog = Arc::clone(&state.current_skills);
         self.driver.bind_turn_skills(catalog).await;
-        self.driver.bind_turn_hooks(materialize_hooks(&current)).await;
+        self.driver
+            .bind_turn_hooks(materialize_hooks(&current))
+            .await;
         if !self.hooks_started.swap(true, Ordering::AcqRel) {
             let _ = self
                 .driver
@@ -1133,17 +1135,25 @@ impl RuntimeSession {
         gate: tokio::sync::MutexGuard<'a, ()>,
     ) -> Result<RuntimeCompactionOutcome, AgentError> {
         let snapshot = self.plugin_snapshot().await;
-        self.driver.bind_turn_hooks(materialize_hooks(&snapshot)).await;
+        self.driver
+            .bind_turn_hooks(materialize_hooks(&snapshot))
+            .await;
         if !self.hooks_started.swap(true, Ordering::AcqRel) {
-            let _ = self.driver.observe_hook(
-                lato_extensions::hooks::HookEventName::SessionStart,
-                serde_json::json!({"source":"compaction","generation":snapshot.generation()}),
-            ).await;
+            let _ = self
+                .driver
+                .observe_hook(
+                    lato_extensions::hooks::HookEventName::SessionStart,
+                    serde_json::json!({"source":"compaction","generation":snapshot.generation()}),
+                )
+                .await;
         }
-        let _ = self.driver.observe_hook(
-            lato_extensions::hooks::HookEventName::PreCompact,
-            serde_json::json!({"trigger":trigger}),
-        ).await;
+        let _ = self
+            .driver
+            .observe_hook(
+                lato_extensions::hooks::HookEventName::PreCompact,
+                serde_json::json!({"trigger":trigger}),
+            )
+            .await;
         let mut events = self.handle.subscribe();
         self.handle
             .submit(Command::CompactSession(CompactSession {
@@ -1190,10 +1200,13 @@ impl RuntimeSession {
                     checkpoint_id,
                     warning,
                 } if observed.as_ref() == Some(&compaction_id) => {
-                    let _ = self.driver.observe_hook(
-                        lato_extensions::hooks::HookEventName::PostCompact,
-                        serde_json::json!({"trigger":trigger,"before":before,"after":after}),
-                    ).await;
+                    let _ = self
+                        .driver
+                        .observe_hook(
+                            lato_extensions::hooks::HookEventName::PostCompact,
+                            serde_json::json!({"trigger":trigger,"before":before,"after":after}),
+                        )
+                        .await;
                     self.clear_operation(Some(&ActiveOperation::Compaction(compaction_id.clone())))
                         .await;
                     self.send_compaction_update(

@@ -32,9 +32,9 @@ pub struct HookMatcher {
 }
 
 impl HookMatcher {
-    pub fn compile(pattern: &str) -> Result<Self, regex::Error> {
+    pub fn compile(pattern: &str) -> Result<Self, HookMatcherError> {
         if pattern.len() > MAX_PATTERN_BYTES {
-            return Err(Regex::new("(").unwrap_err());
+            return Err(HookMatcherError::TooLong);
         }
         let compiled = if pattern.is_empty() || pattern == "*" {
             MatcherKind::All
@@ -48,7 +48,7 @@ impl HookMatcher {
                 .map(ToOwned::to_owned)
                 .collect::<Vec<_>>();
             if values.len() > MAX_SIMPLE_ALTERNATIVES {
-                return Err(Regex::new("(").unwrap_err());
+                return Err(HookMatcherError::TooManyAlternatives);
             }
             MatcherKind::Exact(values)
         } else {
@@ -81,6 +81,16 @@ impl HookMatcher {
             }
         }
     }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum HookMatcherError {
+    #[error("hook matcher exceeds 1 KiB")]
+    TooLong,
+    #[error("hook matcher has more than 64 alternatives")]
+    TooManyAlternatives,
+    #[error("invalid hook matcher: {0}")]
+    Regex(#[from] regex::Error),
 }
 
 fn compatibility_aliases(value: &str) -> Vec<String> {
@@ -126,8 +136,17 @@ pub struct HookRegistry {
 impl HookRegistry {
     pub fn from_specs(generation: u64, specs: Vec<HookSpec>) -> Arc<Self> {
         let mut by_event: BTreeMap<HookEventName, Vec<HookSpec>> = BTreeMap::new();
-        for spec in specs { by_event.entry(spec.event).or_default().push(spec); }
-        Arc::new(Self { generation, by_event: by_event.into_iter().map(|(event, specs)| (event, specs.into())).collect(), diagnostics: Arc::from([]) })
+        for spec in specs {
+            by_event.entry(spec.event).or_default().push(spec);
+        }
+        Arc::new(Self {
+            generation,
+            by_event: by_event
+                .into_iter()
+                .map(|(event, specs)| (event, specs.into()))
+                .collect(),
+            diagnostics: Arc::from([]),
+        })
     }
 
     pub fn generation(&self) -> u64 {
@@ -147,7 +166,11 @@ pub fn materialize_hooks(snapshot: &PluginSnapshot) -> Arc<HookRegistry> {
     let mut by_event: BTreeMap<HookEventName, Vec<HookSpec>> = BTreeMap::new();
     let mut diagnostics = Vec::new();
     let mut plugins = snapshot.active_plugins().collect::<Vec<_>>();
-    plugins.sort_by(|a, b| a.name.cmp(&b.name).then(a.canonical_root.cmp(&b.canonical_root)));
+    plugins.sort_by(|a, b| {
+        a.name
+            .cmp(&b.name)
+            .then(a.canonical_root.cmp(&b.canonical_root))
+    });
     for plugin in plugins {
         let mut sources = Vec::new();
         if let Some(path) = &plugin.hooks_path {
@@ -201,16 +224,34 @@ fn parse_source(
     diagnostics: &mut Vec<HookDiagnostic>,
 ) {
     let Some(events) = value.get("hooks").unwrap_or(value).as_object() else {
-        push_diagnostic(diagnostics, "hook.config_shape", plugin_name, path, "hook configuration must be an object");
+        push_diagnostic(
+            diagnostics,
+            "hook.config_shape",
+            plugin_name,
+            path,
+            "hook configuration must be an object",
+        );
         return;
     };
     for (event_name, groups) in events {
         let Some(event) = HookEventName::parse(event_name) else {
-            push_diagnostic(diagnostics, "hook.event_unknown", plugin_name, path.clone(), "unknown hook event");
+            push_diagnostic(
+                diagnostics,
+                "hook.event_unknown",
+                plugin_name,
+                path.clone(),
+                "unknown hook event",
+            );
             continue;
         };
         let Some(groups) = groups.as_array() else {
-            push_diagnostic(diagnostics, "hook.groups_invalid", plugin_name, path.clone(), "hook event groups must be an array");
+            push_diagnostic(
+                diagnostics,
+                "hook.groups_invalid",
+                plugin_name,
+                path.clone(),
+                "hook event groups must be an array",
+            );
             continue;
         };
         for (group_index, group) in groups.iter().enumerate() {
@@ -218,55 +259,109 @@ fn parse_source(
             let matcher = match HookMatcher::compile(matcher) {
                 Ok(matcher) => matcher,
                 Err(error) => {
-                    push_diagnostic(diagnostics, "hook.matcher_invalid", plugin_name, path.clone(), &error.to_string());
+                    push_diagnostic(
+                        diagnostics,
+                        "hook.matcher_invalid",
+                        plugin_name,
+                        path.clone(),
+                        &error.to_string(),
+                    );
                     continue;
                 }
             };
             let Some(handlers) = group.get("hooks").and_then(Value::as_array) else {
-                push_diagnostic(diagnostics, "hook.handlers_invalid", plugin_name, path.clone(), "hook group requires a hooks array");
+                push_diagnostic(
+                    diagnostics,
+                    "hook.handlers_invalid",
+                    plugin_name,
+                    path.clone(),
+                    "hook group requires a hooks array",
+                );
                 continue;
             };
             for (handler_index, handler) in handlers.iter().enumerate() {
                 let Some(kind) = handler.get("type").and_then(Value::as_str) else {
-                    push_diagnostic(diagnostics, "hook.handler_type_missing", plugin_name, path.clone(), "hook handler type is required");
+                    push_diagnostic(
+                        diagnostics,
+                        "hook.handler_type_missing",
+                        plugin_name,
+                        path.clone(),
+                        "hook handler type is required",
+                    );
                     continue;
                 };
                 let (handler_type, command, url) = match kind.to_ascii_lowercase().as_str() {
                     "command" => {
-                        let command = handler.get("command").and_then(Value::as_str).filter(|value| !value.is_empty());
+                        let command = handler
+                            .get("command")
+                            .and_then(Value::as_str)
+                            .filter(|value| !value.is_empty());
                         let Some(command) = command else {
-                            push_diagnostic(diagnostics, "hook.command_missing", plugin_name, path.clone(), "command handler requires command");
+                            push_diagnostic(
+                                diagnostics,
+                                "hook.command_missing",
+                                plugin_name,
+                                path.clone(),
+                                "command handler requires command",
+                            );
                             continue;
                         };
                         (HandlerType::Command, Some(command.to_owned()), None)
                     }
                     "http" | "https" => {
-                        let url = handler.get("url").and_then(Value::as_str).filter(|value| !value.is_empty());
+                        let url = handler
+                            .get("url")
+                            .and_then(Value::as_str)
+                            .filter(|value| !value.is_empty());
                         let Some(url) = url else {
-                            push_diagnostic(diagnostics, "hook.url_missing", plugin_name, path.clone(), "HTTP handler requires url");
+                            push_diagnostic(
+                                diagnostics,
+                                "hook.url_missing",
+                                plugin_name,
+                                path.clone(),
+                                "HTTP handler requires url",
+                            );
                             continue;
                         };
                         (HandlerType::Http, None, Some(url.to_owned()))
                     }
                     _ => {
-                        push_diagnostic(diagnostics, "hook.handler_type_unknown", plugin_name, path.clone(), "unsupported hook handler type");
+                        push_diagnostic(
+                            diagnostics,
+                            "hook.handler_type_unknown",
+                            plugin_name,
+                            path.clone(),
+                            "unsupported hook handler type",
+                        );
                         continue;
                     }
                 };
-                let configured_timeout = handler.get("timeout").and_then(Value::as_u64).unwrap_or(0);
-                let mut timeout_ms = if configured_timeout == 0 { event.default_timeout_ms() } else { configured_timeout.saturating_mul(1000) };
+                let configured_timeout =
+                    handler.get("timeout").and_then(Value::as_u64).unwrap_or(0);
+                let mut timeout_ms = if configured_timeout == 0 {
+                    event.default_timeout_ms()
+                } else {
+                    configured_timeout.saturating_mul(1000)
+                };
                 if event == HookEventName::SessionEnd && configured_timeout > 0 {
                     timeout_ms = timeout_ms.min(60_000);
                 }
                 let mut extra_env = BTreeMap::new();
                 if let Some(env) = handler.get("env").and_then(Value::as_object) {
                     for (key, value) in env {
-                        if reserved_env(key) { continue; }
-                        if let Some(value) = value.as_str() { extra_env.insert(key.clone(), value.to_owned()); }
+                        if reserved_env(key) {
+                            continue;
+                        }
+                        if let Some(value) = value.as_str() {
+                            extra_env.insert(key.clone(), value.to_owned());
+                        }
                     }
                 }
                 by_event.entry(event).or_default().push(HookSpec {
-                    id: format!("{plugin_name}:{source_index}:{}:{group_index}:{handler_index}", event.as_str()),
+                    id: format!(
+                        "{plugin_name}:{source_index}:{}:{group_index}:{handler_index}",
+                        event.as_str()
+                    ),
                     plugin_name: plugin_name.to_owned(),
                     event,
                     handler_type,
@@ -274,7 +369,11 @@ fn parse_source(
                     command,
                     url,
                     timeout_ms,
-                    source_dir: path.as_ref().and_then(|path| path.parent()).unwrap_or(plugin_root).to_path_buf(),
+                    source_dir: path
+                        .as_ref()
+                        .and_then(|path| path.parent())
+                        .unwrap_or(plugin_root)
+                        .to_path_buf(),
                     extra_env,
                 });
             }
@@ -283,16 +382,38 @@ fn parse_source(
 }
 
 fn reserved_env(key: &str) -> bool {
-    matches!(key, "LATO_HOOK_EVENT" | "LATO_HOOK_NAME" | "LATO_SESSION_ID" | "LATO_WORKSPACE_ROOT" | "CLAUDE_PROJECT_DIR")
+    matches!(
+        key,
+        "LATO_HOOK_EVENT"
+            | "LATO_HOOK_NAME"
+            | "LATO_SESSION_ID"
+            | "LATO_WORKSPACE_ROOT"
+            | "CLAUDE_PROJECT_DIR"
+    )
 }
 
-fn push_diagnostic(diagnostics: &mut Vec<HookDiagnostic>, code: &str, plugin_name: &str, path: Option<PathBuf>, message: &str) {
-    if diagnostics.len() >= MAX_DIAGNOSTICS { return; }
+fn push_diagnostic(
+    diagnostics: &mut Vec<HookDiagnostic>,
+    code: &str,
+    plugin_name: &str,
+    path: Option<PathBuf>,
+    message: &str,
+) {
+    if diagnostics.len() >= MAX_DIAGNOSTICS {
+        return;
+    }
     let mut message = message.to_owned();
     if message.len() > MAX_DIAGNOSTIC_BYTES {
         let mut end = MAX_DIAGNOSTIC_BYTES;
-        while !message.is_char_boundary(end) { end -= 1; }
+        while !message.is_char_boundary(end) {
+            end -= 1;
+        }
         message.truncate(end);
     }
-    diagnostics.push(HookDiagnostic { code: code.to_owned(), plugin_name: plugin_name.to_owned(), path, message });
+    diagnostics.push(HookDiagnostic {
+        code: code.to_owned(),
+        plugin_name: plugin_name.to_owned(),
+        path,
+        message,
+    });
 }

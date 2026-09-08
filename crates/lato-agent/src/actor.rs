@@ -5,8 +5,8 @@
 
 use crate::{
     AutoCompactionSuppression, ContextTracker, HistoryItem, PREFIRE_LEAD_PERCENT,
-    SamplingRecoveryBudget, SessionHookRuntime, SessionSkillHandle, SkillRuntimeBinding, TWO_PASS_SPLIT_PERCENT,
-    compaction_suppression_reason, fingerprint_prefix, split_for_two_pass,
+    SamplingRecoveryBudget, SessionHookRuntime, SessionSkillHandle, SkillRuntimeBinding,
+    TWO_PASS_SPLIT_PERCENT, compaction_suppression_reason, fingerprint_prefix, split_for_two_pass,
 };
 use async_trait::async_trait;
 use lato_ai::{
@@ -15,10 +15,10 @@ use lato_ai::{
 pub use lato_core::ApprovalRequest;
 use lato_core::{
     AgentError, CompactionPolicy, CompactionTrigger, ContextUsage, ExtensionAuditRecord,
-    JournalDurability, JournalRecord, ModelContent, ModelErrorKind, ModelMessage, ModelRole,
-    PolicyAuditDecision, PolicyAuditStage, PolicyDecision, Retryability, SessionId,
-    SkillInvocationOrigin, ToolCallId, ToolContext, ToolError, ToolName, TurnId,
-    journal_request_hash,
+    HookAuditOutcome, HookAuditPhase, JournalDurability, JournalRecord, ModelContent,
+    ModelErrorKind, ModelMessage, ModelRole, PolicyAuditDecision, PolicyAuditStage, PolicyDecision,
+    Retryability, SessionId, SkillInvocationOrigin, ToolCallId, ToolContext, ToolError, ToolName,
+    TurnId, journal_request_hash,
 };
 use lato_extensions::{hooks::HookRegistry, skills::SkillCatalog};
 use lato_runtime::{
@@ -248,9 +248,18 @@ impl SessionActor {
         payload: serde_json::Value,
     ) -> Vec<lato_extensions::hooks::HookRunRecord> {
         match &self.hook_runtime {
-            Some(runtime) => runtime
-                .observe(event, Some(self.turn_id.as_str()), payload, CancellationToken::new())
-                .await,
+            Some(runtime) => {
+                let runs = runtime
+                    .observe(
+                        event,
+                        Some(self.turn_id.as_str()),
+                        payload.clone(),
+                        CancellationToken::new(),
+                    )
+                    .await;
+                let _ = self.commit_hook_runs(runtime, event, &payload, &runs).await;
+                runs
+            }
             None => Vec::new(),
         }
     }
@@ -278,9 +287,18 @@ impl SessionActor {
             let result = runtime
                 .prompt_submit(self.turn_id.as_str(), &text, self.turn_cancellation.clone())
                 .await;
+            self.commit_hook_runs(
+                runtime,
+                lato_extensions::hooks::HookEventName::UserPromptSubmit,
+                &serde_json::json!({"promptHash":journal_request_hash("prompt", &serde_json::json!(text))}),
+                &result.runs,
+            ).await?;
             if let Some(block) = result.block {
                 self.active = false;
-                return Err(format!("hook.prompt_blocked [{}]: {}", block.hook_id, block.reason));
+                return Err(format!(
+                    "hook.prompt_blocked [{}]: {}",
+                    block.hook_id, block.reason
+                ));
             }
         }
         self.history.push(HistoryItem::User(text));
@@ -550,13 +568,21 @@ impl SessionActor {
                     continue;
                 }
                 if let Some(runtime) = &self.hook_runtime {
+                    let stop_input = serde_json::json!({"reason":"model_complete","lastAssistantContext":round_text});
                     let stop = runtime
                         .stop(
                             self.turn_id.as_str(),
-                            serde_json::json!({"reason":"model_complete","lastAssistantContext":round_text}),
+                            stop_input.clone(),
                             self.turn_cancellation.clone(),
                         )
                         .await;
+                    self.commit_hook_runs(
+                        runtime,
+                        lato_extensions::hooks::HookEventName::Stop,
+                        &serde_json::json!({"lastAssistantHash":journal_request_hash("stop", &stop_input)}),
+                        &stop.runs,
+                    )
+                    .await?;
                     if stop.prevent_continuation.is_none()
                         && (!stop.blocks.is_empty() || !stop.additional_context.is_empty())
                         && stop_continuations < lato_extensions::hooks::MAX_STOP_CONTINUATIONS
@@ -566,7 +592,11 @@ impl SessionActor {
                             .blocks
                             .into_iter()
                             .map(|block| block.reason)
-                            .chain(stop.additional_context.into_iter().map(|context| context.text))
+                            .chain(
+                                stop.additional_context
+                                    .into_iter()
+                                    .map(|context| context.text),
+                            )
                             .collect::<Vec<_>>()
                             .join("\n");
                         self.history.push(HistoryItem::System(format!(
@@ -671,16 +701,12 @@ impl SessionActor {
         let messages =
             crate::history_to_model_messages(&self.history).map_err(|error| error.to_string())?;
         let (two_pass, prior_model_attempts) = self.take_prefire(&messages, model_generation).await;
-        if let Some(runtime) = &self.hook_runtime {
-            let _ = runtime
-                .observe(
-                    lato_extensions::hooks::HookEventName::PreCompact,
-                    Some(self.turn_id.as_str()),
-                    serde_json::json!({"trigger": trigger, "messageCount": messages.len()}),
-                    self.turn_cancellation.clone(),
-                )
-                .await;
-        }
+        let _ = self
+            .observe_bound_hook(
+                lato_extensions::hooks::HookEventName::PreCompact,
+                serde_json::json!({"trigger": trigger, "messageCount": messages.len()}),
+            )
+            .await;
         let outcome = events
             .compact(AutomaticCompactionRequest {
                 trigger,
@@ -703,16 +729,12 @@ impl SessionActor {
             Ok(AutomaticCompactionOutcome::Compacted(messages)) => {
                 self.history = crate::model_messages_to_history(&messages)
                     .map_err(|error| error.to_string())?;
-                if let Some(runtime) = &self.hook_runtime {
-                    let _ = runtime
-                        .observe(
-                            lato_extensions::hooks::HookEventName::PostCompact,
-                            Some(self.turn_id.as_str()),
-                            serde_json::json!({"trigger": trigger, "messageCount": messages.len()}),
-                            self.turn_cancellation.clone(),
-                        )
-                        .await;
-                }
+                let _ = self
+                    .observe_bound_hook(
+                        lato_extensions::hooks::HookEventName::PostCompact,
+                        serde_json::json!({"trigger": trigger, "messageCount": messages.len()}),
+                    )
+                    .await;
                 self.context_tracker.reseed(&self.history);
                 let previous_suppression = self.context_tracker.automatic_compaction_suppression();
                 self.context_tracker.on_compaction_success();
@@ -989,6 +1011,12 @@ impl SessionActor {
                     self.turn_cancellation.clone(),
                 )
                 .await;
+            self.commit_hook_runs(
+                runtime,
+                lato_extensions::hooks::HookEventName::PreToolUse,
+                &serde_json::json!({"toolName":validated.canonical_name.as_str(),"argumentsHash":journal_request_hash(validated.canonical_name.as_str(), &final_arguments)}),
+                &result.runs,
+            ).await?;
             if let Some(updated) = result.updated_input {
                 final_arguments = updated;
             }
@@ -1002,7 +1030,8 @@ impl SessionActor {
                     ));
                 }
                 lato_extensions::hooks::HookDecision::Ask { reason, .. } => {
-                    hook_ask_reason = Some(reason.unwrap_or_else(|| "approval requested by hook".into()));
+                    hook_ask_reason =
+                        Some(reason.unwrap_or_else(|| "approval requested by hook".into()));
                 }
                 _ => {}
             }
@@ -1071,7 +1100,9 @@ impl SessionActor {
                             None => false,
                         };
                         if approved {
-                            tool_runtime.approve(&request).map(|fresh_grant| (prepared, fresh_grant))
+                            tool_runtime
+                                .approve(&request)
+                                .map(|fresh_grant| (prepared, fresh_grant))
                         } else {
                             Err(ToolError::new(
                                 "policy.approval_denied",
@@ -1208,7 +1239,7 @@ impl SessionActor {
                 self.commit(
                     JournalRecord::ToolCallRejected {
                         call_id,
-                        request_hash,
+                        request_hash: request_hash.clone(),
                         error: error.clone(),
                     },
                     JournalDurability::SyncData,
@@ -1235,19 +1266,40 @@ impl SessionActor {
                     self.turn_cancellation.clone(),
                 )
                 .await;
+            self.commit_hook_runs(
+                runtime,
+                lato_extensions::hooks::HookEventName::PostToolUse,
+                &serde_json::json!({"toolName":journal_name.as_str(),"requestHash":request_hash}),
+                &post.runs,
+            )
+            .await?;
             if let Some(replacement) = post.replacement {
                 out = replacement
                     .as_str()
                     .map(ToOwned::to_owned)
-                    .or_else(|| replacement.get("content").and_then(serde_json::Value::as_str).map(ToOwned::to_owned))
-                    .or_else(|| replacement.get("text").and_then(serde_json::Value::as_str).map(ToOwned::to_owned))
+                    .or_else(|| {
+                        replacement
+                            .get("content")
+                            .and_then(serde_json::Value::as_str)
+                            .map(ToOwned::to_owned)
+                    })
+                    .or_else(|| {
+                        replacement
+                            .get("text")
+                            .and_then(serde_json::Value::as_str)
+                            .map(ToOwned::to_owned)
+                    })
                     .unwrap_or_else(|| replacement.to_string());
             }
             post_hook_context = post
                 .blocks
                 .into_iter()
                 .map(|block| block.reason)
-                .chain(post.additional_context.into_iter().map(|context| context.text))
+                .chain(
+                    post.additional_context
+                        .into_iter()
+                        .map(|context| context.text),
+                )
                 .collect();
         }
         let out = bound_tool_output(out, &self.cwd, &id).await?;
@@ -1257,10 +1309,85 @@ impl SessionActor {
         }
         self.history
             .push(HistoryItem::ToolResult { id, output: out });
-        for context in pre_hook_context.into_iter().map(|context| context.text).chain(post_hook_context) {
-            self.history.push(HistoryItem::System(format!("Hook context:\n{context}")));
+        for context in pre_hook_context
+            .into_iter()
+            .map(|context| context.text)
+            .chain(post_hook_context)
+        {
+            self.history
+                .push(HistoryItem::System(format!("Hook context:\n{context}")));
         }
         Ok(ProcessTool::Executed)
+    }
+
+    async fn commit_hook_runs(
+        &self,
+        runtime: &SessionHookRuntime,
+        event: lato_extensions::hooks::HookEventName,
+        input: &serde_json::Value,
+        runs: &[lato_extensions::hooks::HookRunRecord],
+    ) -> Result<(), String> {
+        let input_hash = journal_request_hash(event.as_str(), input);
+        for run in runs {
+            self.commit(
+                JournalRecord::ExtensionAudit {
+                    audit: ExtensionAuditRecord::Hook {
+                        generation: runtime.generation(),
+                        hook_id: run.hook_id.clone(),
+                        event: event.as_str().into(),
+                        phase: HookAuditPhase::DispatchStarted,
+                        outcome: HookAuditOutcome::Started,
+                        duration_ms: None,
+                        effective_timeout_ms: runtime.timeout_for(&run.hook_id),
+                        input_hash: input_hash.clone(),
+                        output_hash: None,
+                        replaced_prior_hook_id: None,
+                        truncated: false,
+                        redacted_reason: None,
+                    },
+                },
+                JournalDurability::Flush,
+            )
+            .await?;
+            let (phase, outcome) = match run.outcome {
+                lato_extensions::hooks::HookRunOutcome::Completed => {
+                    (HookAuditPhase::Completed, HookAuditOutcome::Applied)
+                }
+                lato_extensions::hooks::HookRunOutcome::Skipped => {
+                    (HookAuditPhase::Completed, HookAuditOutcome::Skipped)
+                }
+                lato_extensions::hooks::HookRunOutcome::TimedOut => {
+                    (HookAuditPhase::TimedOut, HookAuditOutcome::FailedOpen)
+                }
+                lato_extensions::hooks::HookRunOutcome::Cancelled => {
+                    (HookAuditPhase::Failed, HookAuditOutcome::Cancelled)
+                }
+                lato_extensions::hooks::HookRunOutcome::Failed => {
+                    (HookAuditPhase::Failed, HookAuditOutcome::FailedOpen)
+                }
+            };
+            self.commit(
+                JournalRecord::ExtensionAudit {
+                    audit: ExtensionAuditRecord::Hook {
+                        generation: runtime.generation(),
+                        hook_id: run.hook_id.clone(),
+                        event: event.as_str().into(),
+                        phase,
+                        outcome,
+                        duration_ms: Some(run.duration_ms),
+                        effective_timeout_ms: runtime.timeout_for(&run.hook_id),
+                        input_hash: input_hash.clone(),
+                        output_hash: None,
+                        replaced_prior_hook_id: None,
+                        truncated: false,
+                        redacted_reason: None,
+                    },
+                },
+                JournalDurability::Flush,
+            )
+            .await?;
+        }
+        Ok(())
     }
 
     pub fn compact_explicit(

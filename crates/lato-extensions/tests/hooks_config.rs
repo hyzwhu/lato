@@ -4,9 +4,18 @@ use lato_extensions::hooks::{
 
 #[test]
 fn event_aliases_modes_and_timeouts_are_stable() {
-    assert_eq!(HookEventName::parse("pre-tool-use"), Some(HookEventName::PreToolUse));
-    assert_eq!(HookEventName::parse("BeforeTool"), Some(HookEventName::PreToolUse));
-    assert_eq!(HookEventName::parse("post_compact"), Some(HookEventName::PostCompact));
+    assert_eq!(
+        HookEventName::parse("pre-tool-use"),
+        Some(HookEventName::PreToolUse)
+    );
+    assert_eq!(
+        HookEventName::parse("BeforeTool"),
+        Some(HookEventName::PreToolUse)
+    );
+    assert_eq!(
+        HookEventName::parse("post_compact"),
+        Some(HookEventName::PostCompact)
+    );
     assert_eq!(HookEventName::SessionStart.mode(), HookMode::Observe);
     assert_eq!(HookEventName::PreToolUse.mode(), HookMode::Tool);
     assert_eq!(HookEventName::UserPromptSubmit.default_timeout_ms(), 30_000);
@@ -18,8 +27,16 @@ fn event_aliases_modes_and_timeouts_are_stable() {
 fn matcher_supports_all_exact_aliases_and_regex() {
     assert!(HookMatcher::compile("").unwrap().matches("read_file"));
     assert!(HookMatcher::compile("*").unwrap().matches("read_file"));
-    assert!(HookMatcher::compile("read_file|search").unwrap().matches("read_file"));
-    assert!(HookMatcher::compile("read_.*").unwrap().matches("read_file"));
+    assert!(
+        HookMatcher::compile("read_file|search")
+            .unwrap()
+            .matches("read_file")
+    );
+    assert!(
+        HookMatcher::compile("read_.*")
+            .unwrap()
+            .matches("read_file")
+    );
     assert!(!HookMatcher::compile("^read$").unwrap().matches("read_file"));
     assert!(HookMatcher::compile("(").is_err());
 }
