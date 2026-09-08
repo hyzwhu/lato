@@ -2,6 +2,7 @@
 // License: Apache-2.0
 // Lato changes: immutable registries, bounded runners, and authority-preserving typed outcomes
 
+mod command;
 mod config;
 mod event;
 mod result;
@@ -17,3 +18,4 @@ pub const MAX_FEEDBACK_CHARS: usize = 10_000;
 pub const MAX_REPLACEMENT_CHARS: usize = 64 * 1024;
 pub const MAX_STOP_CONTINUATIONS: usize = 8;
 pub const MAX_CONTEXT_BYTES: usize = 64 * 1024;
+pub use command::*;
