@@ -1,9 +1,13 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use lato_core::{Retryability, SkillInvocationOrigin, ToolContext, ToolError};
+use lato_core::{Retryability, SkillInvocationOrigin, ToolCapability, ToolContext, ToolError};
 use lato_extensions::skills::{SkillCatalog, SkillDiscovery, SkillInvokeError};
-use lato_tools::{ResolvedSkill, SkillResolver};
+use lato_tools::{
+    BuiltinToolEnvironment, ResolvedSkill, RuntimeBuildError, SkillResolver, ToolRuntime,
+};
+use lato_workspace::{FileLocks, SessionTrust};
+use std::path::PathBuf;
 use tokio::sync::RwLock;
 
 /// Session-owned indirection used by the built-in `skill` tool.
@@ -14,6 +18,54 @@ use tokio::sync::RwLock;
 #[derive(Clone)]
 pub struct SessionSkillHandle {
     catalog: Arc<RwLock<Arc<SkillCatalog>>>,
+}
+
+/// Opaque, construction-safe pairing of a tool runtime and its skill catalog
+/// handle. Consumers cannot substitute either half after construction.
+pub struct SkillRuntimeBinding {
+    runtime: Arc<ToolRuntime>,
+    handle: SessionSkillHandle,
+}
+
+impl SkillRuntimeBinding {
+    pub fn builtin(
+        cwd: PathBuf,
+        locks: Arc<FileLocks>,
+        trust: SessionTrust,
+    ) -> Result<Self, RuntimeBuildError> {
+        Self::builtin_for_capabilities(cwd, locks, trust, None)
+    }
+
+    pub fn builtin_for_capabilities(
+        cwd: PathBuf,
+        locks: Arc<FileLocks>,
+        trust: SessionTrust,
+        capabilities: Option<&[ToolCapability]>,
+    ) -> Result<Self, RuntimeBuildError> {
+        Self::build(|resolver| {
+            lato_tools::builtin_tool_runtime_for_capabilities(
+                BuiltinToolEnvironment {
+                    cwd,
+                    locks,
+                    trust,
+                    skill_resolver: Some(resolver),
+                },
+                capabilities,
+            )
+        })
+    }
+
+    pub(crate) fn build(
+        builder: impl FnOnce(Arc<dyn SkillResolver>) -> Result<Arc<ToolRuntime>, RuntimeBuildError>,
+    ) -> Result<Self, RuntimeBuildError> {
+        let handle = SessionSkillHandle::default();
+        let runtime = builder(Arc::new(handle.clone()))?;
+        Ok(Self { runtime, handle })
+    }
+
+    pub(crate) fn into_parts(self) -> (Arc<ToolRuntime>, SessionSkillHandle) {
+        (self.runtime, self.handle)
+    }
 }
 
 impl Default for SessionSkillHandle {

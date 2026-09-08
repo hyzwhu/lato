@@ -426,35 +426,28 @@ async fn production_host_resume_and_child_bind_the_same_resolver_handle() {
     asserts_bound_skill_context(&resume_stream.contexts().await);
 
     let child_stream = Arc::new(RecordingStream::scripted(invocation_script()));
-    let child_handle = SessionSkillHandle::default();
     let locks = Arc::new(FileLocks::new());
     let trust = SessionTrust::for_headless_prompt(&fixture.workspace);
-    let child_runtime = builtin_tool_runtime_for_capabilities(
-        BuiltinToolEnvironment {
-            cwd: fixture.workspace.clone(),
-            locks: locks.clone(),
-            trust: trust.clone(),
-            skill_resolver: Some(Arc::new(child_handle.clone())),
-        },
+    let child_runtime = lato_agent::SkillRuntimeBinding::builtin_for_capabilities(
+        fixture.workspace.clone(),
+        locks.clone(),
+        trust.clone(),
         Some(&[ToolCapability::FileRead, ToolCapability::ExtensionInvoke]),
     )
     .unwrap();
     let (updates, _) = mpsc::unbounded_channel();
-    let child = RuntimeSession::new_child_with_skill_handle(
-        ChildSessionConfig {
-            session_id: "child-skills".into(),
-            stream: child_stream.clone(),
-            locks,
-            trust,
-            cwd: fixture.workspace.clone(),
-            updates,
-            approval: None,
-            tool_runtime: child_runtime,
-            initial_history: vec![HistoryItem::System("child".into())],
-            plugin_snapshot: fixture.snapshot(3, true, true),
-        },
-        Some(child_handle),
-    )
+    let child = RuntimeSession::new_child(ChildSessionConfig {
+        session_id: "child-skills".into(),
+        stream: child_stream.clone(),
+        locks,
+        trust,
+        cwd: fixture.workspace.clone(),
+        updates,
+        approval: None,
+        tool_runtime: lato_agent::ChildToolRuntime::from(child_runtime),
+        initial_history: vec![HistoryItem::System("child".into())],
+        plugin_snapshot: fixture.snapshot(3, true, true),
+    })
     .await
     .unwrap();
     child.prompt("inspect".into()).await.unwrap();

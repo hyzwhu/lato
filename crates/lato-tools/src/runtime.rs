@@ -54,6 +54,7 @@ pub struct PreparedToolCall {
     decision: PolicyDecision,
     audit: PreparedToolAudit,
     skill_scope_guard: Option<SkillScopeGuard>,
+    canonical_builtin_skill: bool,
 }
 
 struct SkillScopeGuard {
@@ -65,6 +66,12 @@ struct SkillScopeGuard {
 impl PreparedToolCall {
     pub fn audit(&self) -> PreparedToolAudit {
         self.audit.clone()
+    }
+
+    /// True only for Lato's original built-in skill tool, never for a
+    /// higher-layer replacement that reuses the same canonical name.
+    pub fn is_canonical_builtin_skill(&self) -> bool {
+        self.canonical_builtin_skill
     }
 
     pub fn policy_audit(
@@ -329,6 +336,10 @@ impl ToolRuntime {
             )
         })?;
         let decision = self.policy.evaluate(&request);
+        let canonical_builtin_skill = descriptor.name.as_str() == "builtin:skill"
+            && descriptor.source.layer == lato_core::ToolLayer::Builtin
+            && descriptor.source.id == "lato.builtin.skill"
+            && descriptor.source.replacement.is_none();
         let audit = PreparedToolAudit {
             call_id: context.call_id.clone(),
             tool_name: descriptor.name,
@@ -352,6 +363,7 @@ impl ToolRuntime {
                 cwd: self.scope.workspace_root.clone(),
                 original_arguments,
             }),
+            canonical_builtin_skill,
         })
     }
 

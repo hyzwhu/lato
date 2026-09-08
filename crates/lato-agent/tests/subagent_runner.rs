@@ -104,7 +104,7 @@ async fn child_session_uses_injected_history_and_shuts_down_boundedly() {
         cwd,
         updates,
         approval: None,
-        tool_runtime,
+        tool_runtime: lato_agent::ChildToolRuntime::without_skills(tool_runtime),
         initial_history: vec![HistoryItem::System("bounded child context".into())],
         plugin_snapshot: lato_extensions::PluginSnapshot::empty(),
     })

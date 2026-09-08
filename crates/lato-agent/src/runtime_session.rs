@@ -3,7 +3,7 @@
 // Lato changes: serialized per-session model switch with checkpoint-first immediate compaction
 
 use crate::{
-    HistoryItem, LegacyTurnDriver, SessionSkillHandle, SwitchCompaction, ToolApproval,
+    HistoryItem, LegacyTurnDriver, SkillRuntimeBinding, SwitchCompaction, ToolApproval,
     decide_switch_compaction, estimate_history_tokens, model_messages_to_history,
 };
 use lato_ai::{ActiveModelStream, ModelStream, adapt_model_endpoint};
@@ -83,10 +83,53 @@ pub struct RuntimeSession {
     handle: SessionHandle,
     driver: Arc<LegacyTurnDriver>,
     updates: mpsc::UnboundedSender<serde_json::Value>,
-    active_operation: Mutex<Option<ActiveOperation>>,
+    active_operation: Arc<Mutex<Option<ActiveOperation>>>,
     submission_gate: Mutex<()>,
-    plugin_state: Mutex<SessionPluginState>,
-    failed_closed: AtomicBool,
+    plugin_state: Arc<Mutex<SessionPluginState>>,
+    failed_closed: Arc<AtomicBool>,
+}
+
+struct PromptCleanupGuard {
+    armed: bool,
+    handle: SessionHandle,
+    active_operation: Arc<Mutex<Option<ActiveOperation>>>,
+    plugin_state: Arc<Mutex<SessionPluginState>>,
+    failed_closed: Arc<AtomicBool>,
+}
+
+impl PromptCleanupGuard {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PromptCleanupGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.failed_closed.store(true, Ordering::Release);
+        let handle = self.handle.clone();
+        let active_operation = Arc::clone(&self.active_operation);
+        let plugin_state = Arc::clone(&self.plugin_state);
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let _ = handle.submit(Command::Shutdown).await;
+                *active_operation.lock().await = None;
+                let mut state = plugin_state.lock().await;
+                state.active_turn = None;
+                state.active_turn_skills = None;
+            });
+        } else {
+            if let Ok(mut active) = active_operation.try_lock() {
+                *active = None;
+            }
+            if let Ok(mut state) = plugin_state.try_lock() {
+                state.active_turn = None;
+                state.active_turn_skills = None;
+            }
+        }
+    }
 }
 
 struct SessionPluginState {
@@ -95,6 +138,11 @@ struct SessionPluginState {
     active_turn: Option<Arc<PluginSnapshot>>,
     active_turn_skills: Option<Arc<SkillCatalog>>,
     pending: Option<(Arc<PluginSnapshot>, Arc<SkillCatalog>)>,
+}
+
+enum DriverToolRuntime {
+    Unbound(Arc<lato_tools::ToolRuntime>),
+    Skills(SkillRuntimeBinding),
 }
 
 impl Default for SessionPluginState {
@@ -117,20 +165,64 @@ pub struct ChildSessionConfig {
     pub cwd: PathBuf,
     pub updates: mpsc::UnboundedSender<serde_json::Value>,
     pub approval: Option<Arc<dyn ToolApproval>>,
-    pub tool_runtime: Arc<lato_tools::ToolRuntime>,
+    pub tool_runtime: ChildToolRuntime,
     pub initial_history: Vec<HistoryItem>,
     pub plugin_snapshot: Arc<PluginSnapshot>,
 }
 
+pub struct ChildToolRuntime {
+    runtime: Option<Arc<lato_tools::ToolRuntime>>,
+    skills: Option<SkillRuntimeBinding>,
+}
+
+impl ChildToolRuntime {
+    pub fn without_skills(runtime: Arc<lato_tools::ToolRuntime>) -> Self {
+        Self {
+            runtime: Some(runtime),
+            skills: None,
+        }
+    }
+}
+
+impl From<SkillRuntimeBinding> for ChildToolRuntime {
+    fn from(skills: SkillRuntimeBinding) -> Self {
+        Self {
+            runtime: None,
+            skills: Some(skills),
+        }
+    }
+}
+
 impl RuntimeSession {
-    pub async fn new_child(config: ChildSessionConfig) -> Result<Self, AgentError> {
-        Self::new_child_with_skill_handle(config, None).await
+    fn from_driver(
+        session_id: SessionId,
+        driver: Arc<LegacyTurnDriver>,
+        updates: mpsc::UnboundedSender<serde_json::Value>,
+    ) -> Self {
+        let runtime_driver: Arc<dyn TurnDriver> = driver.clone();
+        let handle = spawn_session(session_id.clone(), runtime_driver);
+        Self::from_spawned_driver(session_id, driver, updates, handle)
     }
 
-    pub async fn new_child_with_skill_handle(
-        config: ChildSessionConfig,
-        skill_handle: Option<SessionSkillHandle>,
-    ) -> Result<Self, AgentError> {
+    fn from_spawned_driver(
+        session_id: SessionId,
+        driver: Arc<LegacyTurnDriver>,
+        updates: mpsc::UnboundedSender<serde_json::Value>,
+        handle: SessionHandle,
+    ) -> Self {
+        Self {
+            session_id,
+            handle,
+            driver,
+            updates,
+            active_operation: Arc::new(Mutex::new(None)),
+            submission_gate: Mutex::new(()),
+            plugin_state: Arc::new(Mutex::new(SessionPluginState::default())),
+            failed_closed: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub async fn new_child(config: ChildSessionConfig) -> Result<Self, AgentError> {
         let session_id = SessionId::parse(config.session_id.clone()).map_err(|error| {
             AgentError::new(
                 "task.child.invalid_session_id",
@@ -139,8 +231,8 @@ impl RuntimeSession {
                 Retryability::Never,
             )
         })?;
-        let driver = Arc::new(
-            LegacyTurnDriver::new_with_endpoint_tool_runtime_and_skill_handle(
+        let driver = Arc::new(match config.tool_runtime.skills {
+            Some(binding) => LegacyTurnDriver::new_with_endpoint_skill_runtime(
                 config.session_id,
                 endpoint_from_stream(config.stream),
                 config.locks,
@@ -148,10 +240,22 @@ impl RuntimeSession {
                 config.cwd,
                 config.updates.clone(),
                 config.approval,
-                config.tool_runtime,
-                skill_handle,
+                binding,
             ),
-        );
+            None => LegacyTurnDriver::new_with_endpoint_and_tool_runtime(
+                config.session_id,
+                endpoint_from_stream(config.stream),
+                config.locks,
+                config.trust,
+                config.cwd,
+                config.updates.clone(),
+                config.approval,
+                config
+                    .tool_runtime
+                    .runtime
+                    .expect("unbound child runtime is present"),
+            ),
+        });
         if !config.initial_history.is_empty() {
             driver.replace_history(config.initial_history).await;
         }
@@ -162,10 +266,10 @@ impl RuntimeSession {
             handle,
             driver,
             updates: config.updates,
-            active_operation: Mutex::new(None),
+            active_operation: Arc::new(Mutex::new(None)),
             submission_gate: Mutex::new(()),
-            plugin_state: Mutex::new(SessionPluginState::default()),
-            failed_closed: AtomicBool::new(false),
+            plugin_state: Arc::new(Mutex::new(SessionPluginState::default())),
+            failed_closed: Arc::new(AtomicBool::new(false)),
         };
         session
             .stage_plugin_snapshot(config.plugin_snapshot)
@@ -221,10 +325,10 @@ impl RuntimeSession {
             handle,
             driver,
             updates,
-            active_operation: Mutex::new(None),
+            active_operation: Arc::new(Mutex::new(None)),
             submission_gate: Mutex::new(()),
-            plugin_state: Mutex::new(SessionPluginState::default()),
-            failed_closed: AtomicBool::new(false),
+            plugin_state: Arc::new(Mutex::new(SessionPluginState::default())),
+            failed_closed: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -239,21 +343,22 @@ impl RuntimeSession {
         approval: Option<Arc<dyn ToolApproval>>,
         tool_runtime: Arc<lato_tools::ToolRuntime>,
     ) -> Self {
-        Self::new_with_endpoint_tool_runtime_and_skill_handle(
-            session_id,
+        let session_id = SessionId::from(session_id);
+        let driver = Arc::new(LegacyTurnDriver::new_with_endpoint_and_tool_runtime(
+            session_id.to_string(),
             endpoint,
             locks,
             trust,
             cwd,
-            updates,
+            updates.clone(),
             approval,
             tool_runtime,
-            None,
-        )
+        ));
+        Self::from_driver(session_id, driver, updates)
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn new_with_endpoint_tool_runtime_and_skill_handle(
+    pub(crate) fn new_with_endpoint_skill_runtime(
         session_id: String,
         endpoint: ActiveModelStream,
         locks: Arc<FileLocks>,
@@ -261,35 +366,22 @@ impl RuntimeSession {
         cwd: PathBuf,
         updates: mpsc::UnboundedSender<serde_json::Value>,
         approval: Option<Arc<dyn ToolApproval>>,
-        tool_runtime: Arc<lato_tools::ToolRuntime>,
-        skill_handle: Option<SessionSkillHandle>,
+        binding: SkillRuntimeBinding,
     ) -> Self {
         let session_id = SessionId::from(session_id);
-        let driver = Arc::new(
-            LegacyTurnDriver::new_with_endpoint_tool_runtime_and_skill_handle(
-                session_id.to_string(),
-                endpoint,
-                locks,
-                trust,
-                cwd,
-                updates.clone(),
-                approval,
-                tool_runtime,
-                skill_handle,
-            ),
-        );
+        let driver = Arc::new(LegacyTurnDriver::new_with_endpoint_skill_runtime(
+            session_id.to_string(),
+            endpoint,
+            locks,
+            trust,
+            cwd,
+            updates.clone(),
+            approval,
+            binding,
+        ));
         let runtime_driver: Arc<dyn TurnDriver> = driver.clone();
         let handle = spawn_session(session_id.clone(), runtime_driver);
-        Self {
-            session_id,
-            handle,
-            driver,
-            updates,
-            active_operation: Mutex::new(None),
-            submission_gate: Mutex::new(()),
-            plugin_state: Mutex::new(SessionPluginState::default()),
-            failed_closed: AtomicBool::new(false),
-        }
+        Self::from_spawned_driver(session_id, driver, updates, handle)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -330,33 +422,17 @@ impl RuntimeSession {
         store: Arc<dyn SessionStore>,
         replay: JournalReplay,
     ) -> Result<Self, AgentError> {
-        let skill_handle = SessionSkillHandle::default();
-        let tool_runtime = lato_tools::builtin_tool_runtime(lato_tools::BuiltinToolEnvironment {
-            cwd: cwd.clone(),
-            locks: locks.clone(),
-            trust: trust.clone(),
-            skill_resolver: Some(Arc::new(skill_handle.clone())),
-        })
-        .map_err(|error| {
-            AgentError::new(
-                "tool.runtime_initialization",
-                ErrorCategory::Tool,
-                error.to_string(),
-                Retryability::Never,
-            )
-        })?;
-        Self::new_with_store_endpoint_tool_runtime_and_skill_handle(
-            session_id,
-            endpoint,
-            locks,
-            trust,
-            cwd,
-            updates,
-            approval,
-            store,
-            replay,
-            tool_runtime,
-            Some(skill_handle),
+        let binding = SkillRuntimeBinding::builtin(cwd.clone(), locks.clone(), trust.clone())
+            .map_err(|error| {
+                AgentError::new(
+                    "tool.runtime_initialization",
+                    ErrorCategory::Tool,
+                    error.to_string(),
+                    Retryability::Never,
+                )
+            })?;
+        Self::new_with_store_endpoint_skill_runtime(
+            session_id, endpoint, locks, trust, cwd, updates, approval, store, replay, binding,
         )
         .await
     }
@@ -374,7 +450,7 @@ impl RuntimeSession {
         replay: JournalReplay,
         tool_runtime: Arc<lato_tools::ToolRuntime>,
     ) -> Result<Self, AgentError> {
-        Self::new_with_store_endpoint_tool_runtime_and_skill_handle(
+        Self::new_with_store_endpoint_runtime(
             session_id,
             endpoint,
             locks,
@@ -384,14 +460,13 @@ impl RuntimeSession {
             approval,
             store,
             replay,
-            tool_runtime,
-            None,
+            DriverToolRuntime::Unbound(tool_runtime),
         )
         .await
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub async fn new_with_store_endpoint_tool_runtime_and_skill_handle(
+    pub(crate) async fn new_with_store_endpoint_skill_runtime(
         session_id: String,
         endpoint: ActiveModelStream,
         locks: Arc<FileLocks>,
@@ -401,8 +476,35 @@ impl RuntimeSession {
         approval: Option<Arc<dyn ToolApproval>>,
         store: Arc<dyn SessionStore>,
         replay: JournalReplay,
-        tool_runtime: Arc<lato_tools::ToolRuntime>,
-        skill_handle: Option<SessionSkillHandle>,
+        binding: SkillRuntimeBinding,
+    ) -> Result<Self, AgentError> {
+        Self::new_with_store_endpoint_runtime(
+            session_id,
+            endpoint,
+            locks,
+            trust,
+            cwd,
+            updates,
+            approval,
+            store,
+            replay,
+            DriverToolRuntime::Skills(binding),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn new_with_store_endpoint_runtime(
+        session_id: String,
+        endpoint: ActiveModelStream,
+        locks: Arc<FileLocks>,
+        trust: SessionTrust,
+        cwd: PathBuf,
+        updates: mpsc::UnboundedSender<serde_json::Value>,
+        approval: Option<Arc<dyn ToolApproval>>,
+        store: Arc<dyn SessionStore>,
+        replay: JournalReplay,
+        tool_runtime: DriverToolRuntime,
     ) -> Result<Self, AgentError> {
         if let Some(unresolved) = replay.projection.unresolved_tools.first() {
             return Err(journal_error(JournalError::IncompleteSideEffect {
@@ -410,19 +512,32 @@ impl RuntimeSession {
             }));
         }
         let session_id = SessionId::from(session_id);
-        let driver = Arc::new(
-            LegacyTurnDriver::new_with_endpoint_tool_runtime_and_skill_handle(
-                session_id.to_string(),
-                endpoint,
-                locks,
-                trust,
-                cwd,
-                updates.clone(),
-                approval,
-                tool_runtime,
-                skill_handle,
-            ),
-        );
+        let driver = Arc::new(match tool_runtime {
+            DriverToolRuntime::Skills(binding) => {
+                LegacyTurnDriver::new_with_endpoint_skill_runtime(
+                    session_id.to_string(),
+                    endpoint,
+                    locks,
+                    trust,
+                    cwd,
+                    updates.clone(),
+                    approval,
+                    binding,
+                )
+            }
+            DriverToolRuntime::Unbound(tool_runtime) => {
+                LegacyTurnDriver::new_with_endpoint_and_tool_runtime(
+                    session_id.to_string(),
+                    endpoint,
+                    locks,
+                    trust,
+                    cwd,
+                    updates.clone(),
+                    approval,
+                    tool_runtime,
+                )
+            }
+        });
         let mut history =
             model_messages_to_history(&replay.projection.messages).map_err(journal_error)?;
         if !history.is_empty() && !matches!(history.first(), Some(HistoryItem::System(_))) {
@@ -446,10 +561,10 @@ impl RuntimeSession {
             handle,
             driver,
             updates,
-            active_operation: Mutex::new(None),
+            active_operation: Arc::new(Mutex::new(None)),
             submission_gate: Mutex::new(()),
-            plugin_state: Mutex::new(SessionPluginState::default()),
-            failed_closed: AtomicBool::new(false),
+            plugin_state: Arc::new(Mutex::new(SessionPluginState::default())),
+            failed_closed: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -481,7 +596,17 @@ impl RuntimeSession {
         // the gate before binding a plugin generation or touching the command
         // bus.
         self.ensure_observation_open()?;
-        self.begin_plugin_turn().await?;
+        let mut cleanup = PromptCleanupGuard {
+            armed: true,
+            handle: self.handle.clone(),
+            active_operation: Arc::clone(&self.active_operation),
+            plugin_state: Arc::clone(&self.plugin_state),
+            failed_closed: Arc::clone(&self.failed_closed),
+        };
+        if let Err(error) = self.begin_plugin_turn().await {
+            cleanup.disarm();
+            return Err(error);
+        }
         let mut events = self.handle.subscribe();
         if let Err(error) = self
             .handle
@@ -492,6 +617,7 @@ impl RuntimeSession {
             .await
         {
             self.abort_plugin_turn().await;
+            cleanup.disarm();
             return Err(error);
         }
 
@@ -501,14 +627,18 @@ impl RuntimeSession {
             let event = match events.recv().await {
                 Ok(event) => event,
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                    return Err(self
+                    let error = self
                         .fail_prompt_observation(PromptObservationFailure::Lagged(skipped))
-                        .await);
+                        .await;
+                    cleanup.disarm();
+                    return Err(error);
                 }
                 Err(broadcast::error::RecvError::Closed) => {
-                    return Err(self
+                    let error = self
                         .fail_prompt_observation(PromptObservationFailure::Closed)
-                        .await);
+                        .await;
+                    cleanup.disarm();
+                    return Err(error);
                 }
             };
 
@@ -519,9 +649,11 @@ impl RuntimeSession {
             match event.payload {
                 EventPayload::TurnStarted => {
                     let Some(turn_id) = event.turn_id else {
-                        return Err(self
+                        let error = self
                             .fail_prompt_observation(PromptObservationFailure::MissingTurnId)
-                            .await);
+                            .await;
+                        cleanup.disarm();
+                        return Err(error);
                     };
                     observed_turn = Some(turn_id.clone());
                     *self.active_operation.lock().await = Some(ActiveOperation::Turn(turn_id));
@@ -601,6 +733,7 @@ impl RuntimeSession {
                     if event.turn_id.as_ref() == observed_turn.as_ref() =>
                 {
                     self.finish_turn(observed_turn.as_ref()).await?;
+                    cleanup.disarm();
                     return Ok(RuntimePromptOutcome::Complete {
                         text: output.final_text,
                     });
@@ -609,17 +742,20 @@ impl RuntimeSession {
                     if event.turn_id.as_ref() == observed_turn.as_ref() =>
                 {
                     self.finish_turn(observed_turn.as_ref()).await?;
+                    cleanup.disarm();
                     return Ok(RuntimePromptOutcome::Cancelled { reason });
                 }
                 EventPayload::TurnFailed { error }
                     if event.turn_id.as_ref() == observed_turn.as_ref() =>
                 {
                     self.finish_turn(observed_turn.as_ref()).await?;
+                    cleanup.disarm();
                     return Err(error);
                 }
                 EventPayload::SessionStopped => {
                     self.clear_active(observed_turn.as_ref()).await;
                     self.abort_plugin_turn().await;
+                    cleanup.disarm();
                     return Err(runtime_stopped());
                 }
                 EventPayload::SessionStarted
@@ -683,6 +819,12 @@ impl RuntimeSession {
 
     pub async fn cancel(&self) -> Result<(), AgentError> {
         let _gate = self.submission_gate.lock().await;
+        if self.failed_closed.load(Ordering::Acquire) {
+            let _ = self.handle.submit(Command::Shutdown).await;
+            self.clear_active(None).await;
+            self.abort_plugin_turn().await;
+            return Ok(());
+        }
         let operation = self.active_operation.lock().await.clone();
         let Some(operation) = operation else {
             return Ok(());
@@ -719,7 +861,17 @@ impl RuntimeSession {
         let _gate = self.submission_gate.lock().await;
         let result = self.handle.submit(Command::Shutdown).await;
         *self.active_operation.lock().await = None;
-        result
+        self.abort_plugin_turn().await;
+        match result {
+            Err(error)
+                if self.failed_closed.load(Ordering::Acquire)
+                    && (error.code == "runtime.command_bus_closed"
+                        || error.code == "runtime.reply_bus_closed") =>
+            {
+                Ok(())
+            }
+            other => other,
+        }
     }
 
     pub async fn cancel_and_join(&self, deadline: Duration) -> Result<(), AgentError> {
@@ -1322,6 +1474,64 @@ mod tests {
         assert!(state.active_turn_skills.is_none());
         assert_eq!(state.current.generation(), 0);
         assert_eq!(state.pending.as_ref().unwrap().0.generation(), 2);
+    }
+
+    #[tokio::test]
+    async fn aborted_prompt_owns_shutdown_and_clears_facade_without_adopting_pending() {
+        let directory = tempfile::tempdir().unwrap();
+        let (updates, _) = mpsc::unbounded_channel();
+        let session = Arc::new(RuntimeSession::new(
+            "aborted-prompt-cleanup".into(),
+            Arc::new(BlockingTurnStream),
+            Arc::new(FileLocks::new()),
+            SessionTrust::for_headless_prompt(directory.path()),
+            directory.path().to_path_buf(),
+            updates,
+            None,
+        ));
+        let mut events = session.subscribe();
+        let prompt = tokio::spawn({
+            let session = Arc::clone(&session);
+            async move { session.prompt("block".into()).await }
+        });
+        loop {
+            let event = events.recv().await.unwrap();
+            if matches!(event.payload, EventPayload::TurnStarted) {
+                break;
+            }
+        }
+        let pending =
+            build_snapshot(2, DiscoveryResult::default(), &PluginConfig::default()).unwrap();
+        let pending_skills = SkillCatalog::from_discovery(discover_skills(&pending));
+        session.plugin_state.lock().await.pending = Some((pending, pending_skills));
+
+        prompt.abort();
+        assert!(prompt.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let inactive = !session.is_active().await;
+                let state = session.plugin_state.lock().await;
+                let cleaned =
+                    inactive && state.active_turn.is_none() && state.active_turn_skills.is_none();
+                drop(state);
+                if cleaned {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        assert!(session.failed_closed.load(Ordering::Acquire));
+        let state = session.plugin_state.lock().await;
+        assert_eq!(state.current.generation(), 0);
+        assert_eq!(state.pending.as_ref().unwrap().0.generation(), 2);
+        drop(state);
+        session.cancel().await.unwrap();
+        session.shutdown().await.unwrap();
+        assert!(!session.is_active().await);
+        assert_eq!(Arc::strong_count(&session), 1);
     }
 
     fn prefire_request() -> PrefireCompactionRequest {

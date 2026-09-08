@@ -5,8 +5,8 @@
 
 use crate::{
     ChildSessionRunner, PreparedModelSwitch, ProfileResultVerifier, RuntimeCompactionOutcome,
-    RuntimePromptOutcome, RuntimeSession, SessionPluginSnapshots, SessionSkillHandle, ToolApproval,
-    TranscriptStore, import_legacy_if_needed,
+    RuntimePromptOutcome, RuntimeSession, SessionPluginSnapshots, SkillRuntimeBinding,
+    ToolApproval, TranscriptStore, import_legacy_if_needed,
 };
 use lato_ai::{
     ActiveModelStream, CATALOG, CredentialStore, CustomHttpModelStream, CustomModel,
@@ -372,16 +372,17 @@ impl AcpHost {
         replay: Option<JournalReplay>,
     ) -> Result<Arc<RuntimeSession>, String> {
         let backend = self.ensure_task_root(sid).await?;
-        let skill_handle = SessionSkillHandle::default();
-        let tool_runtime = match lato_tools::builtin_tool_runtime_with_subagents(
-            lato_tools::BuiltinToolEnvironment {
-                cwd: self.cwd.clone(),
-                locks: self.locks.clone(),
-                trust: self.trust.clone(),
-                skill_resolver: Some(Arc::new(skill_handle.clone())),
-            },
-            backend.into_resource(),
-        ) {
+        let skill_runtime = match SkillRuntimeBinding::build(|skill_resolver| {
+            lato_tools::builtin_tool_runtime_with_subagents(
+                lato_tools::BuiltinToolEnvironment {
+                    cwd: self.cwd.clone(),
+                    locks: self.locks.clone(),
+                    trust: self.trust.clone(),
+                    skill_resolver: Some(skill_resolver),
+                },
+                backend.into_resource(),
+            )
+        }) {
             Ok(runtime) => runtime,
             Err(error) => {
                 let _ = self.teardown_task_root(sid).await;
@@ -404,7 +405,7 @@ impl AcpHost {
                     .map_err(|error| format!("model.unavailable_on_resume: {error}"))?,
                 None => self.default_endpoint.clone(),
             };
-            let session = RuntimeSession::new_with_store_endpoint_tool_runtime_and_skill_handle(
+            let session = RuntimeSession::new_with_store_endpoint_skill_runtime(
                 sid.to_string(),
                 endpoint,
                 self.locks.clone(),
@@ -414,8 +415,7 @@ impl AcpHost {
                 self.tool_approval.clone(),
                 store,
                 replay,
-                tool_runtime,
-                Some(skill_handle),
+                skill_runtime,
             )
             .await;
             return match session {
@@ -433,19 +433,16 @@ impl AcpHost {
                 }
             };
         }
-        let session = Arc::new(
-            RuntimeSession::new_with_endpoint_tool_runtime_and_skill_handle(
-                sid.to_string(),
-                self.default_endpoint.clone(),
-                self.locks.clone(),
-                self.trust.clone(),
-                self.cwd.clone(),
-                self.updates.clone(),
-                self.tool_approval.clone(),
-                tool_runtime,
-                Some(skill_handle),
-            ),
-        );
+        let session = Arc::new(RuntimeSession::new_with_endpoint_skill_runtime(
+            sid.to_string(),
+            self.default_endpoint.clone(),
+            self.locks.clone(),
+            self.trust.clone(),
+            self.cwd.clone(),
+            self.updates.clone(),
+            self.tool_approval.clone(),
+            skill_runtime,
+        ));
         if let Err(error) = self.attach_session_plugins(sid, &session).await {
             let _ = self.teardown_task_root(sid).await;
             return Err(error);
