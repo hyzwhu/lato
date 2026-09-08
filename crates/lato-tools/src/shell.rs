@@ -397,8 +397,7 @@ mod tests {
         // Pointing the backend at /bin/false simulates a wrapper binary that is on
         // disk but cannot actually execute a sandboxed command. This must surface
         // a typed unavailable error and must not silently run the command unsandboxed.
-        let backend =
-            lato_workspace::HostSandboxBackend::with_wrapper_override("/bin/false");
+        let backend = lato_workspace::HostSandboxBackend::with_wrapper_override("/bin/false");
         let readiness = backend.readiness(SandboxProfile::Workspace);
         // /bin/false is a regular file, so readiness will report Ready or Unavailable
         // depending on whether the probe accepts it; either way prepare must refuse.

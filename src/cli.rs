@@ -13,7 +13,9 @@ use lato_ai::{
     oauth_allowed, phase0_supported, provider_spec, refresh_openai_compatible_models,
     refresh_remote_provider_catalog_with_policy, store_oauth,
 };
-use lato_workspace::{ApprovalMode, HostSandboxBackend, SandboxBackend, SandboxReadiness, SessionTrust};
+use lato_workspace::{
+    ApprovalMode, HostSandboxBackend, SandboxBackend, SandboxReadiness, SessionTrust,
+};
 use std::{
     io::IsTerminal,
     path::PathBuf,
@@ -1079,7 +1081,9 @@ async fn login(provider: String, method: LoginMethod) -> i32 {
             return 1;
         }
         if key.trim().is_empty() {
-            eprintln!("error: --api-key for {provider} is empty; refusing to write an empty credential");
+            eprintln!(
+                "error: --api-key for {provider} is empty; refusing to write an empty credential"
+            );
             return 1;
         }
         let mut store = CredentialStore::open(&home).unwrap();
