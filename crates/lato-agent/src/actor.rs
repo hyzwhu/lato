@@ -264,6 +264,31 @@ impl SessionActor {
         }
     }
 
+    pub async fn gate_prompt_hook(&self, text: &str) -> crate::PromptHookGate {
+        let Some(runtime) = &self.hook_runtime else {
+            return crate::PromptHookGate {
+                block: None,
+                audits: Vec::new(),
+            };
+        };
+        let input = serde_json::json!({
+            "promptHash": journal_request_hash("prompt", &serde_json::json!(text))
+        });
+        let result = runtime
+            .prompt_submit("pre-submit", text, CancellationToken::new())
+            .await;
+        let audits = Self::hook_audit_records(
+            runtime,
+            lato_extensions::hooks::HookEventName::UserPromptSubmit,
+            &input,
+            &result.runs,
+        );
+        let block = result
+            .block
+            .map(|block| format!("hook.prompt_blocked [{}]: {}", block.hook_id, block.reason));
+        crate::PromptHookGate { block, audits }
+    }
+
     pub async fn prompt_with_context(
         &mut self,
         _kind: PromptKind,
@@ -283,24 +308,6 @@ impl SessionActor {
         self.context_tracker.on_new_turn();
         self.emit_suppression_if_changed(previous_suppression);
         let task_requires_workspace_change = task_requires_workspace_change(&text);
-        if let Some(runtime) = &self.hook_runtime {
-            let result = runtime
-                .prompt_submit(self.turn_id.as_str(), &text, self.turn_cancellation.clone())
-                .await;
-            self.commit_hook_runs(
-                runtime,
-                lato_extensions::hooks::HookEventName::UserPromptSubmit,
-                &serde_json::json!({"promptHash":journal_request_hash("prompt", &serde_json::json!(text))}),
-                &result.runs,
-            ).await?;
-            if let Some(block) = result.block {
-                self.active = false;
-                return Err(format!(
-                    "hook.prompt_blocked [{}]: {}",
-                    block.hook_id, block.reason
-                ));
-            }
-        }
         self.history.push(HistoryItem::User(text));
         if let Some(audit) = self.skill_catalog_audit.clone() {
             self.commit(
@@ -1101,7 +1108,7 @@ impl SessionActor {
                         };
                         if approved {
                             tool_runtime
-                                .approve(&request)
+                                .approve_hook_gate(&request)
                                 .map(|fresh_grant| (prepared, fresh_grant))
                         } else {
                             Err(ToolError::new(
@@ -1327,28 +1334,39 @@ impl SessionActor {
         input: &serde_json::Value,
         runs: &[lato_extensions::hooks::HookRunRecord],
     ) -> Result<(), String> {
-        let input_hash = journal_request_hash(event.as_str(), input);
-        for run in runs {
+        for audit in Self::hook_audit_records(runtime, event, input, runs) {
             self.commit(
-                JournalRecord::ExtensionAudit {
-                    audit: ExtensionAuditRecord::Hook {
-                        generation: runtime.generation(),
-                        hook_id: run.hook_id.clone(),
-                        event: event.as_str().into(),
-                        phase: HookAuditPhase::DispatchStarted,
-                        outcome: HookAuditOutcome::Started,
-                        duration_ms: None,
-                        effective_timeout_ms: runtime.timeout_for(&run.hook_id),
-                        input_hash: input_hash.clone(),
-                        output_hash: None,
-                        replaced_prior_hook_id: None,
-                        truncated: false,
-                        redacted_reason: None,
-                    },
-                },
+                JournalRecord::ExtensionAudit { audit },
                 JournalDurability::Flush,
             )
             .await?;
+        }
+        Ok(())
+    }
+
+    fn hook_audit_records(
+        runtime: &SessionHookRuntime,
+        event: lato_extensions::hooks::HookEventName,
+        input: &serde_json::Value,
+        runs: &[lato_extensions::hooks::HookRunRecord],
+    ) -> Vec<ExtensionAuditRecord> {
+        let input_hash = journal_request_hash(event.as_str(), input);
+        let mut audits = Vec::with_capacity(runs.len().saturating_mul(2));
+        for run in runs {
+            audits.push(ExtensionAuditRecord::Hook {
+                generation: runtime.generation(),
+                hook_id: run.hook_id.clone(),
+                event: event.as_str().into(),
+                phase: HookAuditPhase::DispatchStarted,
+                outcome: HookAuditOutcome::Started,
+                duration_ms: None,
+                effective_timeout_ms: runtime.timeout_for(&run.hook_id),
+                input_hash: input_hash.clone(),
+                output_hash: None,
+                replaced_prior_hook_id: None,
+                truncated: false,
+                redacted_reason: None,
+            });
             let (phase, outcome) = match run.outcome {
                 lato_extensions::hooks::HookRunOutcome::Completed => {
                     (HookAuditPhase::Completed, HookAuditOutcome::Applied)
@@ -1366,28 +1384,22 @@ impl SessionActor {
                     (HookAuditPhase::Failed, HookAuditOutcome::FailedOpen)
                 }
             };
-            self.commit(
-                JournalRecord::ExtensionAudit {
-                    audit: ExtensionAuditRecord::Hook {
-                        generation: runtime.generation(),
-                        hook_id: run.hook_id.clone(),
-                        event: event.as_str().into(),
-                        phase,
-                        outcome,
-                        duration_ms: Some(run.duration_ms),
-                        effective_timeout_ms: runtime.timeout_for(&run.hook_id),
-                        input_hash: input_hash.clone(),
-                        output_hash: None,
-                        replaced_prior_hook_id: None,
-                        truncated: false,
-                        redacted_reason: None,
-                    },
-                },
-                JournalDurability::Flush,
-            )
-            .await?;
+            audits.push(ExtensionAuditRecord::Hook {
+                generation: runtime.generation(),
+                hook_id: run.hook_id.clone(),
+                event: event.as_str().into(),
+                phase,
+                outcome,
+                duration_ms: Some(run.duration_ms),
+                effective_timeout_ms: runtime.timeout_for(&run.hook_id),
+                input_hash: input_hash.clone(),
+                output_hash: None,
+                replaced_prior_hook_id: None,
+                truncated: false,
+                redacted_reason: None,
+            });
         }
-        Ok(())
+        audits
     }
 
     pub fn compact_explicit(

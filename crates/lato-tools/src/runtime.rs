@@ -182,6 +182,15 @@ impl ToolRuntime {
         }
     }
 
+    pub fn approve_hook_gate(
+        &self,
+        approval: &ApprovalRequest,
+    ) -> Result<ExecutionGrant, ToolError> {
+        self.policy
+            .approve_external_gate(approval)
+            .map_err(policy_engine_error)
+    }
+
     pub fn model_definitions(&self) -> Vec<Value> {
         self.model_definitions_scoped(None)
     }

@@ -22,6 +22,9 @@ $ cargo test -p lato-core journal
 $ cargo test -p lato-agent --test hooks_runtime
 4 passed; 0 failed
 
+$ cargo test -p lato-policy --test policy_matrix
+9 passed; 0 failed
+
 $ cargo test -p lato-extensions
 69 passed; 0 failed
 ```
@@ -38,12 +41,18 @@ secrets.
 $ cargo fmt --all -- --check
 PASS
 
-$ CARGO_INCREMENTAL=0 CARGO_PROFILE_TEST_DEBUG=0 cargo test --workspace
-954 tests (including 2 compile-fail doc tests); 0 failed
+$ cargo test --workspace --all-features
+955 tests (including 2 compile-fail doc tests); 0 failed
 
-$ CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 cargo clippy --workspace --all-targets -- -D warnings
+$ cargo clippy --workspace --all-targets --all-features -- -D warnings
 Finished dev profile; 0 warnings; PASS
 ```
+
+The final policy regression also proves that a hook-requested approval on an
+otherwise allowed tool still binds a one-shot grant to the exact rewritten
+request and sandbox, while ordinary policy and trust denials remain
+non-bypassable. `UserPromptSubmit` now completes and writes its hash-only audit
+before `StartTurn`, so a blocked prompt never persists as accepted input.
 
 The first clippy run found three new warnings (two intentionally generated
 invalid-regex values and one collapsible conditional). The matcher now uses a

@@ -221,6 +221,56 @@ fn approve_rejects_fabricated_or_now_denied_requests() {
 }
 
 #[test]
+fn external_hook_gate_preserves_fingerprint_denial_and_sandbox_checks() {
+    let engine = engine();
+    let read = request(
+        PolicyMode::Ask,
+        vec![ToolCapability::FileRead],
+        SideEffect::ReadOnly,
+        true,
+    );
+    let approval = lato_core::ApprovalRequest {
+        fingerprint: approval_fingerprint(&read).unwrap(),
+        request: read.clone(),
+        summary: "hook requested approval".into(),
+    };
+    let grant = engine.approve_external_gate(&approval).unwrap();
+    assert_eq!(engine.consume(&grant, &approval.fingerprint, &read), Ok(()));
+
+    let mut tampered = approval.clone();
+    tampered.request.arguments_digest = "rewritten-after-approval".into();
+    assert_eq!(
+        engine.approve_external_gate(&tampered),
+        Err(PolicyError::ApprovalFingerprintMismatch)
+    );
+
+    let denied = request(
+        PolicyMode::Ask,
+        vec![ToolCapability::ExtensionInvoke],
+        SideEffect::ReadOnly,
+        false,
+    );
+    let denied_approval = lato_core::ApprovalRequest {
+        fingerprint: approval_fingerprint(&denied).unwrap(),
+        request: denied,
+        summary: "hook requested approval".into(),
+    };
+    assert_eq!(
+        engine.approve_external_gate(&denied_approval),
+        Err(PolicyError::Denied("policy.untrusted_extension".into()))
+    );
+
+    let mut invalid_sandbox = approval;
+    invalid_sandbox.request.sandbox = SandboxObligation::read_only("/workspace");
+    invalid_sandbox.request.sandbox.writable_roots = vec![PathBuf::from("/workspace")];
+    invalid_sandbox.fingerprint = approval_fingerprint(&invalid_sandbox.request).unwrap();
+    assert!(matches!(
+        engine.approve_external_gate(&invalid_sandbox),
+        Err(PolicyError::Denied(code)) if code == "sandbox.unsupported"
+    ));
+}
+
+#[test]
 fn evaluate_denies_invalid_sandbox_obligations() {
     let engine = engine();
 

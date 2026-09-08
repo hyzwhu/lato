@@ -618,6 +618,28 @@ impl RuntimeSession {
             cleanup.disarm();
             return Err(error);
         }
+        let hook_gate = self.driver.gate_prompt_hook(&input).await;
+        for audit in hook_gate.audits {
+            if let Err(error) = self
+                .handle
+                .submit(Command::RecordExtensionAudit { audit })
+                .await
+            {
+                self.abort_plugin_turn().await;
+                cleanup.disarm();
+                return Err(error);
+            }
+        }
+        if let Some(message) = hook_gate.block {
+            self.abort_plugin_turn().await;
+            cleanup.disarm();
+            return Err(AgentError::new(
+                "hook.prompt_blocked",
+                ErrorCategory::Policy,
+                message,
+                Retryability::Never,
+            ));
+        }
         let mut events = self.handle.subscribe();
         if let Err(error) = self
             .handle

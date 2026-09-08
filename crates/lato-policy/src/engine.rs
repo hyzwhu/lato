@@ -90,6 +90,27 @@ impl PolicyEngine {
             .map_err(PolicyError::Approval)
     }
 
+    /// Issues a one-shot grant after an independent trusted gate requested
+    /// explicit user approval. The request is still fingerprinted, sandboxed,
+    /// and rejected by every ordinary policy denial.
+    pub fn approve_external_gate(
+        &self,
+        approval: &ApprovalRequest,
+    ) -> Result<ExecutionGrant, PolicyError> {
+        validate_request(&approval.request)?;
+        let expected = approval_fingerprint(&approval.request)
+            .map_err(|_| PolicyError::ApprovalFingerprintMismatch)?;
+        if approval.fingerprint != expected {
+            return Err(PolicyError::ApprovalFingerprintMismatch);
+        }
+        if let Some(denial) = denial(&approval.request) {
+            return Err(PolicyError::Denied(denial.code));
+        }
+        self.ledger
+            .issue(expected, approval.request.sandbox.clone())
+            .map_err(PolicyError::Approval)
+    }
+
     pub fn consume(
         &self,
         grant: &ExecutionGrant,

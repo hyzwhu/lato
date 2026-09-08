@@ -238,6 +238,10 @@ impl LegacyTurnDriver {
             .await
     }
 
+    pub async fn gate_prompt_hook(&self, text: &str) -> crate::PromptHookGate {
+        self.state.lock().await.actor.gate_prompt_hook(text).await
+    }
+
     pub async fn active_model(&self) -> ActiveModelPort {
         self.model_stream
             .active_model_port()

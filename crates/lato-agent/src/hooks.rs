@@ -12,6 +12,11 @@ use lato_extensions::hooks::{
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
+pub struct PromptHookGate {
+    pub block: Option<String>,
+    pub audits: Vec<lato_core::ExtensionAuditRecord>,
+}
+
 #[derive(Clone)]
 pub struct SessionHookRuntime {
     registry: Arc<HookRegistry>,
