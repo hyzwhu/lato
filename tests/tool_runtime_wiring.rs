@@ -13,8 +13,9 @@ fn actor_uses_the_tool_runtime_for_definitions_and_execution() {
         !actor.contains("v1_tool_definitions("),
         "actor must not own a second tool list"
     );
-    assert!(actor.contains("tool_runtime.model_definitions()"));
-    assert!(actor.contains("tool_runtime.authorize("));
+    assert!(actor.contains("tool_runtime.model_definitions_scoped(scope)"));
+    assert!(actor.contains("tool_runtime.prepare_scoped("));
+    assert!(actor.contains("tool_runtime.decision("));
     assert!(actor.contains("tool_runtime.execute_authorized("));
 }
 
