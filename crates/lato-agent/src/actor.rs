@@ -5,7 +5,7 @@
 
 use crate::{
     AutoCompactionSuppression, ContextTracker, HistoryItem, PREFIRE_LEAD_PERCENT,
-    SamplingRecoveryBudget, SessionSkillHandle, SkillRuntimeBinding, TWO_PASS_SPLIT_PERCENT,
+    SamplingRecoveryBudget, SessionHookRuntime, SessionSkillHandle, SkillRuntimeBinding, TWO_PASS_SPLIT_PERCENT,
     compaction_suppression_reason, fingerprint_prefix, split_for_two_pass,
 };
 use async_trait::async_trait;
@@ -20,7 +20,7 @@ use lato_core::{
     SkillInvocationOrigin, ToolCallId, ToolContext, ToolError, ToolName, TurnId,
     journal_request_hash,
 };
-use lato_extensions::skills::SkillCatalog;
+use lato_extensions::{hooks::HookRegistry, skills::SkillCatalog};
 use lato_runtime::{
     AutomaticCompactionOutcome, AutomaticCompactionRequest, PrefireCompactionRequest,
     TurnEventEmitter, TwoPassCompactionInput,
@@ -97,6 +97,7 @@ pub struct SessionActor {
     skill_handle: Option<SessionSkillHandle>,
     skill_listing: String,
     skill_catalog_audit: Option<ExtensionAuditRecord>,
+    hook_runtime: Option<SessionHookRuntime>,
     session_id: SessionId,
     turn_id: TurnId,
     turn_cancellation: CancellationToken,
@@ -166,6 +167,7 @@ impl SessionActor {
             skill_handle,
             skill_listing: String::new(),
             skill_catalog_audit: None,
+            hook_runtime: None,
             session_id: SessionId::from("local-session"),
             turn_id: TurnId::from("local-turn-0"),
             turn_cancellation: CancellationToken::new(),
@@ -228,6 +230,31 @@ impl SessionActor {
         handle.install(catalog).await;
     }
 
+    pub fn bind_turn_hooks(&mut self, runtime: SessionHookRuntime) {
+        self.hook_runtime = Some(runtime);
+    }
+
+    pub fn bind_turn_hook_registry(&mut self, registry: Arc<HookRegistry>) {
+        self.hook_runtime = Some(SessionHookRuntime::new(
+            registry,
+            self.cwd.clone(),
+            self.session_id.to_string(),
+        ));
+    }
+
+    pub async fn observe_bound_hook(
+        &self,
+        event: lato_extensions::hooks::HookEventName,
+        payload: serde_json::Value,
+    ) -> Vec<lato_extensions::hooks::HookRunRecord> {
+        match &self.hook_runtime {
+            Some(runtime) => runtime
+                .observe(event, Some(self.turn_id.as_str()), payload, CancellationToken::new())
+                .await,
+            None => Vec::new(),
+        }
+    }
+
     pub async fn prompt_with_context(
         &mut self,
         _kind: PromptKind,
@@ -247,6 +274,15 @@ impl SessionActor {
         self.context_tracker.on_new_turn();
         self.emit_suppression_if_changed(previous_suppression);
         let task_requires_workspace_change = task_requires_workspace_change(&text);
+        if let Some(runtime) = &self.hook_runtime {
+            let result = runtime
+                .prompt_submit(self.turn_id.as_str(), &text, self.turn_cancellation.clone())
+                .await;
+            if let Some(block) = result.block {
+                self.active = false;
+                return Err(format!("hook.prompt_blocked [{}]: {}", block.hook_id, block.reason));
+            }
+        }
         self.history.push(HistoryItem::User(text));
         if let Some(audit) = self.skill_catalog_audit.clone() {
             self.commit(
@@ -255,8 +291,8 @@ impl SessionActor {
             )
             .await?;
         }
-        noop_hooks();
         let mut sampling_steps = 0usize;
+        let mut stop_continuations = 0usize;
         let mut no_tool_retry_used = false;
         let mut executed_any_tool = false;
         let mut force_workspace_tool = false;
@@ -513,6 +549,33 @@ impl SessionActor {
                     ));
                     continue;
                 }
+                if let Some(runtime) = &self.hook_runtime {
+                    let stop = runtime
+                        .stop(
+                            self.turn_id.as_str(),
+                            serde_json::json!({"reason":"model_complete","lastAssistantContext":round_text}),
+                            self.turn_cancellation.clone(),
+                        )
+                        .await;
+                    if stop.prevent_continuation.is_none()
+                        && (!stop.blocks.is_empty() || !stop.additional_context.is_empty())
+                        && stop_continuations < lato_extensions::hooks::MAX_STOP_CONTINUATIONS
+                    {
+                        stop_continuations += 1;
+                        let feedback = stop
+                            .blocks
+                            .into_iter()
+                            .map(|block| block.reason)
+                            .chain(stop.additional_context.into_iter().map(|context| context.text))
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        self.history.push(HistoryItem::System(format!(
+                            "Hook requested continuation ({stop_continuations}/{}):\n{feedback}",
+                            lato_extensions::hooks::MAX_STOP_CONTINUATIONS
+                        )));
+                        continue;
+                    }
+                }
                 self.active = false;
                 return Ok(TurnOutcome::Complete);
             }
@@ -608,6 +671,16 @@ impl SessionActor {
         let messages =
             crate::history_to_model_messages(&self.history).map_err(|error| error.to_string())?;
         let (two_pass, prior_model_attempts) = self.take_prefire(&messages, model_generation).await;
+        if let Some(runtime) = &self.hook_runtime {
+            let _ = runtime
+                .observe(
+                    lato_extensions::hooks::HookEventName::PreCompact,
+                    Some(self.turn_id.as_str()),
+                    serde_json::json!({"trigger": trigger, "messageCount": messages.len()}),
+                    self.turn_cancellation.clone(),
+                )
+                .await;
+        }
         let outcome = events
             .compact(AutomaticCompactionRequest {
                 trigger,
@@ -630,6 +703,16 @@ impl SessionActor {
             Ok(AutomaticCompactionOutcome::Compacted(messages)) => {
                 self.history = crate::model_messages_to_history(&messages)
                     .map_err(|error| error.to_string())?;
+                if let Some(runtime) = &self.hook_runtime {
+                    let _ = runtime
+                        .observe(
+                            lato_extensions::hooks::HookEventName::PostCompact,
+                            Some(self.turn_id.as_str()),
+                            serde_json::json!({"trigger": trigger, "messageCount": messages.len()}),
+                            self.turn_cancellation.clone(),
+                        )
+                        .await;
+                }
                 self.context_tracker.reseed(&self.history);
                 let previous_suppression = self.context_tracker.automatic_compaction_suppression();
                 self.context_tracker.on_compaction_success();
@@ -889,18 +972,57 @@ impl SessionActor {
             cancellation: self.turn_cancellation.clone(),
             execution_grant: None,
         };
+        let initial_validation = tool_runtime.resolve_and_validate(&name, arguments.clone());
+        let mut final_arguments = initial_validation
+            .as_ref()
+            .map(|validated| validated.arguments.clone())
+            .unwrap_or_else(|_| arguments.clone());
+        let mut hook_ask_reason = None;
+        let mut pre_hook_error = None;
+        let mut pre_hook_context = Vec::new();
+        if let (Ok(validated), Some(runtime)) = (&initial_validation, &self.hook_runtime) {
+            let result = runtime
+                .pre_tool_use(
+                    self.turn_id.as_str(),
+                    validated.canonical_name.as_str(),
+                    final_arguments.clone(),
+                    self.turn_cancellation.clone(),
+                )
+                .await;
+            if let Some(updated) = result.updated_input {
+                final_arguments = updated;
+            }
+            pre_hook_context = result.additional_context;
+            match result.decision {
+                lato_extensions::hooks::HookDecision::Deny { hook_id, reason } => {
+                    pre_hook_error = Some(ToolError::new(
+                        "hook.pre_tool_denied",
+                        format!("blocked by {hook_id}: {reason}"),
+                        Retryability::Never,
+                    ));
+                }
+                lato_extensions::hooks::HookDecision::Ask { reason, .. } => {
+                    hook_ask_reason = Some(reason.unwrap_or_else(|| "approval requested by hook".into()));
+                }
+                _ => {}
+            }
+        }
         let skill_is_unbound = self.skill_handle.is_none()
             && tool_runtime
                 .descriptor_for_wire_name(&name)
                 .is_some_and(|descriptor| descriptor.name.local_name() == "skill");
-        let prepared = if skill_is_unbound {
+        let prepared = if let Err(error) = initial_validation {
+            Err(error)
+        } else if let Some(error) = pre_hook_error {
+            Err(error)
+        } else if skill_is_unbound {
             Err(ToolError::new(
                 "skill.resolver_unbound",
                 "skill invocation is unavailable without a session-bound resolver",
                 Retryability::Never,
             ))
         } else {
-            tool_runtime.prepare_scoped(context, &name, arguments.clone(), round_skill_scope)
+            tool_runtime.prepare_scoped(context, &name, final_arguments.clone(), round_skill_scope)
         };
         // Argument-scoped rules may canonicalize a path before policy. The
         // journal lifecycle must use that final prepared request hash even
@@ -913,7 +1035,7 @@ impl SessionActor {
         self.commit(
             JournalRecord::ToolCallRequested {
                 call_id: call_id.clone(),
-                name: journal_name,
+                name: journal_name.clone(),
                 arguments: arguments.clone(),
                 request_hash: request_hash.clone(),
             },
@@ -942,7 +1064,24 @@ impl SessionActor {
                         JournalDurability::Flush,
                     )
                     .await?;
-                    Ok((prepared, grant))
+                    if let Some(reason) = hook_ask_reason.clone() {
+                        let request = tool_runtime.hook_approval_request(&prepared, reason);
+                        let approved = match &self.tool_approval {
+                            Some(approval) => approval.approve(&request).await,
+                            None => false,
+                        };
+                        if approved {
+                            tool_runtime.approve(&request).map(|fresh_grant| (prepared, fresh_grant))
+                        } else {
+                            Err(ToolError::new(
+                                "policy.approval_denied",
+                                "tool approval denied by user",
+                                Retryability::Never,
+                            ))
+                        }
+                    } else {
+                        Ok((prepared, grant))
+                    }
                 }
                 PolicyDecision::RequireApproval(request) => {
                     let approved = match &self.tool_approval {
@@ -1079,9 +1218,38 @@ impl SessionActor {
             }
         };
         let failed = invocation.is_err();
-        let out = invocation
+        let mut out = invocation
             .map(|output| output.content)
             .unwrap_or_else(|error| format!("ERROR [{}]: {}", error.code, error.message));
+        let mut post_hook_context = Vec::new();
+        if let Some(runtime) = &self.hook_runtime {
+            let post = runtime
+                .post_tool_use(
+                    self.turn_id.as_str(),
+                    serde_json::json!({
+                        "toolName": journal_name.as_str(),
+                        "arguments": final_arguments,
+                        "success": !failed,
+                        "output": out,
+                    }),
+                    self.turn_cancellation.clone(),
+                )
+                .await;
+            if let Some(replacement) = post.replacement {
+                out = replacement
+                    .as_str()
+                    .map(ToOwned::to_owned)
+                    .or_else(|| replacement.get("content").and_then(serde_json::Value::as_str).map(ToOwned::to_owned))
+                    .or_else(|| replacement.get("text").and_then(serde_json::Value::as_str).map(ToOwned::to_owned))
+                    .unwrap_or_else(|| replacement.to_string());
+            }
+            post_hook_context = post
+                .blocks
+                .into_iter()
+                .map(|block| block.reason)
+                .chain(post.additional_context.into_iter().map(|context| context.text))
+                .collect();
+        }
         let out = bound_tool_output(out, &self.cwd, &id).await?;
         if let Some((events, session_id)) = &self.events {
             let status = if failed { "error" } else { "done" };
@@ -1089,6 +1257,9 @@ impl SessionActor {
         }
         self.history
             .push(HistoryItem::ToolResult { id, output: out });
+        for context in pre_hook_context.into_iter().map(|context| context.text).chain(post_hook_context) {
+            self.history.push(HistoryItem::System(format!("Hook context:\n{context}")));
+        }
         Ok(ProcessTool::Executed)
     }
 
@@ -1112,8 +1283,6 @@ enum ProcessTool {
     Executed,
     Cancelled,
 }
-
-fn noop_hooks() {}
 
 fn fallback_tool_name(wire_name: &str) -> ToolName {
     let local: String = wire_name

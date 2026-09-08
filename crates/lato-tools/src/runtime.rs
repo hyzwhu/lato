@@ -170,6 +170,18 @@ impl ToolRuntimeBuilder {
 }
 
 impl ToolRuntime {
+    pub fn hook_approval_request(
+        &self,
+        prepared: &PreparedToolCall,
+        summary: String,
+    ) -> ApprovalRequest {
+        ApprovalRequest {
+            request: prepared.request.clone(),
+            fingerprint: prepared.fingerprint.clone(),
+            summary,
+        }
+    }
+
     pub fn model_definitions(&self) -> Vec<Value> {
         self.model_definitions_scoped(None)
     }

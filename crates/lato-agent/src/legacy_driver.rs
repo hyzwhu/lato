@@ -19,7 +19,7 @@ use lato_core::{
     ModelError, ModelErrorKind, ModelRequest, ModelStopReason, ModelStreamEvent, Retryability,
     SamplingParameters, ToolChoice, TurnOutput, UserInput,
 };
-use lato_extensions::skills::SkillCatalog;
+use lato_extensions::{hooks::HookRegistry, skills::SkillCatalog};
 use lato_runtime::{
     CompactionControl, CompactionRequest, PrefireCompactionRequest, PrefireCompactionResult,
     TurnControl, TurnDriver, TurnEventEmitter, TurnRequest,
@@ -215,6 +215,18 @@ impl LegacyTurnDriver {
             .actor
             .bind_turn_skills(catalog)
             .await;
+    }
+
+    pub async fn bind_turn_hooks(&self, registry: Arc<HookRegistry>) {
+        self.state.lock().await.actor.bind_turn_hook_registry(registry);
+    }
+
+    pub async fn observe_hook(
+        &self,
+        event: lato_extensions::hooks::HookEventName,
+        payload: serde_json::Value,
+    ) -> Vec<lato_extensions::hooks::HookRunRecord> {
+        self.state.lock().await.actor.observe_bound_hook(event, payload).await
     }
 
     pub async fn active_model(&self) -> ActiveModelPort {
