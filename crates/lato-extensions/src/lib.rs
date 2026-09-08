@@ -1,4 +1,5 @@
 pub mod discovery;
+pub mod hooks;
 pub mod manifest;
 pub mod registry;
 pub mod reload;
