@@ -152,7 +152,7 @@ mod tests {
                     vec![StreamPiece::ToolCall {
                         id: "write-inside".into(),
                         name: "write_file".into(),
-                        arguments: json!({"path": "inside.txt", "content": "inside"}),
+                        arguments: json!({"path": "inside.txt", "contents": "inside"}),
                     }],
                     vec![StreamPiece::Text("done".into())],
                 ]));
