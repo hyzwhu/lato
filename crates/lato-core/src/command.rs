@@ -1,4 +1,7 @@
-use crate::{CompactSession, CompactionId, ModelSelection, PluginSnapshotSummary, TurnId};
+use crate::{
+    CompactSession, CompactionId, ExtensionAuditRecord, ModelSelection, PluginSnapshotSummary,
+    TurnId,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -19,6 +22,9 @@ pub enum Command {
     },
     AdoptPluginSnapshot {
         summary: PluginSnapshotSummary,
+    },
+    RecordExtensionAudit {
+        audit: ExtensionAuditRecord,
     },
     Shutdown,
 }

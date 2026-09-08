@@ -1,3 +1,7 @@
+// Derived from: Grok Build@bb7f39d5858cbf5e00de639367f59debbdcb0138:crates/codegen/xai-grok-agent/src/prompt/skills.rs
+// License: Apache-2.0
+// Lato changes: binds immutable plugin-qualified skill catalogs to Lato's built-in tool runtime
+
 use std::sync::Arc;
 
 use async_trait::async_trait;

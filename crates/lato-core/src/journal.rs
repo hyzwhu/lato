@@ -28,6 +28,28 @@ pub enum SkillInvocationOrigin {
     User,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ExtensionAuditRecord {
+    SkillCatalogMaterialized {
+        generation: u64,
+        visible_count: u64,
+        omitted_count: u64,
+        catalog_hash: String,
+    },
+    SkillInvoked {
+        qualified_name: String,
+        origin: SkillInvocationOrigin,
+        body_hash: String,
+        allowed_tools_hash: Option<String>,
+    },
+    SkillRejected {
+        requested_name_hash: String,
+        origin: SkillInvocationOrigin,
+        error_code: String,
+    },
+}
+
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 pub struct JournalEnvelope {
     pub schema_version: u32,
@@ -142,6 +164,9 @@ pub enum JournalRecord {
     },
     PluginSnapshotAdopted {
         summary: crate::PluginSnapshotSummary,
+    },
+    ExtensionAudit {
+        audit: ExtensionAuditRecord,
     },
     SessionStopped,
     LegacyTranscriptImported {
@@ -382,6 +407,7 @@ pub fn project_journal(
             | JournalRecord::CompactionFailed { .. }
             | JournalRecord::CompactionCancelled { .. }
             | JournalRecord::PluginSnapshotAdopted { .. }
+            | JournalRecord::ExtensionAudit { .. }
             | JournalRecord::LegacyTranscriptImported { .. } => {}
             JournalRecord::ModelSelected {
                 selection,

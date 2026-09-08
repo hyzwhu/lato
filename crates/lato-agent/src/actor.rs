@@ -1,6 +1,7 @@
 // Derived from: Grok Build@bb7f39d5858cbf5e00de639367f59debbdcb0138:crates/codegen/xai-grok-shell/src/session/compaction.rs
+// Skill lifecycle derived from: Grok Build@bb7f39d5858cbf5e00de639367f59debbdcb0138:crates/codegen/xai-grok-agent/src/prompt/skills.rs
 // License: Apache-2.0
-// Lato changes: checks context at every provider boundary and delegates durable replacement to runtime
+// Lato changes: adds immutable one-step skill prompts/scopes while retaining Lato's durable runtime and policy boundaries
 
 use crate::{
     AutoCompactionSuppression, ContextTracker, HistoryItem, PREFIRE_LEAD_PERCENT,
@@ -13,10 +14,11 @@ use lato_ai::{
 };
 pub use lato_core::ApprovalRequest;
 use lato_core::{
-    AgentError, CompactionPolicy, CompactionTrigger, ContextUsage, JournalDurability,
-    JournalRecord, ModelContent, ModelErrorKind, ModelMessage, ModelRole, PolicyAuditDecision,
-    PolicyAuditStage, PolicyDecision, Retryability, SessionId, ToolCallId, ToolContext, ToolError,
-    ToolName, TurnId, journal_request_hash,
+    AgentError, CompactionPolicy, CompactionTrigger, ContextUsage, ExtensionAuditRecord,
+    JournalDurability, JournalRecord, ModelContent, ModelErrorKind, ModelMessage, ModelRole,
+    PolicyAuditDecision, PolicyAuditStage, PolicyDecision, Retryability, SessionId,
+    SkillInvocationOrigin, ToolCallId, ToolContext, ToolError, ToolName, TurnId,
+    journal_request_hash,
 };
 use lato_extensions::skills::SkillCatalog;
 use lato_runtime::{
@@ -94,6 +96,7 @@ pub struct SessionActor {
     tool_runtime: Arc<ToolRuntime>,
     skill_handle: Option<SessionSkillHandle>,
     skill_listing: String,
+    skill_catalog_audit: Option<ExtensionAuditRecord>,
     session_id: SessionId,
     turn_id: TurnId,
     turn_cancellation: CancellationToken,
@@ -162,6 +165,7 @@ impl SessionActor {
             tool_runtime,
             skill_handle,
             skill_listing: String::new(),
+            skill_catalog_audit: None,
             session_id: SessionId::from("local-session"),
             turn_id: TurnId::from("local-turn-0"),
             turn_cancellation: CancellationToken::new(),
@@ -205,9 +209,22 @@ impl SessionActor {
     pub async fn bind_turn_skills(&mut self, catalog: Arc<SkillCatalog>) {
         let Some(handle) = &self.skill_handle else {
             self.skill_listing.clear();
+            self.skill_catalog_audit = None;
             return;
         };
         self.skill_listing = catalog.render_model_listing();
+        self.skill_catalog_audit = Some(ExtensionAuditRecord::SkillCatalogMaterialized {
+            generation: catalog.generation(),
+            visible_count: self.skill_listing.matches("<skill name=").count() as u64,
+            omitted_count: catalog.omitted_listing_count() as u64,
+            catalog_hash: journal_request_hash(
+                "skill_catalog",
+                &serde_json::json!({
+                    "generation": catalog.generation(),
+                    "listing": self.skill_listing,
+                }),
+            ),
+        });
         handle.install(catalog).await;
     }
 
@@ -231,6 +248,13 @@ impl SessionActor {
         self.emit_suppression_if_changed(previous_suppression);
         let task_requires_workspace_change = task_requires_workspace_change(&text);
         self.history.push(HistoryItem::User(text));
+        if let Some(audit) = self.skill_catalog_audit.clone() {
+            self.commit(
+                JournalRecord::ExtensionAudit { audit },
+                JournalDurability::Flush,
+            )
+            .await?;
+        }
         noop_hooks();
         let mut sampling_steps = 0usize;
         let mut no_tool_retry_used = false;
@@ -808,6 +832,7 @@ impl SessionActor {
             .descriptor_for_wire_name(&name)
             .map(|descriptor| descriptor.name)
             .unwrap_or_else(|| fallback_tool_name(&name));
+        let is_skill_request = journal_name.local_name() == "skill";
         let original_request_hash = journal_request_hash(journal_name.as_str(), &arguments);
         if self.cancelled || self.turn_cancellation.is_cancelled() {
             self.commit(
@@ -823,13 +848,22 @@ impl SessionActor {
             self.history.push(HistoryItem::ToolCall {
                 id,
                 name,
-                arguments,
+                arguments: arguments.clone(),
             });
             let error = ToolError::new(
                 "tool.cancelled",
                 "tool call was cancelled",
                 Retryability::Never,
             );
+            if is_skill_request {
+                self.commit(
+                    JournalRecord::ExtensionAudit {
+                        audit: skill_rejected_audit(&arguments, &error.code),
+                    },
+                    JournalDurability::Flush,
+                )
+                .await?;
+            }
             self.commit(
                 JournalRecord::ToolCallRejected {
                     call_id,
@@ -991,6 +1025,19 @@ impl SessionActor {
                                 output.clone()
                             });
                 }
+                if canonical_builtin_skill {
+                    let audit = match &result {
+                        Ok(output) => skill_invoked_audit(output).unwrap_or_else(|| {
+                            skill_rejected_audit(&arguments, "skill.invalid_metadata")
+                        }),
+                        Err(error) => skill_rejected_audit(&arguments, &error.code),
+                    };
+                    self.commit(
+                        JournalRecord::ExtensionAudit { audit },
+                        JournalDurability::Flush,
+                    )
+                    .await?;
+                }
                 self.commit(
                     JournalRecord::ToolCallCompleted {
                         call_id: audit.call_id,
@@ -1003,6 +1050,15 @@ impl SessionActor {
                 result
             }
             Err(error) => {
+                if is_skill_request {
+                    self.commit(
+                        JournalRecord::ExtensionAudit {
+                            audit: skill_rejected_audit(&arguments, &error.code),
+                        },
+                        JournalDurability::Flush,
+                    )
+                    .await?;
+                }
                 self.commit(
                     JournalRecord::ToolCallRejected {
                         call_id,
@@ -1224,6 +1280,37 @@ fn compile_skill_scope(
     match metadata.allowed_tool_specs {
         Some(specs) => SkillToolScope::compile(&specs, runtime).map(Some),
         None => Ok(None),
+    }
+}
+
+fn skill_invoked_audit(output: &lato_core::ToolOutput) -> Option<ExtensionAuditRecord> {
+    let qualified_name = output.metadata.get("qualifiedName")?.as_str()?.to_owned();
+    let body_hash = output.metadata.get("bodyHash")?.as_str()?.to_owned();
+    let allowed_tools_hash = output
+        .metadata
+        .get("allowedToolSpecs")
+        .filter(|value| !value.is_null())
+        .map(|value| journal_request_hash("skill_allowed_tools", value));
+    Some(ExtensionAuditRecord::SkillInvoked {
+        qualified_name,
+        origin: SkillInvocationOrigin::Model,
+        body_hash,
+        allowed_tools_hash,
+    })
+}
+
+fn skill_rejected_audit(arguments: &serde_json::Value, error_code: &str) -> ExtensionAuditRecord {
+    let requested = arguments
+        .get("skill")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    ExtensionAuditRecord::SkillRejected {
+        requested_name_hash: journal_request_hash(
+            "skill_invocation_name",
+            &serde_json::json!({"skill": requested}),
+        ),
+        origin: SkillInvocationOrigin::Model,
+        error_code: error_code.to_owned(),
     }
 }
 

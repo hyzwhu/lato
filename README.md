@@ -145,7 +145,28 @@ The canonical manifest is `plugin.json`. Component paths are confined to the
 plugin root. `lato/plugins/reload` atomically rebuilds the registry and updates
 live sessions at the next safe turn boundary.
 
-Phase 6A catalogs skill, hook, and MCP components but does not execute them.
+An enabled, trusted plugin may provide skills under the directory named by its
+manifest's `skills` field. Each skill is a directory containing `SKILL.md`.
+Only skills with an authored `description` or `when-to-use` are listed to the
+model; invoke one by its stable qualified identity, such as
+`example-plugin:code-audit`, through the built-in `skill` tool. Bare names work
+only when unique. `disable-model-invocation: true` hides and blocks model calls,
+while `user-invocable: false` blocks explicit user-origin calls.
+
+Skill bodies are loaded from the frozen plugin snapshot only after invocation.
+They may use `$ARGUMENTS`, `$ARGUMENTS[N]`, `$N`, `${SKILL_DIR}`,
+`${SESSION_ID}`, and `${LATO_PLUGIN_ROOT}` tokens. An `allowed-tools` list can
+only narrow the tools available to the next model step; policy, approval,
+sandbox, and child-profile checks still apply, and the enclosing tool catalog
+is restored afterward. A reload received during a turn is staged for the next
+turn, so descriptions, bodies, and tool scopes never mix generations.
+
+Use `lato doctor` (or `lato doctor --json`) to inspect project/plugin trust and
+configuration. ACP clients can call `lato/plugins/reload`; its response includes
+the new generation, active/discovered counts, and bounded diagnostics.
+
+Hooks and MCP descriptors are cataloged but are not executed yet; hook runtime
+support is Phase 6B2 and MCP remains Phase 6C.
 
 ## Doctor
 

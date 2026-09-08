@@ -1,7 +1,8 @@
 use lato_core::{
-    JOURNAL_SCHEMA_VERSION, JournalEnvelope, JournalError, JournalRecord, JournalRecordId,
-    ModelContent, ModelSelection, PluginSnapshotSummary, Retryability, SessionId, ToolCallId,
-    ToolError, ToolName, TurnId, journal_request_hash, project_journal,
+    Command, ExtensionAuditRecord, JOURNAL_SCHEMA_VERSION, JournalEnvelope, JournalError,
+    JournalRecord, JournalRecordId, ModelContent, ModelSelection, PluginSnapshotSummary,
+    Retryability, SessionId, SkillInvocationOrigin, ToolCallId, ToolError, ToolName, TurnId,
+    journal_request_hash, project_journal,
 };
 
 #[test]
@@ -124,6 +125,57 @@ fn plugin_snapshot_adoption_round_trips_through_journal() {
         serde_json::from_slice::<JournalRecord>(&encoded).unwrap(),
         record
     );
+}
+
+#[test]
+fn journal_extension_audit_round_trips_without_projecting_conversation_state() {
+    let sid = SessionId::from("audit-session");
+    let audit = ExtensionAuditRecord::SkillInvoked {
+        qualified_name: "demo:inspect".into(),
+        origin: SkillInvocationOrigin::Model,
+        body_hash: "sha256:v1:body".into(),
+        allowed_tools_hash: Some("sha256:v1:tools".into()),
+    };
+    let record = JournalRecord::ExtensionAudit {
+        audit: audit.clone(),
+    };
+    let encoded = serde_json::to_vec(&record).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<JournalRecord>(&encoded).unwrap(),
+        record
+    );
+
+    let projection = project_journal(
+        &sid,
+        &[
+            envelope(&sid, None, 0, JournalRecord::SessionStarted),
+            envelope(&sid, None, 1, record),
+        ],
+    )
+    .unwrap();
+    assert!(projection.messages.is_empty());
+    assert_eq!(projection.next_journal_sequence, 2);
+
+    let serialized = serde_json::to_string(&audit).unwrap();
+    assert!(!serialized.contains("secret body"));
+    assert!(!serialized.contains("secret arguments"));
+    assert!(!serialized.contains("expanded message"));
+}
+
+#[test]
+fn journal_extension_audit_command_has_stable_snake_case_shape() {
+    let command = Command::RecordExtensionAudit {
+        audit: ExtensionAuditRecord::SkillCatalogMaterialized {
+            generation: 3,
+            visible_count: 2,
+            omitted_count: 1,
+            catalog_hash: "sha256:v1:catalog".into(),
+        },
+    };
+    let value = serde_json::to_value(&command).unwrap();
+    assert_eq!(value["type"], "record_extension_audit");
+    assert_eq!(value["audit"]["type"], "skill_catalog_materialized");
+    assert_eq!(serde_json::from_value::<Command>(value).unwrap(), command);
 }
 
 fn envelope(

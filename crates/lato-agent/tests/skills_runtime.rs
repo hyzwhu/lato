@@ -7,7 +7,8 @@ use lato_agent::{
 };
 use lato_ai::{ModelStream, StreamPiece, adapt_model_endpoint};
 use lato_core::{
-    JournalReplay, SessionId, SessionStore, ToolCallId, ToolCapability, ToolContext, TurnId,
+    ExtensionAuditRecord, JournalRecord, JournalReplay, SessionId, SessionStore, ToolCallId,
+    ToolCapability, ToolContext, TurnId,
 };
 use lato_extensions::{
     CapabilityCeiling, DiscoveryConfig, PluginConfig, PluginSnapshot, build_snapshot,
@@ -693,4 +694,179 @@ async fn child_catalog_and_runtime_cannot_recover_parent_only_tool() {
             )
             .is_err()
     );
+}
+
+struct AuditOrderingStream {
+    store: Arc<dyn SessionStore>,
+    session_id: SessionId,
+    calls: Mutex<usize>,
+}
+
+#[async_trait]
+impl ModelStream for AuditOrderingStream {
+    async fn stream(
+        &self,
+        _prompt_bytes: usize,
+        _context: serde_json::Value,
+        tx: mpsc::Sender<StreamPiece>,
+    ) -> Result<(), lato_core::ModelError> {
+        let mut calls = self.calls.lock().await;
+        let call = *calls;
+        *calls += 1;
+        drop(calls);
+        let replay = self.store.replay(&self.session_id).await.unwrap();
+        let audits = replay
+            .envelopes
+            .iter()
+            .filter_map(|envelope| match &envelope.record {
+                JournalRecord::ExtensionAudit { audit } => Some(audit),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        match call {
+            0 => {
+                assert!(matches!(
+                    audits.as_slice(),
+                    [ExtensionAuditRecord::SkillCatalogMaterialized { generation: 7, .. }]
+                ));
+                tx.send(StreamPiece::ToolCall {
+                    id: "audited-skill-call".into(),
+                    name: "skill".into(),
+                    arguments: serde_json::json!({
+                        "skill": "demo:inspect",
+                        "args": "secret arguments"
+                    }),
+                })
+                .await
+                .unwrap();
+            }
+            1 => {
+                assert!(matches!(
+                    audits.as_slice(),
+                    [
+                        ExtensionAuditRecord::SkillCatalogMaterialized { generation: 7, .. },
+                        ExtensionAuditRecord::SkillInvoked { qualified_name, .. }
+                    ] if qualified_name == "demo:inspect"
+                ));
+                tx.send(StreamPiece::Text("done".into())).await.unwrap();
+            }
+            _ => panic!("unexpected model request {call}"),
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn audit_catalog_precedes_invocation_and_invocation_precedes_next_model_request() {
+    let fixture = PluginFixture::new("demo", "Review safely.", &["read_file"]);
+    let session_id = SessionId::from("skill-audit-ordering");
+    let store: Arc<dyn SessionStore> = Arc::new(MemoryEventStore::new());
+    let stream = Arc::new(AuditOrderingStream {
+        store: store.clone(),
+        session_id: session_id.clone(),
+        calls: Mutex::new(0),
+    });
+    let (updates, _) = mpsc::unbounded_channel();
+    let session = RuntimeSession::new_with_store(
+        session_id.to_string(),
+        stream,
+        Arc::new(FileLocks::new()),
+        SessionTrust::for_headless_prompt(&fixture.workspace),
+        fixture.workspace.clone(),
+        updates,
+        None,
+        store.clone(),
+        JournalReplay::empty(session_id.clone()),
+    )
+    .await
+    .unwrap();
+    session
+        .stage_plugin_snapshot(fixture.snapshot(7, true, true))
+        .await
+        .unwrap();
+    session
+        .prompt("do not persist this prompt in audit".into())
+        .await
+        .unwrap();
+
+    let replay = store.replay(&session_id).await.unwrap();
+    let audits = replay
+        .envelopes
+        .iter()
+        .filter_map(|envelope| match &envelope.record {
+            JournalRecord::ExtensionAudit { audit } => Some(audit),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(audits.len(), 2);
+    let encoded = serde_json::to_string(&audits).unwrap();
+    for secret in [
+        "secret arguments",
+        "Inspect secret arguments.",
+        "do not persist this prompt in audit",
+    ] {
+        assert!(
+            !encoded.contains(secret),
+            "audit leaked {secret:?}: {encoded}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn audit_rejection_hashes_requested_name_without_raw_payload() {
+    let fixture = PluginFixture::new("demo", "Review safely.", &["read_file"]);
+    let session_id = SessionId::from("skill-audit-rejection");
+    let store: Arc<dyn SessionStore> = Arc::new(MemoryEventStore::new());
+    let stream = Arc::new(RecordingStream::scripted(vec![
+        vec![StreamPiece::ToolCall {
+            id: "rejected-skill-call".into(),
+            name: "skill".into(),
+            arguments: serde_json::json!({
+                "skill": "secret-missing-skill",
+                "args": "secret rejected arguments"
+            }),
+        }],
+        vec![StreamPiece::Text("done".into())],
+    ]));
+    let (updates, _) = mpsc::unbounded_channel();
+    let session = RuntimeSession::new_with_store(
+        session_id.to_string(),
+        stream,
+        Arc::new(FileLocks::new()),
+        SessionTrust::for_headless_prompt(&fixture.workspace),
+        fixture.workspace.clone(),
+        updates,
+        None,
+        store.clone(),
+        JournalReplay::empty(session_id.clone()),
+    )
+    .await
+    .unwrap();
+    session
+        .stage_plugin_snapshot(fixture.snapshot(9, true, true))
+        .await
+        .unwrap();
+    session.prompt("reject missing skill".into()).await.unwrap();
+
+    let replay = store.replay(&session_id).await.unwrap();
+    let rejected = replay.envelopes.iter().find_map(|envelope| {
+        let JournalRecord::ExtensionAudit {
+            audit:
+                ExtensionAuditRecord::SkillRejected {
+                    requested_name_hash,
+                    error_code,
+                    ..
+                },
+        } = &envelope.record
+        else {
+            return None;
+        };
+        Some((requested_name_hash, error_code, &envelope.record))
+    });
+    let (requested_name_hash, error_code, audit_record) = rejected.expect("skill rejection audit");
+    assert!(requested_name_hash.starts_with("sha256:v1:"));
+    assert_eq!(error_code, "skill.not_found");
+    let encoded = serde_json::to_string(audit_record).unwrap();
+    assert!(!encoded.contains("secret-missing-skill"));
+    assert!(!encoded.contains("secret rejected arguments"));
 }

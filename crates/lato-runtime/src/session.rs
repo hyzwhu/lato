@@ -299,6 +299,15 @@ impl SessionLoop {
                 self.emit(None, EventPayload::PluginSnapshotAdopted { summary });
                 Ok(())
             }
+            Command::RecordExtensionAudit { audit } => {
+                let turn_id = self.active.as_ref().map(|active| active.id.clone());
+                self.commit(
+                    turn_id,
+                    JournalRecord::ExtensionAudit { audit },
+                    JournalDurability::Flush,
+                )
+                .await
+            }
             Command::Shutdown => self.shutdown().await,
         }
     }

@@ -25,11 +25,11 @@ pub use id::{
     TaskId, ToolCallId, TurnId,
 };
 pub use journal::{
-    EventStore, JOURNAL_SCHEMA_VERSION, JournalDurability, JournalEnvelope, JournalError,
-    JournalRecord, JournalReplay, JournalTerminal, PolicyAuditDecision, PolicyAuditRecord,
-    PolicyAuditStage, PreparedToolAudit, SessionProjection, SkillInvocationOrigin,
-    UnresolvedToolCall, canonical_json, journal_request_hash, project_journal, projection_message,
-    validate_journal,
+    EventStore, ExtensionAuditRecord, JOURNAL_SCHEMA_VERSION, JournalDurability, JournalEnvelope,
+    JournalError, JournalRecord, JournalReplay, JournalTerminal, PolicyAuditDecision,
+    PolicyAuditRecord, PolicyAuditStage, PreparedToolAudit, SessionProjection,
+    SkillInvocationOrigin, UnresolvedToolCall, canonical_json, journal_request_hash,
+    project_journal, projection_message, validate_journal,
 };
 pub use model::{
     ModelCapabilities, ModelContent, ModelError, ModelErrorKind, ModelEventStream, ModelMessage,

@@ -1,11 +1,12 @@
 use async_trait::async_trait;
 use lato_core::{
     CancelReason, Command, CompactSession, CompactionCandidate, CompactionError, CompactionId,
-    CompactionTrigger, ContextUsage, EventPayload, EventStore, HistoryProjectionMetadata,
-    HistoryProjectionStore, HistoryReplacementReason, JOURNAL_SCHEMA_VERSION, JournalDurability,
-    JournalEnvelope, JournalError, JournalRecord, JournalRecordId, JournalReplay, ModelContent,
-    ModelMessage, ModelRole, PluginSnapshotSummary, ProjectionError, SessionId, StartBehavior,
-    StartTurn, TurnOutput, UserInput,
+    CompactionTrigger, ContextUsage, EventPayload, EventStore, ExtensionAuditRecord,
+    HistoryProjectionMetadata, HistoryProjectionStore, HistoryReplacementReason,
+    JOURNAL_SCHEMA_VERSION, JournalDurability, JournalEnvelope, JournalError, JournalRecord,
+    JournalRecordId, JournalReplay, ModelContent, ModelMessage, ModelRole, PluginSnapshotSummary,
+    ProjectionError, SessionId, SkillInvocationOrigin, StartBehavior, StartTurn, TurnOutput,
+    UserInput,
 };
 use lato_runtime::{
     AutomaticCompactionOutcome, AutomaticCompactionRequest, CompactionControl, CompactionRequest,
@@ -267,6 +268,57 @@ async fn plugin_snapshot_adoption_is_committed_before_publication() {
         replay.envelopes[1].record,
         JournalRecord::PluginSnapshotAdopted { summary }
     );
+}
+
+#[tokio::test]
+async fn extension_audit_command_appends_before_and_during_a_live_turn() {
+    let sid = SessionId::from("runtime-extension-audit");
+    let store = Arc::new(MemoryEventStore::new());
+    let session = spawn_session_with_store(
+        sid.clone(),
+        Arc::new(BlockingDriver),
+        store.clone(),
+        bootstrap(&sid),
+    );
+    session
+        .submit(Command::RecordExtensionAudit {
+            audit: ExtensionAuditRecord::SkillCatalogMaterialized {
+                generation: 4,
+                visible_count: 1,
+                omitted_count: 0,
+                catalog_hash: "sha256:v1:catalog".into(),
+            },
+        })
+        .await
+        .unwrap();
+    session
+        .submit(Command::StartTurn(StartTurn {
+            input: UserInput::text("hold"),
+            behavior: StartBehavior::Reject,
+        }))
+        .await
+        .unwrap();
+    session
+        .submit(Command::RecordExtensionAudit {
+            audit: ExtensionAuditRecord::SkillRejected {
+                requested_name_hash: "sha256:v1:name".into(),
+                origin: SkillInvocationOrigin::Model,
+                error_code: "skill.not_found".into(),
+            },
+        })
+        .await
+        .unwrap();
+
+    let replay = store.replay(&sid).await.unwrap();
+    let audits = replay
+        .envelopes
+        .iter()
+        .filter(|envelope| matches!(envelope.record, JournalRecord::ExtensionAudit { .. }))
+        .collect::<Vec<_>>();
+    assert_eq!(audits.len(), 2);
+    assert!(audits[0].turn_id.is_none());
+    assert!(audits[1].turn_id.is_some());
+    session.submit(Command::Shutdown).await.unwrap();
 }
 
 struct BlockingDriver;
