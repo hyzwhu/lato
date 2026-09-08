@@ -94,7 +94,7 @@ pub struct SessionActor {
     _trust: SessionTrust,
     cwd: PathBuf,
     tool_runtime: Arc<ToolRuntime>,
-    skill_handle: SessionSkillHandle,
+    skill_handle: Option<SessionSkillHandle>,
     skill_listing: String,
     session_id: SessionId,
     turn_id: TurnId,
@@ -133,7 +133,7 @@ impl SessionActor {
             trust,
             cwd,
             tool_runtime,
-            skill_handle,
+            Some(skill_handle),
         )
     }
 
@@ -144,23 +144,16 @@ impl SessionActor {
         cwd: PathBuf,
         tool_runtime: Arc<ToolRuntime>,
     ) -> Self {
-        Self::new_with_tool_runtime_and_skill_handle(
-            stream,
-            locks,
-            trust,
-            cwd,
-            tool_runtime,
-            SessionSkillHandle::default(),
-        )
+        Self::new_with_tool_runtime_and_skill_handle(stream, locks, trust, cwd, tool_runtime, None)
     }
 
-    pub(crate) fn new_with_tool_runtime_and_skill_handle(
+    pub fn new_with_tool_runtime_and_skill_handle(
         stream: Arc<dyn ModelStream>,
         locks: Arc<FileLocks>,
         trust: SessionTrust,
         cwd: PathBuf,
         tool_runtime: Arc<ToolRuntime>,
-        skill_handle: SessionSkillHandle,
+        skill_handle: Option<SessionSkillHandle>,
     ) -> Self {
         Self {
             active: false,
@@ -214,8 +207,12 @@ impl SessionActor {
     }
 
     pub async fn bind_turn_skills(&mut self, catalog: Arc<SkillCatalog>) {
+        let Some(handle) = &self.skill_handle else {
+            self.skill_listing.clear();
+            return;
+        };
         self.skill_listing = catalog.render_model_listing();
-        self.skill_handle.install(catalog).await;
+        handle.install(catalog).await;
     }
 
     pub async fn prompt_with_context(
@@ -299,11 +296,10 @@ impl SessionActor {
                 return Err("context exceeds hard limit; automatic compaction unavailable".into());
             }
             let (tx, mut rx) = mpsc::channel(16);
-            let tool_runtime = self.tool_runtime.clone();
             let round_skill_scope = next_skill_scope.take();
             let mut context = serde_json::json!({
                 "messages": messages_with_skill_listing(&self.history, &self.skill_listing),
-                "tools": tool_runtime.model_definitions_scoped(round_skill_scope.as_ref()),
+                "tools": self.model_definitions(round_skill_scope.as_ref()),
                 "session_id": self.session_id.as_str(),
                 "turn_id": self.turn_id.as_str(),
             });
@@ -546,6 +542,19 @@ impl SessionActor {
 
     pub(crate) fn automatic_compaction_allowed(&self, trigger: CompactionTrigger) -> bool {
         self.context_tracker.automatic_compaction_allowed(trigger)
+    }
+
+    fn model_definitions(&self, scope: Option<&SkillToolScope>) -> Vec<serde_json::Value> {
+        let mut definitions = self.tool_runtime.model_definitions_scoped(scope);
+        if self.skill_handle.is_none() {
+            definitions.retain(|definition| {
+                definition
+                    .pointer("/function/name")
+                    .and_then(serde_json::Value::as_str)
+                    != Some("skill")
+            });
+        }
+        definitions
     }
 
     fn emit_context_usage(&self, usage: ContextUsage) -> Result<(), String> {
@@ -843,8 +852,19 @@ impl SessionActor {
             cancellation: self.turn_cancellation.clone(),
             execution_grant: None,
         };
-        let prepared =
-            tool_runtime.prepare_scoped(context, &name, arguments.clone(), round_skill_scope);
+        let skill_is_unbound = self.skill_handle.is_none()
+            && tool_runtime
+                .descriptor_for_wire_name(&name)
+                .is_some_and(|descriptor| descriptor.name.local_name() == "skill");
+        let prepared = if skill_is_unbound {
+            Err(ToolError::new(
+                "skill.resolver_unbound",
+                "skill invocation is unavailable without a session-bound resolver",
+                Retryability::Never,
+            ))
+        } else {
+            tool_runtime.prepare_scoped(context, &name, arguments.clone(), round_skill_scope)
+        };
         // Argument-scoped rules may canonicalize a path before policy. The
         // journal lifecycle must use that final prepared request hash even
         // though the provider's original arguments remain in conversation

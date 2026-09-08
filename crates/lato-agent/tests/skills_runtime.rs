@@ -2,15 +2,20 @@ use std::{collections::VecDeque, fs, path::PathBuf, sync::Arc};
 
 use async_trait::async_trait;
 use lato_agent::{
-    HistoryItem, RuntimePromptOutcome, RuntimeSession, SessionActor, SessionSkillHandle,
+    AcpHost, ChildSessionConfig, HistoryItem, RuntimePromptOutcome, RuntimeSession, SessionActor,
+    SessionSkillHandle,
 };
-use lato_ai::{ModelStream, StreamPiece};
-use lato_core::{SessionId, ToolCallId, ToolCapability, ToolContext, TurnId};
+use lato_ai::{ModelStream, StreamPiece, adapt_model_endpoint};
+use lato_core::{
+    JournalReplay, SessionId, SessionStore, ToolCallId, ToolCapability, ToolContext, TurnId,
+};
 use lato_extensions::{
     CapabilityCeiling, DiscoveryConfig, PluginConfig, PluginSnapshot, build_snapshot,
     discover_plugins,
     skills::{SkillCatalog, discover_skills},
 };
+use lato_protocol::JsonRpcReq;
+use lato_store::MemoryEventStore;
 use lato_tools::{
     BuiltinToolEnvironment, SkillResolver, SkillToolScope, builtin_tool_runtime,
     builtin_tool_runtime_for_capabilities,
@@ -192,6 +197,40 @@ fn runtime_session(fixture: &PluginFixture, stream: Arc<dyn ModelStream>) -> Run
     )
 }
 
+fn invocation_script() -> Vec<Vec<StreamPiece>> {
+    vec![
+        vec![StreamPiece::ToolCall {
+            id: "skill-call".into(),
+            name: "skill".into(),
+            arguments: serde_json::json!({"skill":"demo:inspect"}),
+        }],
+        vec![StreamPiece::Text("done".into())],
+    ]
+}
+
+fn asserts_bound_skill_context(contexts: &[serde_json::Value]) {
+    assert!(
+        contexts[0]["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("demo:inspect")
+    );
+    assert!(tool_names(&contexts[0]).contains(&"skill"));
+    assert!(
+        contexts[1]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|message| {
+                message.get("role").and_then(serde_json::Value::as_str) == Some("tool")
+                    && message
+                        .get("content")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|content| content.contains("<skill name=\"demo:inspect\""))
+            })
+    );
+}
+
 #[tokio::test]
 async fn session_skill_handle_maps_catalog_errors_to_stable_codes() {
     let handle = SessionSkillHandle::default();
@@ -277,6 +316,149 @@ async fn model_definitions_include_skill_only_when_resolver_is_installed() {
         .await
         .unwrap();
     assert!(!tool_names(&without_stream.contexts().await[0]).contains(&"skill"));
+}
+
+#[tokio::test]
+async fn custom_runtime_without_matching_resolver_injects_neither_listing_nor_skill_tool() {
+    let fixture = PluginFixture::new("demo", "Review safely.", &["read_file"]);
+    let stream = Arc::new(RecordingStream::scripted(invocation_script()));
+    let locks = Arc::new(FileLocks::new());
+    let trust = SessionTrust::for_headless_prompt(&fixture.workspace);
+    let runtime = builtin_tool_runtime(BuiltinToolEnvironment {
+        cwd: fixture.workspace.clone(),
+        locks: locks.clone(),
+        trust: trust.clone(),
+        // A caller-supplied resolver that is not paired with the session must
+        // be inert through the compatibility constructor.
+        skill_resolver: Some(Arc::new(SessionSkillHandle::default())),
+    })
+    .unwrap();
+    let endpoint =
+        adapt_model_endpoint("fixture", "custom", Default::default(), stream.clone()).unwrap();
+    let (updates, _) = mpsc::unbounded_channel();
+    let session = RuntimeSession::new_with_endpoint_and_tool_runtime(
+        "custom-no-resolver".into(),
+        endpoint,
+        locks,
+        trust,
+        fixture.workspace.clone(),
+        updates,
+        None,
+        runtime,
+    );
+    session
+        .stage_plugin_snapshot(fixture.snapshot(1, true, true))
+        .await
+        .unwrap();
+    session.prompt("hello".into()).await.unwrap();
+    let contexts = stream.contexts().await;
+    assert!(
+        !contexts[0]["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("available_skills")
+    );
+    assert!(!tool_names(&contexts[0]).contains(&"skill"));
+    assert!(session.history_snapshot().await.iter().any(|item| {
+        matches!(item, HistoryItem::ToolResult { output, .. } if output.contains("ERROR [skill.resolver_unbound]"))
+    }));
+}
+
+#[tokio::test]
+async fn production_host_resume_and_child_bind_the_same_resolver_handle() {
+    let fixture = PluginFixture::new("demo", "Review safely.", &["read_file"]);
+
+    let host_stream = Arc::new(RecordingStream::scripted(invocation_script()));
+    let (updates, _) = mpsc::unbounded_channel();
+    let mut host = AcpHost::new_with_home_and_plugin_dirs(
+        fixture.workspace.clone(),
+        SessionTrust::for_headless_prompt(&fixture.workspace),
+        updates,
+        host_stream.clone(),
+        fixture.home.clone(),
+        vec![fixture.plugin.clone()],
+    );
+    let new = host
+        .handle(JsonRpcReq {
+            jsonrpc: "2.0".into(),
+            id: Some(serde_json::json!(1)),
+            method: "session/new".into(),
+            params: Some(serde_json::json!({})),
+        })
+        .await
+        .unwrap();
+    let sid = new["result"]["sessionId"].as_str().unwrap();
+    let response = host
+        .handle(JsonRpcReq {
+            jsonrpc: "2.0".into(),
+            id: Some(serde_json::json!(2)),
+            method: "session/prompt".into(),
+            params: Some(serde_json::json!({"sessionId":sid,"text":"inspect"})),
+        })
+        .await
+        .unwrap();
+    assert_eq!(response["result"]["status"], "complete");
+    asserts_bound_skill_context(&host_stream.contexts().await);
+
+    let resume_stream = Arc::new(RecordingStream::scripted(invocation_script()));
+    let resume_id = SessionId::from("resume-skills");
+    let replay = JournalReplay::empty(resume_id.clone());
+    let store: Arc<dyn SessionStore> = Arc::new(MemoryEventStore::new());
+    let (updates, _) = mpsc::unbounded_channel();
+    let resumed = RuntimeSession::new_with_store(
+        resume_id.to_string(),
+        resume_stream.clone(),
+        Arc::new(FileLocks::new()),
+        SessionTrust::for_headless_prompt(&fixture.workspace),
+        fixture.workspace.clone(),
+        updates,
+        None,
+        store,
+        replay,
+    )
+    .await
+    .unwrap();
+    resumed
+        .stage_plugin_snapshot(fixture.snapshot(2, true, true))
+        .await
+        .unwrap();
+    resumed.prompt("inspect".into()).await.unwrap();
+    asserts_bound_skill_context(&resume_stream.contexts().await);
+
+    let child_stream = Arc::new(RecordingStream::scripted(invocation_script()));
+    let child_handle = SessionSkillHandle::default();
+    let locks = Arc::new(FileLocks::new());
+    let trust = SessionTrust::for_headless_prompt(&fixture.workspace);
+    let child_runtime = builtin_tool_runtime_for_capabilities(
+        BuiltinToolEnvironment {
+            cwd: fixture.workspace.clone(),
+            locks: locks.clone(),
+            trust: trust.clone(),
+            skill_resolver: Some(Arc::new(child_handle.clone())),
+        },
+        Some(&[ToolCapability::FileRead, ToolCapability::ExtensionInvoke]),
+    )
+    .unwrap();
+    let (updates, _) = mpsc::unbounded_channel();
+    let child = RuntimeSession::new_child_with_skill_handle(
+        ChildSessionConfig {
+            session_id: "child-skills".into(),
+            stream: child_stream.clone(),
+            locks,
+            trust,
+            cwd: fixture.workspace.clone(),
+            updates,
+            approval: None,
+            tool_runtime: child_runtime,
+            initial_history: vec![HistoryItem::System("child".into())],
+            plugin_snapshot: fixture.snapshot(3, true, true),
+        },
+        Some(child_handle),
+    )
+    .await
+    .unwrap();
+    child.prompt("inspect".into()).await.unwrap();
+    asserts_bound_skill_context(&child_stream.contexts().await);
 }
 
 #[tokio::test]

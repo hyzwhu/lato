@@ -9,7 +9,7 @@ use super::{
 };
 use crate::{
     ChildSessionConfig, HistoryItem, RuntimePromptOutcome, RuntimeSession, SessionPluginSnapshots,
-    ToolApproval,
+    SessionSkillHandle, ToolApproval,
 };
 use lato_ai::ModelStream;
 use lato_core::{
@@ -123,12 +123,13 @@ impl ChildSessionRunner {
             workspace: workspace_capabilities,
         });
         let trust = self.child_trust(&request);
+        let skill_handle = SessionSkillHandle::default();
         let tool_runtime = builtin_tool_runtime_for_capabilities_with_subagents(
             BuiltinToolEnvironment {
                 cwd: request.workspace_lease.root.clone(),
                 locks: Arc::clone(&self.locks),
                 trust: trust.clone(),
-                skill_resolver: None,
+                skill_resolver: Some(Arc::new(skill_handle.clone())),
             },
             Some(&request.node.permissions),
             ChannelBackend::new(request.scoped_handle.clone()).into_resource(),
@@ -162,18 +163,21 @@ impl ChildSessionRunner {
 
         let (child_updates_tx, child_updates_rx) = mpsc::unbounded_channel();
         let session = Arc::new(
-            RuntimeSession::new_child(ChildSessionConfig {
-                session_id: request.node.id.to_string(),
-                stream: Arc::clone(&self.stream),
-                locks: Arc::clone(&self.locks),
-                trust,
-                cwd: request.workspace_lease.root.clone(),
-                updates: child_updates_tx,
-                approval: self.approval.clone(),
-                tool_runtime,
-                initial_history: vec![HistoryItem::System(package.render())],
-                plugin_snapshot: Arc::clone(&child_plugins),
-            })
+            RuntimeSession::new_child_with_skill_handle(
+                ChildSessionConfig {
+                    session_id: request.node.id.to_string(),
+                    stream: Arc::clone(&self.stream),
+                    locks: Arc::clone(&self.locks),
+                    trust,
+                    cwd: request.workspace_lease.root.clone(),
+                    updates: child_updates_tx,
+                    approval: self.approval.clone(),
+                    tool_runtime,
+                    initial_history: vec![HistoryItem::System(package.render())],
+                    plugin_snapshot: Arc::clone(&child_plugins),
+                },
+                Some(skill_handle),
+            )
             .await
             .map_err(|error| task_error(TaskErrorCode::RunnerInitialization, error))?,
         );

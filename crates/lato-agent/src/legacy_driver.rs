@@ -124,15 +124,41 @@ impl LegacyTurnDriver {
         approval: Option<Arc<dyn ToolApproval>>,
         tool_runtime: Arc<lato_tools::ToolRuntime>,
     ) -> Self {
+        Self::new_with_endpoint_tool_runtime_and_skill_handle(
+            session_id,
+            endpoint,
+            locks,
+            trust,
+            cwd,
+            passthrough,
+            approval,
+            tool_runtime,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_endpoint_tool_runtime_and_skill_handle(
+        session_id: String,
+        endpoint: ActiveModelStream,
+        locks: Arc<FileLocks>,
+        trust: SessionTrust,
+        cwd: PathBuf,
+        passthrough: mpsc::UnboundedSender<serde_json::Value>,
+        approval: Option<Arc<dyn ToolApproval>>,
+        tool_runtime: Arc<lato_tools::ToolRuntime>,
+        skill_handle: Option<crate::SessionSkillHandle>,
+    ) -> Self {
         let model_port = Arc::new(SwitchableModelPort::from_active(endpoint.port.clone()));
         let model_stream = Arc::new(SwitchableModelStream::new(endpoint));
         let (actor_tx, actor_events) = mpsc::unbounded_channel();
-        let actor = SessionActor::new_with_tool_runtime(
+        let actor = SessionActor::new_with_tool_runtime_and_skill_handle(
             model_stream.clone(),
             locks,
             trust,
             cwd,
             tool_runtime,
+            skill_handle,
         )
         .with_interactive_events(actor_tx, session_id, approval);
         Self::from_actor(actor, actor_events, passthrough, model_port, model_stream)

@@ -3,8 +3,8 @@
 // Lato changes: serialized per-session model switch with checkpoint-first immediate compaction
 
 use crate::{
-    HistoryItem, LegacyTurnDriver, SwitchCompaction, ToolApproval, decide_switch_compaction,
-    estimate_history_tokens, model_messages_to_history,
+    HistoryItem, LegacyTurnDriver, SessionSkillHandle, SwitchCompaction, ToolApproval,
+    decide_switch_compaction, estimate_history_tokens, model_messages_to_history,
 };
 use lato_ai::{ActiveModelStream, ModelStream, adapt_model_endpoint};
 use lato_core::{
@@ -21,7 +21,13 @@ use lato_runtime::{
     SessionBootstrap, SessionHandle, TurnDriver, spawn_session, spawn_session_with_store,
 };
 use lato_workspace::{FileLocks, SessionTrust};
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 use tokio::sync::{Mutex, broadcast, mpsc};
 use tokio::time::Duration;
 
@@ -60,6 +66,13 @@ enum ActiveOperation {
     Compaction(CompactionId),
 }
 
+#[derive(Clone, Copy, Debug)]
+enum PromptObservationFailure {
+    Lagged(u64),
+    Closed,
+    MissingTurnId,
+}
+
 /// Typed session facade used by protocol adapters.
 ///
 /// The submission gate closes the small window between accepting a start
@@ -73,6 +86,7 @@ pub struct RuntimeSession {
     active_operation: Mutex<Option<ActiveOperation>>,
     submission_gate: Mutex<()>,
     plugin_state: Mutex<SessionPluginState>,
+    failed_closed: AtomicBool,
 }
 
 struct SessionPluginState {
@@ -110,6 +124,13 @@ pub struct ChildSessionConfig {
 
 impl RuntimeSession {
     pub async fn new_child(config: ChildSessionConfig) -> Result<Self, AgentError> {
+        Self::new_child_with_skill_handle(config, None).await
+    }
+
+    pub async fn new_child_with_skill_handle(
+        config: ChildSessionConfig,
+        skill_handle: Option<SessionSkillHandle>,
+    ) -> Result<Self, AgentError> {
         let session_id = SessionId::parse(config.session_id.clone()).map_err(|error| {
             AgentError::new(
                 "task.child.invalid_session_id",
@@ -118,16 +139,19 @@ impl RuntimeSession {
                 Retryability::Never,
             )
         })?;
-        let driver = Arc::new(LegacyTurnDriver::new_with_tool_runtime(
-            config.session_id,
-            config.stream,
-            config.locks,
-            config.trust,
-            config.cwd,
-            config.updates.clone(),
-            config.approval,
-            config.tool_runtime,
-        ));
+        let driver = Arc::new(
+            LegacyTurnDriver::new_with_endpoint_tool_runtime_and_skill_handle(
+                config.session_id,
+                endpoint_from_stream(config.stream),
+                config.locks,
+                config.trust,
+                config.cwd,
+                config.updates.clone(),
+                config.approval,
+                config.tool_runtime,
+                skill_handle,
+            ),
+        );
         if !config.initial_history.is_empty() {
             driver.replace_history(config.initial_history).await;
         }
@@ -141,6 +165,7 @@ impl RuntimeSession {
             active_operation: Mutex::new(None),
             submission_gate: Mutex::new(()),
             plugin_state: Mutex::new(SessionPluginState::default()),
+            failed_closed: AtomicBool::new(false),
         };
         session
             .stage_plugin_snapshot(config.plugin_snapshot)
@@ -199,6 +224,7 @@ impl RuntimeSession {
             active_operation: Mutex::new(None),
             submission_gate: Mutex::new(()),
             plugin_state: Mutex::new(SessionPluginState::default()),
+            failed_closed: AtomicBool::new(false),
         }
     }
 
@@ -213,17 +239,45 @@ impl RuntimeSession {
         approval: Option<Arc<dyn ToolApproval>>,
         tool_runtime: Arc<lato_tools::ToolRuntime>,
     ) -> Self {
-        let session_id = SessionId::from(session_id);
-        let driver = Arc::new(LegacyTurnDriver::new_with_endpoint_and_tool_runtime(
-            session_id.to_string(),
+        Self::new_with_endpoint_tool_runtime_and_skill_handle(
+            session_id,
             endpoint,
             locks,
             trust,
             cwd,
-            updates.clone(),
+            updates,
             approval,
             tool_runtime,
-        ));
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_endpoint_tool_runtime_and_skill_handle(
+        session_id: String,
+        endpoint: ActiveModelStream,
+        locks: Arc<FileLocks>,
+        trust: SessionTrust,
+        cwd: PathBuf,
+        updates: mpsc::UnboundedSender<serde_json::Value>,
+        approval: Option<Arc<dyn ToolApproval>>,
+        tool_runtime: Arc<lato_tools::ToolRuntime>,
+        skill_handle: Option<SessionSkillHandle>,
+    ) -> Self {
+        let session_id = SessionId::from(session_id);
+        let driver = Arc::new(
+            LegacyTurnDriver::new_with_endpoint_tool_runtime_and_skill_handle(
+                session_id.to_string(),
+                endpoint,
+                locks,
+                trust,
+                cwd,
+                updates.clone(),
+                approval,
+                tool_runtime,
+                skill_handle,
+            ),
+        );
         let runtime_driver: Arc<dyn TurnDriver> = driver.clone();
         let handle = spawn_session(session_id.clone(), runtime_driver);
         Self {
@@ -234,6 +288,7 @@ impl RuntimeSession {
             active_operation: Mutex::new(None),
             submission_gate: Mutex::new(()),
             plugin_state: Mutex::new(SessionPluginState::default()),
+            failed_closed: AtomicBool::new(false),
         }
     }
 
@@ -275,11 +330,12 @@ impl RuntimeSession {
         store: Arc<dyn SessionStore>,
         replay: JournalReplay,
     ) -> Result<Self, AgentError> {
+        let skill_handle = SessionSkillHandle::default();
         let tool_runtime = lato_tools::builtin_tool_runtime(lato_tools::BuiltinToolEnvironment {
             cwd: cwd.clone(),
             locks: locks.clone(),
             trust: trust.clone(),
-            skill_resolver: None,
+            skill_resolver: Some(Arc::new(skill_handle.clone())),
         })
         .map_err(|error| {
             AgentError::new(
@@ -289,7 +345,7 @@ impl RuntimeSession {
                 Retryability::Never,
             )
         })?;
-        Self::new_with_store_endpoint_and_tool_runtime(
+        Self::new_with_store_endpoint_tool_runtime_and_skill_handle(
             session_id,
             endpoint,
             locks,
@@ -300,6 +356,7 @@ impl RuntimeSession {
             store,
             replay,
             tool_runtime,
+            Some(skill_handle),
         )
         .await
     }
@@ -317,22 +374,55 @@ impl RuntimeSession {
         replay: JournalReplay,
         tool_runtime: Arc<lato_tools::ToolRuntime>,
     ) -> Result<Self, AgentError> {
+        Self::new_with_store_endpoint_tool_runtime_and_skill_handle(
+            session_id,
+            endpoint,
+            locks,
+            trust,
+            cwd,
+            updates,
+            approval,
+            store,
+            replay,
+            tool_runtime,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn new_with_store_endpoint_tool_runtime_and_skill_handle(
+        session_id: String,
+        endpoint: ActiveModelStream,
+        locks: Arc<FileLocks>,
+        trust: SessionTrust,
+        cwd: PathBuf,
+        updates: mpsc::UnboundedSender<serde_json::Value>,
+        approval: Option<Arc<dyn ToolApproval>>,
+        store: Arc<dyn SessionStore>,
+        replay: JournalReplay,
+        tool_runtime: Arc<lato_tools::ToolRuntime>,
+        skill_handle: Option<SessionSkillHandle>,
+    ) -> Result<Self, AgentError> {
         if let Some(unresolved) = replay.projection.unresolved_tools.first() {
             return Err(journal_error(JournalError::IncompleteSideEffect {
                 call_id: unresolved.call_id.clone(),
             }));
         }
         let session_id = SessionId::from(session_id);
-        let driver = Arc::new(LegacyTurnDriver::new_with_endpoint_and_tool_runtime(
-            session_id.to_string(),
-            endpoint,
-            locks,
-            trust,
-            cwd,
-            updates.clone(),
-            approval,
-            tool_runtime,
-        ));
+        let driver = Arc::new(
+            LegacyTurnDriver::new_with_endpoint_tool_runtime_and_skill_handle(
+                session_id.to_string(),
+                endpoint,
+                locks,
+                trust,
+                cwd,
+                updates.clone(),
+                approval,
+                tool_runtime,
+                skill_handle,
+            ),
+        );
         let mut history =
             model_messages_to_history(&replay.projection.messages).map_err(journal_error)?;
         if !history.is_empty() && !matches!(history.first(), Some(HistoryItem::System(_))) {
@@ -359,10 +449,14 @@ impl RuntimeSession {
             active_operation: Mutex::new(None),
             submission_gate: Mutex::new(()),
             plugin_state: Mutex::new(SessionPluginState::default()),
+            failed_closed: AtomicBool::new(false),
         })
     }
 
     pub async fn prompt(&self, input: String) -> Result<RuntimePromptOutcome, AgentError> {
+        if self.failed_closed.load(Ordering::Acquire) {
+            return Err(runtime_observation_failed_closed());
+        }
         // Locking before subscribing prevents a waiting prompt from consuming
         // another prompt's start event while preserving subscribe-before-submit.
         let gate = self.submission_gate.lock().await;
@@ -386,12 +480,14 @@ impl RuntimeSession {
             let event = match events.recv().await {
                 Ok(event) => event,
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                    self.clear_active(observed_turn.as_ref()).await;
-                    return Err(event_lagged(skipped));
+                    return Err(self
+                        .fail_prompt_observation(PromptObservationFailure::Lagged(skipped))
+                        .await);
                 }
                 Err(broadcast::error::RecvError::Closed) => {
-                    self.clear_active(observed_turn.as_ref()).await;
-                    return Err(event_bus_closed());
+                    return Err(self
+                        .fail_prompt_observation(PromptObservationFailure::Closed)
+                        .await);
                 }
             };
 
@@ -401,7 +497,11 @@ impl RuntimeSession {
 
             match event.payload {
                 EventPayload::TurnStarted => {
-                    let turn_id = event.turn_id.ok_or_else(missing_turn_id)?;
+                    let Some(turn_id) = event.turn_id else {
+                        return Err(self
+                            .fail_prompt_observation(PromptObservationFailure::MissingTurnId)
+                            .await);
+                    };
                     observed_turn = Some(turn_id.clone());
                     *self.active_operation.lock().await = Some(ActiveOperation::Turn(turn_id));
                     drop(gate.take());
@@ -730,6 +830,22 @@ impl RuntimeSession {
         self.clear_operation(expected.as_ref()).await;
     }
 
+    /// Losing the authoritative event stream means the facade can no longer
+    /// prove which generation owns the live turn. Fail the session closed and
+    /// wait for the runtime shutdown acknowledgement before clearing facade
+    /// state. Pending plugin generations are deliberately left unapplied.
+    async fn fail_prompt_observation(&self, failure: PromptObservationFailure) -> AgentError {
+        self.failed_closed.store(true, Ordering::Release);
+        let _ = self.handle.submit(Command::Shutdown).await;
+        self.clear_active(None).await;
+        self.abort_plugin_turn().await;
+        match failure {
+            PromptObservationFailure::Lagged(skipped) => event_lagged(skipped),
+            PromptObservationFailure::Closed => event_bus_closed(),
+            PromptObservationFailure::MissingTurnId => missing_turn_id(),
+        }
+    }
+
     async fn finish_turn(&self, turn_id: Option<&TurnId>) -> Result<(), AgentError> {
         self.clear_active(turn_id).await;
         let _gate = self.submission_gate.lock().await;
@@ -951,6 +1067,15 @@ fn event_bus_closed() -> AgentError {
     )
 }
 
+fn runtime_observation_failed_closed() -> AgentError {
+    AgentError::new(
+        "runtime.observation_failed_closed",
+        ErrorCategory::InternalInvariant,
+        "session is unavailable after losing its authoritative runtime event stream",
+        Retryability::Never,
+    )
+}
+
 fn session_busy() -> AgentError {
     AgentError::new(
         "runtime.session_busy",
@@ -1024,6 +1149,7 @@ mod tests {
     use lato_core::{
         ModelContent, ModelError, ModelMessage, ModelRole, ToolCallId, UnresolvedToolCall,
     };
+    use lato_extensions::{DiscoveryResult, PluginConfig, build_snapshot};
     use lato_runtime::{CompactionControl, PrefireCompactionRequest};
     use lato_store::MemoryEventStore;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1035,6 +1161,20 @@ mod tests {
     struct TextStream {
         text: String,
         calls: AtomicUsize,
+    }
+
+    struct BlockingTurnStream;
+
+    #[async_trait]
+    impl ModelStream for BlockingTurnStream {
+        async fn stream(
+            &self,
+            _prompt_bytes: usize,
+            _context: serde_json::Value,
+            _tx: mpsc::Sender<StreamPiece>,
+        ) -> Result<(), ModelError> {
+            std::future::pending().await
+        }
     }
 
     #[async_trait]
@@ -1049,6 +1189,64 @@ mod tests {
             tx.send(StreamPiece::Text(self.text.clone()))
                 .await
                 .map_err(|_| ModelError::cancelled())
+        }
+    }
+
+    #[tokio::test]
+    async fn observation_failures_stop_the_turn_and_never_adopt_pending_generation() {
+        for (failure, expected_code) in [
+            (PromptObservationFailure::Lagged(7), "runtime.event_lagged"),
+            (PromptObservationFailure::Closed, "runtime.event_bus_closed"),
+            (
+                PromptObservationFailure::MissingTurnId,
+                "runtime.missing_turn_id",
+            ),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let (updates, _) = mpsc::unbounded_channel();
+            let session = RuntimeSession::new(
+                format!("observation-failure-{expected_code}"),
+                Arc::new(BlockingTurnStream),
+                Arc::new(FileLocks::new()),
+                SessionTrust::for_headless_prompt(directory.path()),
+                directory.path().to_path_buf(),
+                updates,
+                None,
+            );
+            session.begin_plugin_turn().await.unwrap();
+            let mut events = session.handle.subscribe();
+            session
+                .handle
+                .submit(Command::StartTurn(StartTurn {
+                    input: UserInput::text("block"),
+                    behavior: StartBehavior::Reject,
+                }))
+                .await
+                .unwrap();
+            let turn_id = loop {
+                let event = events.recv().await.unwrap();
+                if matches!(event.payload, EventPayload::TurnStarted) {
+                    break event.turn_id.unwrap();
+                }
+            };
+            *session.active_operation.lock().await = Some(ActiveOperation::Turn(turn_id));
+            let pending =
+                build_snapshot(2, DiscoveryResult::default(), &PluginConfig::default()).unwrap();
+            let pending_skills = SkillCatalog::from_discovery(discover_skills(&pending));
+            session.plugin_state.lock().await.pending = Some((pending, pending_skills));
+
+            let error = session.fail_prompt_observation(failure).await;
+            assert_eq!(error.code, expected_code);
+            assert!(session.failed_closed.load(Ordering::Acquire));
+            assert!(!session.is_active().await);
+            let state = session.plugin_state.lock().await;
+            assert!(state.active_turn.is_none());
+            assert!(state.active_turn_skills.is_none());
+            assert_eq!(state.current.generation(), 0);
+            assert_eq!(state.pending.as_ref().unwrap().0.generation(), 2);
+            drop(state);
+            let prompt_error = session.prompt("again".into()).await.unwrap_err();
+            assert_eq!(prompt_error.code, "runtime.observation_failed_closed");
         }
     }
 
