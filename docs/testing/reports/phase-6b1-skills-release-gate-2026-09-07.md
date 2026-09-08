@@ -1,6 +1,8 @@
 # Phase 6B1 Skills Release Gate
 
-Date: 2026-09-07
+Planned checkpoint date: 2026-09-07
+
+Actual final execution date: 2026-09-08
 
 Result: PASS
 
@@ -78,6 +80,30 @@ test phase6b_installed_command_smoke_exercises_skill_invocation ... ok
 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 ```
 
+The final installed smoke was also executed ten consecutive times after the
+fixture robustness repair:
+
+```text
+$ for run in {1..10}; do
+    printf 'installed smoke run %02d: ' "$run"
+    LATO_SMOKE_BINARY=/Users/huangyongzhao/.cargo/bin/lato \
+      cargo test --test phase6b_skills_smoke \
+      phase6b_installed_command_smoke_exercises_skill_invocation --quiet \
+      >/tmp/lato-phase6b-smoke-${run}.log 2>&1 \
+      && echo PASS || exit 1
+  done
+installed smoke run 01: PASS
+installed smoke run 02: PASS
+installed smoke run 03: PASS
+installed smoke run 04: PASS
+installed smoke run 05: PASS
+installed smoke run 06: PASS
+installed smoke run 07: PASS
+installed smoke run 08: PASS
+installed smoke run 09: PASS
+installed smoke run 10: PASS
+```
+
 The bounded localhost fixture starts the installed binary in a temporary,
 trusted Git workspace with a CLI plugin. It verifies that request one contains
 the qualified authored description, asks the built-in `skill` tool to expand
@@ -86,3 +112,11 @@ only the scoped `read_file` tool. The fixture returns
 `phase6b-skills-smoke-ok`, joins the server thread, waits for the child process,
 validates the persisted audit records, and drops all temporary workspace,
 plugin, home, and session resources.
+
+The 2026-09-08 checkpoint follow-up hardened the fixture itself. Every
+accepted socket is switched to blocking mode before I/O, while bounded retry
+loops handle `Interrupted`, `WouldBlock`, and `TimedOut`. A child-process RAII
+guard always performs kill-and-wait when a test exits early. A server-thread
+RAII guard signals cancellation and joins the thread on every unwind path;
+accept, read, write, and final quiet-period loops all have deadlines, so cleanup
+cannot wait on an unbounded socket operation.

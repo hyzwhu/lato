@@ -1,13 +1,23 @@
 use serde_json::Value;
 use std::{
     fs,
-    io::{Read, Write},
+    io::{self, Read, Write},
     net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
-    process::{Command, Output, Stdio},
-    thread,
+    process::{Child, Command, Output, Stdio},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
+
+const PROCESS_DEADLINE: Duration = Duration::from_secs(30);
+const REQUEST_DEADLINE: Duration = Duration::from_secs(5);
+const SOCKET_RETRY: Duration = Duration::from_millis(10);
+const SOCKET_TIMEOUT: Duration = Duration::from_millis(100);
+const FINAL_QUIET_PERIOD: Duration = Duration::from_millis(100);
 
 const INVOKE_SKILL: &str = concat!(
     "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"skill-1\",",
@@ -27,6 +37,81 @@ struct SmokeOutcome {
     output: Output,
     session_journal: PathBuf,
     _root: tempfile::TempDir,
+}
+
+struct ChildGuard {
+    child: Option<Child>,
+}
+
+impl ChildGuard {
+    fn new(child: Child) -> Self {
+        Self { child: Some(child) }
+    }
+
+    fn wait_with_output(mut self, deadline: Instant) -> Result<Output, String> {
+        loop {
+            let child = self.child.as_mut().expect("child guard is armed");
+            match child.try_wait() {
+                Ok(Some(_)) => {
+                    return self
+                        .child
+                        .take()
+                        .expect("child guard is armed")
+                        .wait_with_output()
+                        .map_err(|error| format!("failed to collect lato output: {error}"));
+                }
+                Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(20)),
+                Ok(None) => return Err("lato command did not finish within 30 seconds".into()),
+                Err(error) => return Err(format!("failed to poll lato command: {error}")),
+            }
+        }
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let Some(child) = self.child.as_mut() else {
+            return;
+        };
+        if child.try_wait().ok().flatten().is_none() {
+            let _ = child.kill();
+        }
+        let _ = child.wait();
+    }
+}
+
+struct ServerGuard {
+    cancellation: Arc<AtomicBool>,
+    handle: Option<JoinHandle<Result<(), String>>>,
+}
+
+impl ServerGuard {
+    fn spawn(listener: TcpListener) -> Self {
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let server_cancellation = Arc::clone(&cancellation);
+        let handle = thread::spawn(move || run_server(listener, &server_cancellation));
+        Self {
+            cancellation,
+            handle: Some(handle),
+        }
+    }
+
+    fn join(mut self) -> Result<(), String> {
+        self.handle
+            .take()
+            .expect("server guard is armed")
+            .join()
+            .map_err(|_| "model fixture server panicked".to_owned())?
+    }
+}
+
+impl Drop for ServerGuard {
+    fn drop(&mut self) {
+        self.cancellation.store(true, Ordering::Release);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
 }
 
 #[test]
@@ -101,20 +186,9 @@ fn run_scripted_skill_smoke(binary: &Path) -> SmokeOutcome {
     )
     .unwrap();
 
-    let server = thread::spawn(move || {
-        for (index, response) in [INVOKE_SKILL, COMPLETE].into_iter().enumerate() {
-            let mut socket = accept_before(&listener, Instant::now() + Duration::from_secs(30));
-            let request = read_request(&mut socket);
-            assert_request(index, &request);
-            write_response(&mut socket, response);
-        }
-        assert!(
-            listener.accept().is_err(),
-            "model received an unexpected request after terminal completion"
-        );
-    });
+    let server = ServerGuard::spawn(listener);
 
-    let mut child = Command::new(binary)
+    let child = Command::new(binary)
         .current_dir(&workspace)
         .env("LATO_HOME", &home)
         .env("PHASE6B_FIXTURE_KEY", "offline-fixture-key")
@@ -130,18 +204,9 @@ fn run_scripted_skill_smoke(binary: &Path) -> SmokeOutcome {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        if child.try_wait().unwrap().is_some() {
-            break;
-        }
-        if Instant::now() >= deadline {
-            child.kill().unwrap();
-            panic!("lato command did not finish within 30 seconds");
-        }
-        thread::sleep(Duration::from_millis(20));
-    }
-    let output = child.wait_with_output().unwrap();
+    let output = ChildGuard::new(child)
+        .wait_with_output(Instant::now() + PROCESS_DEADLINE)
+        .unwrap();
     server.join().unwrap();
 
     SmokeOutcome {
@@ -174,64 +239,172 @@ fn assert_request(index: usize, body: &Value) {
     }
 }
 
-fn accept_before(listener: &TcpListener, deadline: Instant) -> TcpStream {
-    loop {
-        match listener.accept() {
-            Ok((stream, _)) => {
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(5)))
-                    .unwrap();
-                return stream;
-            }
-            Err(error)
-                if error.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline =>
-            {
-                thread::sleep(Duration::from_millis(10));
-            }
-            Err(error) => panic!("fixture accept failed: {error}"),
-        }
+fn run_server(listener: TcpListener, cancellation: &AtomicBool) -> Result<(), String> {
+    for (index, response) in [INVOKE_SKILL, COMPLETE].into_iter().enumerate() {
+        let mut socket = accept_before(&listener, Instant::now() + PROCESS_DEADLINE, cancellation)?;
+        let request = read_request(&mut socket, Instant::now() + REQUEST_DEADLINE, cancellation)?;
+        assert_request(index, &request);
+        write_response(
+            &mut socket,
+            response,
+            Instant::now() + REQUEST_DEADLINE,
+            cancellation,
+        )?;
     }
+    reject_unexpected_connection_before(
+        &listener,
+        Instant::now() + FINAL_QUIET_PERIOD,
+        cancellation,
+    )
 }
 
-fn read_request(socket: &mut TcpStream) -> Value {
+fn accept_before(
+    listener: &TcpListener,
+    deadline: Instant,
+    cancellation: &AtomicBool,
+) -> Result<TcpStream, String> {
+    let (stream, _) = retry_io(deadline, cancellation, "fixture accept", || {
+        listener.accept()
+    })?;
+    // A stream accepted from a nonblocking listener may inherit nonblocking
+    // mode on some platforms. Switch it before any request or response I/O.
+    stream
+        .set_nonblocking(false)
+        .map_err(|error| format!("failed to make accepted fixture socket blocking: {error}"))?;
+    stream
+        .set_read_timeout(Some(SOCKET_TIMEOUT))
+        .map_err(|error| format!("failed to set fixture read timeout: {error}"))?;
+    stream
+        .set_write_timeout(Some(SOCKET_TIMEOUT))
+        .map_err(|error| format!("failed to set fixture write timeout: {error}"))?;
+    Ok(stream)
+}
+
+fn read_request(
+    socket: &mut TcpStream,
+    deadline: Instant,
+    cancellation: &AtomicBool,
+) -> Result<Value, String> {
     let mut bytes = Vec::new();
     let mut chunk = [0u8; 8192];
     let header_end = loop {
-        let count = socket.read(&mut chunk).unwrap();
-        assert!(count > 0, "connection closed before HTTP headers");
+        let count = retry_io(deadline, cancellation, "fixture request read", || {
+            socket.read(&mut chunk)
+        })?;
+        if count == 0 {
+            return Err("connection closed before HTTP headers".into());
+        }
         bytes.extend_from_slice(&chunk[..count]);
         if let Some(position) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
             break position + 4;
         }
-        assert!(bytes.len() <= 128 * 1024, "HTTP headers exceeded limit");
+        if bytes.len() > 128 * 1024 {
+            return Err("HTTP headers exceeded limit".into());
+        }
     };
     let headers = String::from_utf8_lossy(&bytes[..header_end]).to_ascii_lowercase();
-    assert!(headers.starts_with("post /v1/chat/completions "));
+    if !headers.starts_with("post /v1/chat/completions ") {
+        return Err("fixture received an unexpected HTTP request target".into());
+    }
     let content_length = headers
         .lines()
         .find_map(|line| line.strip_prefix("content-length: "))
-        .expect("content-length header")
+        .ok_or_else(|| "fixture request omitted content-length".to_owned())?
         .trim()
         .parse::<usize>()
-        .unwrap();
-    assert!(content_length <= 2 * 1024 * 1024);
+        .map_err(|error| format!("invalid fixture content-length: {error}"))?;
+    if content_length > 2 * 1024 * 1024 {
+        return Err("fixture request body exceeded limit".into());
+    }
     while bytes.len() - header_end < content_length {
-        let count = socket.read(&mut chunk).unwrap();
-        assert!(count > 0, "connection closed before HTTP body");
+        let count = retry_io(deadline, cancellation, "fixture request read", || {
+            socket.read(&mut chunk)
+        })?;
+        if count == 0 {
+            return Err("connection closed before HTTP body".into());
+        }
         bytes.extend_from_slice(&chunk[..count]);
     }
-    serde_json::from_slice(&bytes[header_end..header_end + content_length]).unwrap()
+    serde_json::from_slice(&bytes[header_end..header_end + content_length])
+        .map_err(|error| format!("fixture request body was not valid JSON: {error}"))
 }
 
-fn write_response(socket: &mut TcpStream, body: &str) {
-    write!(
-        socket,
+fn retry_io<T>(
+    deadline: Instant,
+    cancellation: &AtomicBool,
+    operation_name: &str,
+    mut operation: impl FnMut() -> io::Result<T>,
+) -> Result<T, String> {
+    loop {
+        if cancellation.load(Ordering::Acquire) {
+            return Err("model fixture server cancelled".into());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("{operation_name} deadline exceeded"));
+        }
+        match operation() {
+            Ok(value) => return Ok(value),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                thread::sleep(SOCKET_RETRY);
+            }
+            Err(error) => return Err(format!("{operation_name} failed: {error}")),
+        }
+    }
+}
+
+fn write_response(
+    socket: &mut TcpStream,
+    body: &str,
+    deadline: Instant,
+    cancellation: &AtomicBool,
+) -> Result<(), String> {
+    let response = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         body.len(),
         body
-    )
-    .unwrap();
-    socket.flush().unwrap();
+    );
+    let mut written = 0;
+    while written < response.len() {
+        let count = retry_io(deadline, cancellation, "fixture response write", || {
+            socket.write(&response.as_bytes()[written..])
+        })?;
+        if count == 0 {
+            return Err("connection closed before HTTP response completed".into());
+        }
+        written += count;
+    }
+    retry_io(deadline, cancellation, "fixture response flush", || {
+        socket.flush()
+    })
+}
+
+fn reject_unexpected_connection_before(
+    listener: &TcpListener,
+    deadline: Instant,
+    cancellation: &AtomicBool,
+) -> Result<(), String> {
+    loop {
+        if cancellation.load(Ordering::Acquire) {
+            return Err("model fixture server cancelled".into());
+        }
+        match listener.accept() {
+            Ok(_) => return Err("model received an unexpected request after completion".into()),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline =>
+            {
+                thread::sleep(SOCKET_RETRY);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
+            Err(error) => return Err(format!("fixture final accept failed: {error}")),
+        }
+    }
 }
 
 fn initialize_repo(root: &Path) {
