@@ -5,10 +5,12 @@
 mod command;
 mod config;
 mod event;
+mod http;
 mod result;
 
 pub use config::*;
 pub use event::*;
+pub use http::*;
 pub use result::*;
 
 pub const MAX_PAYLOAD_BYTES: usize = 128 * 1024;
