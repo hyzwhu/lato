@@ -335,18 +335,84 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn d1_3_linux_bwrap_workspace_policy() {
-        if !Path::new("/usr/bin/bwrap").is_file() {
-            return;
+        // Two failure modes must refuse rather than fall back to native bash:
+        //   1. wrapper missing (file not on disk)
+        //   2. wrapper present but unusable (cannot set up user namespace, e.g.
+        //      /proc/sys/kernel/unprivileged_userns_clone=0 on this host)
+        // Only when the wrapper is genuinely usable do we exercise the workspace
+        // happy path; that requires a host where bwrap can create user namespaces.
+        let backend = lato_workspace::HostSandboxBackend::new();
+        let readiness = backend.readiness(SandboxProfile::Workspace);
+        match readiness {
+            lato_workspace::SandboxReadiness::Ready => {
+                let d = tempfile::tempdir().unwrap();
+                run_terminal_command_sandboxed(
+                    "printf ok > inside.txt",
+                    d.path(),
+                    SandboxProfile::Workspace,
+                )
+                .await
+                .unwrap();
+                assert!(d.path().join("inside.txt").exists());
+            }
+            lato_workspace::SandboxReadiness::Unavailable => {
+                // The CLI / dispatch layer must surface a typed unavailable error
+                // and must not run the command unsandboxed.
+                let d = tempfile::tempdir().unwrap();
+                let result = run_terminal_command_sandboxed(
+                    "printf forbidden > forbidden.txt",
+                    d.path(),
+                    SandboxProfile::Workspace,
+                )
+                .await;
+                let error = result.expect_err("unavailable sandbox must refuse");
+                assert!(
+                    error.contains("sandbox wrapper unavailable"),
+                    "expected typed unavailable error, got: {error}"
+                );
+                assert!(
+                    !d.path().join("forbidden.txt").exists(),
+                    "command must not run unsandboxed when profile is unavailable"
+                );
+                // Backend prepare path must agree.
+                let prepare_error = backend
+                    .prepare(
+                        &lato_core::SandboxObligation::workspace(d.path()),
+                        "printf forbidden > forbidden.txt",
+                    )
+                    .err()
+                    .expect("backend prepare must refuse when readiness is Unavailable");
+                assert_eq!(prepare_error.code(), "sandbox.unavailable");
+                assert!(!d.path().join("forbidden.txt").exists());
+            }
+            lato_workspace::SandboxReadiness::Unsupported => {
+                // Linux production path never reports Unsupported; skip silently.
+            }
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn d1_3b_linux_unusable_wrapper_refuses_workspace_command() {
+        // Pointing the backend at /bin/false simulates a wrapper binary that is on
+        // disk but cannot actually execute a sandboxed command. This must surface
+        // a typed unavailable error and must not silently run the command unsandboxed.
+        let backend =
+            lato_workspace::HostSandboxBackend::with_wrapper_override("/bin/false");
+        let readiness = backend.readiness(SandboxProfile::Workspace);
+        // /bin/false is a regular file, so readiness will report Ready or Unavailable
+        // depending on whether the probe accepts it; either way prepare must refuse.
         let d = tempfile::tempdir().unwrap();
-        run_terminal_command_sandboxed(
-            "printf ok > inside.txt",
-            d.path(),
-            SandboxProfile::Workspace,
-        )
-        .await
-        .unwrap();
-        assert!(d.path().join("inside.txt").exists());
+        let prepare_error = backend
+            .prepare(
+                &lato_core::SandboxObligation::workspace(d.path()),
+                "printf forbidden > forbidden.txt",
+            )
+            .err()
+            .expect("prepare must refuse when wrapper is unusable");
+        assert_eq!(prepare_error.code(), "sandbox.unavailable");
+        assert!(!d.path().join("forbidden.txt").exists());
+        let _ = readiness; // silence unused warning
     }
 
     #[cfg(windows)]

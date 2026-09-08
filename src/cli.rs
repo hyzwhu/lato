@@ -13,7 +13,7 @@ use lato_ai::{
     oauth_allowed, phase0_supported, provider_spec, refresh_openai_compatible_models,
     refresh_remote_provider_catalog_with_policy, store_oauth,
 };
-use lato_workspace::{ApprovalMode, SessionTrust};
+use lato_workspace::{ApprovalMode, HostSandboxBackend, SandboxBackend, SandboxReadiness, SessionTrust};
 use std::{
     io::IsTerminal,
     path::PathBuf,
@@ -332,6 +332,16 @@ async fn prompt(args: PromptArgs) -> i32 {
         return 2;
     }
     let sandbox = crate::permissions::profile(args.sandbox);
+    let backend = HostSandboxBackend::new();
+    let readiness = backend.readiness(sandbox);
+    if readiness != SandboxReadiness::Ready {
+        eprintln!(
+            "error: requested sandbox profile {} is {readiness:?} on this host; refusing to run unsandboxed. Use --sandbox off if you intend to bypass the sandbox.",
+            sandbox_label(sandbox)
+        );
+        return 1;
+    }
+    let _ = backend;
     let model_arg = args.model.or_else(|| std::env::var("LATO_MODEL").ok());
     let text = args.text;
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -482,6 +492,14 @@ async fn interactive(
                 } else {
                     crate::permissions::select_sandbox(&ui, language, sandbox_override).await?
                 };
+                let sandbox_profile = crate::permissions::profile(sandbox);
+                let readiness = HostSandboxBackend::new().readiness(sandbox_profile);
+                if readiness != SandboxReadiness::Ready {
+                    return Err(format!(
+                        "requested sandbox profile {} is {readiness:?} on this host; refusing to run unsandboxed. Choose a different profile with --sandbox or run `lato doctor` for details.",
+                        sandbox_label(sandbox_profile)
+                    ));
+                }
                 let trust = crate::permissions::interactive_trust(&cwd, trusted, sandbox);
                 let (tui_approval, approvals) = crate::tui::backend::TuiToolApproval::channel();
                 let inline_approval = (trust.mode == ApprovalMode::Ask).then_some(tui_approval);
@@ -1060,6 +1078,10 @@ async fn login(provider: String, method: LoginMethod) -> i32 {
             eprintln!("error: api-key login not supported for {provider}");
             return 1;
         }
+        if key.trim().is_empty() {
+            eprintln!("error: --api-key for {provider} is empty; refusing to write an empty credential");
+            return 1;
+        }
         let mut store = CredentialStore::open(&home).unwrap();
         store
             .modify(|m| {
@@ -1119,11 +1141,21 @@ pub(crate) fn lato_home() -> PathBuf {
         })
 }
 
+fn sandbox_label(profile: lato_workspace::SandboxProfile) -> &'static str {
+    use lato_workspace::SandboxProfile;
+    match profile {
+        SandboxProfile::Off => "off",
+        SandboxProfile::Workspace => "workspace",
+        SandboxProfile::ReadOnly => "read-only",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        LocalFact, is_exit_command, requested_local_facts, requires_authoritative_remote_models,
-        resolve_authoritative_models, should_discover_provider_models,
+        LocalFact, is_exit_command, login, requested_local_facts,
+        requires_authoritative_remote_models, resolve_authoritative_models,
+        should_discover_provider_models,
     };
     use lato_ai::{CustomModel, ModelApi};
 
@@ -1240,5 +1272,64 @@ mod tests {
             requested_local_facts("上一层目录是什么"),
             vec![LocalFact::AncestorDirectory(1)]
         );
+    }
+
+    #[tokio::test]
+    async fn login_api_key_rejects_empty_and_whitespace_keys() {
+        use crate::args::LoginMethod;
+        use lato_ai::CredentialStore;
+
+        for provider in ["openai", "anthropic", "minimax", "kimi-coding"] {
+            for key in ["", " ", "   ", "\t", "\n"] {
+                let temp = tempfile::tempdir().unwrap();
+                let previous = std::env::var_os("LATO_HOME");
+                unsafe {
+                    std::env::set_var("LATO_HOME", temp.path());
+                }
+                let result = login(provider.to_string(), LoginMethod::ApiKey(key.into())).await;
+                match previous.as_ref() {
+                    Some(value) => unsafe { std::env::set_var("LATO_HOME", value) },
+                    None => unsafe { std::env::remove_var("LATO_HOME") },
+                }
+                assert_eq!(
+                    result, 1,
+                    "{provider} should reject empty/whitespace key {key:?}"
+                );
+                let auth = temp.path().join("auth.json");
+                assert!(
+                    !auth.exists() || !std::fs::read_to_string(&auth).unwrap().contains(provider),
+                    "{provider}: auth.json must not contain an empty credential for {provider}"
+                );
+                let store = CredentialStore::open(temp.path()).unwrap();
+                assert!(
+                    !store.contains(provider),
+                    "{provider}: store must not contain a credential"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn login_api_key_writes_non_empty_key() {
+        use crate::args::LoginMethod;
+        use lato_ai::CredentialStore;
+
+        let temp = tempfile::tempdir().unwrap();
+        let previous = std::env::var_os("LATO_HOME");
+        unsafe {
+            std::env::set_var("LATO_HOME", temp.path());
+        }
+        let result = login(
+            "openai".to_string(),
+            LoginMethod::ApiKey("sk-test-not-empty".into()),
+        )
+        .await;
+        match previous.as_ref() {
+            Some(value) => unsafe { std::env::set_var("LATO_HOME", value) },
+            None => unsafe { std::env::remove_var("LATO_HOME") },
+        }
+        assert_eq!(result, 0);
+        let store = CredentialStore::open(temp.path()).unwrap();
+        assert!(store.contains("openai"));
     }
 }

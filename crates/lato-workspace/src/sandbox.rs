@@ -81,25 +81,15 @@ impl SandboxBackend for HostSandboxBackend {
         if profile == SandboxProfile::Off {
             return SandboxReadiness::Ready;
         }
-        if let Some(wrapper) = &self.wrapper_override {
-            return if wrapper.is_file() {
-                platform_readiness()
-            } else {
-                SandboxReadiness::Unavailable
-            };
+        let wrapper = self
+            .wrapper_override
+            .as_deref()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(default_wrapper);
+        if !wrapper.is_file() {
+            return SandboxReadiness::Unavailable;
         }
-        #[cfg(windows)]
-        {
-            // Production Windows non-Off prepare reports sandbox.unsupported
-            // (Restricted Token executor is not wired into this backend).
-            return SandboxReadiness::Unsupported;
-        }
-        #[cfg(not(windows))]
-        if default_wrapper().is_file() {
-            platform_readiness()
-        } else {
-            SandboxReadiness::Unavailable
-        }
+        platform_readiness(&wrapper)
     }
 
     fn prepare(
@@ -127,15 +117,73 @@ impl SandboxBackend for HostSandboxBackend {
     }
 }
 
-fn platform_readiness() -> SandboxReadiness {
+fn platform_readiness(wrapper: &Path) -> SandboxReadiness {
     #[cfg(windows)]
     {
+        let _ = wrapper;
         SandboxReadiness::Unsupported
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
     {
+        if probe_wrapper_usable(wrapper) {
+            SandboxReadiness::Ready
+        } else {
+            SandboxReadiness::Unavailable
+        }
+    }
+    #[cfg(all(not(windows), not(target_os = "linux")))]
+    {
+        let _ = wrapper;
+        // macOS sandbox-exec ships with the OS and is always usable when present.
+        // We deliberately do not probe it here so the macOS readiness check remains
+        // identical to its historical file-existence semantics.
         SandboxReadiness::Ready
     }
+}
+
+#[cfg(target_os = "linux")]
+fn probe_wrapper_usable(wrapper: &Path) -> bool {
+    // Cached per-wrapper-path so repeated readiness/prepare calls don't fork bwrap
+    // on every check. The cache key is the wrapper itself, so test overrides that
+    // swap in a fake wrapper do not poison the default-wrapper cache.
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, bool>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(cache) = cache.lock() {
+        if let Some(usable) = cache.get(wrapper) {
+            return *usable;
+        }
+    }
+    let usable = probe_bwrap(wrapper);
+    if let Ok(mut cache) = cache.lock() {
+        cache.insert(wrapper.to_path_buf(), usable);
+    }
+    usable
+}
+
+#[cfg(target_os = "linux")]
+fn probe_bwrap(wrapper: &Path) -> bool {
+    // bwrap with --unshare-user requires a usable user namespace; on hosts where
+    // /proc/sys/kernel/unprivileged_userns_clone=0 (or otherwise denied) the probe
+    // fails with EPERM and we mark the wrapper Unavailable rather than silently
+    // falling back to running the command unsandboxed.
+    let probe_target = if Path::new("/bin/true").is_file() {
+        Path::new("/bin/true")
+    } else if Path::new("/usr/bin/true").is_file() {
+        Path::new("/usr/bin/true")
+    } else {
+        return false;
+    };
+    std::process::Command::new(wrapper)
+        .args(["--unshare-user", "--ro-bind", "/", "/", "--"])
+        .arg(probe_target)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
 }
 
 #[cfg(not(windows))]
@@ -273,8 +321,15 @@ pub fn wrap_shell_command_with(
                 wrapper.display()
             ));
         }
+        if !probe_bwrap(&wrapper) {
+            return Err(format!(
+                "sandbox wrapper unavailable: {} cannot set up user namespace (uid map permission denied); refusing to run unsandboxed",
+                wrapper.display()
+            ));
+        }
         let mut args = vec![
             "--die-with-parent".into(),
+            "--unshare-user-try".into(),
             "--ro-bind".into(),
             "/".into(),
             "/".into(),
