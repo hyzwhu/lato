@@ -124,6 +124,12 @@ pub struct HookRegistry {
 }
 
 impl HookRegistry {
+    pub fn from_specs(generation: u64, specs: Vec<HookSpec>) -> Arc<Self> {
+        let mut by_event: BTreeMap<HookEventName, Vec<HookSpec>> = BTreeMap::new();
+        for spec in specs { by_event.entry(spec.event).or_default().push(spec); }
+        Arc::new(Self { generation, by_event: by_event.into_iter().map(|(event, specs)| (event, specs.into())).collect(), diagnostics: Arc::from([]) })
+    }
+
     pub fn generation(&self) -> u64 {
         self.generation
     }

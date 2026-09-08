@@ -4,11 +4,13 @@
 
 mod command;
 mod config;
+mod dispatcher;
 mod event;
 mod http;
 mod result;
 
 pub use config::*;
+pub use dispatcher::*;
 pub use event::*;
 pub use http::*;
 pub use result::*;
