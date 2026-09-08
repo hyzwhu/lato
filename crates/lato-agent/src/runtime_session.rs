@@ -454,12 +454,15 @@ impl RuntimeSession {
     }
 
     pub async fn prompt(&self, input: String) -> Result<RuntimePromptOutcome, AgentError> {
-        if self.failed_closed.load(Ordering::Acquire) {
-            return Err(runtime_observation_failed_closed());
-        }
+        self.ensure_observation_open()?;
         // Locking before subscribing prevents a waiting prompt from consuming
         // another prompt's start event while preserving subscribe-before-submit.
         let gate = self.submission_gate.lock().await;
+        // A queued prompt may have passed the fast check before the prompt
+        // holding the gate lost the authoritative event stream. Recheck under
+        // the gate before binding a plugin generation or touching the command
+        // bus.
+        self.ensure_observation_open()?;
         self.begin_plugin_turn().await?;
         let mut events = self.handle.subscribe();
         if let Err(error) = self
@@ -828,6 +831,14 @@ impl RuntimeSession {
     async fn clear_active(&self, turn_id: Option<&TurnId>) {
         let expected = turn_id.cloned().map(ActiveOperation::Turn);
         self.clear_operation(expected.as_ref()).await;
+    }
+
+    fn ensure_observation_open(&self) -> Result<(), AgentError> {
+        if self.failed_closed.load(Ordering::Acquire) {
+            Err(runtime_observation_failed_closed())
+        } else {
+            Ok(())
+        }
     }
 
     /// Losing the authoritative event stream means the facade can no longer
@@ -1248,6 +1259,46 @@ mod tests {
             let prompt_error = session.prompt("again".into()).await.unwrap_err();
             assert_eq!(prompt_error.code, "runtime.observation_failed_closed");
         }
+    }
+
+    #[tokio::test]
+    async fn queued_prompt_rechecks_failed_closed_after_acquiring_submission_gate() {
+        let directory = tempfile::tempdir().unwrap();
+        let (updates, _) = mpsc::unbounded_channel();
+        let session = Arc::new(RuntimeSession::new(
+            "queued-observation-failure".into(),
+            Arc::new(BlockingTurnStream),
+            Arc::new(FileLocks::new()),
+            SessionTrust::for_headless_prompt(directory.path()),
+            directory.path().to_path_buf(),
+            updates,
+            None,
+        ));
+        let gate = session.submission_gate.lock().await;
+        let queued = tokio::spawn({
+            let session = Arc::clone(&session);
+            async move { session.prompt("queued".into()).await }
+        });
+        tokio::task::yield_now().await;
+
+        let pending =
+            build_snapshot(2, DiscoveryResult::default(), &PluginConfig::default()).unwrap();
+        let pending_skills = SkillCatalog::from_discovery(discover_skills(&pending));
+        session.plugin_state.lock().await.pending = Some((pending, pending_skills));
+        let failure = session
+            .fail_prompt_observation(PromptObservationFailure::Closed)
+            .await;
+        assert_eq!(failure.code, "runtime.event_bus_closed");
+        drop(gate);
+
+        let error = queued.await.unwrap().unwrap_err();
+        assert_eq!(error.code, "runtime.observation_failed_closed");
+        assert!(!session.is_active().await);
+        let state = session.plugin_state.lock().await;
+        assert!(state.active_turn.is_none());
+        assert!(state.active_turn_skills.is_none());
+        assert_eq!(state.current.generation(), 0);
+        assert_eq!(state.pending.as_ref().unwrap().0.generation(), 2);
     }
 
     fn prefire_request() -> PrefireCompactionRequest {
