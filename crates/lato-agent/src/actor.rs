@@ -317,8 +317,15 @@ impl SessionActor {
             }
             let (tx, mut rx) = mpsc::channel(16);
             let round_skill_scope = next_skill_scope.take();
+            let messages = match messages_with_skill_listing(&self.history, &self.skill_listing) {
+                Ok(messages) => messages,
+                Err(error) => {
+                    self.active = false;
+                    return Err(error);
+                }
+            };
             let mut context = serde_json::json!({
-                "messages": messages_with_skill_listing(&self.history, &self.skill_listing),
+                "messages": messages,
                 "tools": self.model_definitions(round_skill_scope.as_ref()),
                 "session_id": self.session_id.as_str(),
                 "turn_id": self.turn_id.as_str(),
@@ -1219,27 +1226,33 @@ fn history_to_messages(history: &[HistoryItem]) -> serde_json::Value {
     serde_json::Value::Array(out)
 }
 
-fn messages_with_skill_listing(history: &[HistoryItem], listing: &str) -> serde_json::Value {
+fn messages_with_skill_listing(
+    history: &[HistoryItem],
+    listing: &str,
+) -> Result<serde_json::Value, String> {
     let mut messages = history_to_messages(history);
     if listing.is_empty() {
-        return messages;
+        return Ok(messages);
     }
-    let Some(messages) = messages.as_array_mut() else {
-        return messages;
-    };
-    for message in messages.iter_mut() {
-        if message.get("role").and_then(serde_json::Value::as_str) != Some("system") {
-            continue;
-        }
-        if let Some(content) = message
-            .get_mut("content")
-            .and_then(|content| content.as_str().map(str::to_owned))
-        {
-            message["content"] = serde_json::Value::String(format!("{content}\n\n{listing}"));
-        }
-        break;
-    }
-    serde_json::Value::Array(std::mem::take(messages))
+    let messages_array = messages.as_array_mut().ok_or_else(|| {
+        "skill.listing_unanchored: prompt history did not serialize to a message array".to_string()
+    })?;
+    let target = messages_array
+        .iter_mut()
+        .find(|message| message.get("role").and_then(serde_json::Value::as_str) == Some("system"))
+        .ok_or_else(|| {
+            "skill.listing_unanchored: skill catalog listing requires a string system message to anchor onto; none was found in the prompt history"
+                .to_string()
+        })?;
+    let content = target
+        .get_mut("content")
+        .and_then(|content| content.as_str().map(str::to_owned))
+        .ok_or_else(|| {
+            "skill.listing_unanchored: skill catalog listing requires a string system message to anchor onto; the system message content is not a string"
+                .to_string()
+        })?;
+    target["content"] = serde_json::Value::String(format!("{content}\n\n{listing}"));
+    Ok(serde_json::Value::Array(std::mem::take(messages_array)))
 }
 
 fn compile_skill_scope(
@@ -2123,5 +2136,35 @@ mod tests {
             matches!(&a.history()[0], HistoryItem::CompactionSummary(v) if v.contains("summary"))
         );
         assert!(matches!(&a.history()[1], HistoryItem::User(v) if v == "recent"));
+    }
+
+    #[test]
+    fn skill_listing_anchors_to_string_system_message_without_persisting() {
+        let history = vec![
+            HistoryItem::System("deterministic system".into()),
+            HistoryItem::User("hello".into()),
+        ];
+        let listing = "<available_skills><skill name=\"demo:inspect\"/></available_skills>";
+        let messages = messages_with_skill_listing(&history, listing).unwrap();
+        let system = messages[0]["content"].as_str().unwrap();
+        assert!(system.contains("deterministic system"));
+        assert!(system.contains("<available_skills>"));
+        assert!(!system.contains("available_skills</available_skills></available_skills>"));
+        assert!(messages_with_skill_listing(&history, "").is_ok());
+        assert!(!history.iter().any(|item| {
+            matches!(item, HistoryItem::System(text) if text.contains("available_skills"))
+        }));
+    }
+
+    #[test]
+    fn skill_listing_without_system_message_returns_stable_error() {
+        let history = vec![HistoryItem::User("hello".into())];
+        let listing = "<available_skills><skill name=\"demo:inspect\"/></available_skills>";
+        let error = messages_with_skill_listing(&history, listing).unwrap_err();
+        assert!(
+            error.starts_with("skill.listing_unanchored"),
+            "expected stable skill.listing_unanchored code, got {error}"
+        );
+        assert!(error.contains("system message"));
     }
 }

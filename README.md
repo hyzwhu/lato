@@ -158,12 +158,24 @@ They may use `$ARGUMENTS`, `$ARGUMENTS[N]`, `$N`, `${SKILL_DIR}`,
 `${SESSION_ID}`, and `${LATO_PLUGIN_ROOT}` tokens. An `allowed-tools` list can
 only narrow the tools available to the next model step; policy, approval,
 sandbox, and child-profile checks still apply, and the enclosing tool catalog
-is restored afterward. A reload received during a turn is staged for the next
-turn, so descriptions, bodies, and tool scopes never mix generations.
+is restored afterward. Omitting `allowed-tools` (or writing it as an empty
+list) is treated as "no narrowing": the next step sees the full registered
+tool set rather than a tightened surface, so authors who want to restrict
+tools must enumerate at least one entry. A reload received during a turn is
+staged for the next turn, so descriptions, bodies, and tool scopes never mix
+generations.
 
 Use `lato doctor` (or `lato doctor --json`) to inspect project/plugin trust and
 configuration. ACP clients can call `lato/plugins/reload`; its response includes
-the new generation, active/discovered counts, and bounded diagnostics.
+the new generation, active/discovered counts, and bounded diagnostics. The
+published snapshot is live in the shared registry by the time the call
+returns: sessions that successfully adopted the new generation see it on
+their next turn, and newly created sessions bind to it. If one or more live
+sessions reject adoption, the response carries `failedSessionIds` alongside
+the new generation; those sessions are not rolled back and silently retain
+their previous generation until a subsequent `lato/plugins/reload` (or
+session restart) advances them, so consumers can rely on a follow-up reload
+to converge.
 
 Hooks and MCP descriptors are cataloged but are not executed yet; hook runtime
 support is Phase 6B2 and MCP remains Phase 6C.
