@@ -72,3 +72,4 @@ Copied or substantially derived Rust files begin with an exact project, commit, 
 ```
 
 Do not copy product-specific account, cloud-task, billing, UI, branding, or unrelated telemetry code.
+| `crates/lato-tools/src/mcp_provider.rs` | Lato `crates/lato-tools/src/skill.rs` SkillTool/SkillResolver pattern | Structural derivation | Progressive discovery unit/integration tests | Registers `search_tool`/`use_tool` (+ optional direct expand) over MCP schema cache; invoke requires ToolRuntime grant |

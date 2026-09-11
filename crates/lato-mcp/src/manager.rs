@@ -1,9 +1,10 @@
 //! Session-facing MCP manager.
 //!
-//! Security invariant: this type owns transport lifecycle and generation-scoped
-//! schema discovery only. It must **not** expose a model-facing `tools/call`
-//! bypass around `ToolRuntime`. Tool execution channels are registered later
-//! via `lato-tools` providers (Task 4+).
+//! Security invariant: this type owns transport lifecycle, generation-scoped
+//! schema discovery, and a **transport-level** `call_tool` RPC. It must **not**
+//! expose a model-facing execution channel around `ToolRuntime`. Model-visible
+//! MCP invocation happens only through `lato-tools` providers (`use_tool` /
+//! optional direct expand) after an execution grant is present.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -19,7 +20,7 @@ use crate::{
     config::McpDescriptorSet,
     error::McpError,
     lifecycle::{self, McpServerHandle, initialize_with_resolver, start_server_with_resolver},
-    protocol::InitializeResult,
+    protocol::{InitializeResult, tools_call_params},
     registry::{
         MAX_TOOLS_LIST_PAGES, McpSchemaCache, McpToolDescriptor, parse_tools_list_result,
         tools_list_params,
@@ -208,6 +209,69 @@ impl McpManager {
             lifecycle::shutdown_server(handle, Instant::now() + std::time::Duration::from_secs(1))
                 .await;
         Ok(())
+    }
+
+
+    /// Discover every configured server for this generation. Per-server failures
+    /// are isolated — one unhealthy server does not block the rest.
+    pub async fn ensure_all_discovered(&self) -> Result<(), McpError> {
+        self.ensure_all_discovered_with_resolver(&SystemMcpDnsResolver)
+            .await
+    }
+
+    pub async fn ensure_all_discovered_with_resolver(
+        &self,
+        resolver: &dyn McpDnsResolver,
+    ) -> Result<(), McpError> {
+        let names: Vec<String> = self
+            .descriptors
+            .servers
+            .iter()
+            .map(|server| server.server_name.clone())
+            .collect();
+        let mut first_error: Option<McpError> = None;
+        for name in names {
+            if let Err(error) = self.ensure_discovered_with_resolver(&name, resolver).await {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
+        match first_error {
+            Some(error) if self.cache().is_empty() => Err(error),
+            _ => Ok(()),
+        }
+    }
+
+    /// Transport-level `tools/call`.
+    ///
+    /// **Not model-facing.** Callers (the `use_tool` / direct-expand Tool impls)
+    /// must only invoke this after `ToolRuntime` has issued an execution grant.
+    /// Do not route agent/model results around the ToolRuntime membrane.
+    pub async fn call_tool(
+        &self,
+        server: &str,
+        tool_name: &str,
+        arguments: Value,
+    ) -> Result<Value, McpError> {
+        self.call_tool_with_resolver(server, tool_name, arguments, &SystemMcpDnsResolver)
+            .await
+    }
+
+    pub async fn call_tool_with_resolver(
+        &self,
+        server: &str,
+        tool_name: &str,
+        arguments: Value,
+        resolver: &dyn McpDnsResolver,
+    ) -> Result<Value, McpError> {
+        self.ensure_discovered_with_resolver(server, resolver).await?;
+        let mut servers = self.servers.lock().await;
+        let handle = servers
+            .get_mut(server)
+            .ok_or_else(|| McpError::NotRunning(server.to_owned()))?;
+        let params = Some(tools_call_params(tool_name, arguments));
+        lifecycle::rpc_with_resolver(handle, "tools/call", params, resolver).await
     }
 
     /// SessionEnd-friendly bounded shutdown of every held server.

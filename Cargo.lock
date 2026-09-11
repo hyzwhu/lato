@@ -1390,6 +1390,7 @@ dependencies = [
  "glob",
  "jsonschema",
  "lato-core",
+ "lato-mcp",
  "lato-policy",
  "lato-runtime",
  "lato-workspace",

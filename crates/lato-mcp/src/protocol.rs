@@ -145,6 +145,14 @@ fn parse_server_info(value: Option<&Value>) -> Result<ServerInfo, McpError> {
     })
 }
 
+
+pub fn tools_call_params(name: &str, arguments: Value) -> Value {
+    serde_json::json!({
+        "name": name,
+        "arguments": arguments,
+    })
+}
+
 pub fn encode_line<T: Serialize>(value: &T) -> Result<Vec<u8>, McpError> {
     let mut bytes = serde_json::to_vec(value).map_err(|error| McpError::protocol(error.to_string()))?;
     bytes.push(b'\n');

@@ -1,4 +1,5 @@
 pub mod config;
+pub mod discovery;
 pub mod error;
 pub mod lifecycle;
 pub mod manager;
@@ -12,6 +13,7 @@ pub use config::{
     MAX_MCP_DIAGNOSTICS, MAX_SERVERS_PER_PLUGIN, MAX_TIMEOUT_MS, McpDescriptorSet, McpDiagnostic,
     McpServerSpec, McpTransportKind, ParseContext, parse_mcp_config, push_diagnostic, reserved_env,
 };
+pub use discovery::{MAX_SEARCH_MATCHES, McpSearchHit, search_tools};
 pub use error::McpError;
 pub use lifecycle::{
     McpServerHandle, TransportSession, health, initialize, initialize_with_resolver, rpc,
@@ -20,7 +22,7 @@ pub use lifecycle::{
 };
 pub use manager::McpManager;
 pub use names::{MAX_SERVER_NAME_LEN, normalize_server_name, qualify_tool};
-pub use protocol::{InitializeResult, PROTOCOL_VERSION, ServerInfo};
+pub use protocol::{InitializeResult, PROTOCOL_VERSION, ServerInfo, tools_call_params};
 pub use registry::{
     MAX_TOOL_DESCRIPTION_BYTES, MAX_TOOL_NAME_LEN, MAX_TOOLS_LIST_PAGES, MAX_TOOLS_PER_SERVER,
     McpSchemaCache, McpToolDescriptor, parse_tools_list_result, tools_list_params,

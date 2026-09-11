@@ -393,11 +393,16 @@ impl McpDnsResolver for SystemResolver {
 }
 
 #[tokio::test]
-async fn manager_skeleton_has_no_tool_call_bypass_surface() {
-    // Compile-time / API-shape guard: McpManager exposes lifecycle only.
-    fn assert_lifecycle_only<T>() {}
-    assert_lifecycle_only::<McpManager>();
+async fn manager_call_tool_is_transport_only_not_model_facing() {
+    // McpManager::call_tool is a transport RPC for lato-tools providers.
+    // Model-facing delivery must still go through ToolRuntime (search_tool/use_tool).
     let manager = McpManager::new(McpDescriptorSet::empty(1), CancellationToken::new());
     assert_eq!(manager.generation(), 1);
     assert!(manager.running_servers().await.is_empty());
+    assert!(manager.cache().is_empty());
+    let err = manager
+        .call_tool("missing", "noop", serde_json::json!({}))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, lato_mcp::McpError::NotRunning(_)));
 }

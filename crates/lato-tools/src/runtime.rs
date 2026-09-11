@@ -1,6 +1,6 @@
 use crate::{
-    BuiltinAdapterError, BuiltinToolEnvironment, CatalogError, RegistrationOutcome, SkillToolScope,
-    ToolCatalog, builtin_tools, task_tools,
+    BuiltinAdapterError, BuiltinToolEnvironment, CatalogError, McpProviderConfig, McpToolBackend,
+    RegistrationOutcome, SkillToolScope, ToolCatalog, builtin_tools, mcp_provider_tools, task_tools,
 };
 use lato_core::{
     ApprovalFingerprint, ApprovalRequest, EnvironmentPolicy, ExecutionGrant, NetworkPolicy,
@@ -136,6 +136,18 @@ impl ToolRuntimeBuilder {
         }
         Ok(())
     }
+
+    pub fn register_mcp_provider(
+        &mut self,
+        backend: std::sync::Arc<dyn McpToolBackend>,
+        config: &McpProviderConfig,
+    ) -> Result<(), RuntimeBuildError> {
+        for tool in mcp_provider_tools(backend, config) {
+            self.register(tool)?;
+        }
+        Ok(())
+    }
+
 
     pub fn build(self) -> Result<ToolRuntime, RuntimeBuildError> {
         let mut wire_names = BTreeMap::new();
