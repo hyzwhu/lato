@@ -1,6 +1,7 @@
 pub mod discovery;
 pub mod hooks;
 pub mod manifest;
+pub mod mcp;
 pub mod registry;
 pub mod reload;
 pub mod skills;
@@ -14,6 +15,7 @@ pub use manifest::{
     Author, ManifestError, ManifestLoadResult, PathOrInline, PathOrPaths, PluginManifest,
     load_manifest, name_from_dirname,
 };
+pub use mcp::materialize_mcp;
 pub use registry::{
     CapabilityCeiling, LoadedPlugin, PluginComponentKind, PluginConfig, PluginSnapshot,
     RegistryBuildError, build_snapshot,

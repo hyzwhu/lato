@@ -1297,6 +1297,7 @@ dependencies = [
  "dunce",
  "futures-util",
  "lato-core",
+ "lato-mcp",
  "libc",
  "pulldown-cmark",
  "regex",
@@ -1317,9 +1318,12 @@ dependencies = [
 name = "lato-mcp"
 version = "0.1.0"
 dependencies = [
+ "dunce",
  "reqwest",
+ "serde",
  "serde_json",
  "tempfile",
+ "thiserror 2.0.20",
  "tokio",
  "url",
 ]
