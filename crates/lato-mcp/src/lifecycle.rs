@@ -188,10 +188,7 @@ pub async fn rpc_with_resolver(
     }
 }
 
-pub async fn shutdown_server(
-    handle: McpServerHandle,
-    deadline: Instant,
-) -> Result<(), McpError> {
+pub async fn shutdown_server(handle: McpServerHandle, deadline: Instant) -> Result<(), McpError> {
     match handle.session {
         TransportSession::Stdio(session) => session.shutdown(deadline).await,
         TransportSession::Http(session) => {
@@ -211,9 +208,7 @@ async fn request_raw(
 ) -> Result<Value, McpError> {
     match &mut handle.session {
         TransportSession::Stdio(session) => session.request(method, params, timeout).await,
-        TransportSession::Http(session) => {
-            session.request(method, params, timeout, resolver).await
-        }
+        TransportSession::Http(session) => session.request(method, params, timeout, resolver).await,
     }
 }
 
@@ -226,9 +221,7 @@ async fn notify_raw(
 ) -> Result<(), McpError> {
     match &mut handle.session {
         TransportSession::Stdio(session) => session.notify(method, params).await,
-        TransportSession::Http(session) => {
-            session.notify(method, params, timeout, resolver).await
-        }
+        TransportSession::Http(session) => session.notify(method, params, timeout, resolver).await,
     }
 }
 

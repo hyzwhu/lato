@@ -99,6 +99,10 @@ mod tests {
         assert!(path.contains(".lato/tool-output/mcp-call.txt"));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), output);
         assert!(bounded.content.contains("[tool output truncated"));
-        assert!(!bounded.content.contains(&"y".repeat(TOOL_OUTPUT_LIMIT_BYTES + 50)));
+        assert!(
+            !bounded
+                .content
+                .contains(&"y".repeat(TOOL_OUTPUT_LIMIT_BYTES + 50))
+        );
     }
 }

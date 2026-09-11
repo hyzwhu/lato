@@ -63,10 +63,7 @@ pub fn redact_url_credentials(url: &Url) -> String {
 /// - `http` is allowed **only** when every resolved address is loopback
 /// - `https` allows loopback and public addresses; private/link-local/CGNAT/etc. blocked
 /// - empty resolution fails closed
-pub async fn validate_mcp_url(
-    url: &Url,
-    resolver: &dyn McpDnsResolver,
-) -> Result<(), McpError> {
+pub async fn validate_mcp_url(url: &Url, resolver: &dyn McpDnsResolver) -> Result<(), McpError> {
     if !matches!(url.scheme(), "http" | "https") {
         return Err(McpError::UnsafeUrl);
     }
@@ -167,10 +164,7 @@ impl HttpSession {
         timeout: Duration,
         resolver: &dyn McpDnsResolver,
     ) -> Result<Value, McpError> {
-        if self
-            .closed
-            .load(std::sync::atomic::Ordering::SeqCst)
-        {
+        if self.closed.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(McpError::ShutDown);
         }
         // Re-validate before each call so DNS rebinding cannot widen the grant.
@@ -189,7 +183,7 @@ impl HttpSession {
             for (name, value) in &self.headers {
                 request = request.header(name, value);
             }
-            let response = request.send().await.map_err(|error| map_http_error(error))?;
+            let response = request.send().await.map_err(map_http_error)?;
             let status = response.status();
             if status.is_redirection() {
                 return Err(McpError::Http);
@@ -216,10 +210,8 @@ impl HttpSession {
         resolver: &dyn McpDnsResolver,
     ) -> Result<(), McpError> {
         // Notifications still POST; ignore response body beyond transport errors.
-        let _ = self
-            .request_notification(method, params, timeout, resolver)
-            .await?;
-        Ok(())
+        self.request_notification(method, params, timeout, resolver)
+            .await
     }
 
     async fn request_notification(
@@ -229,10 +221,7 @@ impl HttpSession {
         timeout: Duration,
         resolver: &dyn McpDnsResolver,
     ) -> Result<(), McpError> {
-        if self
-            .closed
-            .load(std::sync::atomic::Ordering::SeqCst)
-        {
+        if self.closed.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(McpError::ShutDown);
         }
         validate_mcp_url(&self.url, resolver).await?;
@@ -247,7 +236,7 @@ impl HttpSession {
             for (name, value) in &self.headers {
                 request = request.header(name, value);
             }
-            let response = request.send().await.map_err(|error| map_http_error(error))?;
+            let response = request.send().await.map_err(map_http_error)?;
             let status = response.status();
             if status.is_redirection() || (!status.is_success() && status.as_u16() != 202) {
                 return Err(McpError::Http);
@@ -263,8 +252,7 @@ impl HttpSession {
     }
 
     pub fn shutdown(&self) {
-        self.closed
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 }
 

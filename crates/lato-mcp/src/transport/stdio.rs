@@ -46,10 +46,9 @@ pub struct StdioSession {
 
 impl StdioSession {
     pub async fn start(spec: &McpServerSpec, cancel: CancellationToken) -> Result<Self, McpError> {
-        let command = spec
-            .command
-            .as_deref()
-            .ok_or_else(|| McpError::InvalidConfiguration("stdio server requires command".into()))?;
+        let command = spec.command.as_deref().ok_or_else(|| {
+            McpError::InvalidConfiguration("stdio server requires command".into())
+        })?;
         let mut process = Command::new(command);
         process
             .args(&spec.args)
@@ -317,4 +316,3 @@ pub fn process_group_alive(pid: u32) -> bool {
         process_signal_alive(pid)
     }
 }
-

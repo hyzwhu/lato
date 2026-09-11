@@ -380,8 +380,7 @@ mod tests {
                         &lato_core::SandboxObligation::workspace(d.path()),
                         "printf forbidden > forbidden.txt",
                     )
-                    .err()
-                    .expect("backend prepare must refuse when readiness is Unavailable");
+                    .expect_err("backend prepare must refuse when readiness is Unavailable");
                 assert_eq!(prepare_error.code(), "sandbox.unavailable");
                 assert!(!d.path().join("forbidden.txt").exists());
             }
@@ -407,8 +406,7 @@ mod tests {
                 &lato_core::SandboxObligation::workspace(d.path()),
                 "printf forbidden > forbidden.txt",
             )
-            .err()
-            .expect("prepare must refuse when wrapper is unusable");
+            .expect_err("prepare must refuse when wrapper is unusable");
         assert_eq!(prepare_error.code(), "sandbox.unavailable");
         assert!(!d.path().join("forbidden.txt").exists());
         let _ = readiness; // silence unused warning

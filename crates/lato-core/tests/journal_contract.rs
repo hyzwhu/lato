@@ -1,8 +1,8 @@
 use lato_core::{
     Command, ExtensionAuditRecord, JOURNAL_SCHEMA_VERSION, JournalEnvelope, JournalError,
     JournalRecord, JournalRecordId, McpAuditOutcome, ModelContent, ModelSelection,
-    PluginSnapshotSummary, Retryability, SessionId, SkillInvocationOrigin, ToolCallId,
-    ToolError, ToolName, TurnId, journal_request_hash, project_journal,
+    PluginSnapshotSummary, Retryability, SessionId, SkillInvocationOrigin, ToolCallId, ToolError,
+    ToolName, TurnId, journal_request_hash, project_journal,
 };
 
 #[test]
@@ -194,7 +194,6 @@ fn envelope(
         record,
     }
 }
-
 
 #[test]
 fn mcp_tool_call_audit_round_trips_without_secrets_or_full_bodies() {

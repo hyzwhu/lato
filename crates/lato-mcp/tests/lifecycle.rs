@@ -12,8 +12,8 @@ use std::{
 use async_trait::async_trait;
 use lato_mcp::{
     McpDescriptorSet, McpDnsResolver, McpError, McpManager, McpServerSpec, McpTransportKind,
-    initialize, pid_alive, redact_url_credentials, shutdown_server,
-    start_server, start_server_with_resolver, stdio_residue_alive, validate_mcp_url,
+    initialize, pid_alive, redact_url_credentials, shutdown_server, start_server,
+    start_server_with_resolver, stdio_residue_alive, validate_mcp_url,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -203,9 +203,7 @@ async fn stdio_cancel_mid_call_reaps_child() {
     let cancel = CancellationToken::new();
     let mut handle = start_server(&spec, 1, cancel.clone()).await.unwrap();
     let pid = handle.stdio_pid().unwrap();
-    let init = tokio::spawn({
-        async move { initialize(&mut handle).await }
-    });
+    let init = tokio::spawn(async move { initialize(&mut handle).await });
     // Let the request land, then cancel.
     tokio::time::sleep(Duration::from_millis(50)).await;
     cancel.cancel();
@@ -245,7 +243,10 @@ async fn manager_isolates_panicking_server() {
     assert!(
         matches!(
             bad_err,
-            McpError::Io | McpError::Unhealthy | McpError::Protocol { .. } | McpError::Timeout { .. }
+            McpError::Io
+                | McpError::Unhealthy
+                | McpError::Protocol { .. }
+                | McpError::Timeout { .. }
         ),
         "unexpected {bad_err:?}"
     );

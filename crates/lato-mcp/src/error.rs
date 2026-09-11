@@ -88,7 +88,10 @@ impl McpError {
     pub fn safe_message(&self) -> String {
         match self {
             Self::InvalidConfiguration(message) => {
-                format!("MCP server configuration is invalid: {}", truncate_safe(message.clone()))
+                format!(
+                    "MCP server configuration is invalid: {}",
+                    truncate_safe(message.clone())
+                )
             }
             Self::Spawn => "MCP server could not be started".into(),
             Self::Io => "MCP transport I/O failed".into(),
@@ -109,7 +112,10 @@ impl McpError {
             Self::NotRunning(name) => format!("MCP server {name} is not running"),
             Self::ShutDown => "MCP server already shut down".into(),
             Self::CapabilityDenied(name) => {
-                format!("MCP capability ceiling denies {}", truncate_safe(name.clone()))
+                format!(
+                    "MCP capability ceiling denies {}",
+                    truncate_safe(name.clone())
+                )
             }
         }
     }

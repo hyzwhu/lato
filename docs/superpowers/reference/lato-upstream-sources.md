@@ -63,6 +63,8 @@ Every copied production file and its tests must add a row before merge.
 
 | `crates/lato-mcp` fault/result hardening + `ExtensionAuditRecord::McpToolCall` + MCP `bound_tool_output` usage | Lato hooks SSRF/redact patterns + Phase 6C design §10 | Behavioral derivation | overflow/spill, cancel, protocol codes, crash isolation, SSRF, no-redirect, journal redaction | Stable `mcp.*` codes; hash-only MCP audits; oversized results spill under `.lato/tool-output/` |
 
+| `tests/phase6c_mcp_smoke.rs`, README Plugin MCP section, `docs/testing/reports/phase-6c-mcp-release-gate-2026-09-11.md` | Lato Phase 6C design/plan/CU cases (original) | Original | stdio+HTTP search→use, SSRF reject, SessionEnd reap, child narrowing, release gate | Installed-binary smoke + docs; SenseNova remains parallel |
+
 ## Required source header
 
 Copied or substantially derived Rust files begin with an exact project, commit, and path. For example:

@@ -7,7 +7,7 @@ pub mod http;
 pub mod stdio;
 
 pub use http::{
-    HttpSession, McpDnsResolver, SystemMcpDnsResolver, build_mcp_http_client, redact_url_credentials,
-    validate_mcp_url,
+    HttpSession, McpDnsResolver, SystemMcpDnsResolver, build_mcp_http_client,
+    redact_url_credentials, validate_mcp_url,
 };
 pub use stdio::{StdioSession, pid_alive, process_group_alive};

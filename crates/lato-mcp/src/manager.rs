@@ -238,7 +238,6 @@ impl McpManager {
         Ok(())
     }
 
-
     /// Discover every configured server for this generation. Per-server failures
     /// are isolated — one unhealthy server does not block the rest.
     pub async fn ensure_all_discovered(&self) -> Result<(), McpError> {
@@ -258,10 +257,10 @@ impl McpManager {
             .collect();
         let mut first_error: Option<McpError> = None;
         for name in names {
-            if let Err(error) = self.ensure_discovered_with_resolver(&name, resolver).await {
-                if first_error.is_none() {
-                    first_error = Some(error);
-                }
+            if let Err(error) = self.ensure_discovered_with_resolver(&name, resolver).await
+                && first_error.is_none()
+            {
+                first_error = Some(error);
             }
         }
         match first_error {
@@ -293,7 +292,8 @@ impl McpManager {
         resolver: &dyn McpDnsResolver,
     ) -> Result<Value, McpError> {
         self.deny_if_tool_outside_ceiling(server, tool_name)?;
-        self.ensure_discovered_with_resolver(server, resolver).await?;
+        self.ensure_discovered_with_resolver(server, resolver)
+            .await?;
         let mut servers = self.servers.lock().await;
         let handle = servers
             .get_mut(server)

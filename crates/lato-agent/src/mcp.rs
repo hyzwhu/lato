@@ -24,9 +24,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use lato_core::{Retryability, ToolContext, ToolError};
 use lato_extensions::{PluginSnapshot, materialize_mcp};
-use lato_mcp::{
-    McpDescriptorSet, McpManager, McpSearchHit, McpToolDescriptor, search_tools,
-};
+use lato_mcp::{McpDescriptorSet, McpManager, McpSearchHit, McpToolDescriptor, search_tools};
 use lato_tools::McpToolBackend;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
@@ -118,10 +116,7 @@ impl SessionMcpHandle {
 
     /// Install an empty generation-scoped manager (no servers).
     pub async fn install_empty(&self, generation: u64, cancel: CancellationToken) {
-        let manager = Arc::new(McpManager::new(
-            McpDescriptorSet::empty(generation),
-            cancel,
-        ));
+        let manager = Arc::new(McpManager::new(McpDescriptorSet::empty(generation), cancel));
         self.adopt_generation(manager).await;
     }
 

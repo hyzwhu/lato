@@ -6,8 +6,8 @@
 use crate::{
     AutoCompactionSuppression, ContextTracker, HistoryItem, PREFIRE_LEAD_PERCENT,
     SamplingRecoveryBudget, SessionHookRuntime, SessionMcpHandle, SessionSkillHandle,
-    SkillRuntimeBinding,
-    TWO_PASS_SPLIT_PERCENT, compaction_suppression_reason, fingerprint_prefix, split_for_two_pass,
+    SkillRuntimeBinding, TWO_PASS_SPLIT_PERCENT, compaction_suppression_reason, fingerprint_prefix,
+    split_for_two_pass,
 };
 use async_trait::async_trait;
 use lato_ai::{
@@ -15,11 +15,11 @@ use lato_ai::{
 };
 pub use lato_core::ApprovalRequest;
 use lato_core::{
-    AgentError, CompactionPolicy, CompactionTrigger, ContextUsage, ExtensionAuditRecord, McpAuditOutcome,
-    HookAuditOutcome, HookAuditPhase, JournalDurability, JournalRecord, ModelContent,
-    ModelErrorKind, ModelMessage, ModelRole, PolicyAuditDecision, PolicyAuditStage, PolicyDecision,
-    Retryability, SessionId, SkillInvocationOrigin, ToolCallId, ToolContext, ToolError, ToolName,
-    TurnId, journal_request_hash,
+    AgentError, CompactionPolicy, CompactionTrigger, ContextUsage, ExtensionAuditRecord,
+    HookAuditOutcome, HookAuditPhase, JournalDurability, JournalRecord, McpAuditOutcome,
+    ModelContent, ModelErrorKind, ModelMessage, ModelRole, PolicyAuditDecision, PolicyAuditStage,
+    PolicyDecision, Retryability, SessionId, SkillInvocationOrigin, ToolCallId, ToolContext,
+    ToolError, ToolName, TurnId, journal_request_hash,
 };
 use lato_extensions::{hooks::HookRegistry, skills::SkillCatalog};
 use lato_runtime::{
@@ -1646,7 +1646,6 @@ fn compile_skill_scope(
     }
 }
 
-
 fn mcp_tool_audit_from_result(
     result: &Result<lato_core::ToolOutput, ToolError>,
 ) -> Option<ExtensionAuditRecord> {
@@ -1671,11 +1670,7 @@ fn mcp_tool_succeeded_audit(output: &lato_core::ToolOutput) -> Option<ExtensionA
     }
     let server = output.metadata.get("server")?.as_str()?.to_owned();
     let tool = output.metadata.get("name")?.as_str()?.to_owned();
-    let qualified_name = output
-        .metadata
-        .get("qualifiedName")?
-        .as_str()?
-        .to_owned();
+    let qualified_name = output.metadata.get("qualifiedName")?.as_str()?.to_owned();
     let generation = output
         .metadata
         .get("generation")
@@ -1692,10 +1687,7 @@ fn mcp_tool_succeeded_audit(output: &lato_core::ToolOutput) -> Option<ExtensionA
         .get("resultHash")
         .and_then(|v| v.as_str())
         .map(str::to_owned);
-    let duration_ms = output
-        .metadata
-        .get("durationMs")
-        .and_then(|v| v.as_u64());
+    let duration_ms = output.metadata.get("durationMs").and_then(|v| v.as_u64());
     let truncated = output.truncated
         || output
             .metadata

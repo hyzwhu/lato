@@ -1,8 +1,4 @@
-use std::{
-    fs,
-    path::PathBuf,
-    sync::Arc,
-};
+use std::{fs, path::PathBuf, sync::Arc};
 
 use lato_extensions::{
     DiscoveryConfig, PluginConfig, PluginSnapshot, build_snapshot, discover_plugins,
@@ -255,10 +251,7 @@ fn relative_command_under_plugin_is_accepted() {
     assert_eq!(set.servers.len(), 1);
     let spec = &set.servers[0];
     let command = spec.command.as_ref().unwrap();
-    assert!(
-        command.ends_with("bin-server"),
-        "command={command:?}"
-    );
+    assert!(command.ends_with("bin-server"), "command={command:?}");
     let canonical_root = dunce::canonicalize(&root).unwrap();
     assert!(
         command.starts_with(&canonical_root),

@@ -371,12 +371,12 @@ fn run_git(cwd: &std::path::Path, args: &[&str]) {
 
 #[tokio::test]
 async fn child_mcp_ceiling_cannot_restore_parent_removed_server() {
-    use std::collections::BTreeSet;
     use lato_extensions::{
         CapabilityCeiling, DiscoveryConfig, McpCapabilityCeiling, PluginConfig, build_snapshot,
         discover_plugins, materialize_mcp,
     };
     use lato_mcp::qualify_tool;
+    use std::collections::BTreeSet;
 
     let root = tempfile::tempdir().unwrap();
     let workspace = root.path().join("workspace");

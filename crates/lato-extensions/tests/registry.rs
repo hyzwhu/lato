@@ -206,10 +206,7 @@ fn child_mcp_ceiling_narrows_and_cannot_restore() {
         workspace: vec![ToolCapability::ExtensionInvoke],
         mcp: McpCapabilityCeiling {
             allowed_servers: Some(BTreeSet::from(["demo".into(), "other".into()])),
-            allowed_tools: Some(BTreeSet::from([
-                "demo__ping".into(),
-                "demo__secret".into(),
-            ])),
+            allowed_tools: Some(BTreeSet::from(["demo__ping".into(), "demo__secret".into()])),
         },
     });
     assert_eq!(

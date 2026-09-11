@@ -192,12 +192,7 @@ fn default_model_definitions_exclude_raw_mcp_tools() {
             input_schema: json!({"type": "object"}),
         },
     ]));
-    let runtime = runtime_with_mcp(
-        root.path(),
-        backend,
-        McpProviderConfig::default(),
-        true,
-    );
+    let runtime = runtime_with_mcp(root.path(), backend, McpProviderConfig::default(), true);
     let names = model_names(&runtime);
     assert!(names.contains(&"search_tool".to_owned()));
     assert!(names.contains(&"use_tool".to_owned()));
@@ -410,12 +405,7 @@ async fn manager_backed_search_and_use_roundtrip() {
         cancel.clone(),
     ));
     let backend: Arc<dyn McpToolBackend> = Arc::new(McpManagerBackend::new(manager.clone()));
-    let runtime = runtime_with_mcp(
-        dir.path(),
-        backend,
-        McpProviderConfig::default(),
-        true,
-    );
+    let runtime = runtime_with_mcp(dir.path(), backend, McpProviderConfig::default(), true);
 
     let names = model_names(&runtime);
     assert!(names.contains(&"search_tool".to_owned()));
@@ -446,7 +436,6 @@ async fn manager_backed_search_and_use_roundtrip() {
         .shutdown_all(std::time::Instant::now() + Duration::from_secs(2))
         .await;
 }
-
 
 #[tokio::test]
 async fn oversized_mcp_result_is_truncated_and_spilled() {
@@ -529,11 +518,25 @@ async fn oversized_mcp_result_is_truncated_and_spilled() {
     assert_eq!(std::fs::read_to_string(&artifact).unwrap(), huge);
     assert!(output.content.len() < huge.len());
     assert!(output.content.contains("[tool output truncated"));
-    assert!(!output.content.contains(&"Z".repeat(lato_tools::TOOL_OUTPUT_LIMIT_BYTES + 2_500)));
+    assert!(
+        !output
+            .content
+            .contains(&"Z".repeat(lato_tools::TOOL_OUTPUT_LIMIT_BYTES + 2_500))
+    );
     assert_eq!(output.metadata["kind"], "mcp_tool_result");
     assert_eq!(output.metadata["generation"], 42);
-    assert!(output.metadata["argsHash"].as_str().unwrap().starts_with("sha256:"));
-    assert!(output.metadata["resultHash"].as_str().unwrap().starts_with("sha256:"));
+    assert!(
+        output.metadata["argsHash"]
+            .as_str()
+            .unwrap()
+            .starts_with("sha256:")
+    );
+    assert!(
+        output.metadata["resultHash"]
+            .as_str()
+            .unwrap()
+            .starts_with("sha256:")
+    );
     // Journal-facing metadata must not embed the full body or secrets.
     let meta = output.metadata.to_string();
     assert!(!meta.contains(&"Z".repeat(100)));
@@ -550,6 +553,9 @@ fn mcp_error_mapping_uses_stable_codes_without_secrets() {
     };
     assert_eq!(mapped.0, "mcp.unsafe_url");
     assert!(!mapped.1.contains("secret"));
-    assert_eq!(lato_mcp::McpError::Timeout { timeout_ms: 9 }.code(), "mcp.timeout");
+    assert_eq!(
+        lato_mcp::McpError::Timeout { timeout_ms: 9 }.code(),
+        "mcp.timeout"
+    );
     assert_eq!(lato_mcp::McpError::rpc(1, "x").code(), "mcp.rpc_error");
 }

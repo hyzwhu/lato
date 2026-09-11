@@ -1,6 +1,7 @@
 use crate::{
     BuiltinAdapterError, BuiltinToolEnvironment, CatalogError, McpProviderConfig, McpToolBackend,
-    RegistrationOutcome, SkillToolScope, ToolCatalog, builtin_tools, mcp_provider_tools, task_tools,
+    RegistrationOutcome, SkillToolScope, ToolCatalog, builtin_tools, mcp_provider_tools,
+    task_tools,
 };
 use lato_core::{
     ApprovalFingerprint, ApprovalRequest, EnvironmentPolicy, ExecutionGrant, NetworkPolicy,
@@ -149,7 +150,6 @@ impl ToolRuntimeBuilder {
         }
         Ok(())
     }
-
 
     pub fn build(self) -> Result<ToolRuntime, RuntimeBuildError> {
         let mut wire_names = BTreeMap::new();

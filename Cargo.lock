@@ -1201,6 +1201,7 @@ dependencies = [
  "lato-ai",
  "lato-core",
  "lato-extensions",
+ "lato-mcp",
  "lato-policy",
  "lato-protocol",
  "lato-tools",
@@ -1215,6 +1216,7 @@ dependencies = [
  "tokio-util",
  "unicode-segmentation",
  "unicode-width 0.2.0",
+ "url",
  "zstd",
 ]
 

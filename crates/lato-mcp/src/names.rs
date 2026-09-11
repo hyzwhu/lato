@@ -21,9 +21,7 @@ pub fn normalize_server_name(raw: &str) -> Option<String> {
     }
     let lower = trimmed.to_ascii_lowercase();
     let mut chars = lower.chars();
-    let Some(first) = chars.next() else {
-        return None;
-    };
+    let first = chars.next()?;
     if !first.is_ascii_alphanumeric() {
         return None;
     }
@@ -46,7 +44,10 @@ mod tests {
 
     #[test]
     fn normalizes_and_rejects_invalid_names() {
-        assert_eq!(normalize_server_name("Demo_Server").as_deref(), Some("demo_server"));
+        assert_eq!(
+            normalize_server_name("Demo_Server").as_deref(),
+            Some("demo_server")
+        );
         assert_eq!(normalize_server_name("a").as_deref(), Some("a"));
         assert!(normalize_server_name("").is_none());
         assert!(normalize_server_name("-leading").is_none());

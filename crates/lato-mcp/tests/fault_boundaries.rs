@@ -53,7 +53,10 @@ fn http_spec(name: &str, url: Url, timeout_ms: u64) -> McpServerSpec {
 fn protocol_timeout_and_ssrf_map_to_stable_codes() {
     assert_eq!(McpError::Timeout { timeout_ms: 30 }.code(), "mcp.timeout");
     assert_eq!(McpError::protocol("bad frame").code(), "mcp.protocol");
-    assert_eq!(McpError::rpc(-32602, "invalid params").code(), "mcp.rpc_error");
+    assert_eq!(
+        McpError::rpc(-32602, "invalid params").code(),
+        "mcp.rpc_error"
+    );
     assert_eq!(McpError::UnsafeUrl.code(), "mcp.unsafe_url");
     assert_eq!(McpError::Cancelled.code(), "tool.cancelled");
     assert_eq!(McpError::Http.code(), "mcp.http");
@@ -64,7 +67,10 @@ fn protocol_timeout_and_ssrf_map_to_stable_codes() {
 
 #[test]
 fn safe_messages_redact_and_bound_sensitive_fragments() {
-    let err = McpError::rpc(-32000, format!("leak https://user:super-secret@host/{}", "x".repeat(800)));
+    let err = McpError::rpc(
+        -32000,
+        format!("leak https://user:super-secret@host/{}", "x".repeat(800)),
+    );
     let message = err.safe_message();
     assert!(message.len() < 600);
     // Truncation may cut mid-string; still must not keep the raw password if present in prefix.
@@ -101,9 +107,13 @@ async fn redirect_response_is_not_followed() {
         let _ = socket.write_all(response.as_bytes()).await;
     });
     let url = Url::parse(&format!("http://{addr}/mcp")).unwrap();
-    let mut handle = start_server(&http_spec("redirect", url, 5_000), 1, CancellationToken::new())
-        .await
-        .unwrap();
+    let mut handle = start_server(
+        &http_spec("redirect", url, 5_000),
+        1,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
     let err = initialize(&mut handle).await.unwrap_err();
     assert!(matches!(err, McpError::Http), "got {err:?}");
     assert_eq!(err.code(), "mcp.http");
@@ -191,7 +201,11 @@ for line in sys.stdin:
     assert!(
         matches!(
             bad_err,
-            McpError::Io | McpError::Unhealthy | McpError::Protocol { .. } | McpError::Timeout { .. } | McpError::Spawn
+            McpError::Io
+                | McpError::Unhealthy
+                | McpError::Protocol { .. }
+                | McpError::Timeout { .. }
+                | McpError::Spawn
         ),
         "got {bad_err:?}"
     );

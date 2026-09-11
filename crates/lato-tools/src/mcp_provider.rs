@@ -17,9 +17,7 @@ use lato_core::{
     ToolDescriptor, ToolError, ToolIdempotency, ToolLayer, ToolName, ToolOutput, ToolSource,
     journal_request_hash,
 };
-use lato_mcp::{
-    McpManager, McpSearchHit, McpToolDescriptor, qualify_tool, search_tools,
-};
+use lato_mcp::{McpManager, McpSearchHit, McpToolDescriptor, qualify_tool, search_tools};
 use semver::Version;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -476,7 +474,12 @@ fn resolve_target(
     input: &UseToolInput,
     backend: &dyn McpToolBackend,
 ) -> Result<(String, String, String), ToolError> {
-    if let Some(tool) = input.tool.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+    if let Some(tool) = input
+        .tool
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         if let Some(descriptor) = backend.lookup(tool) {
             return Ok((
                 descriptor.server,
@@ -522,6 +525,7 @@ fn split_qualified(raw: &str) -> Option<(&str, &str)> {
     Some((server, name))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn format_mcp_result(
     qualified: &str,
     server: &str,
@@ -586,11 +590,11 @@ fn render_mcp_content(result: &Value) -> String {
     if let Some(items) = result.get("content").and_then(Value::as_array) {
         let mut parts = Vec::new();
         for item in items {
-            if item.get("type").and_then(Value::as_str) == Some("text") {
-                if let Some(text) = item.get("text").and_then(Value::as_str) {
-                    parts.push(text.to_owned());
-                    continue;
-                }
+            if item.get("type").and_then(Value::as_str) == Some("text")
+                && let Some(text) = item.get("text").and_then(Value::as_str)
+            {
+                parts.push(text.to_owned());
+                continue;
             }
             parts.push(item.to_string());
         }

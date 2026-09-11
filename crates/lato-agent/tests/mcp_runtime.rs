@@ -29,10 +29,7 @@ use lato_extensions::{
     CapabilityCeiling, DiscoveryConfig, McpCapabilityCeiling, PluginConfig, PluginSnapshot,
     build_snapshot, discover_plugins, materialize_mcp,
 };
-use lato_mcp::{
-    McpDescriptorSet, McpManager, McpSearchHit, McpToolDescriptor, qualify_tool,
-};
-use tokio::sync::{Semaphore, mpsc};
+use lato_mcp::{McpDescriptorSet, McpManager, McpSearchHit, McpToolDescriptor, qualify_tool};
 use lato_policy::{ApprovalLedger, PolicyEngine};
 use lato_tools::{
     BuiltinToolEnvironment, McpProviderConfig, McpToolBackend, PolicyScope, ToolRuntimeBuilder,
@@ -40,6 +37,7 @@ use lato_tools::{
 };
 use lato_workspace::{FileLocks, SessionTrust};
 use serde_json::{Value, json};
+use tokio::sync::{Semaphore, mpsc};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Default)]
@@ -213,9 +211,8 @@ fn write_hook_script(dir: &Path, name: &str, json_stdout: &str) -> PathBuf {
     // Emit JSON via a here-doc so nested quotes/braces stay intact.
     // Drain stdin first so the hook runner's payload write cannot race with a
     // short-lived process exit (EPIPE → fail-open Allow).
-    let body = format!(
-        "#!/bin/sh\ncat >/dev/null\ncat <<'LATO_HOOK_EOF'\n{json_stdout}\nLATO_HOOK_EOF\n"
-    );
+    let body =
+        format!("#!/bin/sh\ncat >/dev/null\ncat <<'LATO_HOOK_EOF'\n{json_stdout}\nLATO_HOOK_EOF\n");
     std::fs::write(&path, body).unwrap();
     #[cfg(unix)]
     {
@@ -325,15 +322,9 @@ async fn session_mcp_handle_refuses_call_without_grant() {
         )))
         .await;
     assert_eq!(handle.snapshot_generation().await, 3);
-    let err = McpToolBackend::call_tool(
-        &handle,
-        &context("direct"),
-        "demo",
-        "ping",
-        json!({}),
-    )
-    .await
-    .unwrap_err();
+    let err = McpToolBackend::call_tool(&handle, &context("direct"), "demo", "ping", json!({}))
+        .await
+        .unwrap_err();
     assert_eq!(err.code, "policy.grant_missing");
 }
 
@@ -490,7 +481,10 @@ async fn pre_tool_deny_blocks_mcp_before_execute() {
         "mcp-deny".into(),
     ));
 
-    actor.prompt(PromptKind::Start, "nope".into()).await.unwrap();
+    actor
+        .prompt(PromptKind::Start, "nope".into())
+        .await
+        .unwrap();
     assert_eq!(backend.calls.load(Ordering::Acquire), 0);
     assert!(actor.history().iter().any(|item| matches!(
         item,
@@ -538,10 +532,7 @@ async fn pre_tool_ask_still_requires_approval_and_hook_allow_never_skips_policy(
         "mcp-untrusted".into(),
     ));
 
-    actor
-        .prompt(PromptKind::Start, "try".into())
-        .await
-        .unwrap();
+    actor.prompt(PromptKind::Start, "try".into()).await.unwrap();
     assert_eq!(backend.calls.load(Ordering::Acquire), 0);
     assert!(actor.history().iter().any(|item| matches!(
         item,
@@ -651,13 +642,17 @@ async fn pre_tool_ask_routes_through_approval_before_execute() {
 async fn updated_mcp_tool_output_is_rebound_via_bound_tool_output() {
     let root = tempfile::tempdir().unwrap();
     let huge = "X".repeat(30_000);
-    let payload = format!(
-        "{{\"hookSpecificOutput\":{{\"updatedMCPToolOutput\":{{\"text\":\"{huge}\"}}}}}}"
-    );
+    let payload =
+        format!("{{\"hookSpecificOutput\":{{\"updatedMCPToolOutput\":{{\"text\":\"{huge}\"}}}}}}");
     let hooks = SessionHookRuntime::new(
         HookRegistry::from_specs(
             16,
-            vec![hook_spec(root.path(), "post", HookEventName::PostToolUse, &payload)],
+            vec![hook_spec(
+                root.path(),
+                "post",
+                HookEventName::PostToolUse,
+                &payload,
+            )],
         ),
         root.path().to_path_buf(),
         "session".into(),
@@ -676,7 +671,9 @@ async fn updated_mcp_tool_output_is_rebound_via_bound_tool_output() {
         .await;
     let replacement = post.replacement.expect("mcp replacement");
     let text = replacement["text"].as_str().unwrap().to_owned();
-    let bounded = bound_tool_output(text, root.path(), "call-mcp").await.unwrap();
+    let bounded = bound_tool_output(text, root.path(), "call-mcp")
+        .await
+        .unwrap();
     assert!(
         bounded.len() < 30_000 || bounded.contains("tool-output"),
         "MCP replacement must pass bound_tool_output"
@@ -699,7 +696,6 @@ async fn no_public_agent_bypass_of_mcp_manager_call_tool() {
         .unwrap_err();
     assert_eq!(err.code, "policy.grant_missing");
 }
-
 
 // --- Phase 6C Task 7: reload & parent/child capability narrowing ---
 
@@ -1002,12 +998,20 @@ async fn parent_reload_does_not_mutate_running_child_snapshot() {
         .adopt(SessionId::from("parent"), Arc::clone(&parent_reload))
         .await;
     assert_eq!(
-        table.get(&SessionId::from("parent")).await.unwrap().generation(),
+        table
+            .get(&SessionId::from("parent"))
+            .await
+            .unwrap()
+            .generation(),
         2
     );
     // Child table entry and live child session remain frozen.
     assert_eq!(
-        table.get(&SessionId::from("child")).await.unwrap().generation(),
+        table
+            .get(&SessionId::from("child"))
+            .await
+            .unwrap()
+            .generation(),
         1
     );
     assert_eq!(

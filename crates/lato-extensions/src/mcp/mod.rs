@@ -51,7 +51,9 @@ pub fn materialize_mcp(snapshot: &PluginSnapshot) -> Arc<McpDescriptorSet> {
         if let Some(value) = &plugin.inline_mcp_servers {
             // Inline mcpServers field is the servers map (or wrapped object).
             let wrapped = match value {
-                Value::Object(map) if map.contains_key("mcpServers") || map.values().all(Value::is_object) => {
+                Value::Object(map)
+                    if map.contains_key("mcpServers") || map.values().all(Value::is_object) =>
+                {
                     value.clone()
                 }
                 other => Value::Object(
@@ -104,10 +106,13 @@ pub fn materialize_mcp(snapshot: &PluginSnapshot) -> Arc<McpDescriptorSet> {
     });
     // Apply the snapshot's monotone MCP ceiling (server + qualified-tool allowlists).
     let ceiling = snapshot.mcp_ceiling();
-    set.narrow(ceiling.allowed_servers.as_ref(), ceiling.allowed_tools.as_ref())
+    set.narrow(
+        ceiling.allowed_servers.as_ref(),
+        ceiling.allowed_tools.as_ref(),
+    )
 }
 
 pub use lato_mcp::{
-    DEFAULT_TIMEOUT_MS, MAX_ENV_ENTRIES, MAX_HEADER_ENTRIES, MAX_SERVERS_PER_PLUGIN, MAX_TIMEOUT_MS,
-    McpTransportKind, qualify_tool,
+    DEFAULT_TIMEOUT_MS, MAX_ENV_ENTRIES, MAX_HEADER_ENTRIES, MAX_SERVERS_PER_PLUGIN,
+    MAX_TIMEOUT_MS, McpTransportKind, qualify_tool,
 };

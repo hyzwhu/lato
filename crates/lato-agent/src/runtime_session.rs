@@ -14,8 +14,9 @@ use lato_core::{
     UserInput,
 };
 use lato_extensions::{
-    PluginSnapshot, materialize_mcp,
+    PluginSnapshot,
     hooks::materialize_hooks,
+    materialize_mcp,
     skills::{SkillCatalog, discover_skills},
 };
 use lato_runtime::{

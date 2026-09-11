@@ -210,7 +210,59 @@ and lifecycle/compaction observer mutations are ignored. Audit records store
 hashes and bounded metadata rather than prompt, arguments, output, environment,
 or URL credentials.
 
-MCP execution remains Phase 6C.
+### Plugin MCP
+
+Trusted, enabled plugins may declare MCP servers in `.mcp.json` or an inline
+`mcpServers` object. Phase 6C supports **stdio** and **streamable HTTP**
+transports only. A canonical configuration is:
+
+```json
+{
+  "mcpServers": {
+    "demo-stdio": {
+      "command": "python3",
+      "args": ["server.py"],
+      "env": { "DEMO": "1" },
+      "cwd": "."
+    },
+    "demo-http": {
+      "url": "http://127.0.0.1:9443/mcp",
+      "headers": { "Authorization": "Bearer …" },
+      "transport": "streamable-http"
+    }
+  }
+}
+```
+
+Only descriptors from the turn's frozen `PluginSnapshot` of **trusted and
+enabled** plugins are materialized. Untrusted project plugins never start MCP
+child processes or HTTP client sessions. Command/`cwd` paths must stay inside
+the plugin root; reserved identity environment variables cannot be forged by
+server config.
+
+By default the model sees only progressive discovery tools — `search_tool` and
+`use_tool` — plus ordinary non-MCP builtins. `search_tool` retrieves qualified
+`server__tool` names from the generation-scoped schema cache; `use_tool`
+invokes one discovered tool. Optional direct expansion of a small allowlisted
+server set into model tool definitions is opt-in and still passes the same
+ToolRuntime membrane. Colliding qualified names do not silently overwrite.
+
+Every MCP invocation is a ToolRegistry provider call: PreToolUse →
+`prepare_scoped` → PolicyEngine → approval → execute → PostToolUse. There is no
+second execution channel around `McpManager`. Streamable HTTP endpoints are
+checked after DNS resolution (SSRF), never follow redirects, allow plain `http`
+only on loopback, and redact URL credentials from user-visible errors and
+journals. Oversized results are truncated inline and spilled under
+`.lato/tool-output/`.
+
+Stdio servers run in a fresh process group. Cancel, timeout, crash isolation,
+and SessionEnd shut them down under a bounded deadline with process-tree reap.
+A single unhealthy server does not take down peer MCP servers or builtin tools.
+Plugin reload is generation-paired: in-flight turns keep generation N MCP
+resources; the next turn adopts N+1 and retires the previous manager. Child
+sessions may only **narrow** parent MCP server/tool allowlists (or drop
+`ExtensionInvoke`); they cannot restore a parent-disabled plugin or a
+previously removed tool.
 
 ## Doctor
 
