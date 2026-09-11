@@ -21,7 +21,7 @@ use lato_runtime::{
     ChannelBackend, StartedTask, TaskCompletion, TaskReporter, TaskRunOutput, TaskRunRequest,
     TaskRunner,
 };
-use lato_tools::{BuiltinToolEnvironment, builtin_tool_runtime_for_capabilities_with_subagents};
+use lato_tools::BuiltinToolEnvironment;
 use lato_workspace::{FileLocks, SandboxProfile, SessionTrust, WorkspaceMode};
 use std::{
     sync::{Arc, Mutex},
@@ -123,8 +123,8 @@ impl ChildSessionRunner {
             workspace: workspace_capabilities,
         });
         let trust = self.child_trust(&request);
-        let skill_runtime = SkillRuntimeBinding::build(|skill_resolver| {
-            builtin_tool_runtime_for_capabilities_with_subagents(
+        let skill_runtime = SkillRuntimeBinding::build(|skill_resolver, mcp_backend| {
+            lato_tools::builtin_tool_runtime_for_capabilities_with_subagents_and_mcp(
                 BuiltinToolEnvironment {
                     cwd: request.workspace_lease.root.clone(),
                     locks: Arc::clone(&self.locks),
@@ -133,6 +133,7 @@ impl ChildSessionRunner {
                 },
                 Some(&request.node.permissions),
                 ChannelBackend::new(request.scoped_handle.clone()).into_resource(),
+                mcp_backend,
             )
         })
         .map_err(|error| task_error(TaskErrorCode::RunnerInitialization, error))?;

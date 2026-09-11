@@ -225,6 +225,14 @@ impl LegacyTurnDriver {
             .bind_turn_hook_registry(registry);
     }
 
+    pub async fn bind_turn_mcp(&self, manager: Arc<lato_mcp::McpManager>) {
+        self.state.lock().await.actor.bind_turn_mcp(manager).await;
+    }
+
+    pub async fn shutdown_mcp(&self, deadline: std::time::Instant) {
+        self.state.lock().await.actor.shutdown_mcp(deadline).await;
+    }
+
     pub async fn observe_hook(
         &self,
         event: lato_extensions::hooks::HookEventName,

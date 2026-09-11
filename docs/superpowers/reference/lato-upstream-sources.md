@@ -73,3 +73,4 @@ Copied or substantially derived Rust files begin with an exact project, commit, 
 
 Do not copy product-specific account, cloud-task, billing, UI, branding, or unrelated telemetry code.
 | `crates/lato-tools/src/mcp_provider.rs` | Lato `crates/lato-tools/src/skill.rs` SkillTool/SkillResolver pattern | Structural derivation | Progressive discovery unit/integration tests | Registers `search_tool`/`use_tool` (+ optional direct expand) over MCP schema cache; invoke requires ToolRuntime grant |
+| `crates/lato-agent/src/mcp.rs` and MCP ToolRuntime membrane wiring in `actor.rs` / `skills.rs` | Lato `crates/lato-agent/src/skills.rs` generation-paired handle pattern + Phase 6B2 hook membrane | Structural derivation | Membrane ordering, deny/ask, rewrite re-entry, grant-gated call_tool, updatedMCPToolOutput | Binds generation-scoped `McpManager` behind `search_tool`/`use_tool`; never bypasses ToolRuntime |

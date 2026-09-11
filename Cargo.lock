@@ -1228,6 +1228,7 @@ dependencies = [
  "lato-ai",
  "lato-core",
  "lato-extensions",
+ "lato-mcp",
  "lato-policy",
  "lato-protocol",
  "lato-runtime",

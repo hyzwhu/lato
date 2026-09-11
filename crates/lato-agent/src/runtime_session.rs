@@ -14,7 +14,7 @@ use lato_core::{
     UserInput,
 };
 use lato_extensions::{
-    PluginSnapshot,
+    PluginSnapshot, materialize_mcp,
     hooks::materialize_hooks,
     skills::{SkillCatalog, discover_skills},
 };
@@ -904,6 +904,12 @@ impl RuntimeSession {
             )
             .await;
         }
+        let _ = tokio::time::timeout(
+            Duration::from_secs(2),
+            self.driver
+                .shutdown_mcp(std::time::Instant::now() + Duration::from_secs(2)),
+        )
+        .await;
         let result = self.handle.submit(Command::Shutdown).await;
         *self.active_operation.lock().await = None;
         self.abort_plugin_turn().await;
@@ -1105,6 +1111,11 @@ impl RuntimeSession {
         self.driver
             .bind_turn_hooks(materialize_hooks(&current))
             .await;
+        let mcp_manager = Arc::new(lato_mcp::McpManager::new(
+            materialize_mcp(&current),
+            tokio_util::sync::CancellationToken::new(),
+        ));
+        self.driver.bind_turn_mcp(mcp_manager).await;
         if !self.hooks_started.swap(true, Ordering::AcqRel) {
             let _ = self
                 .driver

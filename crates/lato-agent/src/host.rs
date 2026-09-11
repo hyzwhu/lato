@@ -372,8 +372,8 @@ impl AcpHost {
         replay: Option<JournalReplay>,
     ) -> Result<Arc<RuntimeSession>, String> {
         let backend = self.ensure_task_root(sid).await?;
-        let skill_runtime = match SkillRuntimeBinding::build(|skill_resolver| {
-            lato_tools::builtin_tool_runtime_with_subagents(
+        let skill_runtime = match SkillRuntimeBinding::build(|skill_resolver, mcp_backend| {
+            lato_tools::builtin_tool_runtime_with_subagents_and_mcp(
                 lato_tools::BuiltinToolEnvironment {
                     cwd: self.cwd.clone(),
                     locks: self.locks.clone(),
@@ -381,6 +381,7 @@ impl AcpHost {
                     skill_resolver: Some(skill_resolver),
                 },
                 backend.into_resource(),
+                mcp_backend,
             )
         }) {
             Ok(runtime) => runtime,

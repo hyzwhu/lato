@@ -17,6 +17,7 @@ pub struct ParsedHookResult {
     pub updated_input: Option<Value>,
     pub additional_context: Option<String>,
     pub updated_tool_output: Option<Value>,
+    pub updated_mcp_tool_output: Option<Value>,
     pub continue_: Option<bool>,
     pub stop_reason: Option<String>,
     pub system_message: Option<String>,
@@ -30,6 +31,7 @@ impl Default for ParsedHookResult {
             updated_input: None,
             additional_context: None,
             updated_tool_output: None,
+            updated_mcp_tool_output: None,
             continue_: None,
             stop_reason: None,
             system_message: None,
@@ -86,6 +88,12 @@ fn parse_value(event: HookEventName, value: &Value) -> ParsedHookResult {
                 serde_json::to_vec(value).is_ok_and(|bytes| bytes.len() <= MAX_REPLACEMENT_CHARS)
             })
             .cloned(),
+        updated_mcp_tool_output: nested
+            .and_then(|nested| nested.get("updatedMCPToolOutput"))
+            .filter(|value| {
+                serde_json::to_vec(value).is_ok_and(|bytes| bytes.len() <= MAX_REPLACEMENT_CHARS)
+            })
+            .cloned(),
         continue_: value.get("continue").and_then(Value::as_bool),
         stop_reason: value
             .get("stopReason")
@@ -103,6 +111,7 @@ fn parse_value(event: HookEventName, value: &Value) -> ParsedHookResult {
             result.updated_input = None;
             result.additional_context = None;
             result.updated_tool_output = None;
+            result.updated_mcp_tool_output = None;
             result.continue_ = None;
             result.stop_reason = None;
         }
@@ -110,10 +119,12 @@ fn parse_value(event: HookEventName, value: &Value) -> ParsedHookResult {
             result.updated_input = None;
             result.additional_context = None;
             result.updated_tool_output = None;
+            result.updated_mcp_tool_output = None;
             result.continue_ = None;
         }
         super::HookMode::Tool => {
             result.updated_tool_output = None;
+            result.updated_mcp_tool_output = None;
             result.continue_ = None;
             result.stop_reason = None;
         }
@@ -125,6 +136,7 @@ fn parse_value(event: HookEventName, value: &Value) -> ParsedHookResult {
         super::HookMode::Stop => {
             result.updated_input = None;
             result.updated_tool_output = None;
+            result.updated_mcp_tool_output = None;
         }
     }
     result

@@ -1,6 +1,7 @@
 // Derived from: Grok Build@bb7f39d5858cbf5e00de639367f59debbdcb0138:crates/codegen/xai-grok-agent/src/prompt/skills.rs
 // License: Apache-2.0
-// Lato changes: binds immutable plugin-qualified skill catalogs to Lato's built-in tool runtime
+// Lato changes: binds immutable plugin-qualified skill catalogs to Lato's built-in tool runtime;
+// also pairs a generation-scoped SessionMcpHandle so MCP tools share the same ToolRuntime membrane.
 
 use std::sync::Arc;
 
@@ -8,11 +9,14 @@ use async_trait::async_trait;
 use lato_core::{Retryability, SkillInvocationOrigin, ToolCapability, ToolContext, ToolError};
 use lato_extensions::skills::{SkillCatalog, SkillDiscovery, SkillInvokeError};
 use lato_tools::{
-    BuiltinToolEnvironment, ResolvedSkill, RuntimeBuildError, SkillResolver, ToolRuntime,
+    BuiltinToolEnvironment, McpToolBackend, ResolvedSkill, RuntimeBuildError, SkillResolver,
+    ToolRuntime,
 };
 use lato_workspace::{FileLocks, SessionTrust};
 use std::path::PathBuf;
 use tokio::sync::RwLock;
+
+use crate::SessionMcpHandle;
 
 /// Session-owned indirection used by the built-in `skill` tool.
 ///
@@ -24,11 +28,12 @@ pub struct SessionSkillHandle {
     catalog: Arc<RwLock<Arc<SkillCatalog>>>,
 }
 
-/// Opaque, construction-safe pairing of a tool runtime and its skill catalog
-/// handle. Consumers cannot substitute either half after construction.
+/// Opaque, construction-safe pairing of a tool runtime and its skill + MCP
+/// catalog handles. Consumers cannot substitute either half after construction.
 pub struct SkillRuntimeBinding {
     runtime: Arc<ToolRuntime>,
     handle: SessionSkillHandle,
+    mcp_handle: SessionMcpHandle,
 }
 
 impl SkillRuntimeBinding {
@@ -46,8 +51,8 @@ impl SkillRuntimeBinding {
         trust: SessionTrust,
         capabilities: Option<&[ToolCapability]>,
     ) -> Result<Self, RuntimeBuildError> {
-        Self::build(|resolver| {
-            lato_tools::builtin_tool_runtime_for_capabilities(
+        Self::build(|resolver, mcp_backend| {
+            lato_tools::builtin_tool_runtime_for_capabilities_with_mcp(
                 BuiltinToolEnvironment {
                     cwd,
                     locks,
@@ -55,20 +60,33 @@ impl SkillRuntimeBinding {
                     skill_resolver: Some(resolver),
                 },
                 capabilities,
+                mcp_backend,
             )
         })
     }
 
     pub(crate) fn build(
-        builder: impl FnOnce(Arc<dyn SkillResolver>) -> Result<Arc<ToolRuntime>, RuntimeBuildError>,
+        builder: impl FnOnce(
+            Arc<dyn SkillResolver>,
+            Arc<dyn McpToolBackend>,
+        ) -> Result<Arc<ToolRuntime>, RuntimeBuildError>,
     ) -> Result<Self, RuntimeBuildError> {
         let handle = SessionSkillHandle::default();
-        let runtime = builder(Arc::new(handle.clone()))?;
-        Ok(Self { runtime, handle })
+        let mcp_handle = SessionMcpHandle::default();
+        let runtime = builder(Arc::new(handle.clone()), Arc::new(mcp_handle.clone()))?;
+        Ok(Self {
+            runtime,
+            handle,
+            mcp_handle,
+        })
     }
 
-    pub(crate) fn into_parts(self) -> (Arc<ToolRuntime>, SessionSkillHandle) {
-        (self.runtime, self.handle)
+    pub fn into_parts(self) -> (Arc<ToolRuntime>, SessionSkillHandle, SessionMcpHandle) {
+        (self.runtime, self.handle, self.mcp_handle)
+    }
+
+    pub fn mcp_handle(&self) -> &SessionMcpHandle {
+        &self.mcp_handle
     }
 }
 

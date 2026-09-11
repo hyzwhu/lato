@@ -39,7 +39,7 @@ async fn prompt_block_is_explicit_and_runner_failure_fails_open() {
         spec(
             "block",
             HookEventName::UserPromptSubmit,
-            "printf '%s' '{\"decision\":\"block\",\"reason\":\"no prompts\"}'",
+            "cat >/dev/null; printf '%s' '{\"decision\":\"block\",\"reason\":\"no prompts\"}'",
         ),
     ]);
     let result = hooks
@@ -54,7 +54,7 @@ async fn pre_tool_rewrites_only_arguments_and_preserves_gate() {
     let hooks = runtime(vec![spec(
         "rewrite",
         HookEventName::PreToolUse,
-        "printf '%s' '{\"hookSpecificOutput\":{\"permissionDecision\":\"ask\",\"updatedInput\":{\"path\":\"safe.txt\"}}}'",
+        "cat >/dev/null; printf '%s' '{\"hookSpecificOutput\":{\"permissionDecision\":\"ask\",\"updatedInput\":{\"path\":\"safe.txt\"}}}'",
     )]);
     let result = hooks
         .pre_tool_use(
@@ -74,12 +74,12 @@ async fn post_tool_replacement_and_stop_force_stop_are_typed() {
         spec(
             "post",
             HookEventName::PostToolUse,
-            "printf '%s' '{\"hookSpecificOutput\":{\"updatedToolOutput\":{\"text\":\"bounded replacement\"}}}'",
+            "cat >/dev/null; printf '%s' '{\"hookSpecificOutput\":{\"updatedToolOutput\":{\"text\":\"bounded replacement\"}}}'",
         ),
         spec(
             "stop",
             HookEventName::Stop,
-            "printf '%s' '{\"decision\":\"block\",\"reason\":\"continue\",\"continue\":false,\"stopReason\":\"finished\"}'",
+            "cat >/dev/null; printf '%s' '{\"decision\":\"block\",\"reason\":\"continue\",\"continue\":false,\"stopReason\":\"finished\"}'",
         ),
     ]);
     let post = hooks

@@ -5,7 +5,8 @@
 
 use crate::{
     AutoCompactionSuppression, ContextTracker, HistoryItem, PREFIRE_LEAD_PERCENT,
-    SamplingRecoveryBudget, SessionHookRuntime, SessionSkillHandle, SkillRuntimeBinding,
+    SamplingRecoveryBudget, SessionHookRuntime, SessionMcpHandle, SessionSkillHandle,
+    SkillRuntimeBinding,
     TWO_PASS_SPLIT_PERCENT, compaction_suppression_reason, fingerprint_prefix, split_for_two_pass,
 };
 use async_trait::async_trait;
@@ -95,6 +96,7 @@ pub struct SessionActor {
     cwd: PathBuf,
     tool_runtime: Arc<ToolRuntime>,
     skill_handle: Option<SessionSkillHandle>,
+    mcp_handle: Option<SessionMcpHandle>,
     skill_listing: String,
     skill_catalog_audit: Option<ExtensionAuditRecord>,
     hook_runtime: Option<SessionHookRuntime>,
@@ -133,7 +135,7 @@ impl SessionActor {
         cwd: PathBuf,
         tool_runtime: Arc<ToolRuntime>,
     ) -> Self {
-        Self::from_tool_runtime(stream, locks, trust, cwd, tool_runtime, None)
+        Self::from_tool_runtime(stream, locks, trust, cwd, tool_runtime, None, None)
     }
 
     pub(crate) fn new_with_skill_runtime(
@@ -143,8 +145,16 @@ impl SessionActor {
         cwd: PathBuf,
         binding: SkillRuntimeBinding,
     ) -> Self {
-        let (tool_runtime, skill_handle) = binding.into_parts();
-        Self::from_tool_runtime(stream, locks, trust, cwd, tool_runtime, Some(skill_handle))
+        let (tool_runtime, skill_handle, mcp_handle) = binding.into_parts();
+        Self::from_tool_runtime(
+            stream,
+            locks,
+            trust,
+            cwd,
+            tool_runtime,
+            Some(skill_handle),
+            Some(mcp_handle),
+        )
     }
 
     fn from_tool_runtime(
@@ -154,6 +164,7 @@ impl SessionActor {
         cwd: PathBuf,
         tool_runtime: Arc<ToolRuntime>,
         skill_handle: Option<SessionSkillHandle>,
+        mcp_handle: Option<SessionMcpHandle>,
     ) -> Self {
         Self {
             active: false,
@@ -165,6 +176,7 @@ impl SessionActor {
             cwd,
             tool_runtime,
             skill_handle,
+            mcp_handle,
             skill_listing: String::new(),
             skill_catalog_audit: None,
             hook_runtime: None,
@@ -240,6 +252,28 @@ impl SessionActor {
             self.cwd.clone(),
             self.session_id.to_string(),
         ));
+    }
+
+    /// Bind a generation-scoped MCP manager for the upcoming turn.
+    ///
+    /// Paired with [`Self::bind_turn_skills`] / [`Self::bind_turn_hooks`]. MCP
+    /// tools remain ordinary ToolRuntime entries — this only swaps the
+    /// transport backend behind `search_tool` / `use_tool`.
+    pub async fn bind_turn_mcp(&mut self, manager: Arc<lato_mcp::McpManager>) {
+        let Some(handle) = &self.mcp_handle else {
+            return;
+        };
+        handle.install(manager).await;
+    }
+
+    pub fn mcp_handle(&self) -> Option<&SessionMcpHandle> {
+        self.mcp_handle.as_ref()
+    }
+
+    pub async fn shutdown_mcp(&self, deadline: std::time::Instant) {
+        if let Some(handle) = &self.mcp_handle {
+            handle.shutdown(deadline).await;
+        }
     }
 
     pub async fn observe_bound_hook(
