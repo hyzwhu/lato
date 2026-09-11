@@ -264,6 +264,12 @@ sessions may only **narrow** parent MCP server/tool allowlists (or drop
 `ExtensionInvoke`); they cannot restore a parent-disabled plugin or a
 previously removed tool.
 
+Installed-command MCP smoke must use the cargo-installed binary
+(`cargo install --path .` → typically `~/.cargo/bin/lato`). Prefer
+`LATO_SMOKE_BINARY="$HOME/.cargo/bin/lato"` (or
+`LATO_SMOKE_BINARY="$(command -v lato)"` only after confirming PATH order). An
+older `~/.local/bin/lato` may shadow PATH and exercise a stale build.
+
 ## Doctor
 
 ```bash
@@ -291,8 +297,12 @@ cleaned up. Run it against the just-installed binary with:
 
 ```bash
 cargo install --path .
-LATO_SMOKE_BINARY="$(command -v lato)" \
+# Prefer ~/.cargo/bin/lato; an older ~/.local/bin/lato may shadow PATH.
+LATO_SMOKE_BINARY="${LATO_SMOKE_BINARY:-$HOME/.cargo/bin/lato}" \
   cargo test --test phase5_command_smoke -- --nocapture
+# Phase 6C MCP smoke (same binary pin):
+# LATO_SMOKE_BINARY="$LATO_SMOKE_BINARY" \
+#   cargo test --test phase6c_mcp_smoke -- --nocapture
 ```
 
 Use a real catalog model by selecting `provider/model`. Credentials resolve in this order: runtime override, persisted OAuth, persisted API key, then provider environment variables.

@@ -25,7 +25,7 @@ remained parallel and did not block this gate.
 | 5 | `10fd978d22d7a6037387eca80d8bbf8932d41c72` | feat(agent): route MCP calls through ToolRuntime safety membrane |
 | 6 | `00fd26e24e2fec1deeadc389248190d7a14e5646` | feat(mcp): harden MCP results, SSRF, and fault isolation |
 | 7 | `aed4d9afafdbb4c7e163f49f8af7fd8186ec9e37` | feat(agent): isolate MCP generations and narrow child capabilities |
-| 8 | `9af7ee73bd61e370f6217c0b93a5fb07b9b43d1c` | docs: record phase 6c mcp runtime gate |
+| 8 | `83e3c22a197a2a58ba9051dcf37dc486636158bb` | docs: record phase 6c mcp runtime gate |
 
 ## Focused verification
 
@@ -73,6 +73,15 @@ Phase 6C tasks.
   do not race the runner's stdin write (EPIPE → fail-open / `HookRunError::Io`).
   These were pre-existing flakes exposed under the denser Phase 6C workspace run.
 
+### Post-gate doc hygiene (before PR)
+
+- Corrected Task 8 SHA in this report from a stale `9af7ee73…` to tip
+  `83e3c22a197a2a58ba9051dcf37dc486636158bb` (`docs: record phase 6c mcp runtime
+  gate`).
+- Documented cargo-installed smoke binary / `~/.local/bin/lato` PATH shadow risk.
+- Imported Phase 6C design docs + SenseNova parallel bug note into
+  `docs/superpowers/` and marked draft status as A-level gate passed.
+
 ## Local deployment
 
 ```text
@@ -86,14 +95,29 @@ lato 0.1.0-beta.2
 
 ## Installed-command smoke
 
+Smoke **must** target the cargo-installed binary from `cargo install --path .`
+(typically `~/.cargo/bin/lato`). Prefer an explicit pin so an older
+`~/.local/bin/lato` cannot shadow PATH:
+
 ```text
-$ LATO_SMOKE_BINARY="$(command -v lato)" \
+$ cargo install --path .
+$ export LATO_SMOKE_BINARY="${LATO_SMOKE_BINARY:-$HOME/.cargo/bin/lato}"
+# or after confirming PATH order: LATO_SMOKE_BINARY="$(command -v lato)"
+$ "$LATO_SMOKE_BINARY" --version
+lato 0.1.0-beta.2
+
+$ LATO_SMOKE_BINARY="$LATO_SMOKE_BINARY" \
     cargo test --test phase6c_mcp_smoke -- --nocapture
 running 1 test
 phase6c-mcp-smoke-ok
 test phase6c_installed_command_smoke_exercises_mcp_runtime ... ok
 test result: ok. 1 passed; 0 failed
 ```
+
+**PATH warning:** if `command -v lato` resolves to `~/.local/bin/lato` (or another
+stale install) instead of `~/.cargo/bin/lato`, set
+`LATO_SMOKE_BINARY="$HOME/.cargo/bin/lato"` explicitly. The gate smoke below used
+the cargo-installed binary under `/home/box/.cargo/bin/lato`.
 
 The smoke verifies the installed binary, then exercises a trusted temp plugin
 with:
@@ -111,8 +135,16 @@ Default model surface remains `search_tool` / `use_tool` only (no direct
 
 - README `### Plugin MCP` documents config, progressive discovery, trust
   prerequisite, shutdown/reap, and child narrowing; removed
-  “MCP execution remains Phase 6C”.
+  “MCP execution remains Phase 6C”. Smoke notes warn that an older
+  `~/.local/bin/lato` may shadow the cargo-installed binary.
 - Upstream ledger updated with smoke / release-gate attribution.
+- Design docs imported under `docs/superpowers/` with status **A-level gate
+  passed**:
+  - `docs/superpowers/specs/2026-09-11-phase-6c-mcp-product-design.md`
+  - `docs/superpowers/plans/2026-09-11-phase-6c-mcp-implementation-plan.md`
+  - `docs/superpowers/specs/2026-09-11-phase-6c-mcp-computer-use-cases.md`
+  - `docs/superpowers/specs/2026-09-11-bug-sensenova-exit0-no-artifact.md`
+    (parallel bug tracking; does not block 6C)
 
 ## SenseNova parallel confirmation
 
