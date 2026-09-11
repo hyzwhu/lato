@@ -637,6 +637,7 @@ async fn child_catalog_and_runtime_cannot_recover_parent_only_tool() {
         parent: vec![ToolCapability::FileRead, ToolCapability::ExtensionInvoke],
         profile: vec![ToolCapability::FileRead, ToolCapability::ExtensionInvoke],
         workspace: vec![ToolCapability::FileRead, ToolCapability::ExtensionInvoke],
+        mcp: Default::default(),
     });
     let child_catalog = SkillCatalog::from_discovery(discover_skills(&child));
     assert!(

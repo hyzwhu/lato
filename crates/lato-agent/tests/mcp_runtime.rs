@@ -5,7 +5,7 @@
 //! PreToolUse → prepare_scoped → PolicyEngine → approval → execute → PostToolUse.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -16,8 +16,8 @@ use std::{
 
 use async_trait::async_trait;
 use lato_agent::{
-    PromptKind, SessionActor, SessionHookRuntime, SessionMcpHandle, SkillRuntimeBinding,
-    ToolApproval,
+    PromptKind, RuntimePromptOutcome, RuntimeSession, SessionActor, SessionHookRuntime,
+    SessionMcpHandle, SessionPluginSnapshots, SkillRuntimeBinding, ToolApproval,
 };
 use lato_ai::{FakeModelStream, StreamPiece};
 use lato_core::{
@@ -25,9 +25,14 @@ use lato_core::{
     TurnId,
 };
 use lato_extensions::hooks::{HandlerType, HookEventName, HookRegistry, HookSpec};
+use lato_extensions::{
+    CapabilityCeiling, DiscoveryConfig, McpCapabilityCeiling, PluginConfig, PluginSnapshot,
+    build_snapshot, discover_plugins, materialize_mcp,
+};
 use lato_mcp::{
     McpDescriptorSet, McpManager, McpSearchHit, McpToolDescriptor, qualify_tool,
 };
+use tokio::sync::{Semaphore, mpsc};
 use lato_policy::{ApprovalLedger, PolicyEngine};
 use lato_tools::{
     BuiltinToolEnvironment, McpProviderConfig, McpToolBackend, PolicyScope, ToolRuntimeBuilder,
@@ -695,3 +700,373 @@ async fn no_public_agent_bypass_of_mcp_manager_call_tool() {
     assert_eq!(err.code, "policy.grant_missing");
 }
 
+
+// --- Phase 6C Task 7: reload & parent/child capability narrowing ---
+
+struct GatedStream {
+    started: Semaphore,
+    release: Semaphore,
+    contexts: Mutex<Vec<Value>>,
+}
+
+impl Default for GatedStream {
+    fn default() -> Self {
+        Self {
+            started: Semaphore::new(0),
+            release: Semaphore::new(0),
+            contexts: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+#[async_trait]
+impl lato_ai::ModelStream for GatedStream {
+    async fn stream(
+        &self,
+        _prompt_bytes: usize,
+        context: Value,
+        tx: mpsc::Sender<StreamPiece>,
+    ) -> Result<(), lato_core::ModelError> {
+        self.contexts.lock().unwrap().push(context);
+        self.started.add_permits(1);
+        self.release.acquire().await.unwrap().forget();
+        tx.send(StreamPiece::Text("done".into()))
+            .await
+            .map_err(|_| lato_core::ModelError::cancelled())
+    }
+}
+
+fn mcp_plugin_snapshot(generation: u64, servers: &[(&str, &str)]) -> Arc<PluginSnapshot> {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("workspace");
+    let home = root.path().join("home");
+    let plugin = root.path().join("plugin");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&plugin).unwrap();
+    let mut mcp_servers = serde_json::Map::new();
+    for (name, command) in servers {
+        mcp_servers.insert(
+            (*name).into(),
+            json!({"command": command, "args": ["server.js"]}),
+        );
+    }
+    std::fs::write(
+        plugin.join("plugin.json"),
+        json!({
+            "name": "demo",
+            "mcpServers": mcp_servers,
+        })
+        .to_string(),
+    )
+    .unwrap();
+    // Keep tempdir alive by leaking — tests are short-lived.
+    std::mem::forget(root);
+    build_snapshot(
+        generation,
+        discover_plugins(&DiscoveryConfig {
+            cwd: workspace,
+            lato_home: home,
+            cli_plugin_dirs: vec![plugin],
+            project_trusted: true,
+        }),
+        &PluginConfig::default(),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn mid_turn_reload_keeps_gen_n_mcp_and_next_turn_adopts_n_plus_one() {
+    let old = mcp_plugin_snapshot(1, &[("alpha", "node")]);
+    let new = mcp_plugin_snapshot(2, &[("beta", "node")]);
+    assert_eq!(materialize_mcp(&old).servers[0].server_name, "alpha");
+    assert_eq!(materialize_mcp(&new).servers[0].server_name, "beta");
+
+    let stream = Arc::new(GatedStream::default());
+    let directory = tempfile::tempdir().unwrap();
+    let (updates, _rx) = mpsc::unbounded_channel();
+    let session = Arc::new(RuntimeSession::new(
+        "mcp-reload".into(),
+        stream.clone(),
+        Arc::new(FileLocks::new()),
+        SessionTrust::for_headless_prompt(directory.path()),
+        directory.path().to_path_buf(),
+        updates,
+        None,
+    ));
+    session.stage_plugin_snapshot(old).await.unwrap();
+
+    let first = tokio::spawn({
+        let session = Arc::clone(&session);
+        async move { session.prompt("first".into()).await }
+    });
+    stream.started.acquire().await.unwrap().forget();
+
+    assert_eq!(
+        session
+            .active_turn_plugin_snapshot()
+            .await
+            .unwrap()
+            .generation(),
+        1
+    );
+    assert_eq!(session.mcp_generation().await, Some(1));
+    let active_set = materialize_mcp(&session.active_turn_plugin_snapshot().await.unwrap());
+    assert_eq!(active_set.servers[0].server_name, "alpha");
+
+    session.stage_plugin_snapshot(new).await.unwrap();
+    // Mid-turn: staged N+1 must not mutate the live MCP generation.
+    assert_eq!(session.mcp_generation().await, Some(1));
+    assert_eq!(
+        session
+            .active_turn_plugin_snapshot()
+            .await
+            .unwrap()
+            .generation(),
+        1
+    );
+    assert_eq!(session.plugin_snapshot().await.generation(), 1);
+
+    stream.release.add_permits(1);
+    assert!(matches!(
+        first.await.unwrap().unwrap(),
+        RuntimePromptOutcome::Complete { .. }
+    ));
+    assert_eq!(session.plugin_snapshot().await.generation(), 2);
+
+    // After turn 1, gen 1 should already be retired once turn 2's begin adopts gen 2.
+    // Probe retired generations only while idle (driver lock is free).
+    let second = tokio::spawn({
+        let session = Arc::clone(&session);
+        async move { session.prompt("second".into()).await }
+    });
+    stream.started.acquire().await.unwrap().forget();
+    assert_eq!(session.mcp_generation().await, Some(2));
+    let active_set = materialize_mcp(&session.active_turn_plugin_snapshot().await.unwrap());
+    assert_eq!(active_set.servers[0].server_name, "beta");
+    stream.release.add_permits(1);
+    second.await.unwrap().unwrap();
+
+    let retired = session.mcp_retired_generations().await;
+    assert!(
+        retired.contains(&1),
+        "generation 1 must be retired when 2 is adopted: {retired:?}"
+    );
+    assert_eq!(session.mcp_generation().await, Some(2));
+}
+
+#[tokio::test]
+async fn adopt_generation_retires_previous_with_cancel_and_reap() {
+    let handle = SessionMcpHandle::empty();
+    let cancel_a = CancellationToken::new();
+    let manager_a = Arc::new(McpManager::new(
+        McpDescriptorSet::empty(10),
+        cancel_a.clone(),
+    ));
+    handle.adopt_generation(manager_a).await;
+    assert_eq!(handle.snapshot_generation().await, 10);
+
+    let cancel_b = CancellationToken::new();
+    let manager_b = Arc::new(McpManager::new(
+        McpDescriptorSet::empty(11),
+        cancel_b.clone(),
+    ));
+    handle.adopt_generation(manager_b).await;
+    assert_eq!(handle.snapshot_generation().await, 11);
+    assert!(cancel_a.is_cancelled(), "retired generation must cancel");
+    assert!(
+        handle.retired_generations().await.contains(&10),
+        "retired generation recorded"
+    );
+
+    // Same-generation re-adopt is a no-op (keeps live manager, no extra retire).
+    let before = handle.retired_generations().await.len();
+    handle
+        .adopt_generation(Arc::new(McpManager::new(
+            McpDescriptorSet::empty(11),
+            CancellationToken::new(),
+        )))
+        .await;
+    assert_eq!(handle.retired_generations().await.len(), before);
+    assert_eq!(handle.snapshot_generation().await, 11);
+}
+
+#[tokio::test]
+async fn child_cannot_restore_removed_mcp_server_or_tool() {
+    let parent = mcp_plugin_snapshot(5, &[("demo", "node"), ("other", "node")]);
+    let parent_set = materialize_mcp(&parent);
+    assert_eq!(parent_set.servers.len(), 2);
+
+    let narrowed = parent.derive_child(&CapabilityCeiling {
+        parent: vec![lato_core::ToolCapability::ExtensionInvoke],
+        profile: vec![lato_core::ToolCapability::ExtensionInvoke],
+        workspace: vec![lato_core::ToolCapability::ExtensionInvoke],
+        mcp: McpCapabilityCeiling {
+            allowed_servers: Some(BTreeSet::from(["demo".into()])),
+            allowed_tools: Some(BTreeSet::from([qualify_tool("demo", "ping")])),
+        },
+    });
+    assert_eq!(
+        narrowed.mcp_ceiling().allowed_servers,
+        Some(BTreeSet::from(["demo".into()]))
+    );
+    let child_set = materialize_mcp(&narrowed);
+    assert_eq!(child_set.servers.len(), 1);
+    assert_eq!(child_set.servers[0].server_name, "demo");
+    assert!(child_set.allows_tool(&qualify_tool("demo", "ping")));
+    assert!(!child_set.allows_tool(&qualify_tool("demo", "secret")));
+    assert!(!child_set.allows_tool(&qualify_tool("other", "ping")));
+
+    // Nested child attempts to restore `other` / extra tools — intersection blocks it.
+    let restored = narrowed.derive_child(&CapabilityCeiling {
+        parent: vec![lato_core::ToolCapability::ExtensionInvoke],
+        profile: vec![lato_core::ToolCapability::ExtensionInvoke],
+        workspace: vec![lato_core::ToolCapability::ExtensionInvoke],
+        mcp: McpCapabilityCeiling {
+            allowed_servers: Some(BTreeSet::from(["demo".into(), "other".into()])),
+            allowed_tools: Some(BTreeSet::from([
+                qualify_tool("demo", "ping"),
+                qualify_tool("demo", "secret"),
+                qualify_tool("other", "ping"),
+            ])),
+        },
+    });
+    let restored_set = materialize_mcp(&restored);
+    assert_eq!(restored_set.servers.len(), 1);
+    assert_eq!(restored_set.servers[0].server_name, "demo");
+    assert!(restored_set.allows_tool(&qualify_tool("demo", "ping")));
+    assert!(!restored_set.allows_tool(&qualify_tool("demo", "secret")));
+    assert!(!restored_set.allows_tool(&qualify_tool("other", "ping")));
+}
+
+#[tokio::test]
+async fn parent_reload_does_not_mutate_running_child_snapshot() {
+    let parent_snap = mcp_plugin_snapshot(1, &[("demo", "node")]);
+    let child_snap = parent_snap.derive_child(&CapabilityCeiling {
+        parent: vec![lato_core::ToolCapability::ExtensionInvoke],
+        profile: vec![lato_core::ToolCapability::ExtensionInvoke],
+        workspace: vec![lato_core::ToolCapability::ExtensionInvoke],
+        mcp: McpCapabilityCeiling {
+            allowed_servers: Some(BTreeSet::from(["demo".into()])),
+            allowed_tools: None,
+        },
+    });
+
+    let table = SessionPluginSnapshots::default();
+    table
+        .register(SessionId::from("parent"), Arc::clone(&parent_snap))
+        .await;
+    table
+        .register(SessionId::from("child"), Arc::clone(&child_snap))
+        .await;
+
+    let directory = tempfile::tempdir().unwrap();
+    let (updates, _rx) = mpsc::unbounded_channel();
+    let stream = Arc::new(GatedStream::default());
+    let child_session = Arc::new(
+        RuntimeSession::new_child(lato_agent::ChildSessionConfig {
+            session_id: "child".into(),
+            stream: stream.clone(),
+            locks: Arc::new(FileLocks::new()),
+            trust: SessionTrust::for_headless_prompt(directory.path()),
+            cwd: directory.path().to_path_buf(),
+            updates,
+            approval: None,
+            tool_runtime: lato_agent::ChildToolRuntime::from(
+                SkillRuntimeBinding::builtin(
+                    directory.path().to_path_buf(),
+                    Arc::new(FileLocks::new()),
+                    SessionTrust::for_headless_prompt(directory.path()),
+                )
+                .unwrap(),
+            ),
+            initial_history: vec![],
+            plugin_snapshot: Arc::clone(&child_snap),
+        })
+        .await
+        .unwrap(),
+    );
+
+    let prompt = tokio::spawn({
+        let session = Arc::clone(&child_session);
+        async move { session.prompt("child-turn".into()).await }
+    });
+    stream.started.acquire().await.unwrap().forget();
+
+    let before = materialize_mcp(&child_session.active_turn_plugin_snapshot().await.unwrap());
+    assert_eq!(before.servers.len(), 1);
+
+    // Parent reloads to a generation that removes demo / adds other.
+    let parent_reload = mcp_plugin_snapshot(2, &[("other", "node")]);
+    table
+        .adopt(SessionId::from("parent"), Arc::clone(&parent_reload))
+        .await;
+    assert_eq!(
+        table.get(&SessionId::from("parent")).await.unwrap().generation(),
+        2
+    );
+    // Child table entry and live child session remain frozen.
+    assert_eq!(
+        table.get(&SessionId::from("child")).await.unwrap().generation(),
+        1
+    );
+    assert_eq!(
+        child_session
+            .active_turn_plugin_snapshot()
+            .await
+            .unwrap()
+            .generation(),
+        1
+    );
+    let after = materialize_mcp(&child_session.active_turn_plugin_snapshot().await.unwrap());
+    assert_eq!(after.servers.len(), 1);
+    assert_eq!(after.servers[0].server_name, "demo");
+
+    stream.release.add_permits(1);
+    prompt.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn server_and_tool_narrowing_on_child_derivation_filters_manager() {
+    let parent = mcp_plugin_snapshot(3, &[("keep", "node"), ("drop", "node")]);
+    let child = parent.derive_child(&CapabilityCeiling {
+        parent: vec![lato_core::ToolCapability::ExtensionInvoke],
+        profile: vec![lato_core::ToolCapability::ExtensionInvoke],
+        workspace: vec![lato_core::ToolCapability::ExtensionInvoke],
+        mcp: McpCapabilityCeiling {
+            allowed_servers: Some(BTreeSet::from(["keep".into()])),
+            allowed_tools: Some(BTreeSet::from([qualify_tool("keep", "ok")])),
+        },
+    });
+    let descriptors = materialize_mcp(&child);
+    assert_eq!(descriptors.servers.len(), 1);
+    assert_eq!(descriptors.servers[0].server_name, "keep");
+    let manager = McpManager::new(descriptors, CancellationToken::new());
+    let denied = manager
+        .call_tool("keep", "nope", json!({}))
+        .await
+        .unwrap_err();
+    assert_eq!(denied.code(), "mcp.capability_denied");
+    // Dropped server is absent from descriptors; tool ceiling also denies it.
+    let missing_server = manager
+        .call_tool("drop", "ok", json!({}))
+        .await
+        .unwrap_err();
+    assert_eq!(missing_server.code(), "mcp.capability_denied");
+
+    let server_only = parent.derive_child(&CapabilityCeiling {
+        parent: vec![lato_core::ToolCapability::ExtensionInvoke],
+        profile: vec![lato_core::ToolCapability::ExtensionInvoke],
+        workspace: vec![lato_core::ToolCapability::ExtensionInvoke],
+        mcp: McpCapabilityCeiling {
+            allowed_servers: Some(BTreeSet::from(["keep".into()])),
+            allowed_tools: None,
+        },
+    });
+    let manager = McpManager::new(materialize_mcp(&server_only), CancellationToken::new());
+    let missing = manager
+        .call_tool("drop", "anything", json!({}))
+        .await
+        .unwrap_err();
+    assert_eq!(missing.code(), "mcp.not_running");
+}

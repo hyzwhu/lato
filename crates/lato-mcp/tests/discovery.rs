@@ -44,6 +44,7 @@ fn descriptors(generation: u64, servers: Vec<McpServerSpec>) -> Arc<McpDescripto
         generation,
         servers: Arc::from(servers),
         diagnostics: Arc::from([]),
+        allowed_tools: None,
     })
 }
 

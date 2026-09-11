@@ -34,6 +34,8 @@ pub enum McpError {
     NotRunning(String),
     #[error("MCP server already shut down")]
     ShutDown,
+    #[error("MCP capability ceiling denies {0}")]
+    CapabilityDenied(String),
 }
 
 impl McpError {
@@ -65,6 +67,7 @@ impl McpError {
             Self::Unhealthy => "mcp.unhealthy",
             Self::NotRunning(_) => "mcp.not_running",
             Self::ShutDown => "mcp.shutdown",
+            Self::CapabilityDenied(_) => "mcp.capability_denied",
         }
     }
 
@@ -105,6 +108,9 @@ impl McpError {
             Self::Unhealthy => "MCP server is unhealthy".into(),
             Self::NotRunning(name) => format!("MCP server {name} is not running"),
             Self::ShutDown => "MCP server already shut down".into(),
+            Self::CapabilityDenied(name) => {
+                format!("MCP capability ceiling denies {}", truncate_safe(name.clone()))
+            }
         }
     }
 }

@@ -3,7 +3,7 @@
 //! Parsing only — this module never starts processes or opens HTTP sessions.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::{Component, Path, PathBuf},
     sync::Arc,
 };
@@ -58,6 +58,9 @@ pub struct McpDescriptorSet {
     pub generation: u64,
     pub servers: Arc<[McpServerSpec]>,
     pub diagnostics: Arc<[McpDiagnostic]>,
+    /// `None` inherits every discovered tool from retained servers.
+    /// `Some` is a qualified-name (`server__tool`) allowlist that never widens.
+    pub allowed_tools: Option<Arc<BTreeSet<String>>>,
 }
 
 impl McpDescriptorSet {
@@ -66,7 +69,47 @@ impl McpDescriptorSet {
             generation,
             servers: Arc::from([]),
             diagnostics: Arc::from([]),
+            allowed_tools: None,
         })
+    }
+
+    /// Narrow servers/tools under a capability ceiling. Never re-adds entries.
+    pub fn narrow(
+        &self,
+        allowed_servers: Option<&BTreeSet<String>>,
+        allowed_tools: Option<&BTreeSet<String>>,
+    ) -> Arc<Self> {
+        let servers: Arc<[McpServerSpec]> = match allowed_servers {
+            None => Arc::clone(&self.servers),
+            Some(allow) => self
+                .servers
+                .iter()
+                .filter(|spec| allow.contains(&spec.server_name))
+                .cloned()
+                .collect::<Vec<_>>()
+                .into(),
+        };
+        let allowed_tools = match (&self.allowed_tools, allowed_tools) {
+            (None, None) => None,
+            (Some(parent), None) => Some(Arc::clone(parent)),
+            (None, Some(child)) => Some(Arc::new(child.clone())),
+            (Some(parent), Some(child)) => Some(Arc::new(
+                parent.intersection(child).cloned().collect::<BTreeSet<_>>(),
+            )),
+        };
+        Arc::new(Self {
+            generation: self.generation,
+            servers,
+            diagnostics: Arc::clone(&self.diagnostics),
+            allowed_tools,
+        })
+    }
+
+    pub fn allows_tool(&self, qualified_name: &str) -> bool {
+        match &self.allowed_tools {
+            None => true,
+            Some(allow) => allow.contains(qualified_name),
+        }
     }
 }
 

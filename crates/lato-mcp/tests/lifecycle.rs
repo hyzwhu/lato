@@ -238,6 +238,7 @@ async fn manager_isolates_panicking_server() {
         generation: 7,
         servers: servers.into(),
         diagnostics: Arc::from([]),
+        allowed_tools: None,
     });
     let manager = McpManager::new(descriptors, CancellationToken::new());
     let bad_err = manager.initialize_server("bad").await.unwrap_err();

@@ -17,8 +17,8 @@ pub use manifest::{
 };
 pub use mcp::materialize_mcp;
 pub use registry::{
-    CapabilityCeiling, LoadedPlugin, PluginComponentKind, PluginConfig, PluginSnapshot,
-    RegistryBuildError, build_snapshot,
+    CapabilityCeiling, LoadedPlugin, McpCapabilityCeiling, PluginComponentKind, PluginConfig,
+    PluginSnapshot, RegistryBuildError, build_snapshot,
 };
 pub use reload::{ReloadError, ReloadOutcome, ReloadRequest, SharedPluginRegistryHandle};
 

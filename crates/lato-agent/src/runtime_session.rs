@@ -130,6 +130,7 @@ impl Drop for PromptCleanupGuard {
             if let Ok(mut state) = plugin_state.try_lock() {
                 state.active_turn = None;
                 state.active_turn_skills = None;
+                state.active_turn_mcp_generation = None;
             }
         }
     }
@@ -140,6 +141,8 @@ struct SessionPluginState {
     current_skills: Arc<SkillCatalog>,
     active_turn: Option<Arc<PluginSnapshot>>,
     active_turn_skills: Option<Arc<SkillCatalog>>,
+    /// MCP manager generation bound for the active turn (avoids driver-lock probes).
+    active_turn_mcp_generation: Option<u64>,
     pending: Option<(Arc<PluginSnapshot>, Arc<SkillCatalog>)>,
 }
 
@@ -155,6 +158,7 @@ impl Default for SessionPluginState {
             current_skills: SkillCatalog::from_discovery(Default::default()),
             active_turn: None,
             active_turn_skills: None,
+            active_turn_mcp_generation: None,
             pending: None,
         }
     }
@@ -850,6 +854,26 @@ impl RuntimeSession {
         self.plugin_state.lock().await.active_turn.clone()
     }
 
+    /// Generation currently bound into the session MCP handle (turn-scoped).
+    ///
+    /// Prefer the plugin-state stamp while a turn is active so callers do not
+    /// need the driver lock (held across model streaming).
+    pub async fn mcp_generation(&self) -> Option<u64> {
+        let state = self.plugin_state.lock().await;
+        if let Some(generation) = state.active_turn_mcp_generation {
+            return Some(generation);
+        }
+        drop(state);
+        self.driver.mcp_generation().await
+    }
+
+    /// MCP generations that have been retired with cancel+reap.
+    ///
+    /// Must not be called while a turn holds the driver lock.
+    pub async fn mcp_retired_generations(&self) -> Vec<u64> {
+        self.driver.mcp_retired_generations().await
+    }
+
     pub async fn cancel(&self) -> Result<(), AgentError> {
         let _gate = self.submission_gate.lock().await;
         if self.failed_closed.load(Ordering::Acquire) {
@@ -1085,6 +1109,7 @@ impl RuntimeSession {
             let mut state = self.plugin_state.lock().await;
             state.active_turn = None;
             state.active_turn_skills = None;
+            state.active_turn_mcp_generation = None;
             state.pending.take()
         };
         let Some((pending, pending_skills)) = pending else {
@@ -1111,10 +1136,14 @@ impl RuntimeSession {
         self.driver
             .bind_turn_hooks(materialize_hooks(&current))
             .await;
+        // Generation-scoped MCP manager for this turn's frozen snapshot.
+        // Mid-turn staged reloads must not call bind — N stays live until the
+        // next begin_plugin_turn adopts N+1 and retires N.
         let mcp_manager = Arc::new(lato_mcp::McpManager::new(
             materialize_mcp(&current),
             tokio_util::sync::CancellationToken::new(),
         ));
+        let mcp_generation = current.generation();
         self.driver.bind_turn_mcp(mcp_manager).await;
         if !self.hooks_started.swap(true, Ordering::AcqRel) {
             let _ = self
@@ -1127,6 +1156,7 @@ impl RuntimeSession {
         }
         state.active_turn = Some(current);
         state.active_turn_skills = Some(Arc::clone(&state.current_skills));
+        state.active_turn_mcp_generation = Some(mcp_generation);
         Ok(())
     }
 
@@ -1134,6 +1164,7 @@ impl RuntimeSession {
         let mut state = self.plugin_state.lock().await;
         state.active_turn = None;
         state.active_turn_skills = None;
+        state.active_turn_mcp_generation = None;
     }
 
     async fn adopt_plugin_snapshot(&self, snapshot: &PluginSnapshot) -> Result<(), AgentError> {

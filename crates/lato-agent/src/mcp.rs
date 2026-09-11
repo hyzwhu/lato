@@ -2,6 +2,7 @@
 // License: Apache-2.0
 // Lato changes: binds generation-scoped McpManager into ToolRuntime via McpToolBackend;
 // transport call_tool is reachable only after an execution grant — never a second channel.
+// Phase 6C Task 7: generation adopt/retire (cancel+reap) and child capability narrowing.
 
 //! Session-owned MCP manager binding for the unified ToolRuntime safety membrane.
 //!
@@ -9,6 +10,13 @@
 //! always enter through `ToolRuntime::prepare_scoped` → PolicyEngine → approval →
 //! `execute` → PostToolUse. This handle is the generation-paired backend installed
 //! into `search_tool` / `use_tool` (and optional direct expand) at turn boundaries.
+//!
+//! # Generation adopt / retire
+//!
+//! Turns bind a manager at the turn boundary via [`SessionMcpHandle::adopt_generation`].
+//! Adopting generation N+1 retires generation N with cancel + process-tree reap.
+//! Mid-turn plugin reloads must not call adopt; the active turn keeps generation N
+//! until the next turn begins.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -36,6 +44,8 @@ pub struct SessionMcpHandle {
 struct SessionMcpState {
     manager: Option<Arc<McpManager>>,
     generation: u64,
+    /// Generations that have been retired (cancel+reap completed or in flight).
+    retired_generations: Vec<u64>,
 }
 
 impl SessionMcpHandle {
@@ -44,6 +54,7 @@ impl SessionMcpHandle {
             inner: Arc::new(RwLock::new(SessionMcpState {
                 manager: None,
                 generation: 0,
+                retired_generations: Vec::new(),
             })),
         }
     }
@@ -56,27 +67,44 @@ impl SessionMcpHandle {
         self.inner.read().await.manager.clone()
     }
 
-    /// Install a generation-scoped manager for the upcoming turn.
+    pub async fn retired_generations(&self) -> Vec<u64> {
+        self.inner.read().await.retired_generations.clone()
+    }
+
+    /// Adopt a generation-scoped manager for the upcoming turn.
     ///
-    /// Replaces any previous manager. The retired manager is shut down with a
-    /// bounded deadline so process-tree resources are reaped.
-    pub async fn install(&self, manager: Arc<McpManager>) {
+    /// Same-generation re-adopt is a no-op (keeps the live manager). Adopting a
+    /// different generation retires the previous manager with cancel + process-tree
+    /// reap under a bounded deadline.
+    pub async fn adopt_generation(&self, manager: Arc<McpManager>) {
         let generation = manager.generation();
         let previous = {
             let mut state = self.inner.write().await;
+            if state.generation == generation && state.manager.is_some() {
+                return;
+            }
             let previous = state.manager.take();
+            if let Some(prev) = previous.as_ref() {
+                state.retired_generations.push(prev.generation());
+            }
             state.manager = Some(manager);
             state.generation = generation;
             previous
         };
         if let Some(previous) = previous {
-            let _ = previous
-                .shutdown_all(Instant::now() + Duration::from_secs(2))
-                .await;
+            retire_manager(previous).await;
         }
     }
 
-    /// Materialize descriptors from a frozen snapshot and install a fresh manager.
+    /// Install a generation-scoped manager for the upcoming turn.
+    ///
+    /// Prefer [`Self::adopt_generation`] at turn boundaries; this remains as a
+    /// thin alias used by existing call sites.
+    pub async fn install(&self, manager: Arc<McpManager>) {
+        self.adopt_generation(manager).await;
+    }
+
+    /// Materialize descriptors from a frozen snapshot and adopt a fresh manager.
     pub async fn install_from_snapshot(
         &self,
         snapshot: &PluginSnapshot,
@@ -84,7 +112,7 @@ impl SessionMcpHandle {
     ) -> Arc<McpManager> {
         let descriptors = materialize_mcp(snapshot);
         let manager = Arc::new(McpManager::new(descriptors, cancel));
-        self.install(Arc::clone(&manager)).await;
+        self.adopt_generation(Arc::clone(&manager)).await;
         manager
     }
 
@@ -94,20 +122,31 @@ impl SessionMcpHandle {
             McpDescriptorSet::empty(generation),
             cancel,
         ));
-        self.install(manager).await;
+        self.adopt_generation(manager).await;
     }
 
     /// SessionEnd-friendly bounded shutdown of the active manager.
     pub async fn shutdown(&self, deadline: Instant) {
         let manager = {
             let mut state = self.inner.write().await;
+            let previous = state.manager.take();
+            if let Some(prev) = previous.as_ref() {
+                state.retired_generations.push(prev.generation());
+            }
             state.generation = 0;
-            state.manager.take()
+            previous
         };
         if let Some(manager) = manager {
             let _ = manager.shutdown_all(deadline).await;
         }
     }
+}
+
+async fn retire_manager(manager: Arc<McpManager>) {
+    // Cancel + process-tree reap under a bounded deadline (hook-style SessionEnd).
+    let _ = manager
+        .shutdown_all(Instant::now() + Duration::from_secs(2))
+        .await;
 }
 
 impl Default for SessionMcpHandle {
@@ -133,7 +172,13 @@ impl McpToolBackend for SessionMcpHandle {
             return Vec::new();
         };
         match &state.manager {
-            Some(manager) => search_tools(manager.cache().as_ref(), query),
+            Some(manager) => {
+                let descriptors = manager.descriptors();
+                search_tools(manager.cache().as_ref(), query)
+                    .into_iter()
+                    .filter(|hit| descriptors.allows_tool(&hit.qualified_name))
+                    .collect()
+            }
             None => Vec::new(),
         }
     }
@@ -155,11 +200,17 @@ impl McpToolBackend for SessionMcpHandle {
         let Some(manager) = &state.manager else {
             return Vec::new();
         };
+        let descriptors = manager.descriptors();
         let cache = manager.cache();
         let mut out = Vec::new();
         for server in servers {
             if let Some(tools) = cache.tools_for_server(server) {
-                out.extend(tools.iter().cloned());
+                out.extend(
+                    tools
+                        .iter()
+                        .filter(|tool| descriptors.allows_tool(&tool.qualified_name))
+                        .cloned(),
+                );
             }
         }
         out

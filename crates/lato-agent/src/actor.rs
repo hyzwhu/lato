@@ -263,7 +263,8 @@ impl SessionActor {
         let Some(handle) = &self.mcp_handle else {
             return;
         };
-        handle.install(manager).await;
+        // Turn-boundary adopt: retires the previous generation with cancel+reap.
+        handle.adopt_generation(manager).await;
     }
 
     pub fn mcp_handle(&self) -> Option<&SessionMcpHandle> {

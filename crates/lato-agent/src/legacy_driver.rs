@@ -233,6 +233,28 @@ impl LegacyTurnDriver {
         self.state.lock().await.actor.shutdown_mcp(deadline).await;
     }
 
+    pub async fn mcp_generation(&self) -> Option<u64> {
+        let handle = {
+            let state = self.state.lock().await;
+            state.actor.mcp_handle().cloned()
+        };
+        match handle {
+            Some(handle) => Some(handle.snapshot_generation().await),
+            None => None,
+        }
+    }
+
+    pub async fn mcp_retired_generations(&self) -> Vec<u64> {
+        let handle = {
+            let state = self.state.lock().await;
+            state.actor.mcp_handle().cloned()
+        };
+        match handle {
+            Some(handle) => handle.retired_generations().await,
+            None => Vec::new(),
+        }
+    }
+
     pub async fn observe_hook(
         &self,
         event: lato_extensions::hooks::HookEventName,

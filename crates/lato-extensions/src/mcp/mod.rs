@@ -96,11 +96,15 @@ pub fn materialize_mcp(snapshot: &PluginSnapshot) -> Arc<McpDescriptorSet> {
         }
     }
 
-    Arc::new(McpDescriptorSet {
+    let set = Arc::new(McpDescriptorSet {
         generation: snapshot.generation(),
         servers: servers.into(),
         diagnostics: diagnostics.into(),
-    })
+        allowed_tools: None,
+    });
+    // Apply the snapshot's monotone MCP ceiling (server + qualified-tool allowlists).
+    let ceiling = snapshot.mcp_ceiling();
+    set.narrow(ceiling.allowed_servers.as_ref(), ceiling.allowed_tools.as_ref())
 }
 
 pub use lato_mcp::{

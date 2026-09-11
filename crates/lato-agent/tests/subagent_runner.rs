@@ -368,3 +368,67 @@ fn run_git(cwd: &std::path::Path, args: &[&str]) {
             .success()
     );
 }
+
+#[tokio::test]
+async fn child_mcp_ceiling_cannot_restore_parent_removed_server() {
+    use std::collections::BTreeSet;
+    use lato_extensions::{
+        CapabilityCeiling, DiscoveryConfig, McpCapabilityCeiling, PluginConfig, build_snapshot,
+        discover_plugins, materialize_mcp,
+    };
+    use lato_mcp::qualify_tool;
+
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("workspace");
+    let home = root.path().join("home");
+    let plugin = root.path().join("plugin");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&plugin).unwrap();
+    std::fs::write(
+        plugin.join("plugin.json"),
+        r#"{"name":"demo","mcpServers":{"keep":{"command":"node"},"drop":{"command":"node"}}}"#,
+    )
+    .unwrap();
+    let parent = build_snapshot(
+        9,
+        discover_plugins(&DiscoveryConfig {
+            cwd: workspace,
+            lato_home: home,
+            cli_plugin_dirs: vec![plugin],
+            project_trusted: true,
+        }),
+        &PluginConfig::default(),
+    )
+    .unwrap();
+    assert_eq!(materialize_mcp(&parent).servers.len(), 2);
+
+    let child = parent.derive_child(&CapabilityCeiling {
+        parent: vec![lato_core::ToolCapability::ExtensionInvoke],
+        profile: vec![lato_core::ToolCapability::ExtensionInvoke],
+        workspace: vec![lato_core::ToolCapability::ExtensionInvoke],
+        mcp: McpCapabilityCeiling {
+            allowed_servers: Some(BTreeSet::from(["keep".into()])),
+            allowed_tools: Some(BTreeSet::from([qualify_tool("keep", "ping")])),
+        },
+    });
+    let set = materialize_mcp(&child);
+    assert_eq!(set.servers.len(), 1);
+    assert_eq!(set.servers[0].server_name, "keep");
+    assert!(set.allows_tool(&qualify_tool("keep", "ping")));
+    assert!(!set.allows_tool(&qualify_tool("drop", "ping")));
+
+    // Nested restore attempt fails.
+    let nested = child.derive_child(&CapabilityCeiling {
+        parent: vec![lato_core::ToolCapability::ExtensionInvoke],
+        profile: vec![lato_core::ToolCapability::ExtensionInvoke],
+        workspace: vec![lato_core::ToolCapability::ExtensionInvoke],
+        mcp: McpCapabilityCeiling {
+            allowed_servers: None,
+            allowed_tools: None,
+        },
+    });
+    let nested_set = materialize_mcp(&nested);
+    assert_eq!(nested_set.servers.len(), 1);
+    assert_eq!(nested_set.servers[0].server_name, "keep");
+}

@@ -183,6 +183,7 @@ for line in sys.stdin:
             generation: 11,
             servers: vec![stdio("good", good), stdio("bad", bad)].into(),
             diagnostics: Arc::from([]),
+            allowed_tools: None,
         }),
         CancellationToken::new(),
     );

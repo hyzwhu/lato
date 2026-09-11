@@ -405,6 +405,7 @@ async fn manager_backed_search_and_use_roundtrip() {
                 source_dir: PathBuf::from("."),
             }]),
             diagnostics: Arc::from([]),
+            allowed_tools: None,
         }),
         cancel.clone(),
     ));

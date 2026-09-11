@@ -20,6 +20,7 @@ use crate::{
     config::McpDescriptorSet,
     error::McpError,
     lifecycle::{self, McpServerHandle, initialize_with_resolver, start_server_with_resolver},
+    names::qualify_tool,
     protocol::{InitializeResult, tools_call_params},
     registry::{
         MAX_TOOLS_LIST_PAGES, McpSchemaCache, McpToolDescriptor, parse_tools_list_result,
@@ -173,7 +174,19 @@ impl McpManager {
                 .write()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let cache = Arc::make_mut(&mut *cache_guard);
-            cache.ingest_server_tools(server, &plugin_name, &tools);
+            let filtered: Vec<Value> = match &self.descriptors.allowed_tools {
+                None => tools,
+                Some(allow) => tools
+                    .into_iter()
+                    .filter(|tool| {
+                        tool.get("name")
+                            .and_then(|name| name.as_str())
+                            .map(|name| allow.contains(&qualify_tool(server, name)))
+                            .unwrap_or(false)
+                    })
+                    .collect(),
+            };
+            cache.ingest_server_tools(server, &plugin_name, &filtered);
         }
         discovered.insert(server.to_owned());
         Ok(())
@@ -185,7 +198,21 @@ impl McpManager {
             .cache
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        cache.lookup(qualified_or_parts).cloned()
+        let found = cache.lookup(qualified_or_parts).cloned()?;
+        if self.descriptors.allows_tool(&found.qualified_name) {
+            Some(found)
+        } else {
+            None
+        }
+    }
+
+    fn deny_if_tool_outside_ceiling(&self, server: &str, tool_name: &str) -> Result<(), McpError> {
+        let qualified = qualify_tool(server, tool_name);
+        if self.descriptors.allows_tool(&qualified) {
+            Ok(())
+        } else {
+            Err(McpError::CapabilityDenied(qualified))
+        }
     }
 
     pub async fn health(&self, server_name: &str) -> Result<bool, McpError> {
@@ -265,6 +292,7 @@ impl McpManager {
         arguments: Value,
         resolver: &dyn McpDnsResolver,
     ) -> Result<Value, McpError> {
+        self.deny_if_tool_outside_ceiling(server, tool_name)?;
         self.ensure_discovered_with_resolver(server, resolver).await?;
         let mut servers = self.servers.lock().await;
         let handle = servers
