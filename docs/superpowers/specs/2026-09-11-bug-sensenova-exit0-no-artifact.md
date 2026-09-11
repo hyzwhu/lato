@@ -4,7 +4,7 @@
 | --- | --- |
 | Title | SenseNova exit0 / no artifact on tool tasks (`-p`) |
 | Severity | High（影响商汤模型工具环可用性；不阻断内置默认模型路径） |
-| Status | **open** / **parallel to Phase 6C**（**不挡** 6C） |
+| Status | **fixed** on `fix/sensenova-exit0`（**不挡** 6C；未重做 MCP） |
 | Date filed | 2026-09-11 |
 | Source | `docs/testing/reports/2026-09-03-pty.md` @ master |
 | Baseline note | 报告源码基线曾记 `78c008c…`；本 ticket 相对当前 master 跟踪，不假设已修复 |
@@ -38,23 +38,23 @@ lato -p --ask --sandbox workspace --model sensenova/glm-5.2 \
   '请在当前目录创建 hello.txt，内容是 Hello, world!。…'
 ```
 
-## Hypothesis labels only（不宣称根因）
+## Investigation findings
 
-现有黑盒证据 **不足以** 判定根因。仅作调查标签：
+三条假设都成立，且会叠成 PTY 报告里的「exit 0 / 无产物 / `</think>` 泄漏」：
 
-1. **model** — 模型未发出有效 tool_calls / 提前结束 / 标签泄漏污染协议。
-2. **provider adapter** — SenseNova/GLM 适配对 tool 协议、finish reason、流式事件解析不正确。
-3. **tool loop** — 运行时工具环在无调用或软失败时仍以成功收束（exit 0），未把“未完成任务”升级为非零或可见错误。
+1. **model / think tags** — `glm-5.2` 默认思考。网关常把思维链放进 `reasoning_content`，`content` 只剩 `</think>` 或空。思考块里的 GLM `<tool_call>` XML 从未变成用户可见文本，也从未被当成 tool call。
+2. **provider adapter** — 解析器丢弃 `reasoning_content`（正确：不应打印），但没有再扫描其中的 GLM XML；`</think>` 当普通 content 输出；`finish_reason: "tool_call"`（单数）和扁平 `tool_calls`（无 `function` 包装）未覆盖。GLM 思考还可能吃掉过小的默认 `max_tokens`。
+3. **tool loop** — 工作区写入任务若零次 tool call，最多 retry 一次 `tool_choice=required`，然后 `TurnOutcome::Complete` → headless **exit 0**。TB-002「生成 report.txt」甚至进不了 retry（原先只匹配「生成文件」）。
 
-> 源报告原文结论：未读取 HTTP trace，未定位根因。本 ticket 维持该立场。
+无工具的 `LATO_SMOKE_OK` 仍走纯文本路径，因此不能证明工具环可用。未使用真实 SenseNova 凭据；修复用 offline fixture/replay 锁定。
 
-## Suggested next investigations
+## Fix
 
-1. 对同提示词抓取 **HTTP/provider trace**（请求/响应中的 tool_calls、content、finish_reason），与工作模型（默认 Codex 路径）对比。
-2. 对比 **工作模型工具环**：同 `-p --ask` 写 `hello.txt`，确认批准框、`ToolCall*` journal、产物出现。
-3. 检查 headless `-p` 在“零 tool call”时的退出策略是否应非零或至少表面错误。
-4. 确认是否存在 `</think>` / 特殊 token 未剥离导致解析短路。
-5. 复现时固定模型版本、凭据通道、sandbox、ask 策略；保留 `script`/journal 证据。
+- 剥离 `<think>…</think>` / 残留 `</think>`，不作为助手可见文本。
+- 从 `reasoning_content` 与 think 块中提取 GLM `<tool_call>` XML。
+- 兼容扁平 tool_calls 与 `finish_reason: "tool_call"`；GLM/SenseNova 带 tools 时发送 `max_tokens=16384`。
+- 工作区变更任务在 retry 后仍未执行工具 → 显式错误（headless 非 0）。
+- 「生成 report.txt」一类产出文件意图计入工作区变更检测。
 
 ## Relationship to Phase 6C
 

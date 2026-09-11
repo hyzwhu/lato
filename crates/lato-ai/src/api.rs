@@ -331,8 +331,17 @@ pub(crate) fn openai_chat_body(
         // Callers can raise this to "required" when a workspace mutation was requested but
         // the model only produced assistant text.
         body["tool_choice"] = tool_choice.unwrap_or_else(|| serde_json::json!("auto"));
+        if glm_family_model(model_id) {
+            // glm-5.2 thinking can exhaust a small provider default before any tool_call.
+            body["max_tokens"] = serde_json::json!(16384);
+        }
     }
     body
+}
+
+fn glm_family_model(model_id: &str) -> bool {
+    let id = model_id.to_ascii_lowercase();
+    id.contains("glm") || id.starts_with("sensenova")
 }
 
 fn bearer_headers(auth: &Auth) -> Vec<(String, String)> {
@@ -671,6 +680,7 @@ mod tests {
             "run_terminal_command"
         );
         assert_eq!(r.body["tool_choice"], "auto");
+        assert_eq!(r.body["max_tokens"], 16384);
     }
 
     #[test]
@@ -696,6 +706,7 @@ mod tests {
         .unwrap();
         assert_eq!(r.body["tool_choice"], "required");
         assert_eq!(r.body["stream"], false);
+        assert_eq!(r.body["max_tokens"], 16384);
     }
 
     #[test]
