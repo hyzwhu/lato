@@ -3455,9 +3455,17 @@ impl<R: TaskRunner, A: WorkspaceAllocator> TaskCoordinator<R, A> {
             });
         let cleanup_task_id = task_id.clone();
         let cleanup_task = tokio::spawn(async move {
-            match tokio::time::timeout(timeout, allocator.release(&lease)).await {
-                Ok(Ok(())) => TaskJobExit::LeaseReleased(cleanup_task_id, lease_id),
-                Ok(Err(error)) => TaskJobExit::LeaseReleaseFailed(cleanup_task_id, error),
+            let release = std::panic::AssertUnwindSafe(allocator.release(&lease)).catch_unwind();
+            match tokio::time::timeout(timeout, release).await {
+                Ok(Ok(Ok(()))) => TaskJobExit::LeaseReleased(cleanup_task_id, lease_id),
+                Ok(Ok(Err(error))) => TaskJobExit::LeaseReleaseFailed(cleanup_task_id, error),
+                Ok(Err(_)) => TaskJobExit::LeaseReleaseFailed(
+                    cleanup_task_id,
+                    TaskError::new(
+                        TaskErrorCode::WorkspaceRelease,
+                        "workspace allocator panicked during lease release",
+                    ),
+                ),
                 Err(_) => TaskJobExit::LeaseReleaseFailed(
                     cleanup_task_id,
                     TaskError::new(

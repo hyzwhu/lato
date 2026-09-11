@@ -1776,14 +1776,23 @@ async fn workspace_release_panic_is_truthful_observable_and_actor_survives() {
     })
     .await
     .unwrap();
-    assert!(sink.events().iter().any(|event| {
-        matches!(
-            &event.payload,
-            TaskEventPayload::WorkspaceLeaseReleaseFailed { error, .. }
-                if error.code == TaskErrorCode::WorkspaceRelease
-                    && error.message.contains("panicked")
-        )
-    }));
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if sink.events().iter().any(|event| {
+                matches!(
+                    &event.payload,
+                    TaskEventPayload::WorkspaceLeaseReleaseFailed { error, .. }
+                        if error.code == TaskErrorCode::WorkspaceRelease
+                            && error.message.contains("panicked")
+                )
+            }) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("workspace release panic must be published to the event sink");
     assert_eq!(handle.registry_counts().await.unwrap().completed, 1);
     assert_eq!(inner.live_count().await, 1);
 }
