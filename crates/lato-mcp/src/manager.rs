@@ -1,25 +1,29 @@
-//! Session-facing MCP manager skeleton.
+//! Session-facing MCP manager.
 //!
-//! Security invariant: this type owns transport lifecycle only. It must **not**
-//! expose a model-facing `tools/call` bypass around `ToolRuntime`. Tool execution
-//! channels are registered later via `lato-tools` providers.
+//! Security invariant: this type owns transport lifecycle and generation-scoped
+//! schema discovery only. It must **not** expose a model-facing `tools/call`
+//! bypass around `ToolRuntime`. Tool execution channels are registered later
+//! via `lato-tools` providers (Task 4+).
 
 use std::{
-    collections::HashMap,
-    sync::Arc,
+    collections::{HashMap, HashSet},
+    sync::{Arc, RwLock},
     time::Instant,
 };
 
+use serde_json::Value;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
     config::McpDescriptorSet,
     error::McpError,
-    lifecycle::{
-        self, McpServerHandle, initialize_with_resolver, start_server_with_resolver,
-    },
+    lifecycle::{self, McpServerHandle, initialize_with_resolver, start_server_with_resolver},
     protocol::InitializeResult,
+    registry::{
+        MAX_TOOLS_LIST_PAGES, McpSchemaCache, McpToolDescriptor, parse_tools_list_result,
+        tools_list_params,
+    },
     transport::{McpDnsResolver, SystemMcpDnsResolver},
 };
 
@@ -28,15 +32,20 @@ pub struct McpManager {
     descriptors: Arc<McpDescriptorSet>,
     cancel: CancellationToken,
     servers: Mutex<HashMap<String, McpServerHandle>>,
+    cache: RwLock<Arc<McpSchemaCache>>,
+    discovered: Mutex<HashSet<String>>,
 }
 
 impl McpManager {
     pub fn new(descriptors: Arc<McpDescriptorSet>, cancel: CancellationToken) -> Self {
+        let generation = descriptors.generation;
         Self {
-            generation: descriptors.generation,
+            generation,
             descriptors,
             cancel,
             servers: Mutex::new(HashMap::new()),
+            cache: RwLock::new(Arc::new(McpSchemaCache::new(generation))),
+            discovered: Mutex::new(HashSet::new()),
         }
     }
 
@@ -46,6 +55,16 @@ impl McpManager {
 
     pub fn descriptors(&self) -> Arc<McpDescriptorSet> {
         Arc::clone(&self.descriptors)
+    }
+
+    /// Snapshot of the generation-scoped schema cache.
+    pub fn cache(&self) -> Arc<McpSchemaCache> {
+        Arc::clone(
+            &self
+                .cache
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        )
     }
 
     pub async fn ensure_started(&self, server_name: &str) -> Result<(), McpError> {
@@ -70,13 +89,9 @@ impl McpManager {
             .iter()
             .find(|server| server.server_name == server_name)
             .ok_or_else(|| McpError::NotRunning(server_name.to_owned()))?;
-        let handle = start_server_with_resolver(
-            spec,
-            self.generation,
-            self.cancel.child_token(),
-            resolver,
-        )
-        .await?;
+        let handle =
+            start_server_with_resolver(spec, self.generation, self.cancel.child_token(), resolver)
+                .await?;
         let mut servers = self.servers.lock().await;
         // Another task may have won the race.
         if servers.contains_key(server_name) {
@@ -87,10 +102,7 @@ impl McpManager {
         Ok(())
     }
 
-    pub async fn initialize_server(
-        &self,
-        server_name: &str,
-    ) -> Result<InitializeResult, McpError> {
+    pub async fn initialize_server(&self, server_name: &str) -> Result<InitializeResult, McpError> {
         self.initialize_server_with_resolver(server_name, &SystemMcpDnsResolver)
             .await
     }
@@ -112,6 +124,69 @@ impl McpManager {
         initialize_with_resolver(handle, resolver).await
     }
 
+    /// Ensure `initialize` + `tools/list` have run for `server` and are cached
+    /// for this snapshot generation. Idempotent within a generation.
+    pub async fn ensure_discovered(&self, server: &str) -> Result<(), McpError> {
+        self.ensure_discovered_with_resolver(server, &SystemMcpDnsResolver)
+            .await
+    }
+
+    pub async fn ensure_discovered_with_resolver(
+        &self,
+        server: &str,
+        resolver: &dyn McpDnsResolver,
+    ) -> Result<(), McpError> {
+        {
+            let discovered = self.discovered.lock().await;
+            if discovered.contains(server) {
+                return Ok(());
+            }
+        }
+
+        self.initialize_server_with_resolver(server, resolver)
+            .await?;
+
+        let plugin_name = self
+            .descriptors
+            .servers
+            .iter()
+            .find(|spec| spec.server_name == server)
+            .map(|spec| spec.plugin_name.clone())
+            .unwrap_or_else(|| "unknown".into());
+
+        let tools = {
+            let mut servers = self.servers.lock().await;
+            let handle = servers
+                .get_mut(server)
+                .ok_or_else(|| McpError::NotRunning(server.to_owned()))?;
+            list_all_tools(handle, resolver).await?
+        };
+
+        let mut discovered = self.discovered.lock().await;
+        if discovered.contains(server) {
+            return Ok(());
+        }
+        {
+            let mut cache_guard = self
+                .cache
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let cache = Arc::make_mut(&mut *cache_guard);
+            cache.ingest_server_tools(server, &plugin_name, &tools);
+        }
+        discovered.insert(server.to_owned());
+        Ok(())
+    }
+
+    /// Lookup by qualified wire name (`server__tool`) or `server/tool` parts.
+    pub fn lookup(&self, qualified_or_parts: &str) -> Option<McpToolDescriptor> {
+        let cache = self
+            .cache
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        cache.lookup(qualified_or_parts).cloned()
+    }
+
     pub async fn health(&self, server_name: &str) -> Result<bool, McpError> {
         let mut servers = self.servers.lock().await;
         let Some(handle) = servers.get_mut(server_name) else {
@@ -125,8 +200,13 @@ impl McpManager {
         let Some(handle) = servers.remove(server_name) else {
             return Ok(());
         };
-        let _ = lifecycle::shutdown_server(handle, Instant::now() + std::time::Duration::from_secs(1))
-            .await;
+        {
+            let mut discovered = self.discovered.lock().await;
+            discovered.remove(server_name);
+        }
+        let _ =
+            lifecycle::shutdown_server(handle, Instant::now() + std::time::Duration::from_secs(1))
+                .await;
         Ok(())
     }
 
@@ -135,6 +215,10 @@ impl McpManager {
         let mut servers = self.servers.lock().await;
         let handles: Vec<_> = servers.drain().map(|(_, handle)| handle).collect();
         drop(servers);
+        {
+            let mut discovered = self.discovered.lock().await;
+            discovered.clear();
+        }
         for handle in handles {
             let _ = lifecycle::shutdown_server(handle, deadline).await;
         }
@@ -145,4 +229,25 @@ impl McpManager {
     pub async fn running_servers(&self) -> Vec<String> {
         self.servers.lock().await.keys().cloned().collect()
     }
+}
+
+async fn list_all_tools(
+    handle: &mut McpServerHandle,
+    resolver: &dyn McpDnsResolver,
+) -> Result<Vec<Value>, McpError> {
+    let mut all = Vec::new();
+    let mut cursor: Option<String> = None;
+    for _ in 0..MAX_TOOLS_LIST_PAGES {
+        let params = Some(tools_list_params(cursor.as_deref()));
+        let result = lifecycle::rpc_with_resolver(handle, "tools/list", params, resolver).await?;
+        let (page, next) = parse_tools_list_result(result)?;
+        all.extend(page);
+        match next {
+            Some(next_cursor) => cursor = Some(next_cursor),
+            None => return Ok(all),
+        }
+    }
+    Err(McpError::protocol(format!(
+        "tools/list exceeded {MAX_TOOLS_LIST_PAGES} pages"
+    )))
 }
