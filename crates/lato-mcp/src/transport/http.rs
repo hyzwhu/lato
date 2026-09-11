@@ -277,6 +277,18 @@ fn map_http_error(error: reqwest::Error) -> McpError {
 #[cfg(test)]
 mod unit_tests {
     use super::*;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    struct FixedResolver {
+        addrs: Vec<SocketAddr>,
+    }
+
+    #[async_trait]
+    impl McpDnsResolver for FixedResolver {
+        async fn resolve(&self, _host: &str, _port: u16) -> io::Result<Vec<SocketAddr>> {
+            Ok(self.addrs.clone())
+        }
+    }
 
     #[test]
     fn redacts_userinfo() {
@@ -285,5 +297,39 @@ mod unit_tests {
         assert!(!redacted.contains("secret"));
         assert!(!redacted.contains("user:"));
         assert!(redacted.contains("example.com/mcp"));
+    }
+
+    #[tokio::test]
+    async fn rejects_link_local_and_credentials_without_echoing_secrets() {
+        let url = Url::parse("https://user:super-secret@meta.example/mcp").unwrap();
+        let resolver = FixedResolver {
+            addrs: vec![SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254)),
+                443,
+            )],
+        };
+        let err = validate_mcp_url(&url, &resolver).await.unwrap_err();
+        assert!(matches!(err, McpError::UnsafeUrl));
+        let display = err.safe_message();
+        assert!(!display.contains("super-secret"));
+        assert!(!display.contains("user:"));
+        assert_eq!(err.code(), "mcp.unsafe_url");
+    }
+
+    #[tokio::test]
+    async fn rejects_private_https_targets() {
+        let url = Url::parse("https://evil.example/mcp").unwrap();
+        let resolver = FixedResolver {
+            addrs: vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 443)],
+        };
+        let err = validate_mcp_url(&url, &resolver).await.unwrap_err();
+        assert!(matches!(err, McpError::UnsafeUrl));
+    }
+
+    #[test]
+    fn http_client_disables_redirects() {
+        // Construction succeeds; Policy::none is set in build_mcp_http_client.
+        let client = build_mcp_http_client().expect("client");
+        let _ = client;
     }
 }

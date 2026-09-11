@@ -246,10 +246,7 @@ async fn dispatch_line(pending: &PendingMap, line: &str) {
         return;
     };
     let result = if let Some(error) = response.error {
-        Err(McpError::Rpc {
-            code: error.code,
-            message: error.message,
-        })
+        Err(McpError::rpc(error.code, error.message))
     } else {
         Ok(response.result.unwrap_or(Value::Null))
     };

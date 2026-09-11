@@ -95,10 +95,7 @@ pub fn parse_response_value(value: Value) -> Result<Value, McpError> {
     let response: JsonRpcResponse =
         serde_json::from_value(value).map_err(|error| McpError::protocol(error.to_string()))?;
     if let Some(error) = response.error {
-        return Err(McpError::Rpc {
-            code: error.code,
-            message: error.message,
-        });
+        return Err(McpError::rpc(error.code, error.message));
     }
     Ok(response.result.unwrap_or(Value::Null))
 }

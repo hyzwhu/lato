@@ -142,7 +142,9 @@ impl ToolRuntimeBuilder {
         backend: std::sync::Arc<dyn McpToolBackend>,
         config: &McpProviderConfig,
     ) -> Result<(), RuntimeBuildError> {
-        for tool in mcp_provider_tools(backend, config) {
+        let mut config = config.clone();
+        config.workspace_root = self.scope.workspace_root.clone();
+        for tool in mcp_provider_tools(backend, &config) {
             self.register(tool)?;
         }
         Ok(())
@@ -691,8 +693,9 @@ fn build_builtin_tool_runtime(
     backend: Option<lato_runtime::SubagentBackendResource>,
     mcp_backend: Option<Arc<dyn McpToolBackend>>,
 ) -> Result<Arc<ToolRuntime>, RuntimeBuildError> {
+    let workspace_root = environment.cwd.clone();
     let scope = PolicyScope {
-        workspace_root: environment.cwd.clone(),
+        workspace_root: workspace_root.clone(),
         mode: match environment.trust.mode {
             lato_workspace::ApprovalMode::Ask => PolicyMode::Ask,
             lato_workspace::ApprovalMode::Auto => PolicyMode::Auto,
@@ -736,7 +739,10 @@ fn build_builtin_tool_runtime(
     if let Some(mcp_backend) = mcp_backend {
         // MCP tools are ordinary ToolRegistry entries — same prepare_scoped /
         // PolicyEngine / approval / execute membrane as builtins.
-        let config = McpProviderConfig::default();
+        let config = McpProviderConfig {
+            workspace_root,
+            ..McpProviderConfig::default()
+        };
         for tool in mcp_provider_tools(mcp_backend, &config) {
             let descriptor = tool.descriptor();
             if capabilities.is_none_or(|allowed| {

@@ -15,7 +15,7 @@ use lato_ai::{
 };
 pub use lato_core::ApprovalRequest;
 use lato_core::{
-    AgentError, CompactionPolicy, CompactionTrigger, ContextUsage, ExtensionAuditRecord,
+    AgentError, CompactionPolicy, CompactionTrigger, ContextUsage, ExtensionAuditRecord, McpAuditOutcome,
     HookAuditOutcome, HookAuditPhase, JournalDurability, JournalRecord, ModelContent,
     ModelErrorKind, ModelMessage, ModelRole, PolicyAuditDecision, PolicyAuditStage, PolicyDecision,
     Retryability, SessionId, SkillInvocationOrigin, ToolCallId, ToolContext, ToolError, ToolName,
@@ -1256,6 +1256,13 @@ impl SessionActor {
                     )
                     .await?;
                 }
+                if let Some(mcp_audit) = mcp_tool_audit_from_result(&result) {
+                    self.commit(
+                        JournalRecord::ExtensionAudit { audit: mcp_audit },
+                        JournalDurability::Flush,
+                    )
+                    .await?;
+                }
                 self.commit(
                     JournalRecord::ToolCallCompleted {
                         call_id: audit.call_id,
@@ -1636,6 +1643,115 @@ fn compile_skill_scope(
         Some(specs) => SkillToolScope::compile(&specs, runtime).map(Some),
         None => Ok(None),
     }
+}
+
+
+fn mcp_tool_audit_from_result(
+    result: &Result<lato_core::ToolOutput, ToolError>,
+) -> Option<ExtensionAuditRecord> {
+    match result {
+        Ok(output) => mcp_tool_succeeded_audit(output),
+        Err(error) => {
+            // Failures without MCP metadata (e.g. policy denies) skip this audit.
+            if error.code.starts_with("mcp.") || error.code == "tool.cancelled" {
+                // Without metadata we cannot safely name server/tool; skip hash-only
+                // failure audits here — provider success path always attaches metadata.
+                None
+            } else {
+                None
+            }
+        }
+    }
+}
+
+fn mcp_tool_succeeded_audit(output: &lato_core::ToolOutput) -> Option<ExtensionAuditRecord> {
+    if output.metadata.get("kind")?.as_str()? != "mcp_tool_result" {
+        return None;
+    }
+    let server = output.metadata.get("server")?.as_str()?.to_owned();
+    let tool = output.metadata.get("name")?.as_str()?.to_owned();
+    let qualified_name = output
+        .metadata
+        .get("qualifiedName")?
+        .as_str()?
+        .to_owned();
+    let generation = output
+        .metadata
+        .get("generation")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let args_hash = output
+        .metadata
+        .get("argsHash")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_owned();
+    let result_hash = output
+        .metadata
+        .get("resultHash")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned);
+    let duration_ms = output
+        .metadata
+        .get("durationMs")
+        .and_then(|v| v.as_u64());
+    let truncated = output.truncated
+        || output
+            .metadata
+            .get("truncated")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+    let is_error = output
+        .metadata
+        .get("isError")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let outcome = if is_error {
+        McpAuditOutcome::Failed
+    } else {
+        McpAuditOutcome::Succeeded
+    };
+    let redacted_reason = if truncated {
+        Some("mcp.result_spilled".into())
+    } else {
+        None
+    };
+    // Refuse to journal if the inline content still looks like a raw secret-bearing URL.
+    let serialized = serde_json::to_string(&output.metadata).unwrap_or_default();
+    if serialized.contains("://")
+        && (serialized.contains("@") || serialized.to_ascii_lowercase().contains("authorization"))
+    {
+        return Some(ExtensionAuditRecord::McpToolCall {
+            generation,
+            server,
+            tool,
+            qualified_name,
+            duration_ms,
+            outcome,
+            args_hash,
+            result_hash,
+            truncated: true,
+            error_code: None,
+            redacted_reason: Some("mcp.metadata_redacted".into()),
+        });
+    }
+    Some(ExtensionAuditRecord::McpToolCall {
+        generation,
+        server,
+        tool,
+        qualified_name,
+        duration_ms,
+        outcome,
+        args_hash,
+        result_hash,
+        truncated,
+        error_code: if is_error {
+            Some("mcp.tool_reported_error".into())
+        } else {
+            None
+        },
+        redacted_reason,
+    })
 }
 
 fn skill_invoked_audit(output: &lato_core::ToolOutput) -> Option<ExtensionAuditRecord> {

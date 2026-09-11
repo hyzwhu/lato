@@ -165,6 +165,13 @@ impl McpToolBackend for SessionMcpHandle {
         out
     }
 
+    fn generation(&self) -> u64 {
+        self.inner
+            .try_read()
+            .map(|state| state.generation)
+            .unwrap_or(0)
+    }
+
     async fn call_tool(
         &self,
         context: &ToolContext,
@@ -203,15 +210,10 @@ impl McpToolBackend for SessionMcpHandle {
 }
 
 fn map_session_mcp_error(error: lato_mcp::McpError) -> ToolError {
-    let (code, retry) = match &error {
-        lato_mcp::McpError::Cancelled => ("tool.cancelled", Retryability::Never),
-        lato_mcp::McpError::Timeout { .. } => ("mcp.timeout", Retryability::AfterBackoff),
-        lato_mcp::McpError::UnsafeUrl => ("mcp.unsafe_url", Retryability::Never),
-        lato_mcp::McpError::NotRunning(_) => ("mcp.not_running", Retryability::AfterBackoff),
-        lato_mcp::McpError::Unhealthy => ("mcp.unhealthy", Retryability::AfterBackoff),
-        lato_mcp::McpError::Rpc { .. } => ("mcp.rpc_error", Retryability::Never),
-        lato_mcp::McpError::Protocol { .. } => ("mcp.protocol", Retryability::Never),
-        _ => ("mcp.execution_failed", Retryability::Never),
+    let retry = if error.retryable_after_backoff() {
+        Retryability::AfterBackoff
+    } else {
+        Retryability::Never
     };
-    ToolError::new(code, error.to_string(), retry)
+    ToolError::new(error.code(), error.safe_message(), retry)
 }

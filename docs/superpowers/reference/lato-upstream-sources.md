@@ -61,6 +61,8 @@ Every copied production file and its tests must add a row before merge.
 | `crates/lato-mcp/src/{transport,lifecycle,manager,protocol,error,registry}.rs` | Lato hooks command/HTTP runners (`crates/lato-extensions/src/hooks/{command,http}.rs`) + MCP session patterns + Phase 6C design §8 | Behavioral/structural derivation | stdio start→init→shutdown reap, timeout PG kill, cancel, panic isolation, HTTP loopback/SSRF/no-redirect, credential redact, tools/list schema cache, diagnose+keep-first collisions, bad-schema isolation | Persistent stdio JSON-RPC + streamable HTTP; McpManager discovery/cache with no ToolRuntime bypass |
 | `crates/lato-extensions/src/mcp/mod.rs` and `crates/lato-mcp/src/{config,names}.rs` | Grok Build plugin MCP descriptor / config patterns @ `bb7f39d5858cbf5e00de639367f59debbdcb0138` | Structural derivation | Trust/enable isolation, path confinement, stdio vs HTTP shape, reserved env, collision diagnostics | Materializes immutable descriptors from Phase 6A snapshots only; does not start processes |
 
+| `crates/lato-mcp` fault/result hardening + `ExtensionAuditRecord::McpToolCall` + MCP `bound_tool_output` usage | Lato hooks SSRF/redact patterns + Phase 6C design §10 | Behavioral derivation | overflow/spill, cancel, protocol codes, crash isolation, SSRF, no-redirect, journal redaction | Stable `mcp.*` codes; hash-only MCP audits; oversized results spill under `.lato/tool-output/` |
+
 ## Required source header
 
 Copied or substantially derived Rust files begin with an exact project, commit, and path. For example:

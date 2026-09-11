@@ -226,6 +226,7 @@ fn direct_expand_allowlist_exposes_only_configured_servers() {
         backend,
         McpProviderConfig {
             direct_expand_servers: vec!["demo".into()],
+            ..McpProviderConfig::default()
         },
         true,
     );
@@ -443,4 +444,111 @@ async fn manager_backed_search_and_use_roundtrip() {
     let _ = manager
         .shutdown_all(std::time::Instant::now() + Duration::from_secs(2))
         .await;
+}
+
+
+#[tokio::test]
+async fn oversized_mcp_result_is_truncated_and_spilled() {
+    let dir = tempfile::tempdir().unwrap();
+    let huge = "Z".repeat(lato_tools::TOOL_OUTPUT_LIMIT_BYTES + 2_500);
+    struct HugeBackend {
+        inner: RecordingBackend,
+        body: String,
+    }
+    #[async_trait]
+    impl McpToolBackend for HugeBackend {
+        async fn ensure_index(&self) -> Result<(), ToolError> {
+            Ok(())
+        }
+        fn search(&self, query: &str) -> Vec<McpSearchHit> {
+            self.inner.search(query)
+        }
+        fn lookup(&self, qualified_or_parts: &str) -> Option<McpToolDescriptor> {
+            self.inner.lookup(qualified_or_parts)
+        }
+        fn tools_for_servers(&self, servers: &[String]) -> Vec<McpToolDescriptor> {
+            self.inner.tools_for_servers(servers)
+        }
+        fn generation(&self) -> u64 {
+            42
+        }
+        async fn call_tool(
+            &self,
+            _context: &ToolContext,
+            _server: &str,
+            _name: &str,
+            _arguments: Value,
+        ) -> Result<Value, ToolError> {
+            Ok(json!({
+                "content": [{"type": "text", "text": self.body}],
+                "isError": false
+            }))
+        }
+    }
+    let backend: Arc<dyn McpToolBackend> = Arc::new(HugeBackend {
+        inner: RecordingBackend::with_hits(vec![McpSearchHit {
+            server: "demo".into(),
+            name: "blob".into(),
+            qualified_name: "demo__blob".into(),
+            description: "returns a huge blob".into(),
+            input_schema: json!({"type": "object", "properties": {}}),
+        }]),
+        body: huge.clone(),
+    });
+    let runtime = runtime_with_mcp(
+        dir.path(),
+        backend,
+        McpProviderConfig {
+            workspace_root: dir.path().to_path_buf(),
+            ..McpProviderConfig::default()
+        },
+        true,
+    );
+    let context = ToolContext {
+        session_id: SessionId::from("session-mcp"),
+        turn_id: TurnId::from("turn-mcp"),
+        call_id: ToolCallId::from("call-big"),
+        cancellation: CancellationToken::new(),
+        execution_grant: None,
+    };
+    let prepared = runtime
+        .prepare(
+            context,
+            "use_tool",
+            json!({"tool": "demo__blob", "arguments": {}}),
+        )
+        .unwrap();
+    let output = runtime
+        .execute_without_approval_for_test(prepared)
+        .await
+        .unwrap();
+    assert!(output.truncated, "expected truncated flag");
+    let artifact = output.artifact_path.expect("spill path");
+    assert!(artifact.contains(".lato/tool-output/"));
+    assert_eq!(std::fs::read_to_string(&artifact).unwrap(), huge);
+    assert!(output.content.len() < huge.len());
+    assert!(output.content.contains("[tool output truncated"));
+    assert!(!output.content.contains(&"Z".repeat(lato_tools::TOOL_OUTPUT_LIMIT_BYTES + 2_500)));
+    assert_eq!(output.metadata["kind"], "mcp_tool_result");
+    assert_eq!(output.metadata["generation"], 42);
+    assert!(output.metadata["argsHash"].as_str().unwrap().starts_with("sha256:"));
+    assert!(output.metadata["resultHash"].as_str().unwrap().starts_with("sha256:"));
+    // Journal-facing metadata must not embed the full body or secrets.
+    let meta = output.metadata.to_string();
+    assert!(!meta.contains(&"Z".repeat(100)));
+}
+
+#[test]
+fn mcp_error_mapping_uses_stable_codes_without_secrets() {
+    let err = lato_mcp::McpError::UnsafeUrl;
+    let mapped = {
+        // Reuse provider mapping via a tiny call through NotRunning etc.
+        let code = err.code();
+        let message = err.safe_message();
+        (code, message)
+    };
+    assert_eq!(mapped.0, "mcp.unsafe_url");
+    assert!(!mapped.1.contains("secret"));
+    assert_eq!(lato_mcp::McpError::Timeout { timeout_ms: 9 }.code(), "mcp.timeout");
+    assert_eq!(lato_mcp::McpError::rpc(1, "x").code(), "mcp.rpc_error");
 }

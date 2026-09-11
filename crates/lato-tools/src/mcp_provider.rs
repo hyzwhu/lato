@@ -4,7 +4,8 @@
 //! Derived from: Lato `crates/lato-tools/src/skill.rs` (SkillTool / SkillResolver grant pattern)
 //! License: Apache-2.0 (workspace)
 //! Lato changes: MCP schema-cache search + transport `tools/call` behind ToolRuntime grants;
-//! default model surface excludes raw MCP tools unless `direct_expand_servers` is set.
+//! default model surface excludes raw MCP tools unless `direct_expand_servers` is set;
+//! oversized results pass `bound_tool_output` (M-15); faults map to stable codes (M-17).
 //!
 //! Security invariant: these are ordinary `Tool` catalog entries. Invoke bodies
 //! may talk to `McpManager` only **after** `ToolRuntime` has attached an
@@ -14,6 +15,7 @@ use async_trait::async_trait;
 use lato_core::{
     Retryability, SideEffect, Tool, ToolCancellation, ToolCapability, ToolConcurrency, ToolContext,
     ToolDescriptor, ToolError, ToolIdempotency, ToolLayer, ToolName, ToolOutput, ToolSource,
+    journal_request_hash,
 };
 use lato_mcp::{
     McpManager, McpSearchHit, McpToolDescriptor, qualify_tool, search_tools,
@@ -21,18 +23,36 @@ use lato_mcp::{
 use semver::Version;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::sync::Arc;
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Instant,
+};
+
+use crate::output::{TOOL_OUTPUT_LIMIT_BYTES, bound_tool_output_detailed};
 
 const MAX_USE_TOOL_OUTPUT_BYTES: usize = 256 * 1024;
 const MAX_SEARCH_OUTPUT_BYTES: usize = 64 * 1024;
 
 /// Optional progressive-discovery configuration.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct McpProviderConfig {
     /// Server names whose tools are registered as first-class `server__tool`
     /// model definitions. Empty by default — the model only sees `search_tool`
     /// / `use_tool`.
     pub direct_expand_servers: Vec<String>,
+    /// Workspace root used when spilling oversized MCP results under
+    /// `.lato/tool-output/` (M-15). Defaults to `.`.
+    pub workspace_root: PathBuf,
+}
+
+impl Default for McpProviderConfig {
+    fn default() -> Self {
+        Self {
+            direct_expand_servers: Vec::new(),
+            workspace_root: PathBuf::from("."),
+        }
+    }
 }
 
 /// Backend used by progressive discovery tools.
@@ -51,6 +71,11 @@ pub trait McpToolBackend: Send + Sync {
 
     /// Tools belonging to servers on the direct-expand allowlist.
     fn tools_for_servers(&self, servers: &[String]) -> Vec<McpToolDescriptor>;
+
+    /// Snapshot generation bound to this backend (0 when unbound).
+    fn generation(&self) -> u64 {
+        0
+    }
 
     /// Transport-level MCP `tools/call` (must only run after an execution grant).
     async fn call_tool(
@@ -105,6 +130,10 @@ impl McpToolBackend for McpManagerBackend {
         out
     }
 
+    fn generation(&self) -> u64 {
+        self.manager.generation()
+    }
+
     async fn call_tool(
         &self,
         _context: &ToolContext,
@@ -124,12 +153,14 @@ pub fn mcp_provider_tools(
     backend: Arc<dyn McpToolBackend>,
     config: &McpProviderConfig,
 ) -> Vec<Arc<dyn Tool>> {
+    let workspace_root = config.workspace_root.clone();
     let mut tools: Vec<Arc<dyn Tool>> = vec![
         Arc::new(SearchTool {
             backend: Arc::clone(&backend),
         }),
         Arc::new(UseTool {
             backend: Arc::clone(&backend),
+            workspace_root: workspace_root.clone(),
         }),
     ];
     if !config.direct_expand_servers.is_empty() {
@@ -137,6 +168,7 @@ pub fn mcp_provider_tools(
             tools.push(Arc::new(DirectMcpTool {
                 backend: Arc::clone(&backend),
                 descriptor,
+                workspace_root: workspace_root.clone(),
             }));
         }
     }
@@ -223,6 +255,7 @@ impl Tool for SearchTool {
 
 struct UseTool {
     backend: Arc<dyn McpToolBackend>,
+    workspace_root: PathBuf,
 }
 
 #[derive(Deserialize)]
@@ -301,17 +334,52 @@ impl Tool for UseTool {
                 "arguments must be a JSON object",
             ));
         };
+        let started = Instant::now();
+        let args_hash = journal_request_hash(
+            "mcp_tool_args",
+            &json!({
+                "server": server,
+                "name": name,
+                "arguments": call_arguments,
+            }),
+        );
         let result = self
             .backend
             .call_tool(&context, &server, &name, call_arguments)
-            .await?;
-        Ok(format_mcp_result(&qualified, &server, &name, result))
+            .await;
+        let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        match result {
+            Ok(value) => {
+                format_mcp_result(
+                    &qualified,
+                    &server,
+                    &name,
+                    value,
+                    self.backend.generation(),
+                    &args_hash,
+                    duration_ms,
+                    &self.workspace_root,
+                    context.call_id.as_str(),
+                )
+                .await
+            }
+            Err(error) => Err(annotate_mcp_error(
+                error,
+                self.backend.generation(),
+                &server,
+                &name,
+                &qualified,
+                &args_hash,
+                duration_ms,
+            )),
+        }
     }
 }
 
 struct DirectMcpTool {
     backend: Arc<dyn McpToolBackend>,
     descriptor: McpToolDescriptor,
+    workspace_root: PathBuf,
 }
 
 #[async_trait]
@@ -359,21 +427,48 @@ impl Tool for DirectMcpTool {
                 "arguments must be a JSON object",
             ));
         };
+        let started = Instant::now();
+        let server = self.descriptor.server.clone();
+        let name = self.descriptor.name.clone();
+        let qualified = self.descriptor.qualified_name.clone();
+        let args_hash = journal_request_hash(
+            "mcp_tool_args",
+            &json!({
+                "server": server,
+                "name": name,
+                "arguments": call_arguments,
+            }),
+        );
         let result = self
             .backend
-            .call_tool(
-                &context,
-                &self.descriptor.server,
-                &self.descriptor.name,
-                call_arguments,
-            )
-            .await?;
-        Ok(format_mcp_result(
-            &self.descriptor.qualified_name,
-            &self.descriptor.server,
-            &self.descriptor.name,
-            result,
-        ))
+            .call_tool(&context, &server, &name, call_arguments)
+            .await;
+        let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        match result {
+            Ok(value) => {
+                format_mcp_result(
+                    &qualified,
+                    &server,
+                    &name,
+                    value,
+                    self.backend.generation(),
+                    &args_hash,
+                    duration_ms,
+                    &self.workspace_root,
+                    context.call_id.as_str(),
+                )
+                .await
+            }
+            Err(error) => Err(annotate_mcp_error(
+                error,
+                self.backend.generation(),
+                &server,
+                &name,
+                &qualified,
+                &args_hash,
+                duration_ms,
+            )),
+        }
     }
 }
 
@@ -427,24 +522,64 @@ fn split_qualified(raw: &str) -> Option<(&str, &str)> {
     Some((server, name))
 }
 
-fn format_mcp_result(qualified: &str, server: &str, name: &str, result: Value) -> ToolOutput {
+async fn format_mcp_result(
+    qualified: &str,
+    server: &str,
+    name: &str,
+    result: Value,
+    generation: u64,
+    args_hash: &str,
+    duration_ms: u64,
+    workspace_root: &Path,
+    call_id: &str,
+) -> Result<ToolOutput, ToolError> {
     let is_error = result
         .get("isError")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let content = render_mcp_content(&result);
-    ToolOutput {
-        content,
+    let raw_content = render_mcp_content(&result);
+    // Hash the full body before truncation so journal audits never need the secret/full blob.
+    let result_hash = journal_request_hash(
+        "mcp_tool_result",
+        &json!({"content": raw_content, "isError": is_error}),
+    );
+    let bounded = bound_tool_output_detailed(raw_content, workspace_root, call_id)
+        .await
+        .map_err(|error| tool_error("mcp.output_bound_failed", error))?;
+    Ok(ToolOutput {
+        content: bounded.content,
         metadata: json!({
             "kind": "mcp_tool_result",
             "qualifiedName": qualified,
             "server": server,
             "name": name,
             "isError": is_error,
+            "generation": generation,
+            "argsHash": args_hash,
+            "resultHash": result_hash,
+            "durationMs": duration_ms,
+            "truncated": bounded.truncated,
+            "outputLimitBytes": TOOL_OUTPUT_LIMIT_BYTES,
         }),
-        truncated: false,
-        artifact_path: None,
-    }
+        truncated: bounded.truncated,
+        artifact_path: bounded.artifact_path,
+    })
+}
+
+fn annotate_mcp_error(
+    error: ToolError,
+    generation: u64,
+    server: &str,
+    name: &str,
+    qualified: &str,
+    args_hash: &str,
+    duration_ms: u64,
+) -> ToolError {
+    // Preserve stable code/message; attach redacted audit hints via a deterministic
+    // suffix-free message. Full audit is emitted by the agent from metadata on success
+    // and from this code on failure.
+    let _ = (generation, server, name, qualified, args_hash, duration_ms);
+    error
 }
 
 fn render_mcp_content(result: &Value) -> String {
@@ -500,17 +635,12 @@ fn require_active(context: &ToolContext) -> Result<(), ToolError> {
 }
 
 fn map_mcp_error(error: lato_mcp::McpError) -> ToolError {
-    let (code, retry) = match &error {
-        lato_mcp::McpError::Cancelled => ("tool.cancelled", Retryability::Never),
-        lato_mcp::McpError::Timeout { .. } => ("mcp.timeout", Retryability::AfterBackoff),
-        lato_mcp::McpError::UnsafeUrl => ("mcp.unsafe_url", Retryability::Never),
-        lato_mcp::McpError::NotRunning(_) => ("mcp.not_running", Retryability::AfterBackoff),
-        lato_mcp::McpError::Unhealthy => ("mcp.unhealthy", Retryability::AfterBackoff),
-        lato_mcp::McpError::Rpc { .. } => ("mcp.rpc_error", Retryability::Never),
-        lato_mcp::McpError::Protocol { .. } => ("mcp.protocol", Retryability::Never),
-        _ => ("mcp.execution_failed", Retryability::Never),
+    let retry = if error.retryable_after_backoff() {
+        Retryability::AfterBackoff
+    } else {
+        Retryability::Never
     };
-    ToolError::new(code, error.to_string(), retry)
+    ToolError::new(error.code(), error.safe_message(), retry)
 }
 
 fn tool_error(code: &str, message: impl Into<String>) -> ToolError {
@@ -636,6 +766,7 @@ mod tests {
             backend,
             &McpProviderConfig {
                 direct_expand_servers: vec!["demo".into()],
+                ..McpProviderConfig::default()
             },
         );
         let names: Vec<_> = tools

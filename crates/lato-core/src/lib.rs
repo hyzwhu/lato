@@ -27,9 +27,9 @@ pub use id::{
 pub use journal::{
     EventStore, ExtensionAuditRecord, HookAuditOutcome, HookAuditPhase, JOURNAL_SCHEMA_VERSION,
     JournalDurability, JournalEnvelope, JournalError, JournalRecord, JournalReplay,
-    JournalTerminal, PolicyAuditDecision, PolicyAuditRecord, PolicyAuditStage, PreparedToolAudit,
-    SessionProjection, SkillInvocationOrigin, UnresolvedToolCall, canonical_json,
-    journal_request_hash, project_journal, projection_message, validate_journal,
+    JournalTerminal, McpAuditOutcome, PolicyAuditDecision, PolicyAuditRecord, PolicyAuditStage,
+    PreparedToolAudit, SessionProjection, SkillInvocationOrigin, UnresolvedToolCall,
+    canonical_json, journal_request_hash, project_journal, projection_message, validate_journal,
 };
 pub use model::{
     ModelCapabilities, ModelContent, ModelError, ModelErrorKind, ModelEventStream, ModelMessage,
