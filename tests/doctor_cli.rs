@@ -14,6 +14,15 @@ use std::{
     },
 };
 
+fn prepend_path(dir: &Path) -> OsString {
+    let mut path = dir.as_os_str().to_owned();
+    path.push(if cfg!(windows) { ";" } else { ":" });
+    if let Some(existing) = std::env::var_os("PATH") {
+        path.push(existing);
+    }
+    path
+}
+
 fn lato(args: &[&str], home: &Path) -> Output {
     std::process::Command::new(env!("CARGO_BIN_EXE_lato"))
         .args(args)
@@ -326,4 +335,57 @@ fn help_lists_all_four_doctor_forms() {
     assert!(help.contains("--json"));
     assert!(help.contains("--strict"));
     assert!(help.contains("--live"));
+}
+
+fn doctor_binary_path_check(home: &Path, path: OsString) -> serde_json::Value {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_lato"))
+        .args(["doctor", "--json"])
+        .env("LATO_HOME", home)
+        .env("PATH", path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["id"] == "binary_path")
+        .cloned()
+        .expect("binary_path check")
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_warns_when_path_lato_shadows_this_binary() {
+    let home = tempfile::tempdir().unwrap();
+    let decoy_dir = tempfile::tempdir().unwrap();
+    let decoy = decoy_dir.path().join("lato");
+    std::fs::write(&decoy, b"#!/bin/sh\nexit 0\n").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&decoy, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let check = doctor_binary_path_check(home.path(), prepend_path(decoy_dir.path()));
+    assert_eq!(check["status"], "warn");
+    assert_eq!(check["code"], "doctor.path_shadow");
+    let message = check["message"].as_str().unwrap();
+    assert!(message.contains("shadow"), "message={message}");
+    assert!(
+        message.contains(&decoy.display().to_string()),
+        "message={message}"
+    );
+}
+
+#[test]
+fn doctor_path_check_is_ok_when_path_matches_this_binary() {
+    let home = tempfile::tempdir().unwrap();
+    let bin = Path::new(env!("CARGO_BIN_EXE_lato"));
+    let dir = bin.parent().expect("lato binary parent");
+    let check = doctor_binary_path_check(home.path(), prepend_path(dir));
+    assert_eq!(check["status"], "ok", "check={check}");
+    assert!(check["code"].is_null());
 }
