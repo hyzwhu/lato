@@ -5,8 +5,9 @@
 
 use crate::{
     AutoCompactionSuppression, ContextTracker, HistoryItem, PREFIRE_LEAD_PERCENT,
-    SamplingRecoveryBudget, SessionHookRuntime, SessionSkillHandle, SkillRuntimeBinding,
-    TWO_PASS_SPLIT_PERCENT, compaction_suppression_reason, fingerprint_prefix, split_for_two_pass,
+    SamplingRecoveryBudget, SessionHookRuntime, SessionMcpHandle, SessionSkillHandle,
+    SkillRuntimeBinding, TWO_PASS_SPLIT_PERCENT, compaction_suppression_reason, fingerprint_prefix,
+    split_for_two_pass,
 };
 use async_trait::async_trait;
 use lato_ai::{
@@ -15,10 +16,10 @@ use lato_ai::{
 pub use lato_core::ApprovalRequest;
 use lato_core::{
     AgentError, CompactionPolicy, CompactionTrigger, ContextUsage, ExtensionAuditRecord,
-    HookAuditOutcome, HookAuditPhase, JournalDurability, JournalRecord, ModelContent,
-    ModelErrorKind, ModelMessage, ModelRole, PolicyAuditDecision, PolicyAuditStage, PolicyDecision,
-    Retryability, SessionId, SkillInvocationOrigin, ToolCallId, ToolContext, ToolError, ToolName,
-    TurnId, journal_request_hash,
+    HookAuditOutcome, HookAuditPhase, JournalDurability, JournalRecord, McpAuditOutcome,
+    ModelContent, ModelErrorKind, ModelMessage, ModelRole, PolicyAuditDecision, PolicyAuditStage,
+    PolicyDecision, Retryability, SessionId, SkillInvocationOrigin, ToolCallId, ToolContext,
+    ToolError, ToolName, TurnId, journal_request_hash,
 };
 use lato_extensions::{hooks::HookRegistry, skills::SkillCatalog};
 use lato_runtime::{
@@ -95,6 +96,7 @@ pub struct SessionActor {
     cwd: PathBuf,
     tool_runtime: Arc<ToolRuntime>,
     skill_handle: Option<SessionSkillHandle>,
+    mcp_handle: Option<SessionMcpHandle>,
     skill_listing: String,
     skill_catalog_audit: Option<ExtensionAuditRecord>,
     hook_runtime: Option<SessionHookRuntime>,
@@ -133,7 +135,7 @@ impl SessionActor {
         cwd: PathBuf,
         tool_runtime: Arc<ToolRuntime>,
     ) -> Self {
-        Self::from_tool_runtime(stream, locks, trust, cwd, tool_runtime, None)
+        Self::from_tool_runtime(stream, locks, trust, cwd, tool_runtime, None, None)
     }
 
     pub(crate) fn new_with_skill_runtime(
@@ -143,8 +145,16 @@ impl SessionActor {
         cwd: PathBuf,
         binding: SkillRuntimeBinding,
     ) -> Self {
-        let (tool_runtime, skill_handle) = binding.into_parts();
-        Self::from_tool_runtime(stream, locks, trust, cwd, tool_runtime, Some(skill_handle))
+        let (tool_runtime, skill_handle, mcp_handle) = binding.into_parts();
+        Self::from_tool_runtime(
+            stream,
+            locks,
+            trust,
+            cwd,
+            tool_runtime,
+            Some(skill_handle),
+            Some(mcp_handle),
+        )
     }
 
     fn from_tool_runtime(
@@ -154,6 +164,7 @@ impl SessionActor {
         cwd: PathBuf,
         tool_runtime: Arc<ToolRuntime>,
         skill_handle: Option<SessionSkillHandle>,
+        mcp_handle: Option<SessionMcpHandle>,
     ) -> Self {
         Self {
             active: false,
@@ -165,6 +176,7 @@ impl SessionActor {
             cwd,
             tool_runtime,
             skill_handle,
+            mcp_handle,
             skill_listing: String::new(),
             skill_catalog_audit: None,
             hook_runtime: None,
@@ -240,6 +252,29 @@ impl SessionActor {
             self.cwd.clone(),
             self.session_id.to_string(),
         ));
+    }
+
+    /// Bind a generation-scoped MCP manager for the upcoming turn.
+    ///
+    /// Paired with [`Self::bind_turn_skills`] / [`Self::bind_turn_hooks`]. MCP
+    /// tools remain ordinary ToolRuntime entries — this only swaps the
+    /// transport backend behind `search_tool` / `use_tool`.
+    pub async fn bind_turn_mcp(&mut self, manager: Arc<lato_mcp::McpManager>) {
+        let Some(handle) = &self.mcp_handle else {
+            return;
+        };
+        // Turn-boundary adopt: retires the previous generation with cancel+reap.
+        handle.adopt_generation(manager).await;
+    }
+
+    pub fn mcp_handle(&self) -> Option<&SessionMcpHandle> {
+        self.mcp_handle.as_ref()
+    }
+
+    pub async fn shutdown_mcp(&self, deadline: std::time::Instant) {
+        if let Some(handle) = &self.mcp_handle {
+            handle.shutdown(deadline).await;
+        }
     }
 
     pub async fn observe_bound_hook(
@@ -1222,6 +1257,13 @@ impl SessionActor {
                     )
                     .await?;
                 }
+                if let Some(mcp_audit) = mcp_tool_audit_from_result(&result) {
+                    self.commit(
+                        JournalRecord::ExtensionAudit { audit: mcp_audit },
+                        JournalDurability::Flush,
+                    )
+                    .await?;
+                }
                 self.commit(
                     JournalRecord::ToolCallCompleted {
                         call_id: audit.call_id,
@@ -1602,6 +1644,107 @@ fn compile_skill_scope(
         Some(specs) => SkillToolScope::compile(&specs, runtime).map(Some),
         None => Ok(None),
     }
+}
+
+fn mcp_tool_audit_from_result(
+    result: &Result<lato_core::ToolOutput, ToolError>,
+) -> Option<ExtensionAuditRecord> {
+    match result {
+        Ok(output) => mcp_tool_succeeded_audit(output),
+        Err(error) => {
+            // Failures without MCP metadata (e.g. policy denies) skip this audit.
+            if error.code.starts_with("mcp.") || error.code == "tool.cancelled" {
+                // Without metadata we cannot safely name server/tool; skip hash-only
+                // failure audits here — provider success path always attaches metadata.
+                None
+            } else {
+                None
+            }
+        }
+    }
+}
+
+fn mcp_tool_succeeded_audit(output: &lato_core::ToolOutput) -> Option<ExtensionAuditRecord> {
+    if output.metadata.get("kind")?.as_str()? != "mcp_tool_result" {
+        return None;
+    }
+    let server = output.metadata.get("server")?.as_str()?.to_owned();
+    let tool = output.metadata.get("name")?.as_str()?.to_owned();
+    let qualified_name = output.metadata.get("qualifiedName")?.as_str()?.to_owned();
+    let generation = output
+        .metadata
+        .get("generation")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let args_hash = output
+        .metadata
+        .get("argsHash")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_owned();
+    let result_hash = output
+        .metadata
+        .get("resultHash")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned);
+    let duration_ms = output.metadata.get("durationMs").and_then(|v| v.as_u64());
+    let truncated = output.truncated
+        || output
+            .metadata
+            .get("truncated")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+    let is_error = output
+        .metadata
+        .get("isError")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let outcome = if is_error {
+        McpAuditOutcome::Failed
+    } else {
+        McpAuditOutcome::Succeeded
+    };
+    let redacted_reason = if truncated {
+        Some("mcp.result_spilled".into())
+    } else {
+        None
+    };
+    // Refuse to journal if the inline content still looks like a raw secret-bearing URL.
+    let serialized = serde_json::to_string(&output.metadata).unwrap_or_default();
+    if serialized.contains("://")
+        && (serialized.contains("@") || serialized.to_ascii_lowercase().contains("authorization"))
+    {
+        return Some(ExtensionAuditRecord::McpToolCall {
+            generation,
+            server,
+            tool,
+            qualified_name,
+            duration_ms,
+            outcome,
+            args_hash,
+            result_hash,
+            truncated: true,
+            error_code: None,
+            redacted_reason: Some("mcp.metadata_redacted".into()),
+        });
+    }
+    Some(ExtensionAuditRecord::McpToolCall {
+        generation,
+        server,
+        tool,
+        qualified_name,
+        duration_ms,
+        outcome,
+        args_hash,
+        result_hash,
+        truncated,
+        error_code: if is_error {
+            Some("mcp.tool_reported_error".into())
+        } else {
+            None
+        },
+        redacted_reason,
+    })
 }
 
 fn skill_invoked_audit(output: &lato_core::ToolOutput) -> Option<ExtensionAuditRecord> {

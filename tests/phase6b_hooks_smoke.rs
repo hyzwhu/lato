@@ -29,10 +29,10 @@ fn phase6b_installed_command_smoke_exercises_hook_lifecycle() {
     let runtime = tokio::runtime::Runtime::new().unwrap();
     runtime.block_on(async {
         let hooks = SessionHookRuntime::new(HookRegistry::from_specs(1, vec![
-            hook("prompt", HookEventName::UserPromptSubmit, "printf '%s' '{}'") ,
-            hook("pre", HookEventName::PreToolUse, "printf '%s' '{\"hookSpecificOutput\":{\"permissionDecision\":\"ask\",\"updatedInput\":{\"path\":\"safe.txt\"}}}'"),
-            hook("post", HookEventName::PostToolUse, "printf '%s' '{\"hookSpecificOutput\":{\"updatedToolOutput\":{\"text\":\"replacement\"}}}'"),
-            hook("stop", HookEventName::Stop, "printf '%s' '{\"continue\":false,\"stopReason\":\"done\"}'"),
+            hook("prompt", HookEventName::UserPromptSubmit, "cat >/dev/null; printf '%s' '{}'") ,
+            hook("pre", HookEventName::PreToolUse, "cat >/dev/null; printf '%s' '{\"hookSpecificOutput\":{\"permissionDecision\":\"ask\",\"updatedInput\":{\"path\":\"safe.txt\"}}}'"),
+            hook("post", HookEventName::PostToolUse, "cat >/dev/null; printf '%s' '{\"hookSpecificOutput\":{\"updatedToolOutput\":{\"text\":\"replacement\"}}}'"),
+            hook("stop", HookEventName::Stop, "cat >/dev/null; printf '%s' '{\"continue\":false,\"stopReason\":\"done\"}'"),
         ]), PathBuf::from("."), "smoke-session".into());
         assert!(hooks.prompt_submit("turn", "hello", CancellationToken::new()).await.block.is_none());
         let pre = hooks.pre_tool_use("turn", "read_file", serde_json::json!({"path":"unsafe"}), CancellationToken::new()).await;

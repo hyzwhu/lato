@@ -54,6 +54,16 @@ pub enum HookAuditOutcome {
     Cancelled,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpAuditOutcome {
+    Succeeded,
+    Failed,
+    Cancelled,
+    TimedOut,
+    UnsafeUrl,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ExtensionAuditRecord {
@@ -87,6 +97,21 @@ pub enum ExtensionAuditRecord {
         requested_name_hash: String,
         origin: SkillInvocationOrigin,
         error_code: String,
+    },
+    /// MCP tools/call audit. Stores hashes only — never raw args, results,
+    /// headers, env, or URL credentials.
+    McpToolCall {
+        generation: u64,
+        server: String,
+        tool: String,
+        qualified_name: String,
+        duration_ms: Option<u64>,
+        outcome: McpAuditOutcome,
+        args_hash: String,
+        result_hash: Option<String>,
+        truncated: bool,
+        error_code: Option<String>,
+        redacted_reason: Option<String>,
     },
 }
 

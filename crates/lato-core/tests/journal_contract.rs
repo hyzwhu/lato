@@ -1,8 +1,8 @@
 use lato_core::{
     Command, ExtensionAuditRecord, JOURNAL_SCHEMA_VERSION, JournalEnvelope, JournalError,
-    JournalRecord, JournalRecordId, ModelContent, ModelSelection, PluginSnapshotSummary,
-    Retryability, SessionId, SkillInvocationOrigin, ToolCallId, ToolError, ToolName, TurnId,
-    journal_request_hash, project_journal,
+    JournalRecord, JournalRecordId, McpAuditOutcome, ModelContent, ModelSelection,
+    PluginSnapshotSummary, Retryability, SessionId, SkillInvocationOrigin, ToolCallId, ToolError,
+    ToolName, TurnId, journal_request_hash, project_journal,
 };
 
 #[test]
@@ -193,4 +193,58 @@ fn envelope(
         timestamp_ms: sequence,
         record,
     }
+}
+
+#[test]
+fn mcp_tool_call_audit_round_trips_without_secrets_or_full_bodies() {
+    let sid = SessionId::from("mcp-audit");
+    let secret_args = r#"{"token":"super-secret-token","url":"https://user:pass@evil/mcp"}"#;
+    let huge = "X".repeat(40_000);
+    let audit = ExtensionAuditRecord::McpToolCall {
+        generation: 3,
+        server: "demo".into(),
+        tool: "ping".into(),
+        qualified_name: "demo__ping".into(),
+        duration_ms: Some(12),
+        outcome: McpAuditOutcome::Succeeded,
+        args_hash: journal_request_hash(
+            "mcp_tool_args",
+            &serde_json::json!({"arguments": serde_json::from_str::<serde_json::Value>(secret_args).unwrap()}),
+        ),
+        result_hash: Some(journal_request_hash(
+            "mcp_tool_result",
+            &serde_json::json!({"content": huge}),
+        )),
+        truncated: true,
+        error_code: None,
+        redacted_reason: Some("mcp.result_spilled".into()),
+    };
+    let record = JournalRecord::ExtensionAudit {
+        audit: audit.clone(),
+    };
+    let encoded = serde_json::to_vec(&record).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<JournalRecord>(&encoded).unwrap(),
+        record
+    );
+    let serialized = serde_json::to_string(&audit).unwrap();
+    assert!(!serialized.contains("super-secret-token"));
+    assert!(!serialized.contains("user:pass"));
+    assert!(!serialized.contains(&"X".repeat(100)));
+    assert!(serialized.contains("args_hash"));
+    assert!(serialized.contains("result_hash"));
+    assert_eq!(
+        serde_json::to_value(&audit).unwrap()["type"],
+        "mcp_tool_call"
+    );
+
+    let projection = project_journal(
+        &sid,
+        &[
+            envelope(&sid, None, 0, JournalRecord::SessionStarted),
+            envelope(&sid, None, 1, record),
+        ],
+    )
+    .unwrap();
+    assert!(projection.messages.is_empty());
 }

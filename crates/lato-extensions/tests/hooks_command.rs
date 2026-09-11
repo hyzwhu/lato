@@ -61,7 +61,7 @@ async fn relative_executable_uses_source_dir_and_environment_cannot_spoof_identi
     let script = root.path().join("hook.sh");
     fs::write(
         &script,
-        "#!/bin/sh\nprintf '%s|%s' \"$LATO_SESSION_ID\" \"$EXTRA\"\n",
+        "#!/bin/sh\ncat >/dev/null\nprintf '%s|%s' \"$LATO_SESSION_ID\" \"$EXTRA\"\n",
     )
     .unwrap();
     fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();

@@ -264,7 +264,12 @@ pub async fn dispatch_post_tool_use(
                 text,
             );
         }
-        if let Some(replacement) = parsed.updated_tool_output {
+        // Phase 6C: updatedMCPToolOutput is now applied (MCP result type exists).
+        // Prefer the MCP-specific field when a handler returns both.
+        if let Some(replacement) = parsed
+            .updated_mcp_tool_output
+            .or(parsed.updated_tool_output)
+        {
             result.replacement = Some(replacement);
         }
     }

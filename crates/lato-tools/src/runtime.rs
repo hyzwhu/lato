@@ -1,6 +1,7 @@
 use crate::{
-    BuiltinAdapterError, BuiltinToolEnvironment, CatalogError, RegistrationOutcome, SkillToolScope,
-    ToolCatalog, builtin_tools, task_tools,
+    BuiltinAdapterError, BuiltinToolEnvironment, CatalogError, McpProviderConfig, McpToolBackend,
+    RegistrationOutcome, SkillToolScope, ToolCatalog, builtin_tools, mcp_provider_tools,
+    task_tools,
 };
 use lato_core::{
     ApprovalFingerprint, ApprovalRequest, EnvironmentPolicy, ExecutionGrant, NetworkPolicy,
@@ -132,6 +133,19 @@ impl ToolRuntimeBuilder {
         environment: BuiltinToolEnvironment,
     ) -> Result<(), RuntimeBuildError> {
         for tool in builtin_tools(environment)? {
+            self.register(tool)?;
+        }
+        Ok(())
+    }
+
+    pub fn register_mcp_provider(
+        &mut self,
+        backend: std::sync::Arc<dyn McpToolBackend>,
+        config: &McpProviderConfig,
+    ) -> Result<(), RuntimeBuildError> {
+        let mut config = config.clone();
+        config.workspace_root = self.scope.workspace_root.clone();
+        for tool in mcp_provider_tools(backend, &config) {
             self.register(tool)?;
         }
         Ok(())
@@ -623,21 +637,37 @@ pub struct ValidatedToolCall {
 pub fn builtin_tool_runtime(
     environment: BuiltinToolEnvironment,
 ) -> Result<Arc<ToolRuntime>, RuntimeBuildError> {
-    build_builtin_tool_runtime(environment, None, None)
+    build_builtin_tool_runtime(environment, None, None, None)
 }
 
 pub fn builtin_tool_runtime_for_capabilities(
     environment: BuiltinToolEnvironment,
     capabilities: Option<&[lato_core::ToolCapability]>,
 ) -> Result<Arc<ToolRuntime>, RuntimeBuildError> {
-    build_builtin_tool_runtime(environment, capabilities, None)
+    build_builtin_tool_runtime(environment, capabilities, None, None)
+}
+
+pub fn builtin_tool_runtime_for_capabilities_with_mcp(
+    environment: BuiltinToolEnvironment,
+    capabilities: Option<&[lato_core::ToolCapability]>,
+    mcp_backend: Arc<dyn McpToolBackend>,
+) -> Result<Arc<ToolRuntime>, RuntimeBuildError> {
+    build_builtin_tool_runtime(environment, capabilities, None, Some(mcp_backend))
 }
 
 pub fn builtin_tool_runtime_with_subagents(
     environment: BuiltinToolEnvironment,
     backend: lato_runtime::SubagentBackendResource,
 ) -> Result<Arc<ToolRuntime>, RuntimeBuildError> {
-    build_builtin_tool_runtime(environment, None, Some(backend))
+    build_builtin_tool_runtime(environment, None, Some(backend), None)
+}
+
+pub fn builtin_tool_runtime_with_subagents_and_mcp(
+    environment: BuiltinToolEnvironment,
+    backend: lato_runtime::SubagentBackendResource,
+    mcp_backend: Arc<dyn McpToolBackend>,
+) -> Result<Arc<ToolRuntime>, RuntimeBuildError> {
+    build_builtin_tool_runtime(environment, None, Some(backend), Some(mcp_backend))
 }
 
 pub fn builtin_tool_runtime_for_capabilities_with_subagents(
@@ -645,16 +675,27 @@ pub fn builtin_tool_runtime_for_capabilities_with_subagents(
     capabilities: Option<&[lato_core::ToolCapability]>,
     backend: lato_runtime::SubagentBackendResource,
 ) -> Result<Arc<ToolRuntime>, RuntimeBuildError> {
-    build_builtin_tool_runtime(environment, capabilities, Some(backend))
+    build_builtin_tool_runtime(environment, capabilities, Some(backend), None)
+}
+
+pub fn builtin_tool_runtime_for_capabilities_with_subagents_and_mcp(
+    environment: BuiltinToolEnvironment,
+    capabilities: Option<&[lato_core::ToolCapability]>,
+    backend: lato_runtime::SubagentBackendResource,
+    mcp_backend: Arc<dyn McpToolBackend>,
+) -> Result<Arc<ToolRuntime>, RuntimeBuildError> {
+    build_builtin_tool_runtime(environment, capabilities, Some(backend), Some(mcp_backend))
 }
 
 fn build_builtin_tool_runtime(
     environment: BuiltinToolEnvironment,
     capabilities: Option<&[lato_core::ToolCapability]>,
     backend: Option<lato_runtime::SubagentBackendResource>,
+    mcp_backend: Option<Arc<dyn McpToolBackend>>,
 ) -> Result<Arc<ToolRuntime>, RuntimeBuildError> {
+    let workspace_root = environment.cwd.clone();
     let scope = PolicyScope {
-        workspace_root: environment.cwd.clone(),
+        workspace_root: workspace_root.clone(),
         mode: match environment.trust.mode {
             lato_workspace::ApprovalMode::Ask => PolicyMode::Ask,
             lato_workspace::ApprovalMode::Auto => PolicyMode::Auto,
@@ -684,6 +725,25 @@ fn build_builtin_tool_runtime(
     }
     if let Some(backend) = backend {
         for tool in task_tools(backend) {
+            let descriptor = tool.descriptor();
+            if capabilities.is_none_or(|allowed| {
+                descriptor
+                    .capabilities
+                    .iter()
+                    .all(|capability| allowed.contains(capability))
+            }) {
+                builder.register(tool)?;
+            }
+        }
+    }
+    if let Some(mcp_backend) = mcp_backend {
+        // MCP tools are ordinary ToolRegistry entries — same prepare_scoped /
+        // PolicyEngine / approval / execute membrane as builtins.
+        let config = McpProviderConfig {
+            workspace_root,
+            ..McpProviderConfig::default()
+        };
+        for tool in mcp_provider_tools(mcp_backend, &config) {
             let descriptor = tool.descriptor();
             if capabilities.is_none_or(|allowed| {
                 descriptor

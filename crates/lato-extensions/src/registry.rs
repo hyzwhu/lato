@@ -3,7 +3,7 @@
 // Lato changes: publishes immutable generation snapshots and derives monotone child capability views
 
 use std::{
-    collections::HashSet,
+    collections::{BTreeSet, HashSet},
     path::PathBuf,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
@@ -76,6 +76,8 @@ pub struct PluginSnapshot {
     cli_plugin_dirs: Arc<[PathBuf]>,
     plugins: Arc<[LoadedPlugin]>,
     diagnostics: Arc<[DiscoveryDiagnostic]>,
+    /// Effective MCP server/tool ceiling for this snapshot (monotone under derive_child).
+    mcp_ceiling: McpCapabilityCeiling,
 }
 
 impl PluginSnapshot {
@@ -88,6 +90,7 @@ impl PluginSnapshot {
             cli_plugin_dirs: Arc::from([]),
             plugins: Arc::from([]),
             diagnostics: Arc::from([]),
+            mcp_ceiling: McpCapabilityCeiling::default(),
         })
     }
 
@@ -119,6 +122,10 @@ impl PluginSnapshot {
         &self.diagnostics
     }
 
+    pub fn mcp_ceiling(&self) -> &McpCapabilityCeiling {
+        &self.mcp_ceiling
+    }
+
     pub fn active_plugins(&self) -> impl Iterator<Item = &LoadedPlugin> {
         self.plugins.iter().filter(|plugin| plugin.active)
     }
@@ -137,6 +144,11 @@ impl PluginSnapshot {
         ]
         .into_iter()
         .all(|capabilities| capabilities.contains(&ToolCapability::ExtensionInvoke));
+        // Child MCP ceiling is the intersection with the parent grant — never widens.
+        let mut mcp_ceiling = self.mcp_ceiling.intersect(&ceiling.mcp);
+        if !extension_allowed {
+            mcp_ceiling = McpCapabilityCeiling::deny_all();
+        }
         let plugins = self
             .plugins
             .iter()
@@ -161,7 +173,63 @@ impl PluginSnapshot {
             cli_plugin_dirs: Arc::clone(&self.cli_plugin_dirs),
             plugins: plugins.into(),
             diagnostics: Arc::clone(&self.diagnostics),
+            mcp_ceiling,
         })
+    }
+}
+
+/// Server/tool-level MCP capability ceiling for parent→child narrowing.
+///
+/// `None` means inherit all servers/tools present in the parent grant.
+/// `Some(empty)` denies everything. Intersecting ceilings never re-adds entries
+/// that were absent from the parent grant.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct McpCapabilityCeiling {
+    pub allowed_servers: Option<BTreeSet<String>>,
+    pub allowed_tools: Option<BTreeSet<String>>,
+}
+
+impl McpCapabilityCeiling {
+    /// Deny every MCP server and tool.
+    pub fn deny_all() -> Self {
+        Self {
+            allowed_servers: Some(BTreeSet::new()),
+            allowed_tools: Some(BTreeSet::new()),
+        }
+    }
+
+    /// Intersect with a parent grant. The result never widens either side.
+    pub fn intersect(&self, child: &Self) -> Self {
+        Self {
+            allowed_servers: intersect_optional_sets(&self.allowed_servers, &child.allowed_servers),
+            allowed_tools: intersect_optional_sets(&self.allowed_tools, &child.allowed_tools),
+        }
+    }
+
+    pub fn allows_server(&self, server: &str) -> bool {
+        match &self.allowed_servers {
+            None => true,
+            Some(allow) => allow.contains(server),
+        }
+    }
+
+    pub fn allows_tool(&self, qualified_name: &str) -> bool {
+        match &self.allowed_tools {
+            None => true,
+            Some(allow) => allow.contains(qualified_name),
+        }
+    }
+}
+
+fn intersect_optional_sets(
+    parent: &Option<BTreeSet<String>>,
+    child: &Option<BTreeSet<String>>,
+) -> Option<BTreeSet<String>> {
+    match (parent, child) {
+        (None, None) => None,
+        (Some(parent), None) => Some(parent.clone()),
+        (None, Some(child)) => Some(child.clone()),
+        (Some(parent), Some(child)) => Some(parent.intersection(child).cloned().collect()),
     }
 }
 
@@ -170,6 +238,7 @@ pub struct CapabilityCeiling {
     pub parent: Vec<ToolCapability>,
     pub profile: Vec<ToolCapability>,
     pub workspace: Vec<ToolCapability>,
+    pub mcp: McpCapabilityCeiling,
 }
 
 pub fn build_snapshot(
@@ -230,6 +299,7 @@ pub fn build_snapshot(
         cli_plugin_dirs: discovery.cli_plugin_dirs.into(),
         plugins: plugins.into(),
         diagnostics: diagnostics.into(),
+        mcp_ceiling: McpCapabilityCeiling::default(),
     }))
 }
 

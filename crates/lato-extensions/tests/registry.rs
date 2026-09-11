@@ -75,6 +75,7 @@ fn child_derivation_can_only_remove_extension_capability() {
         parent: vec![ToolCapability::ExtensionInvoke, ToolCapability::FileRead],
         profile: vec![ToolCapability::FileRead],
         workspace: vec![ToolCapability::FileRead],
+        mcp: Default::default(),
     });
     assert!(child.active_plugins().next().is_none());
     assert_eq!(child.parent_generation(), Some(parent.generation()));
@@ -84,6 +85,7 @@ fn child_derivation_can_only_remove_extension_capability() {
         parent: vec![ToolCapability::ExtensionInvoke],
         profile: vec![ToolCapability::ExtensionInvoke],
         workspace: vec![ToolCapability::ExtensionInvoke],
+        mcp: Default::default(),
     });
     assert_eq!(allowed.active_names(), vec!["all"]);
 }
@@ -167,4 +169,74 @@ impl RegistryFixture {
         });
         build_snapshot(7, discovery, &config).unwrap()
     }
+}
+
+#[test]
+fn child_mcp_ceiling_narrows_and_cannot_restore() {
+    use std::collections::BTreeSet;
+
+    use lato_extensions::McpCapabilityCeiling;
+
+    let fixture = RegistryFixture::new();
+    let cli = fixture.plugin_with_components(Scope::Cli, "all");
+    let parent = fixture.snapshot(true, vec![cli], PluginConfig::default());
+    assert!(parent.mcp_ceiling().allowed_servers.is_none());
+
+    let child = parent.derive_child(&CapabilityCeiling {
+        parent: vec![ToolCapability::ExtensionInvoke],
+        profile: vec![ToolCapability::ExtensionInvoke],
+        workspace: vec![ToolCapability::ExtensionInvoke],
+        mcp: McpCapabilityCeiling {
+            allowed_servers: Some(BTreeSet::from(["demo".into()])),
+            allowed_tools: Some(BTreeSet::from(["demo__ping".into()])),
+        },
+    });
+    assert_eq!(
+        child.mcp_ceiling().allowed_servers,
+        Some(BTreeSet::from(["demo".into()]))
+    );
+    assert_eq!(
+        child.mcp_ceiling().allowed_tools,
+        Some(BTreeSet::from(["demo__ping".into()]))
+    );
+
+    let grandchild = child.derive_child(&CapabilityCeiling {
+        parent: vec![ToolCapability::ExtensionInvoke],
+        profile: vec![ToolCapability::ExtensionInvoke],
+        workspace: vec![ToolCapability::ExtensionInvoke],
+        mcp: McpCapabilityCeiling {
+            allowed_servers: Some(BTreeSet::from(["demo".into(), "other".into()])),
+            allowed_tools: Some(BTreeSet::from(["demo__ping".into(), "demo__secret".into()])),
+        },
+    });
+    assert_eq!(
+        grandchild.mcp_ceiling().allowed_servers,
+        Some(BTreeSet::from(["demo".into()])),
+        "child cannot restore a server absent from parent grant"
+    );
+    assert_eq!(
+        grandchild.mcp_ceiling().allowed_tools,
+        Some(BTreeSet::from(["demo__ping".into()])),
+        "child cannot restore a tool absent from parent grant"
+    );
+}
+
+#[test]
+fn extension_invoke_denial_clears_mcp_ceiling() {
+    use lato_extensions::McpCapabilityCeiling;
+
+    let fixture = RegistryFixture::new();
+    let cli = fixture.plugin_with_components(Scope::Cli, "all");
+    let parent = fixture.snapshot(true, vec![cli], PluginConfig::default());
+    let child = parent.derive_child(&CapabilityCeiling {
+        parent: vec![ToolCapability::FileRead],
+        profile: vec![ToolCapability::FileRead],
+        workspace: vec![ToolCapability::FileRead],
+        mcp: McpCapabilityCeiling {
+            allowed_servers: None,
+            allowed_tools: None,
+        },
+    });
+    assert_eq!(child.mcp_ceiling(), &McpCapabilityCeiling::deny_all());
+    assert!(child.active_plugins().next().is_none());
 }

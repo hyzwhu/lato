@@ -1201,6 +1201,7 @@ dependencies = [
  "lato-ai",
  "lato-core",
  "lato-extensions",
+ "lato-mcp",
  "lato-policy",
  "lato-protocol",
  "lato-tools",
@@ -1215,6 +1216,7 @@ dependencies = [
  "tokio-util",
  "unicode-segmentation",
  "unicode-width 0.2.0",
+ "url",
  "zstd",
 ]
 
@@ -1228,6 +1230,7 @@ dependencies = [
  "lato-ai",
  "lato-core",
  "lato-extensions",
+ "lato-mcp",
  "lato-policy",
  "lato-protocol",
  "lato-runtime",
@@ -1297,6 +1300,7 @@ dependencies = [
  "dunce",
  "futures-util",
  "lato-core",
+ "lato-mcp",
  "libc",
  "pulldown-cmark",
  "regex",
@@ -1317,10 +1321,16 @@ dependencies = [
 name = "lato-mcp"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "dunce",
+ "libc",
  "reqwest",
+ "serde",
  "serde_json",
  "tempfile",
+ "thiserror 2.0.20",
  "tokio",
+ "tokio-util",
  "url",
 ]
 
@@ -1383,6 +1393,7 @@ dependencies = [
  "glob",
  "jsonschema",
  "lato-core",
+ "lato-mcp",
  "lato-policy",
  "lato-runtime",
  "lato-workspace",

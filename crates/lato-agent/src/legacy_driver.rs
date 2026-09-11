@@ -225,6 +225,36 @@ impl LegacyTurnDriver {
             .bind_turn_hook_registry(registry);
     }
 
+    pub async fn bind_turn_mcp(&self, manager: Arc<lato_mcp::McpManager>) {
+        self.state.lock().await.actor.bind_turn_mcp(manager).await;
+    }
+
+    pub async fn shutdown_mcp(&self, deadline: std::time::Instant) {
+        self.state.lock().await.actor.shutdown_mcp(deadline).await;
+    }
+
+    pub async fn mcp_generation(&self) -> Option<u64> {
+        let handle = {
+            let state = self.state.lock().await;
+            state.actor.mcp_handle().cloned()
+        };
+        match handle {
+            Some(handle) => Some(handle.snapshot_generation().await),
+            None => None,
+        }
+    }
+
+    pub async fn mcp_retired_generations(&self) -> Vec<u64> {
+        let handle = {
+            let state = self.state.lock().await;
+            state.actor.mcp_handle().cloned()
+        };
+        match handle {
+            Some(handle) => handle.retired_generations().await,
+            None => Vec::new(),
+        }
+    }
+
     pub async fn observe_hook(
         &self,
         event: lato_extensions::hooks::HookEventName,

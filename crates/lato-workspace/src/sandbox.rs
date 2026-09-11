@@ -150,10 +150,10 @@ fn probe_wrapper_usable(wrapper: &Path) -> bool {
     use std::sync::{Mutex, OnceLock};
     static CACHE: OnceLock<Mutex<HashMap<PathBuf, bool>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Ok(cache) = cache.lock() {
-        if let Some(usable) = cache.get(wrapper) {
-            return *usable;
-        }
+    if let Ok(cache) = cache.lock()
+        && let Some(usable) = cache.get(wrapper)
+    {
+        return *usable;
     }
     let usable = probe_bwrap(wrapper);
     if let Ok(mut cache) = cache.lock() {
@@ -349,10 +349,10 @@ pub fn wrap_shell_command_with(
             "-lc".into(),
             command.into(),
         ]);
-        return Ok(SandboxCommand {
+        Ok(SandboxCommand {
             program: wrapper,
             args,
-        });
+        })
     }
 
     #[cfg(windows)]
