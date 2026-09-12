@@ -367,6 +367,130 @@ fn b1_6_headless_http_model_tool_loop_edits_workspace_offline_fixture() {
     assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "done");
 }
 
+fn write_http_json(socket: &mut std::net::TcpStream, body: &str) {
+    use std::io::Write;
+    write!(
+        socket,
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    )
+    .unwrap();
+}
+
+#[test]
+fn headless_sensenova_think_only_write_task_exits_nonzero_without_artifact() {
+    use std::io::Read;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        for _ in 0..2 {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = [0u8; 64 * 1024];
+            let _ = socket.read(&mut request).unwrap();
+            write_http_json(
+                &mut socket,
+                r#"{"choices":[{"message":{"reasoning_content":"I will create hello.txt","content":"</think>"},"finish_reason":"stop"}]}"#,
+            );
+        }
+    });
+    let workspace = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(
+        home.path().join("models.json"),
+        format!(
+            r#"{{"models":[{{"provider":"sensenova","id":"glm-5.2","api":"openai-completions","base_url":"http://{address}/v1","env":"SENSENOVA_API_KEY"}}]}}"#
+        ),
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_lato"))
+        .current_dir(workspace.path())
+        .env("LATO_HOME", home.path())
+        .env("SENSENOVA_API_KEY", "key")
+        .args([
+            "-p",
+            "--model",
+            "sensenova/glm-5.2",
+            "请在当前目录创建 hello.txt，内容是 Hello, world!",
+        ])
+        .output()
+        .unwrap();
+    let _ = server.join();
+    assert_ne!(
+        output.status.code(),
+        Some(0),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("workspace tool was required"),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!workspace.path().join("hello.txt").exists());
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains("think"),
+        "stdout={}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[test]
+fn headless_sensenova_reasoning_xml_tool_call_writes_artifact() {
+    use std::io::Read;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        for turn in 0..2 {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = [0u8; 64 * 1024];
+            let _ = socket.read(&mut request).unwrap();
+            let body = if turn == 0 {
+                r#"{"choices":[{"message":{"reasoning_content":"<tool_call>write_file<arg_key>path</arg_key><arg_value>hello.txt</arg_value><arg_key>contents</arg_key><arg_value>Hello, world!</arg_value></tool_call>","content":"</think>"},"finish_reason":"stop"}]}"#
+            } else {
+                r#"{"choices":[{"message":{"content":"已创建 hello.txt"},"finish_reason":"stop"}]}"#
+            };
+            write_http_json(&mut socket, body);
+        }
+    });
+    let workspace = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(
+        home.path().join("models.json"),
+        format!(
+            r#"{{"models":[{{"provider":"sensenova","id":"glm-5.2","api":"openai-completions","base_url":"http://{address}/v1","env":"SENSENOVA_API_KEY"}}]}}"#
+        ),
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_lato"))
+        .current_dir(workspace.path())
+        .env("LATO_HOME", home.path())
+        .env("SENSENOVA_API_KEY", "key")
+        .args([
+            "-p",
+            "--model",
+            "sensenova/glm-5.2",
+            "请在当前目录创建 hello.txt，内容是 Hello, world!",
+        ])
+        .output()
+        .unwrap();
+    let _ = server.join();
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(workspace.path().join("hello.txt")).unwrap(),
+        "Hello, world!"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("已创建 hello.txt"), "stdout={stdout}");
+    assert!(!stdout.contains("think"), "stdout={stdout}");
+}
+
 #[test]
 fn headless_answers_current_workspace_without_model_or_tool_call() {
     let d = tempfile::tempdir().unwrap();

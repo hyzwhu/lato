@@ -11,7 +11,8 @@ use crate::{
 };
 use async_trait::async_trait;
 use lato_ai::{
-    CONTEXT_HARD_LIMIT_BYTES, ModelStream, StreamPiece, extract_text_embedded_tool_calls,
+    CONTEXT_HARD_LIMIT_BYTES, ModelStream, StreamPiece, ThinkTagFilter,
+    extract_text_embedded_tool_calls, strip_think_tags,
 };
 pub use lato_core::ApprovalRequest;
 use lato_core::{
@@ -448,6 +449,7 @@ impl SessionActor {
             let mut round_text = String::new();
             let mut uncommitted_text = String::new();
             let mut observed_output = false;
+            let mut think_filter = ThinkTagFilter::default();
             while let Some(piece) = rx.recv().await {
                 if self.cancelled || self.turn_cancellation.is_cancelled() {
                     self.active = false;
@@ -456,12 +458,16 @@ impl SessionActor {
                 match piece {
                     StreamPiece::Text(t) => {
                         observed_output = true;
-                        if let Some((events, session_id)) = &self.events {
-                            let _ = events.send(serde_json::json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":session_id,"delta":t}}));
-                        }
                         round_text.push_str(&t);
-                        uncommitted_text.push_str(&t);
-                        self.history.push(HistoryItem::AssistantText(t));
+                        self.history.push(HistoryItem::AssistantText(t.clone()));
+                        let visible = think_filter.push(&t);
+                        if visible.is_empty() {
+                            continue;
+                        }
+                        if let Some((events, session_id)) = &self.events {
+                            let _ = events.send(serde_json::json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":session_id,"delta":visible}}));
+                        }
+                        uncommitted_text.push_str(&visible);
                     }
                     StreamPiece::ToolCall {
                         id,
@@ -491,6 +497,13 @@ impl SessionActor {
                         }
                     }
                 }
+            }
+            let trailing = think_filter.finish();
+            if !trailing.is_empty() {
+                if let Some((events, session_id)) = &self.events {
+                    let _ = events.send(serde_json::json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":session_id,"delta":trailing}}));
+                }
+                uncommitted_text.push_str(&trailing);
             }
             let stream_result = stream_task.await.map_err(|error| error.to_string())?;
             let report = match stream_result {
@@ -609,6 +622,13 @@ impl SessionActor {
                     ));
                     continue;
                 }
+                if task_requires_workspace_change && !executed_any_tool {
+                    self.active = false;
+                    return Err(
+                        "workspace tool was required but the model finished without calling one"
+                            .into(),
+                    );
+                }
                 if let Some(runtime) = &self.hook_runtime {
                     let stop_input = serde_json::json!({"reason":"model_complete","lastAssistantContext":round_text});
                     let stop = runtime
@@ -671,7 +691,7 @@ impl SessionActor {
             })
             .collect::<Vec<_>>();
         parts.reverse();
-        parts.concat()
+        strip_think_tags(&parts.concat())
     }
     pub fn history_mut(&mut self) -> &mut Vec<HistoryItem> {
         &mut self.history
@@ -1485,7 +1505,7 @@ fn fallback_tool_name(wire_name: &str) -> ToolName {
 
 fn task_requires_workspace_change(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
-    [
+    let explicit = [
         "写入",
         "写个",
         "写一个",
@@ -1504,7 +1524,33 @@ fn task_requires_workspace_change(text: &str) -> bool {
         "update ",
     ]
     .iter()
-    .any(|term| lower.contains(term))
+    .any(|term| lower.contains(term));
+    if explicit {
+        return true;
+    }
+    let produce = ["生成", "产出", "写出", "generate ", "produce "];
+    produce.iter().any(|term| lower.contains(term)) && looks_like_filename_mention(&lower)
+}
+
+fn looks_like_filename_mention(text: &str) -> bool {
+    text.contains("文件")
+        || text
+            .split(|ch: char| {
+                ch.is_whitespace()
+                    || matches!(ch, '"' | '\'' | '`' | ',' | '，' | '。' | ';' | '；')
+            })
+            .any(|token| {
+                let token = token.trim_matches(|ch: char| {
+                    !ch.is_ascii_alphanumeric() && ch != '.' && ch != '_' && ch != '-' && ch != '/'
+                });
+                let Some((_, ext)) = token.rsplit_once('.') else {
+                    return false;
+                };
+                !ext.is_empty()
+                    && ext.len() <= 8
+                    && ext.chars().all(|ch| ch.is_ascii_alphanumeric())
+                    && token.chars().any(|ch| ch.is_ascii_alphanumeric())
+            })
 }
 
 fn history_to_messages(history: &[HistoryItem]) -> serde_json::Value {
@@ -2533,8 +2579,80 @@ mod tests {
             "create a file named hello.txt"
         ));
         assert!(task_requires_workspace_change("修改 src/main.rs"));
+        assert!(task_requires_workspace_change(
+            "分析当前目录的 access_log，保持输入文件不变，生成 report.txt。"
+        ));
+        assert!(task_requires_workspace_change("generate report.txt"));
         assert!(!task_requires_workspace_change("explain this file format"));
         assert!(!task_requires_workspace_change("what is a program?"));
+        assert!(!task_requires_workspace_change("生成一个计划"));
+    }
+
+    #[tokio::test]
+    async fn workspace_write_without_tools_fails_instead_of_exit_success() {
+        let d = tempfile::tempdir().unwrap();
+        let mut a = actor(
+            vec![
+                vec![StreamPiece::Text("</think>".into())],
+                vec![StreamPiece::Text("</think>".into())],
+            ],
+            d.path().to_path_buf(),
+        );
+        let error = a
+            .prompt(
+                PromptKind::Start,
+                "请在当前目录创建 hello.txt，内容是 Hello, world!".into(),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.contains("workspace tool was required"), "{error}");
+        assert!(!d.path().join("hello.txt").exists());
+        assert!(
+            !a.latest_assistant_text().contains("think"),
+            "{}",
+            a.latest_assistant_text()
+        );
+    }
+
+    #[tokio::test]
+    async fn think_tags_are_stripped_from_visible_assistant_text() {
+        let d = tempfile::tempdir().unwrap();
+        let mut a = actor(
+            vec![vec![StreamPiece::Text(
+                "<think>internal</think>LATO_SMOKE_OK".into(),
+            )]],
+            d.path().to_path_buf(),
+        );
+        a.prompt(PromptKind::Start, "只回复一行：LATO_SMOKE_OK".into())
+            .await
+            .unwrap();
+        assert_eq!(a.latest_assistant_text(), "LATO_SMOKE_OK");
+    }
+
+    #[tokio::test]
+    async fn glm_think_wrapped_xml_write_file_is_executed() {
+        let d = tempfile::tempdir().unwrap();
+        let mut a = actor(
+            vec![
+                vec![StreamPiece::Text(
+                    "<think><tool_call>write_file<arg_key>path</arg_key><arg_value>hello.txt</arg_value><arg_key>contents</arg_key><arg_value>Hello, world!</arg_value></tool_call></think>"
+                        .into(),
+                )],
+                vec![StreamPiece::Text("已写入".into())],
+            ],
+            d.path().to_path_buf(),
+        );
+        a.prompt(
+            PromptKind::Start,
+            "请在当前目录创建 hello.txt，内容是 Hello, world!".into(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(d.path().join("hello.txt")).unwrap(),
+            "Hello, world!"
+        );
+        assert_eq!(a.latest_assistant_text(), "已写入");
     }
 
     #[test]

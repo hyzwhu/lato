@@ -504,6 +504,8 @@ struct ModelEventParser {
     responses: crate::codex::events::CodexEventMapper,
     terminal: bool,
     text: String,
+    hidden_text: String,
+    think: ThinkTagFilter,
     saw_tool: bool,
     usage: Option<lato_core::ModelUsage>,
 }
@@ -521,6 +523,13 @@ impl ModelEventParser {
             }
         }
         Ok(pieces)
+    }
+
+    fn push_visible_text(&mut self, text: &str, pieces: &mut Vec<StreamPiece>) {
+        let visible = self.think.push(text);
+        if !visible.is_empty() {
+            pieces.push(StreamPiece::Text(visible));
+        }
     }
 
     fn accept_event(&mut self, value: serde_json::Value) -> Result<Vec<StreamPiece>, String> {
@@ -597,6 +606,9 @@ impl ModelEventParser {
             }
             return Ok(pieces);
         }
+        if let Some(text) = reasoning_field_text(&value) {
+            self.hidden_text.push_str(text);
+        }
         if let Some(text) = json_str_non_empty(&value, "/choices/0/delta/content")
             .or_else(|| json_str_non_empty(&value, "/choices/0/message/content"))
             .or_else(|| json_str_non_empty(&value, "/delta/text"))
@@ -606,10 +618,12 @@ impl ModelEventParser {
                     .flatten()
             })
         {
-            pieces.push(StreamPiece::Text(text.into()));
+            self.hidden_text.push_str(text);
+            self.push_visible_text(text, &mut pieces);
         }
         if let Some(text) = value.get("text").and_then(|v| v.as_str()) {
-            pieces.push(StreamPiece::Text(text.into()));
+            self.hidden_text.push_str(text);
+            self.push_visible_text(text, &mut pieces);
         }
         if event_type == "content_block_start" {
             if let Some(block) = value
@@ -690,10 +704,18 @@ impl ModelEventParser {
                 if let Some(id) = call.get("id").and_then(|v| v.as_str()) {
                     pending.id = id.to_string();
                 }
-                if let Some(name) = call.pointer("/function/name").and_then(|v| v.as_str()) {
+                if let Some(name) = call
+                    .pointer("/function/name")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| call.get("name").and_then(|v| v.as_str()))
+                {
                     pending.name = name.to_string();
                 }
-                append_tool_arguments(pending, call.pointer("/function/arguments"));
+                append_tool_arguments(
+                    pending,
+                    call.pointer("/function/arguments")
+                        .or_else(|| call.get("arguments")),
+                );
             }
         }
         if let Some(function) = value
@@ -710,7 +732,7 @@ impl ModelEventParser {
             value
                 .pointer("/choices/0/finish_reason")
                 .and_then(|v| v.as_str()),
-            Some("tool_calls") | Some("function_call")
+            Some("tool_calls") | Some("tool_call") | Some("function_call")
         ) {
             drain_complete_tool_calls(&mut self.pending_tools, &mut pieces)?;
         }
@@ -720,9 +742,21 @@ impl ModelEventParser {
     fn finish(&mut self) -> Result<Vec<StreamPiece>, String> {
         self.responses.ensure_complete()?;
         let mut pieces = Vec::new();
+        let visible = self.think.finish();
+        if !visible.is_empty() {
+            pieces.push(StreamPiece::Text(visible));
+        }
         drain_complete_tool_calls(&mut self.pending_tools, &mut pieces)?;
-        if !self.saw_tool && pieces.is_empty() {
-            pieces.extend(extract_text_embedded_tool_calls(&self.text));
+        let saw_tool = self.saw_tool
+            || pieces
+                .iter()
+                .any(|piece| matches!(piece, StreamPiece::ToolCall { .. }));
+        if !saw_tool {
+            let mut scan = std::mem::take(&mut self.hidden_text);
+            if scan.is_empty() {
+                scan = self.text.clone();
+            }
+            pieces.extend(extract_text_embedded_tool_calls(&scan));
         }
         Ok(pieces)
     }
@@ -837,6 +871,109 @@ pub fn parse_stream_body_with_report(body: &str) -> Result<ParsedModelOutput, St
         pieces,
         usage: parser.usage,
     })
+}
+
+const THINK_OPEN: &str = "<think>";
+const THINK_CLOSE: &str = "</think>";
+
+/// Streaming filter that drops GLM/SenseNova chain-of-thought tags.
+///
+/// `glm-5.2` often streams reasoning as `<think>…</think>` in `content`
+/// (or leaves a stray `</think>` after `reasoning_content`). Those tokens
+/// must not be shown as assistant text, but the raw buffer is still
+/// scanned for XML `<tool_call>` payloads.
+#[derive(Clone, Debug, Default)]
+pub struct ThinkTagFilter {
+    in_think: bool,
+    pending: String,
+}
+
+impl ThinkTagFilter {
+    pub fn push(&mut self, chunk: &str) -> String {
+        if chunk.is_empty() {
+            return String::new();
+        }
+        self.pending.push_str(chunk);
+        let mut visible = String::new();
+        loop {
+            if self.in_think {
+                if let Some(pos) = self.pending.find(THINK_CLOSE) {
+                    self.pending.replace_range(..pos + THINK_CLOSE.len(), "");
+                    self.in_think = false;
+                    continue;
+                }
+                let keep = suffix_that_is_tag_prefix(&self.pending, THINK_CLOSE);
+                self.pending.replace_range(..self.pending.len() - keep, "");
+                break;
+            }
+            let open_at = self.pending.find(THINK_OPEN);
+            let close_at = self.pending.find(THINK_CLOSE);
+            match (open_at, close_at) {
+                (Some(open), Some(close)) if close < open => {
+                    visible.push_str(&self.pending[..close]);
+                    self.pending.replace_range(..close + THINK_CLOSE.len(), "");
+                }
+                (Some(open), _) => {
+                    visible.push_str(&self.pending[..open]);
+                    self.pending.replace_range(..open + THINK_OPEN.len(), "");
+                    self.in_think = true;
+                }
+                (None, Some(close)) => {
+                    visible.push_str(&self.pending[..close]);
+                    self.pending.replace_range(..close + THINK_CLOSE.len(), "");
+                }
+                (None, None) => {
+                    let keep = suffix_that_is_tag_prefix(&self.pending, THINK_OPEN)
+                        .max(suffix_that_is_tag_prefix(&self.pending, THINK_CLOSE));
+                    let emit_upto = self.pending.len() - keep;
+                    visible.push_str(&self.pending[..emit_upto]);
+                    self.pending.replace_range(..emit_upto, "");
+                    break;
+                }
+            }
+        }
+        visible
+    }
+
+    pub fn finish(&mut self) -> String {
+        if self.in_think {
+            self.pending.clear();
+            String::new()
+        } else {
+            std::mem::take(&mut self.pending)
+        }
+    }
+}
+
+fn suffix_that_is_tag_prefix(text: &str, tag: &str) -> usize {
+    let start = text.len().saturating_sub(tag.len());
+    let mut best = 0;
+    for index in start..=text.len() {
+        if !text.is_char_boundary(index) {
+            continue;
+        }
+        let suffix = &text[index..];
+        if !suffix.is_empty() && tag.starts_with(suffix) {
+            best = suffix.len();
+        }
+    }
+    best
+}
+
+pub fn strip_think_tags(text: &str) -> String {
+    let mut filter = ThinkTagFilter::default();
+    let mut visible = filter.push(text);
+    visible.push_str(&filter.finish());
+    visible
+}
+
+fn reasoning_field_text(value: &serde_json::Value) -> Option<&str> {
+    json_str_non_empty(value, "/choices/0/delta/reasoning_content")
+        .or_else(|| json_str_non_empty(value, "/choices/0/message/reasoning_content"))
+        .or_else(|| json_str_non_empty(value, "/choices/0/delta/reasoning"))
+        .or_else(|| json_str_non_empty(value, "/choices/0/message/reasoning"))
+        .or_else(|| json_str_non_empty(value, "/choices/0/delta/thinking"))
+        .or_else(|| json_str_non_empty(value, "/choices/0/message/thinking"))
 }
 
 pub fn extract_text_embedded_tool_calls(text: &str) -> Vec<StreamPiece> {
@@ -1243,6 +1380,107 @@ data: [DONE]
             matches!(&pieces[0], StreamPiece::ToolCall { name, arguments, .. }
                 if name == "write_file" && arguments["path"] == "hello.go")
         );
+    }
+
+    #[test]
+    fn stray_think_close_tag_is_not_user_visible_text() {
+        let fixture = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"</think>\"}}]}\n",
+            "data: [DONE]\n"
+        );
+        let pieces = parse_stream_body(fixture).unwrap();
+        assert!(pieces.is_empty(), "think tags must not leak: {pieces:?}");
+    }
+
+    #[test]
+    fn think_block_in_content_is_stripped_but_trailing_answer_remains() {
+        let fixture = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"<think>plan the write\"}}]}\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"</think>done\"}}]}\n",
+            "data: [DONE]\n"
+        );
+        let pieces = parse_stream_body(fixture).unwrap();
+        assert_eq!(
+            pieces,
+            vec![StreamPiece::Text("done".into())],
+            "pieces={pieces:?}"
+        );
+    }
+
+    #[test]
+    fn glm_xml_tool_call_inside_reasoning_content_is_extracted() {
+        let fixture = r#"{"choices":[{"message":{"reasoning_content":"<tool_call>write_file<arg_key>path</arg_key><arg_value>hello.txt</arg_value><arg_key>contents</arg_key><arg_value>Hello, world!</arg_value></tool_call>","content":"</think>"},"finish_reason":"stop"}]}"#;
+        let pieces = parse_stream_body(fixture).unwrap();
+        assert!(
+            pieces
+                .iter()
+                .all(|piece| !matches!(piece, StreamPiece::Text(text) if text.contains("think"))),
+            "think tags must not leak: {pieces:?}"
+        );
+        assert!(
+            pieces.iter().any(|piece| matches!(
+                piece,
+                StreamPiece::ToolCall { name, arguments, .. }
+                    if name == "write_file"
+                        && arguments["path"] == "hello.txt"
+                        && arguments["contents"] == "Hello, world!"
+            )),
+            "pieces={pieces:?}"
+        );
+    }
+
+    #[test]
+    fn glm_xml_tool_call_inside_think_tags_is_extracted_and_hidden() {
+        let fixture = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"<think>need a file\\n\"}}]}\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"<tool_call>write_file<arg_key>path</arg_key><arg_value>hello.txt</arg_value><arg_key>contents</arg_key><arg_value>Hello, world!</arg_value></tool_call>\"}}]}\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"</think>\"}}]}\n",
+            "data: [DONE]\n"
+        );
+        let pieces = parse_stream_body(fixture).unwrap();
+        assert!(
+            !pieces.iter().any(|piece| matches!(piece, StreamPiece::Text(text) if text.contains("think") || text.contains("tool_call"))),
+            "pieces={pieces:?}"
+        );
+        assert!(
+            pieces.iter().any(|piece| matches!(
+                piece,
+                StreamPiece::ToolCall { name, arguments, .. }
+                    if name == "write_file" && arguments["path"] == "hello.txt"
+            )),
+            "pieces={pieces:?}"
+        );
+    }
+
+    #[test]
+    fn split_think_close_tag_across_sse_chunks_does_not_leak() {
+        let fixture = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"</th\"}}]}\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"ink>\"}}]}\n",
+            "data: [DONE]\n"
+        );
+        let pieces = parse_stream_body(fixture).unwrap();
+        assert!(pieces.is_empty(), "split think tag leaked: {pieces:?}");
+    }
+
+    #[test]
+    fn flat_openai_compat_tool_call_without_function_wrapper_is_parsed() {
+        let fixture = r#"{"choices":[{"message":{"tool_calls":[{"id":"c1","name":"write_file","arguments":"{\"path\":\"hello.txt\",\"contents\":\"Hello, world!\"}"}]},"finish_reason":"tool_call"}]}"#;
+        let pieces = parse_stream_body(fixture).unwrap();
+        assert!(
+            matches!(&pieces[0], StreamPiece::ToolCall { name, arguments, .. }
+                if name == "write_file" && arguments["path"] == "hello.txt"),
+            "pieces={pieces:?}"
+        );
+    }
+
+    #[test]
+    fn think_tag_filter_holds_incomplete_prefixes() {
+        let mut filter = ThinkTagFilter::default();
+        assert_eq!(filter.push("hello <"), "hello ");
+        assert_eq!(filter.push(" 2"), "< 2");
+        assert_eq!(filter.finish(), "");
+        assert_eq!(strip_think_tags("</think>\nvisible"), "\nvisible");
     }
 
     #[test]
