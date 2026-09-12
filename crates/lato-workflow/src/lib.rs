@@ -1,7 +1,7 @@
-//! Inert workflow descriptors and trait (Phase 7A).
+//! Workflow descriptors, coordinator engine, and Rhai script host types.
 //!
-//! Parsing/materialization lives in `lato-extensions`. This crate never
-//! interprets scripts, spawns agents, or reserves budget.
+//! Parsing/materialization of JSON workflow configs lives in `lato-extensions`.
+//! Script execution (Rhai engine) is layered in later Phase 7B3 tasks.
 
 pub mod completing;
 pub mod config;
@@ -9,6 +9,7 @@ pub mod engine;
 pub mod error;
 pub mod inert;
 pub mod names;
+pub mod script;
 pub mod types;
 
 pub use completing::CompletingTaskRunner;
@@ -18,6 +19,10 @@ pub use error::WorkflowError;
 pub use inert::InertWorkflow;
 pub use names::{
     MAX_WORKFLOW_NAME_LEN, clamp_agent_budget, normalize_workflow_name, qualify_workflow,
+};
+pub use script::{
+    AgentOpts, AgentResult, BudgetState, HostError, Journal, ScriptOutcome, WorkflowHostRequest,
+    extract_meta, run::PauseKind,
 };
 pub use types::{
     DEFAULT_AGENT_BUDGET, MAX_AGENT_BUDGET, MAX_DESCRIPTION_BYTES, MAX_WORKFLOW_DIAGNOSTIC_BYTES,
