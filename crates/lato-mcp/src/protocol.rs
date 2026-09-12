@@ -9,7 +9,9 @@ use serde_json::{Map, Value};
 
 use crate::error::McpError;
 
-pub const PROTOCOL_VERSION: &str = "2024-11-05";
+/// Streamable HTTP was introduced in 2025-03-26; stdio servers may still
+/// negotiate an older version in `InitializeResult`.
+pub const PROTOCOL_VERSION: &str = "2025-03-26";
 pub const CLIENT_NAME: &str = "lato";
 pub const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 

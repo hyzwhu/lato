@@ -191,11 +191,7 @@ pub async fn rpc_with_resolver(
 pub async fn shutdown_server(handle: McpServerHandle, deadline: Instant) -> Result<(), McpError> {
     match handle.session {
         TransportSession::Stdio(session) => session.shutdown(deadline).await,
-        TransportSession::Http(session) => {
-            session.shutdown();
-            let _ = deadline;
-            Ok(())
-        }
+        TransportSession::Http(session) => session.shutdown(deadline).await,
     }
 }
 

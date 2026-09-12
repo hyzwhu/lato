@@ -249,11 +249,19 @@ ToolRuntime membrane. Colliding qualified names do not silently overwrite.
 
 Every MCP invocation is a ToolRegistry provider call: PreToolUse →
 `prepare_scoped` → PolicyEngine → approval → execute → PostToolUse. There is no
-second execution channel around `McpManager`. Streamable HTTP endpoints are
-checked after DNS resolution (SSRF), never follow redirects, allow plain `http`
-only on loopback, and redact URL credentials from user-visible errors and
-journals. Oversized results are truncated inline and spilled under
-`.lato/tool-output/`.
+second execution channel around `McpManager`. Streamable HTTP POSTs send
+`Accept: application/json, text/event-stream`, advertise
+`MCP-Protocol-Version: 2025-03-26` (and then the negotiated version), echo
+`Mcp-Session-Id`, and read a JSON body or an SSE JSON-RPC result without waiting
+for the stream to end. After initialize the client opens a GET SSE listener
+(`405` is ignored; `ping` is answered; other server requests are rejected;
+stream EOF reconnects with `Last-Event-ID`).
+Shutdown `DELETE`s a session when one was assigned. A session `404` starts a
+new session (initialize without `Mcp-Session-Id`) and retries the RPC once;
+a second failure marks the server unhealthy. Endpoints are checked after DNS resolution (SSRF), never
+follow redirects, allow plain `http` only on loopback, and redact URL
+credentials from user-visible errors and journals. Oversized results are
+truncated inline and spilled under `.lato/tool-output/`.
 
 Stdio servers run in a fresh process group. Cancel, timeout, crash isolation,
 and SessionEnd shut them down under a bounded deadline with process-tree reap.
