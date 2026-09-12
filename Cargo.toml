@@ -12,6 +12,7 @@ members = [
     "crates/lato-agent",
     "crates/lato-extensions",
     "crates/lato-mcp",
+    "crates/lato-workflow",
     "crates/lato-store",
 ]
 
