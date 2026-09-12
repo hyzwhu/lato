@@ -66,6 +66,10 @@ pub struct WorkflowContext {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WorkflowStatus {
     NotImplemented,
+    Running,
+    Completed,
+    Cancelled,
+    Failed,
 }
 
 #[derive(Clone, Debug)]
