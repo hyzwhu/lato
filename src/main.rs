@@ -5,6 +5,7 @@ mod permissions;
 mod sessions;
 mod stdio;
 mod tui;
+mod workflow;
 
 #[tokio::main]
 async fn main() {

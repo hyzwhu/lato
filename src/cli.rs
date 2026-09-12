@@ -1,4 +1,4 @@
-use crate::args::{DoctorArgs, Invocation, LoginMethod, PromptArgs, SandboxArg};
+use crate::args::{DoctorArgs, Invocation, LoginMethod, PromptArgs, SandboxArg, WorkflowCommand};
 use crate::tui::{
     dialog::{self, Interaction},
     i18n::Language,
@@ -210,6 +210,7 @@ pub async fn run(args: Vec<String>) -> i32 {
         Invocation::Login { provider, method } => login(provider, method).await,
         Invocation::Doctor(args) => doctor_cmd(args).await,
         Invocation::Acp { plugin_dirs } => crate::stdio::run(plugin_dirs).await,
+        Invocation::Workflow(command) => crate::workflow::run(command).await,
     }
 }
 
@@ -242,6 +243,21 @@ fn canonicalize_invocation_plugin_dirs(invocation: Invocation) -> Result<Invocat
         Invocation::Acp { plugin_dirs } => Invocation::Acp {
             plugin_dirs: canonicalize_plugin_dirs(plugin_dirs)?,
         },
+        Invocation::Workflow(command) => Invocation::Workflow(match command {
+            WorkflowCommand::List { json, plugin_dirs } => WorkflowCommand::List {
+                json,
+                plugin_dirs: canonicalize_plugin_dirs(plugin_dirs)?,
+            },
+            WorkflowCommand::Run {
+                id,
+                input,
+                plugin_dirs,
+            } => WorkflowCommand::Run {
+                id,
+                input,
+                plugin_dirs: canonicalize_plugin_dirs(plugin_dirs)?,
+            },
+        }),
         other => other,
     })
 }

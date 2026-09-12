@@ -54,6 +54,7 @@ pub enum Invocation {
     Acp {
         plugin_dirs: Vec<PathBuf>,
     },
+    Workflow(WorkflowCommand),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -63,12 +64,25 @@ pub enum SessionCommand {
     Delete { session_id: String, yes: bool },
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum WorkflowCommand {
+    List {
+        json: bool,
+        plugin_dirs: Vec<PathBuf>,
+    },
+    Run {
+        id: String,
+        input: Option<String>,
+        plugin_dirs: Vec<PathBuf>,
+    },
+}
+
 #[derive(Debug, Parser)]
 #[command(
     name = "lato",
     version,
     about = "Public Beta coding agent",
-    after_help = "Run without arguments for the interactive coding CLI.\n\nInteractive: lato [--sandbox off|workspace|read-only]\nResume: lato resume ID [--sandbox off|workspace|read-only]\nHeadless: lato -p [--ask] [--sandbox off|workspace|read-only] [--model provider/model] TEXT\nDoctor: lato doctor [--json] [--strict] [--live]"
+    after_help = "Run without arguments for the interactive coding CLI.\n\nInteractive: lato [--sandbox off|workspace|read-only]\nResume: lato resume ID [--sandbox off|workspace|read-only]\nHeadless: lato -p [--ask] [--sandbox off|workspace|read-only] [--model provider/model] TEXT\nWorkflows: lato workflow list|run ID [--plugin-dir PATH]\nDoctor: lato doctor [--json] [--strict] [--live]"
 )]
 struct Cli {
     /// Interface language for interactive mode
@@ -147,6 +161,27 @@ enum Command {
     },
     /// Serve the Agent Client Protocol over stdio
     Acp,
+    /// List or run plugin workflow descriptors
+    Workflow {
+        #[command(subcommand)]
+        action: WorkflowAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum WorkflowAction {
+    /// List materialized workflows from trusted plugins
+    List {
+        #[arg(long, action = ArgAction::SetTrue)]
+        json: bool,
+    },
+    /// Run a workflow id (`plugin/name`) through the coordinator
+    Run {
+        id: String,
+        /// JSON object passed as workflow input
+        #[arg(long)]
+        input: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -188,11 +223,14 @@ impl Cli {
                 ));
             }
             if !self.plugin_dirs.is_empty()
-                && !matches!(&command, Command::Resume { .. } | Command::Acp)
+                && !matches!(
+                    &command,
+                    Command::Resume { .. } | Command::Acp | Command::Workflow { .. }
+                )
             {
                 return Err(semantic_error(
                     ErrorKind::ArgumentConflict,
-                    "--plugin-dir is only available in interactive mode, resume, -p, or acp",
+                    "--plugin-dir is only available in interactive mode, resume, -p, acp, or workflow",
                 ));
             }
             return Ok(match command {
@@ -241,6 +279,17 @@ impl Cli {
                 Command::Acp => Invocation::Acp {
                     plugin_dirs: self.plugin_dirs,
                 },
+                Command::Workflow { action } => Invocation::Workflow(match action {
+                    WorkflowAction::List { json } => WorkflowCommand::List {
+                        json,
+                        plugin_dirs: self.plugin_dirs,
+                    },
+                    WorkflowAction::Run { id, input } => WorkflowCommand::Run {
+                        id,
+                        input,
+                        plugin_dirs: self.plugin_dirs,
+                    },
+                }),
             });
         }
 
@@ -290,7 +339,10 @@ pub fn parse(args: Vec<String>) -> Result<Invocation, clap::Error> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Invocation, LoginMethod, PathBuf, PromptArgs, SandboxArg, SessionCommand, parse};
+    use super::{
+        Invocation, LoginMethod, PathBuf, PromptArgs, SandboxArg, SessionCommand, WorkflowCommand,
+        parse,
+    };
     use crate::tui::i18n::Language;
     use clap::error::ErrorKind;
 
@@ -312,6 +364,29 @@ mod tests {
         assert_eq!(prompt.text, "hello world");
         assert_eq!(prompt.sandbox, SandboxArg::Workspace);
         assert_eq!(prompt.model.as_deref(), Some("openai/gpt-4.1"));
+    }
+
+    #[test]
+    fn parses_workflow_commands() {
+        assert_eq!(
+            parse(vec!["workflow".into(), "list".into(), "--json".into()]).unwrap(),
+            Invocation::Workflow(WorkflowCommand::List {
+                json: true,
+                plugin_dirs: Vec::new(),
+            })
+        );
+        let Invocation::Workflow(WorkflowCommand::Run { id, input, .. }) = parse(vec![
+            "workflow".into(),
+            "run".into(),
+            "demo/review".into(),
+            "--input".into(),
+            "{\"n\":1}".into(),
+        ])
+        .unwrap() else {
+            panic!("expected workflow run");
+        };
+        assert_eq!(id, "demo/review");
+        assert_eq!(input.as_deref(), Some("{\"n\":1}"));
     }
 
     #[test]

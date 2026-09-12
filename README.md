@@ -285,7 +285,8 @@ inline map or a `workflows.json` path under the plugin root). Qualified ids are
 `plugin/workflow`. Phase 7A materializes descriptors. Phase 7B can **start
 coordinator-backed steps** (`TaskOwner::Workflow`) from `prompt` / `steps` /
 `profile` (`explorer`, `worker`, `reviewer`) with `child_tasks` budgeting and
-`cancel_workflow`. It still does not interpret scripts or call a model.
+`cancel_workflow`. List or run them with `lato workflow list` and
+`lato workflow run plugin/name` (still no script interpreter or model call).
 `agentBudget` is a declared cap (default 128, max 1024). Untrusted
 project plugins contribute no workflow descriptors. Child sessions may only
 narrow the parent allowlist. `doctor` does not list workflows.

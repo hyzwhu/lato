@@ -31,6 +31,8 @@ lato-tools = { path = "crates/lato-tools" }
 lato-agent = { path = "crates/lato-agent" }
 lato-extensions = { path = "crates/lato-extensions" }
 lato-mcp = { path = "crates/lato-mcp" }
+lato-runtime = { path = "crates/lato-runtime" }
+lato-workflow = { path = "crates/lato-workflow" }
 url = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "process", "io-util", "io-std", "fs", "signal"] }
 serde = { version = "1", features = ["derive"] }
@@ -46,7 +48,8 @@ futures-util = "0.3"
 unicode-width = "0.2"
 unicode-segmentation = "1"
 
-[dev-dependencies]
 tempfile = "3"
+
+[dev-dependencies]
 tokio-util = { version = "0.7", features = ["rt"] }
 zstd = "0.13"
