@@ -274,3 +274,123 @@ async fn parallel_reserve_rejects_over_budget_without_spawns() {
     );
     shutdown_host(tx, join).await;
 }
+
+fn schema_ok_worker_output() -> String {
+    serde_json::json!({
+        "summary": "schema-ok",
+        "changed_files": [],
+        "tests": [],
+        "artifacts": []
+    })
+    .to_string()
+}
+
+fn worker_output_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "required": ["summary", "changed_files", "tests", "artifacts"],
+        "properties": {
+            "summary": { "type": "string", "const": "schema-ok" },
+            "changed_files": { "type": "array" },
+            "tests": { "type": "array" },
+            "artifacts": { "type": "array" }
+        }
+    })
+}
+
+fn workspace_root_from_system(system: &str) -> Option<&str> {
+    let marker = "Workspace:\n";
+    let start = system.find(marker)? + marker.len();
+    let end = system[start..]
+        .find('\n')
+        .map(|offset| start + offset)
+        .unwrap_or(system.len());
+    Some(system[start..end].trim())
+}
+
+#[tokio::test]
+async fn output_schema_retry_does_not_consume_logical_budget() {
+    let repo = init_git_repo();
+    let stream = Arc::new(FakeModelStream::new(vec![
+        vec![StreamPiece::Text(worker_output_text())],
+        vec![StreamPiece::Text(schema_ok_worker_output())],
+    ]));
+    let (tx, join, _cancel) = start_host(1, stream, repo.path().to_path_buf());
+    let (reserve_tx, reserve_rx) = oneshot::channel();
+    tx.send(WorkflowHostRequest::ReserveAgentCalls {
+        count: 1,
+        reply: reserve_tx,
+    })
+    .unwrap();
+    reserve_rx
+        .await
+        .unwrap()
+        .expect("reserve one logical agent");
+
+    let (reply_tx, reply_rx) = oneshot::channel();
+    tx.send(WorkflowHostRequest::SpawnAgent {
+        opts: AgentOpts {
+            prompt: "return contracted json".into(),
+            output_schema: Some(worker_output_schema()),
+            ..AgentOpts::default()
+        },
+        reply: reply_tx,
+    })
+    .unwrap();
+    let result = reply_rx.await.unwrap().expect("schema retry spawn");
+    assert!(result.success, "{result:?}");
+    assert_eq!(result.output["summary"], "schema-ok");
+
+    let (budget_tx, budget_rx) = oneshot::channel();
+    tx.send(WorkflowHostRequest::BudgetQuery { reply: budget_tx })
+        .unwrap();
+    let budget = budget_rx.await.unwrap().expect("budget query");
+    assert_eq!(budget.spent, 1, "{budget:?}");
+    assert_eq!(budget.remaining, Some(0), "{budget:?}");
+    shutdown_host(tx, join).await;
+}
+
+#[tokio::test]
+async fn isolation_worktree_applies_to_read_only_child() {
+    let repo = init_git_repo();
+    let contexts = Arc::new(Mutex::new(Vec::new()));
+    let stream = Arc::new(CapturingStream {
+        contexts: Arc::clone(&contexts),
+        reply: explorer_output_text(),
+    });
+    let (tx, join, _cancel) = start_host(8, stream, repo.path().to_path_buf());
+    let (reply_tx, reply_rx) = oneshot::channel();
+    tx.send(WorkflowHostRequest::SpawnAgent {
+        opts: AgentOpts {
+            prompt: "inspect in isolation".into(),
+            capability_mode: Some("read-only".into()),
+            isolation_worktree: true,
+            ..AgentOpts::default()
+        },
+        reply: reply_tx,
+    })
+    .unwrap();
+    let result = reply_rx.await.unwrap().expect("isolated read-only spawn");
+    assert!(result.success, "{result:?}");
+    let captured = contexts.lock().unwrap().clone();
+    assert_eq!(captured.len(), 1, "expected one child model call");
+    let system = system_content(&captured[0]);
+    let workspace = workspace_root_from_system(&system).expect("workspace root in system prompt");
+    assert!(
+        workspace.contains(".lato/worktrees"),
+        "expected IsolatedWorktree path, got {workspace}"
+    );
+    assert_ne!(workspace, repo.path().to_string_lossy().as_ref());
+    let names = tool_names(&captured[0]);
+    assert!(
+        names.iter().any(|name| name == "read_file"),
+        "explorer tools: {names:?}"
+    );
+    assert!(
+        !names
+            .iter()
+            .any(|name| name == "write_file" || name == "run_terminal_command"),
+        "read-only isolation must not expose write/execute tools: {names:?}"
+    );
+    shutdown_host(tx, join).await;
+}

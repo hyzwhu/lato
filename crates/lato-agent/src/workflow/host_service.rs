@@ -154,7 +154,12 @@ async fn setup_host(
         };
     let root_id = TaskId::from(format!("wf-root-{}", params.run_id));
     let mut budget = BudgetLimits::unlimited();
-    budget.child_tasks = Some(params.agent_budget);
+    // Schema correction re-spawns one child under the same logical agent_budget.
+    budget.child_tasks = Some(
+        params
+            .agent_budget
+            .saturating_mul(u64::from(SCHEMA_CONTRACT_RETRIES.saturating_add(1))),
+    );
     let scoped = coordinator
         .register_root(TaskRootRequest {
             task_id: root_id.clone(),
@@ -393,15 +398,13 @@ impl HostService {
             ));
         }
 
-        let profile =
+        let mut profile =
             resolve_child_profile(opts.agent_type.as_deref(), opts.capability_mode.as_deref())?;
+        if opts.isolation_worktree {
+            profile.workspace = WorkspaceIntent::IsolatedWorktree;
+        }
         let requested_capabilities =
             requested_capabilities_for_mode(&profile, opts.capability_mode.as_deref())?;
-        if opts.isolation_worktree && profile.workspace != WorkspaceIntent::IsolatedWorktree {
-            return Err(HostError::Failed(
-                "isolation_worktree requires a write-capable worker profile".into(),
-            ));
-        }
 
         let schema_validator = match &opts.output_schema {
             None => None,
@@ -446,6 +449,9 @@ impl HostService {
                 )
             };
             let child_cancel = CancellationToken::new();
+            let mut child_budget = BudgetLimits::unlimited();
+            // Reserve only the coordinator's fixed child_tasks=1, not the parent remainder.
+            child_budget.child_tasks = Some(0);
             let request = SpawnTaskRequest {
                 task_id: TaskId::from(child_id.clone()),
                 scope: TaskScope {
@@ -454,7 +460,7 @@ impl HostService {
                 },
                 profile: profile.clone(),
                 requested_capabilities: requested_capabilities.clone(),
-                budget: BudgetLimits::unlimited(),
+                budget: child_budget,
                 result_contract: ResultContract {
                     schema: None,
                     max_output_bytes: CONTRACT_OUTPUT_MAX_BYTES,

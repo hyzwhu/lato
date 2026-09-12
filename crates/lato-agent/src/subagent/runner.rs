@@ -327,14 +327,22 @@ impl TaskRunner for ChildSessionRunner {
 
     async fn validate_profile(&self, profile: &AgentProfile) -> Result<(), TaskError> {
         let name = BuiltinProfileName::try_from(profile.name.as_str())?;
-        if name.resolve() == *profile {
-            Ok(())
-        } else {
-            Err(TaskError::new(
-                TaskErrorCode::InvalidProfile,
-                "built-in task profiles cannot be overridden",
-            ))
+        let expected = name.resolve();
+        if *profile == expected {
+            return Ok(());
         }
+        // IsolatedWorktree may be applied without widening built-in capabilities.
+        if profile.workspace == WorkspaceIntent::IsolatedWorktree {
+            let mut isolated = expected;
+            isolated.workspace = WorkspaceIntent::IsolatedWorktree;
+            if *profile == isolated {
+                return Ok(());
+            }
+        }
+        Err(TaskError::new(
+            TaskErrorCode::InvalidProfile,
+            "built-in task profiles cannot be overridden",
+        ))
     }
 
     fn on_completed(&self, _completion: TaskCompletion) {}
