@@ -283,17 +283,25 @@ older `~/.local/bin/lato` may shadow PATH and exercise a stale build.
 
 ### Plugin Workflows
 
-Trusted, enabled plugins may declare workflows in `plugin.json` (`workflows`
-inline map or a `workflows.json` path under the plugin root). Qualified ids are
-`plugin/workflow`. Phase 7A materializes descriptors. Phase 7B can **start
-coordinator-backed steps** (`TaskOwner::Workflow`) from `prompt` / `steps` /
-`profile` (`explorer`, `worker`, `reviewer`) with `child_tasks` budgeting and
-`cancel_workflow`. List or run them with `lato workflow list` and
-`lato workflow run plugin/name` (still no script interpreter or model call).
-In the TUI, `/workflows` lists the current session snapshot's descriptors.
-`agentBudget` is a declared cap (default 128, max 1024). Untrusted
-project plugins contribute no workflow descriptors. Child sessions may only
-narrow the parent allowlist. `doctor` does not list workflows.
+Workflows are Rhai scripts (`agent`, `parallel`, `phase`, `complete`) run by
+`lato workflow run`. Discovery is keep-first: `$LATO_HOME/workflows/*.rhai`,
+then `.lato/workflows/*.rhai` in a trusted project, then trusted+enabled plugin
+descriptors. Plugin JSON `prompt` / `steps` / `profile` (`explorer`, `worker`,
+`reviewer`) compile into sequential `agent()` calls. Qualified plugin ids are
+`plugin/workflow`.
+
+```text
+lato workflow list [--json] [--plugin-dir PATH]
+lato workflow run <id> [--input JSON] [--model provider/model] [--sandbox off|workspace|read-only] [--validate-only] [--agent-budget N] [--plugin-dir PATH]
+```
+
+`--model` / `LATO_MODEL` match `-p`; with neither, the run uses the built-in
+fake stream. `--validate-only` compiles and walks one canned path without
+spawning child sessions or calling a model. `agentBudget` is a logical-agent
+cap (default 128, max 1024). Untrusted project plugins and untrusted
+`.lato/workflows` contribute nothing. Child sessions may only narrow the parent
+allowlist. The TUI `/workflows` command still only lists descriptors; there is
+no in-session `/workflow run`. `doctor` does not list workflows.
 
 ## Doctor
 

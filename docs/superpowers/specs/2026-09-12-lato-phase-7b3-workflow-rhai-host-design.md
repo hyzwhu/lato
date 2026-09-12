@@ -2,7 +2,7 @@
 
 | 字段 | 值 |
 | --- | --- |
-| 状态 | **设计已确认，待实施** |
+| 状态 | **已实施** |
 | 日期 | 2026-09-12 |
 | 基线 | 7B2 declarative `prompt`/`steps`/`profile` + `CompletingTaskRunner` CLI |
 | 上游 | Grok Build `bb7f39d5858cbf5e00de639367f59debbdcb0138`：`crates/codegen/xai-workflow` + `xai-grok-shell/src/session/workflow/host_service.rs` |

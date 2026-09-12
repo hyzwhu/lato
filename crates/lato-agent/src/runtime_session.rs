@@ -734,17 +734,17 @@ impl RuntimeSession {
                 Retryability::Never,
             ));
         }
-        if let Some(invocation) = &invocation {
-            if let Err(error) = self.driver.bind_user_skill(invocation).await {
-                self.abort_plugin_turn().await;
-                cleanup.disarm();
-                return Err(AgentError::new(
-                    error.code,
-                    ErrorCategory::Policy,
-                    error.message,
-                    Retryability::Never,
-                ));
-            }
+        if let Some(invocation) = &invocation
+            && let Err(error) = self.driver.bind_user_skill(invocation).await
+        {
+            self.abort_plugin_turn().await;
+            cleanup.disarm();
+            return Err(AgentError::new(
+                error.code,
+                ErrorCategory::Policy,
+                error.message,
+                Retryability::Never,
+            ));
         }
         let mut events = self.handle.subscribe();
         if let Err(error) = self
