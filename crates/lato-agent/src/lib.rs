@@ -15,6 +15,7 @@ pub mod skills;
 pub mod subagent;
 pub mod transcript;
 mod two_pass;
+pub mod workflow;
 
 pub use actor::*;
 pub use compaction::*;

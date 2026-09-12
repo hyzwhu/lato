@@ -13,6 +13,7 @@ lato-ai = { path = "../lato-ai" }
 lato-tools = { path = "../lato-tools" }
 lato-mcp = { path = "../lato-mcp" }
 lato-store = { path = "../lato-store" }
+lato-workflow = { path = "../lato-workflow" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"

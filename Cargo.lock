@@ -1265,6 +1265,7 @@ dependencies = [
  "lato-runtime",
  "lato-store",
  "lato-tools",
+ "lato-workflow",
  "lato-workspace",
  "reqwest",
  "semver",
