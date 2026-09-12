@@ -68,6 +68,7 @@ pub async fn run(options: DoctorOptions, deps: &DoctorDependencies) -> DoctorRep
     let mut checks = Vec::new();
 
     checks.push(version_check());
+    checks.push(binary_path_check());
     checks.push(home_check(&deps.home));
 
     let settings = load_settings(&deps.home);
@@ -189,6 +190,82 @@ fn version_check() -> DoctorCheck {
         ),
         None,
     )
+}
+
+fn binary_path_check() -> DoctorCheck {
+    let current = match std::env::current_exe() {
+        Ok(path) => path,
+        Err(error) => {
+            return check(
+                "binary_path",
+                DoctorStatus::Warn,
+                format!("cannot resolve the running binary: {error}"),
+                Some("doctor.path_unresolved"),
+            );
+        }
+    };
+    if !is_lato_executable(&current) {
+        return check(
+            "binary_path",
+            DoctorStatus::Ok,
+            format!("running process is {}", current.display()),
+            None,
+        );
+    }
+    let Some(path_lato) = find_lato_on_path() else {
+        return check(
+            "binary_path",
+            DoctorStatus::Warn,
+            format!("lato is not on PATH; this process is {}", current.display()),
+            Some("doctor.path_missing"),
+        );
+    };
+    let current_canon = current.canonicalize().unwrap_or_else(|_| current.clone());
+    let path_canon = path_lato
+        .canonicalize()
+        .unwrap_or_else(|_| path_lato.clone());
+    if current_canon == path_canon {
+        return check(
+            "binary_path",
+            DoctorStatus::Ok,
+            format!("PATH resolves lato to {}", path_lato.display()),
+            None,
+        );
+    }
+    check(
+        "binary_path",
+        DoctorStatus::Warn,
+        format!(
+            "PATH resolves lato to {} but this process is {}; an older ~/.local/bin/lato (or similar) may be shadowing cargo/bin",
+            path_lato.display(),
+            current.display()
+        ),
+        Some("doctor.path_shadow"),
+    )
+}
+
+fn is_lato_executable(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == "lato" || name.eq_ignore_ascii_case("lato.exe"))
+}
+
+fn find_lato_on_path() -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    let names: &[&str] = if cfg!(windows) {
+        &["lato.exe", "lato"]
+    } else {
+        &["lato"]
+    };
+    for dir in std::env::split_paths(&path) {
+        for name in names {
+            let candidate = dir.join(name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
 }
 
 fn home_check(home: &Path) -> DoctorCheck {
