@@ -1,9 +1,11 @@
-//! Rhai script host channel, journal, meta, and run outcome (Phase 7B3).
+//! Rhai script host channel, journal, meta, run outcome, engine, and canned validate.
 
+pub mod engine;
 pub mod host;
 pub mod journal;
 pub mod meta;
 pub mod run;
+pub mod validate;
 
 pub const MAX_PARALLEL: usize = 1_024;
 pub const MAX_HOST_CALLS: u64 = 10_000;
@@ -14,10 +16,15 @@ pub const MAX_WORKFLOW_PHASES: usize = 64;
 pub const MAX_PHASE_TITLE_LEN: usize = 128;
 pub const MAX_PHASE_DETAIL_LEN: usize = 1_024;
 
+pub use engine::{WorkflowRunParams, run_workflow};
 pub use host::{AgentOpts, AgentResult, BudgetState, HostError, WorkflowHostRequest};
 pub use journal::Journal;
 pub use meta::extract_meta;
 pub use run::ScriptOutcome;
+pub use validate::{
+    ValidationError, ValidationReport, validate_script, validate_script_with_agent_budget,
+    validate_script_with_cancel,
+};
 
 pub(crate) fn with_rhai_hint(msg: String) -> String {
     let hint = if msg.contains("Expression exceeds maximum complexity") {

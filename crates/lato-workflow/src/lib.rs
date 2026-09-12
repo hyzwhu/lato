@@ -1,7 +1,6 @@
 //! Workflow descriptors, coordinator engine, and Rhai script host types.
 //!
 //! Parsing/materialization of JSON workflow configs lives in `lato-extensions`.
-//! Script execution (Rhai engine) is layered in later Phase 7B3 tasks.
 
 pub mod completing;
 pub mod config;
@@ -21,8 +20,9 @@ pub use names::{
     MAX_WORKFLOW_NAME_LEN, clamp_agent_budget, normalize_workflow_name, qualify_workflow,
 };
 pub use script::{
-    AgentOpts, AgentResult, BudgetState, HostError, Journal, ScriptOutcome, WorkflowHostRequest,
-    extract_meta, run::PauseKind,
+    AgentOpts, AgentResult, BudgetState, HostError, Journal, ScriptOutcome, ValidationError,
+    ValidationReport, WorkflowHostRequest, WorkflowRunParams, extract_meta, run::PauseKind,
+    run_workflow, validate_script, validate_script_with_agent_budget,
 };
 pub use types::{
     DEFAULT_AGENT_BUDGET, MAX_AGENT_BUDGET, MAX_DESCRIPTION_BYTES, MAX_WORKFLOW_DIAGNOSTIC_BYTES,
