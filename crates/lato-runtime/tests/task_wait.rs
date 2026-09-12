@@ -1522,6 +1522,60 @@ async fn every_terminal_event_publishes_a_complete_atomic_snapshot() {
     assert_event_observes_complete_terminal_snapshot(&handle, event).await;
 }
 
+async fn spawn_completed_data_child(
+    handle: &lato_runtime::TaskHandle,
+    runner: &DataRunner,
+    task_id: &str,
+) {
+    let root = handle
+        .register_root(lato_runtime::TaskRootRequest {
+            task_id: TaskId::from("root"),
+            owner: lato_core::TaskOwner::Interactive {
+                session_id: lato_core::SessionId::from("session"),
+                turn_id: lato_core::TurnId::from("turn"),
+            },
+            profile: AgentProfile::worker(),
+            permissions: AgentProfile::worker().capabilities,
+            budget: BudgetLimits::unlimited(),
+        })
+        .await
+        .unwrap();
+    root.spawn(request(task_id, SpawnMode::Background))
+        .await
+        .unwrap();
+    while !handle
+        .inspect_admin(TaskId::from(task_id))
+        .await
+        .is_ok_and(|snapshot| snapshot.node.status == TaskStatus::Running)
+    {
+        tokio::task::yield_now().await;
+    }
+    runner.finish(task_id).await;
+    while !handle
+        .inspect_admin(TaskId::from(task_id))
+        .await
+        .is_ok_and(|snapshot| snapshot.node.status == TaskStatus::Completed)
+    {
+        tokio::task::yield_now().await;
+    }
+}
+
+async fn assert_supervisors_reaped(handle: &lato_runtime::TaskHandle) {
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while handle
+            .registry_counts()
+            .await
+            .unwrap()
+            .output_load_supervisors
+            != 0
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("completed supervisors must be reaped continuously");
+}
+
 #[tokio::test]
 async fn sequential_output_loads_leave_no_retained_supervisor_bookkeeping() {
     let workspace = TempDir::new().unwrap();
@@ -1536,64 +1590,187 @@ async fn sequential_output_loads_leave_no_retained_supervisor_bookkeeping() {
         allocator,
         Arc::new(lato_runtime::NoopTaskEventSink),
     );
-    let root = handle
-        .register_root(lato_runtime::TaskRootRequest {
-            task_id: TaskId::from("root"),
-            owner: lato_core::TaskOwner::Interactive {
-                session_id: lato_core::SessionId::from("session"),
-                turn_id: lato_core::TurnId::from("turn"),
-            },
-            profile: AgentProfile::worker(),
-            permissions: AgentProfile::worker().capabilities,
-            budget: BudgetLimits::unlimited(),
-        })
-        .await
-        .unwrap();
-    root.spawn(request("child", SpawnMode::Background))
-        .await
-        .unwrap();
-    while !handle
-        .inspect_admin(TaskId::from("child"))
-        .await
-        .is_ok_and(|snapshot| snapshot.node.status == TaskStatus::Running)
-    {
-        tokio::task::yield_now().await;
-    }
-    runner.finish("child").await;
-    while !handle
-        .inspect_admin(TaskId::from("child"))
-        .await
-        .is_ok_and(|snapshot| snapshot.node.status == TaskStatus::Completed)
-    {
-        tokio::task::yield_now().await;
-    }
+    spawn_completed_data_child(&handle, &runner, "child").await;
+
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let peak = Arc::new(AtomicUsize::new(0));
+    let sampler_handle = handle.clone();
+    let sampler_stop = Arc::clone(&stop);
+    let sampler_peak = Arc::clone(&peak);
+    let sampler = tokio::spawn(async move {
+        while !sampler_stop.load(Ordering::Acquire) {
+            if let Ok(counts) = sampler_handle.registry_counts().await {
+                sampler_peak.fetch_max(counts.output_load_supervisors, Ordering::AcqRel);
+            }
+            tokio::task::yield_now().await;
+        }
+    });
+
     for _ in 0..200 {
         handle
             .inspect_detailed_admin(TaskId::from("child"))
             .await
             .unwrap();
-        assert!(
-            handle
-                .registry_counts()
-                .await
-                .unwrap()
-                .output_load_supervisors
-                <= 2
-        );
-    }
-    tokio::time::timeout(Duration::from_secs(1), async {
-        while handle
+        let supervisors = handle
             .registry_counts()
             .await
             .unwrap()
-            .output_load_supervisors
-            != 0
-        {
+            .output_load_supervisors;
+        peak.fetch_max(supervisors, Ordering::AcqRel);
+        assert!(
+            supervisors <= 2,
+            "sequential inspect retained {supervisors} supervisors"
+        );
+    }
+    stop.store(true, Ordering::Release);
+    sampler.await.unwrap();
+    assert!(
+        peak.load(Ordering::Acquire) <= 2,
+        "output_load_supervisors peaked at {} under sequential load",
+        peak.load(Ordering::Acquire)
+    );
+    assert_supervisors_reaped(&handle).await;
+}
+
+#[tokio::test]
+async fn overlapping_output_loads_never_exceed_supervisor_capacity() {
+    let workspace = TempDir::new().unwrap();
+    let runner = Arc::new(DataRunner {
+        block_load: true,
+        ..DataRunner::default()
+    });
+    let allocator = Arc::new(MemoryWorkspaceAllocator::new(workspace.path()).unwrap());
+    let (handle, _actor) = spawn_task_coordinator(
+        CoordinatorConfig {
+            max_output_loads: 2,
+            ..CoordinatorConfig::default()
+        },
+        runner.clone(),
+        allocator,
+        Arc::new(lato_runtime::NoopTaskEventSink),
+    );
+    spawn_completed_data_child(&handle, &runner, "child").await;
+
+    let first_handle = handle.clone();
+    let first = tokio::spawn(async move {
+        first_handle
+            .inspect_detailed_admin(TaskId::from("child"))
+            .await
+    });
+    let second_handle = handle.clone();
+    let second = tokio::spawn(async move {
+        second_handle
+            .inspect_detailed_admin(TaskId::from("child"))
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while runner.load_calls.load(Ordering::Acquire) < 2 {
             tokio::task::yield_now().await;
         }
     })
     .await
-    .expect("completed supervisors must be reaped continuously");
+    .expect("both capacity slots must start loading");
+    let supervisors = handle
+        .registry_counts()
+        .await
+        .unwrap()
+        .output_load_supervisors;
+    assert!(
+        supervisors <= 2,
+        "held loads reported {supervisors} supervisors"
+    );
+    assert!(
+        handle
+            .inspect_detailed_admin(TaskId::from("child"))
+            .await
+            .is_err(),
+        "a third load must be rejected while both slots are held"
+    );
+    assert!(
+        handle
+            .registry_counts()
+            .await
+            .unwrap()
+            .output_load_supervisors
+            <= 2
+    );
+
+    runner.load_gate.notify_waiters();
+    assert_eq!(
+        first
+            .await
+            .unwrap()
+            .unwrap()
+            .snapshot
+            .result
+            .unwrap()
+            .output,
+        "abcdefgh"
+    );
+    assert_eq!(
+        second
+            .await
+            .unwrap()
+            .unwrap()
+            .snapshot
+            .result
+            .unwrap()
+            .output,
+        "abcdefgh"
+    );
+    assert_supervisors_reaped(&handle).await;
+}
+
+#[tokio::test]
+async fn concurrent_output_loads_never_spawn_past_capacity() {
+    let workspace = TempDir::new().unwrap();
+    let runner = Arc::new(DataRunner::default());
+    let allocator = Arc::new(MemoryWorkspaceAllocator::new(workspace.path()).unwrap());
+    let (handle, _actor) = spawn_task_coordinator(
+        CoordinatorConfig {
+            max_output_loads: 2,
+            ..CoordinatorConfig::default()
+        },
+        runner.clone(),
+        allocator,
+        Arc::new(lato_runtime::NoopTaskEventSink),
+    );
+    spawn_completed_data_child(&handle, &runner, "child").await;
+
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let peak = Arc::new(AtomicUsize::new(0));
+    let sampler_handle = handle.clone();
+    let sampler_stop = Arc::clone(&stop);
+    let sampler_peak = Arc::clone(&peak);
+    let sampler = tokio::spawn(async move {
+        while !sampler_stop.load(Ordering::Acquire) {
+            if let Ok(counts) = sampler_handle.registry_counts().await {
+                sampler_peak.fetch_max(counts.output_load_supervisors, Ordering::AcqRel);
+            }
+            tokio::task::yield_now().await;
+        }
+    });
+
+    let mut loads = Vec::new();
+    for _ in 0..16 {
+        let load_handle = handle.clone();
+        loads.push(tokio::spawn(async move {
+            load_handle
+                .inspect_detailed_admin(TaskId::from("child"))
+                .await
+        }));
+    }
+    for load in loads {
+        let _ = load.await.unwrap();
+    }
+    stop.store(true, Ordering::Release);
+    sampler.await.unwrap();
+    assert!(
+        peak.load(Ordering::Acquire) <= 2,
+        "output_load_supervisors peaked at {} under concurrent load",
+        peak.load(Ordering::Acquire)
+    );
+    assert_supervisors_reaped(&handle).await;
 }
 
 #[derive(Default)]
