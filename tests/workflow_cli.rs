@@ -29,6 +29,7 @@ fn workflow_list_and_run_use_plugin_dir() {
     let list = Command::new(env!("CARGO_BIN_EXE_lato"))
         .current_dir(fixture.path())
         .env("LATO_HOME", home.path())
+        .env_remove("LATO_MODEL")
         .args(["--plugin-dir", plugin.to_str().unwrap(), "workflow", "list"])
         .output()
         .unwrap();
@@ -46,6 +47,7 @@ fn workflow_list_and_run_use_plugin_dir() {
     let run = Command::new(env!("CARGO_BIN_EXE_lato"))
         .current_dir(fixture.path())
         .env("LATO_HOME", home.path())
+        .env_remove("LATO_MODEL")
         .args([
             "--plugin-dir",
             plugin.to_str().unwrap(),
@@ -121,6 +123,7 @@ fn workflow_run_rejects_invalid_agent_budget() {
         let output = Command::new(env!("CARGO_BIN_EXE_lato"))
             .current_dir(fixture.path())
             .env("LATO_HOME", home.path())
+            .env_remove("LATO_MODEL")
             .args([
                 "--plugin-dir",
                 plugin.to_str().unwrap(),
@@ -147,10 +150,11 @@ fn workflow_run_unknown_id_fails() {
     let output = Command::new(env!("CARGO_BIN_EXE_lato"))
         .current_dir(fixture.path())
         .env("LATO_HOME", fixture.path().join("home"))
+        .env_remove("LATO_MODEL")
         .args(["workflow", "run", "missing/none"])
         .output()
         .unwrap();
     assert!(!output.status.success());
     let err = String::from_utf8_lossy(&output.stderr);
-    assert!(err.contains("not found") || err.contains("error"), "{err}");
+    assert!(err.contains("workflow.not_found"), "{err}");
 }
