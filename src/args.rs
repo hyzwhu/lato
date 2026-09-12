@@ -74,6 +74,10 @@ pub enum WorkflowCommand {
         id: String,
         input: Option<String>,
         plugin_dirs: Vec<PathBuf>,
+        model: Option<String>,
+        sandbox: Option<SandboxArg>,
+        validate_only: bool,
+        agent_budget: Option<u64>,
     },
 }
 
@@ -82,7 +86,7 @@ pub enum WorkflowCommand {
     name = "lato",
     version,
     about = "Public Beta coding agent",
-    after_help = "Run without arguments for the interactive coding CLI.\n\nInteractive: lato [--sandbox off|workspace|read-only]\nResume: lato resume ID|TITLE [--sandbox off|workspace|read-only]\nHeadless: lato -p [--ask] [--sandbox off|workspace|read-only] [--model provider/model] TEXT\nWorkflows: lato workflow list|run ID [--plugin-dir PATH]\nDoctor: lato doctor [--json] [--strict] [--live]"
+    after_help = "Run without arguments for the interactive coding CLI.\n\nInteractive: lato [--sandbox off|workspace|read-only]\nResume: lato resume ID|TITLE [--sandbox off|workspace|read-only]\nHeadless: lato -p [--ask] [--sandbox off|workspace|read-only] [--model provider/model] TEXT\nWorkflows: lato workflow list|run ID [--input JSON] [--model provider/model] [--sandbox off|workspace|read-only] [--validate-only] [--agent-budget N] [--plugin-dir PATH]\nDoctor: lato doctor [--json] [--strict] [--live]"
 )]
 struct Cli {
     /// Interface language for interactive mode
@@ -178,12 +182,21 @@ enum WorkflowAction {
         #[arg(long, action = ArgAction::SetTrue)]
         json: bool,
     },
-    /// Run a workflow id (`plugin/name`) through the coordinator
+    /// Run a workflow id (`plugin/name`) through the Rhai host
     Run {
         id: String,
         /// JSON object passed as workflow input
         #[arg(long)]
         input: Option<String>,
+        /// Model selection in provider/model form; same semantics as -p
+        #[arg(long)]
+        model: Option<String>,
+        /// Validate the script with a canned host; do not start agents
+        #[arg(long, action = ArgAction::SetTrue)]
+        validate_only: bool,
+        /// Override the descriptor agent-budget (1..=1024)
+        #[arg(long, value_name = "N")]
+        agent_budget: Option<u64>,
     },
 }
 
@@ -219,10 +232,18 @@ impl Cli {
                     "--lang is only available in interactive mode",
                 ));
             }
-            if self.sandbox.is_some() && !matches!(&command, Command::Resume { .. }) {
+            if self.sandbox.is_some()
+                && !matches!(
+                    &command,
+                    Command::Resume { .. }
+                        | Command::Workflow {
+                            action: WorkflowAction::Run { .. },
+                        }
+                )
+            {
                 return Err(semantic_error(
                     ErrorKind::ArgumentConflict,
-                    "--sandbox is only available in interactive mode, resume, or -p",
+                    "--sandbox is only available in interactive mode, resume, -p, or workflow run",
                 ));
             }
             if !self.plugin_dirs.is_empty()
@@ -287,10 +308,20 @@ impl Cli {
                         json,
                         plugin_dirs: self.plugin_dirs,
                     },
-                    WorkflowAction::Run { id, input } => WorkflowCommand::Run {
+                    WorkflowAction::Run {
+                        id,
+                        input,
+                        model,
+                        validate_only,
+                        agent_budget,
+                    } => WorkflowCommand::Run {
                         id,
                         input,
                         plugin_dirs: self.plugin_dirs,
+                        model,
+                        sandbox: self.sandbox,
+                        validate_only,
+                        agent_budget,
                     },
                 }),
             });
@@ -390,6 +421,34 @@ mod tests {
         };
         assert_eq!(id, "demo/review");
         assert_eq!(input.as_deref(), Some("{\"n\":1}"));
+    }
+
+    #[test]
+    fn parses_workflow_run_host_flags() {
+        assert_eq!(
+            parse(vec![
+                "workflow".into(),
+                "run".into(),
+                "demo/review".into(),
+                "--model".into(),
+                "openai/gpt-4.1".into(),
+                "--sandbox".into(),
+                "workspace".into(),
+                "--validate-only".into(),
+                "--agent-budget".into(),
+                "32".into(),
+            ])
+            .unwrap(),
+            Invocation::Workflow(WorkflowCommand::Run {
+                id: "demo/review".into(),
+                input: None,
+                plugin_dirs: Vec::new(),
+                model: Some("openai/gpt-4.1".into()),
+                sandbox: Some(SandboxArg::Workspace),
+                validate_only: true,
+                agent_budget: Some(32),
+            })
+        );
     }
 
     #[test]

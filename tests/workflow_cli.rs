@@ -63,8 +63,82 @@ fn workflow_list_and_run_use_plugin_dir() {
         String::from_utf8_lossy(&run.stderr)
     );
     let body = String::from_utf8_lossy(&run.stdout);
-    assert!(body.contains("demo/review-changes"), "run stdout: {body}");
-    assert!(body.contains("Completed"), "run stdout: {body}");
+    let payload: serde_json::Value = serde_json::from_str(body.trim())
+        .unwrap_or_else(|error| panic!("run stdout is not JSON ({error}): {body}"));
+    assert_eq!(payload["runId"], "wf-1");
+    assert_eq!(payload["status"], "completed");
+    assert!(
+        payload.get("output").is_some() && payload["output"].get("workflow").is_none(),
+        "expected host ScriptOutcome output, got: {body}"
+    );
+}
+
+#[test]
+fn workflow_validate_only_does_not_need_a_model() {
+    let fixture = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    write_workflow_plugin(fixture.path(), "demo");
+    let plugin = fixture.path().join("demo");
+    let output = Command::new(env!("CARGO_BIN_EXE_lato"))
+        .current_dir(fixture.path())
+        .env("LATO_HOME", home.path())
+        .env_remove("LATO_MODEL")
+        .args([
+            "--plugin-dir",
+            plugin.to_str().unwrap(),
+            "workflow",
+            "run",
+            "demo/review-changes",
+            "--validate-only",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let body = String::from_utf8_lossy(&output.stdout);
+    let payload: serde_json::Value = serde_json::from_str(body.trim())
+        .unwrap_or_else(|error| panic!("validate-only stdout is not JSON ({error}): {body}"));
+    assert_eq!(payload["status"], "validated");
+    assert_eq!(payload["name"], "review-changes");
+    assert!(
+        payload["outcome"]
+            .as_str()
+            .is_some_and(|outcome| outcome.contains("completed")),
+        "validate-only stdout: {body}"
+    );
+}
+
+#[test]
+fn workflow_run_rejects_invalid_agent_budget() {
+    let fixture = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    write_workflow_plugin(fixture.path(), "demo");
+    let plugin = fixture.path().join("demo");
+    for budget in ["0", "1025"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_lato"))
+            .current_dir(fixture.path())
+            .env("LATO_HOME", home.path())
+            .args([
+                "--plugin-dir",
+                plugin.to_str().unwrap(),
+                "workflow",
+                "run",
+                "demo/review-changes",
+                "--agent-budget",
+                budget,
+            ])
+            .output()
+            .unwrap();
+        let err = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(2), "budget {budget}: {err}");
+        assert!(
+            err.contains("workflow.invalid_configuration"),
+            "budget {budget}: {err}"
+        );
+    }
 }
 
 #[test]
