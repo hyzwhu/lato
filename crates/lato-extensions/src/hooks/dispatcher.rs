@@ -6,8 +6,7 @@ use serde_json::Value;
 use super::{
     HandlerType, HookEventEnvelope, HookEventName, HookRegistry, HookRunContext, HookRunError,
     HookSpec, MAX_CONTEXT_BYTES, ParsedDecision, ParsedHookResult, RawHookRun,
-    SystemHookDnsResolver, build_hook_http_client, parse_hook_result, run_command_hook,
-    run_http_hook,
+    SystemHookDnsResolver, parse_hook_result, run_command_hook, run_http_hook,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -96,14 +95,12 @@ pub trait HookExecutor: Send + Sync {
 }
 
 pub struct DefaultHookExecutor {
-    client: reqwest::Client,
     resolver: Arc<dyn super::HookDnsResolver>,
 }
 
 impl DefaultHookExecutor {
     pub fn new() -> Result<Self, HookRunError> {
         Ok(Self {
-            client: build_hook_http_client()?,
             resolver: Arc::new(SystemHookDnsResolver),
         })
     }
@@ -120,14 +117,7 @@ impl HookExecutor for DefaultHookExecutor {
         match spec.handler_type {
             HandlerType::Command => run_command_hook(spec, envelope, context).await,
             HandlerType::Http => {
-                run_http_hook(
-                    spec,
-                    envelope,
-                    context,
-                    &self.client,
-                    self.resolver.as_ref(),
-                )
-                .await
+                run_http_hook(spec, envelope, context, self.resolver.as_ref()).await
             }
         }
     }

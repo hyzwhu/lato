@@ -194,9 +194,9 @@ forms are regular expressions. Command hooks receive bounded JSON on stdin,
 authentic `LATO_*` identity variables, a one-MiB combined output limit, and
 process-tree cleanup on timeout or cancellation. HTTP hooks accept HTTPS only,
 disable redirects, resolve and reject private/link-local/CGNAT/unspecified
-destinations, and intentionally allow loopback for trusted local hooks. As in
-the pinned upstream baseline, DNS is checked before the request; connection-time
-address pinning is not yet provided.
+destinations, and intentionally allow loopback for trusted local hooks. DNS is
+checked before the request and the HTTPS client is pinned to those validated
+addresses so a later lookup cannot reconnect to a blocked destination.
 
 Failures and timeouts fail open; healthy explicit block decisions are enforced.
 Defaults are 5s for observers and `PreToolUse`, 30s for `UserPromptSubmit`, 600s
