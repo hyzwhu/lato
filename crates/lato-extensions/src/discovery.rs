@@ -84,6 +84,7 @@ pub struct DiscoveredPlugin {
     pub skill_dirs: Vec<PathBuf>,
     pub hooks_path: Option<PathBuf>,
     pub mcp_config_path: Option<PathBuf>,
+    pub workflow_config_path: Option<PathBuf>,
     pub conflict: Option<String>,
 }
 
@@ -318,6 +319,7 @@ fn collect_candidate(
     let skill_dirs = manifest.skill_dirs(&canonical_root);
     let hooks_path = manifest.hooks_path(&canonical_root);
     let mcp_config_path = manifest.mcp_config_path(&canonical_root);
+    let workflow_config_path = manifest.workflow_config_path(&canonical_root);
     let name = manifest.name.clone();
     candidates.push(DiscoveredPlugin {
         manifest,
@@ -330,6 +332,7 @@ fn collect_candidate(
         skill_dirs,
         hooks_path,
         mcp_config_path,
+        workflow_config_path,
         conflict: None,
     });
 }

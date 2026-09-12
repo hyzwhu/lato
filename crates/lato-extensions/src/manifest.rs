@@ -57,6 +57,8 @@ pub struct PluginManifest {
     pub hooks: Option<PathOrInline>,
     #[serde(default)]
     pub mcp_servers: Option<PathOrInline>,
+    #[serde(default)]
+    pub workflows: Option<PathOrInline>,
 }
 
 impl PluginManifest {
@@ -99,6 +101,14 @@ impl PluginManifest {
 
     pub fn inline_mcp_servers(&self) -> Option<&serde_json::Value> {
         inline_value(&self.mcp_servers)
+    }
+
+    pub fn workflow_config_path(&self, plugin_root: &Path) -> Option<PathBuf> {
+        resolve_component(&self.workflows, plugin_root, "workflows.json")
+    }
+
+    pub fn inline_workflows(&self) -> Option<&serde_json::Value> {
+        inline_value(&self.workflows)
     }
 }
 
@@ -146,6 +156,7 @@ pub fn load_manifest(plugin_root: &Path) -> Result<ManifestLoadResult, ManifestE
     if !manifest.skill_dirs(plugin_root).is_empty()
         || manifest.hooks_path(plugin_root).is_some()
         || manifest.mcp_config_path(plugin_root).is_some()
+        || manifest.workflow_config_path(plugin_root).is_some()
     {
         Ok(ManifestLoadResult::Convention(Box::new(manifest)))
     } else {

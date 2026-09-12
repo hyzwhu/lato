@@ -3,11 +3,13 @@
 //! Parsing/materialization lives in `lato-extensions`. This crate never
 //! interprets scripts, spawns agents, or reserves budget.
 
+pub mod config;
 pub mod error;
 pub mod inert;
 pub mod names;
 pub mod types;
 
+pub use config::{ParseContext, parse_workflow_config};
 pub use error::WorkflowError;
 pub use inert::InertWorkflow;
 pub use names::{

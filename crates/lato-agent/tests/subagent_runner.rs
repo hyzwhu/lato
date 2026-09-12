@@ -411,6 +411,7 @@ async fn child_mcp_ceiling_cannot_restore_parent_removed_server() {
             allowed_servers: Some(BTreeSet::from(["keep".into()])),
             allowed_tools: Some(BTreeSet::from([qualify_tool("keep", "ping")])),
         },
+        workflows: Default::default(),
     });
     let set = materialize_mcp(&child);
     assert_eq!(set.servers.len(), 1);
@@ -427,6 +428,7 @@ async fn child_mcp_ceiling_cannot_restore_parent_removed_server() {
             allowed_servers: None,
             allowed_tools: None,
         },
+        workflows: Default::default(),
     });
     let nested_set = materialize_mcp(&nested);
     assert_eq!(nested_set.servers.len(), 1);

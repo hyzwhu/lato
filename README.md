@@ -278,6 +278,16 @@ Installed-command MCP smoke must use the cargo-installed binary
 `LATO_SMOKE_BINARY="$(command -v lato)"` only after confirming PATH order). An
 older `~/.local/bin/lato` may shadow PATH and exercise a stale build.
 
+### Plugin Workflows
+
+Trusted, enabled plugins may declare workflows in `plugin.json` (`workflows`
+inline map or a `workflows.json` path under the plugin root). Qualified ids are
+`plugin/workflow`. Phase 7A **materializes descriptors only**: `lato` will not
+run them, list them in `doctor`, or spawn agents. `agentBudget` is a declared
+cap (default 128, max 1024). Execution belongs to a later phase. Untrusted
+project plugins contribute no workflow descriptors. Child sessions may only
+narrow the parent allowlist.
+
 ## Doctor
 
 ```bash

@@ -901,6 +901,7 @@ async fn child_cannot_restore_removed_mcp_server_or_tool() {
             allowed_servers: Some(BTreeSet::from(["demo".into()])),
             allowed_tools: Some(BTreeSet::from([qualify_tool("demo", "ping")])),
         },
+        workflows: Default::default(),
     });
     assert_eq!(
         narrowed.mcp_ceiling().allowed_servers,
@@ -926,6 +927,7 @@ async fn child_cannot_restore_removed_mcp_server_or_tool() {
                 qualify_tool("other", "ping"),
             ])),
         },
+        workflows: Default::default(),
     });
     let restored_set = materialize_mcp(&restored);
     assert_eq!(restored_set.servers.len(), 1);
@@ -946,6 +948,7 @@ async fn parent_reload_does_not_mutate_running_child_snapshot() {
             allowed_servers: Some(BTreeSet::from(["demo".into()])),
             allowed_tools: None,
         },
+        workflows: Default::default(),
     });
 
     let table = SessionPluginSnapshots::default();
@@ -1041,6 +1044,7 @@ async fn server_and_tool_narrowing_on_child_derivation_filters_manager() {
             allowed_servers: Some(BTreeSet::from(["keep".into()])),
             allowed_tools: Some(BTreeSet::from([qualify_tool("keep", "ok")])),
         },
+        workflows: Default::default(),
     });
     let descriptors = materialize_mcp(&child);
     assert_eq!(descriptors.servers.len(), 1);
@@ -1066,6 +1070,7 @@ async fn server_and_tool_narrowing_on_child_derivation_filters_manager() {
             allowed_servers: Some(BTreeSet::from(["keep".into()])),
             allowed_tools: None,
         },
+        workflows: Default::default(),
     });
     let manager = McpManager::new(materialize_mcp(&server_only), CancellationToken::new());
     let missing = manager

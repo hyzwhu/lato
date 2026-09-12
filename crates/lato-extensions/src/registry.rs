@@ -33,6 +33,7 @@ pub enum PluginComponentKind {
     Skills,
     Hooks,
     Mcp,
+    Workflows,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -51,8 +52,10 @@ pub struct LoadedPlugin {
     pub skill_dirs: Vec<PathBuf>,
     pub hooks_path: Option<PathBuf>,
     pub mcp_config_path: Option<PathBuf>,
+    pub workflow_config_path: Option<PathBuf>,
     pub inline_hooks: Option<serde_json::Value>,
     pub inline_mcp_servers: Option<serde_json::Value>,
+    pub inline_workflows: Option<serde_json::Value>,
     pub conflict: Option<String>,
 }
 
@@ -63,7 +66,9 @@ impl LoadedPlugin {
             .then_some(PluginComponentKind::Hooks);
         let mcp = (self.mcp_config_path.is_some() || self.inline_mcp_servers.is_some())
             .then_some(PluginComponentKind::Mcp);
-        skills.into_iter().chain(hooks).chain(mcp)
+        let workflows = (self.workflow_config_path.is_some() || self.inline_workflows.is_some())
+            .then_some(PluginComponentKind::Workflows);
+        skills.into_iter().chain(hooks).chain(mcp).chain(workflows)
     }
 }
 
@@ -78,6 +83,7 @@ pub struct PluginSnapshot {
     diagnostics: Arc<[DiscoveryDiagnostic]>,
     /// Effective MCP server/tool ceiling for this snapshot (monotone under derive_child).
     mcp_ceiling: McpCapabilityCeiling,
+    workflow_ceiling: WorkflowCapabilityCeiling,
 }
 
 impl PluginSnapshot {
@@ -91,6 +97,7 @@ impl PluginSnapshot {
             plugins: Arc::from([]),
             diagnostics: Arc::from([]),
             mcp_ceiling: McpCapabilityCeiling::default(),
+            workflow_ceiling: WorkflowCapabilityCeiling::default(),
         })
     }
 
@@ -126,6 +133,10 @@ impl PluginSnapshot {
         &self.mcp_ceiling
     }
 
+    pub fn workflow_ceiling(&self) -> &WorkflowCapabilityCeiling {
+        &self.workflow_ceiling
+    }
+
     pub fn active_plugins(&self) -> impl Iterator<Item = &LoadedPlugin> {
         self.plugins.iter().filter(|plugin| plugin.active)
     }
@@ -146,8 +157,10 @@ impl PluginSnapshot {
         .all(|capabilities| capabilities.contains(&ToolCapability::ExtensionInvoke));
         // Child MCP ceiling is the intersection with the parent grant — never widens.
         let mut mcp_ceiling = self.mcp_ceiling.intersect(&ceiling.mcp);
+        let mut workflow_ceiling = self.workflow_ceiling.intersect(&ceiling.workflows);
         if !extension_allowed {
             mcp_ceiling = McpCapabilityCeiling::deny_all();
+            workflow_ceiling = WorkflowCapabilityCeiling::deny_all();
         }
         let plugins = self
             .plugins
@@ -159,8 +172,10 @@ impl PluginSnapshot {
                     plugin.skill_dirs.clear();
                     plugin.hooks_path = None;
                     plugin.mcp_config_path = None;
+                    plugin.workflow_config_path = None;
                     plugin.inline_hooks = None;
                     plugin.inline_mcp_servers = None;
+                    plugin.inline_workflows = None;
                 }
                 plugin
             })
@@ -174,6 +189,7 @@ impl PluginSnapshot {
             plugins: plugins.into(),
             diagnostics: Arc::clone(&self.diagnostics),
             mcp_ceiling,
+            workflow_ceiling,
         })
     }
 }
@@ -221,6 +237,33 @@ impl McpCapabilityCeiling {
     }
 }
 
+/// Qualified `plugin/workflow` allowlist for parent→child narrowing.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct WorkflowCapabilityCeiling {
+    pub allowed: Option<BTreeSet<String>>,
+}
+
+impl WorkflowCapabilityCeiling {
+    pub fn deny_all() -> Self {
+        Self {
+            allowed: Some(BTreeSet::new()),
+        }
+    }
+
+    pub fn intersect(&self, child: &Self) -> Self {
+        Self {
+            allowed: intersect_optional_sets(&self.allowed, &child.allowed),
+        }
+    }
+
+    pub fn allows(&self, qualified_id: &str) -> bool {
+        match &self.allowed {
+            None => true,
+            Some(allow) => allow.contains(qualified_id),
+        }
+    }
+}
+
 fn intersect_optional_sets(
     parent: &Option<BTreeSet<String>>,
     child: &Option<BTreeSet<String>>,
@@ -239,6 +282,7 @@ pub struct CapabilityCeiling {
     pub profile: Vec<ToolCapability>,
     pub workspace: Vec<ToolCapability>,
     pub mcp: McpCapabilityCeiling,
+    pub workflows: WorkflowCapabilityCeiling,
 }
 
 pub fn build_snapshot(
@@ -300,6 +344,7 @@ pub fn build_snapshot(
         plugins: plugins.into(),
         diagnostics: diagnostics.into(),
         mcp_ceiling: McpCapabilityCeiling::default(),
+        workflow_ceiling: WorkflowCapabilityCeiling::default(),
     }))
 }
 
@@ -337,6 +382,7 @@ fn load_plugin(
     }
     let inline_hooks = inline(&plugin.manifest.hooks);
     let inline_mcp_servers = inline(&plugin.manifest.mcp_servers);
+    let inline_workflows = inline(&plugin.manifest.workflows);
     LoadedPlugin {
         name: plugin.manifest.name,
         id: plugin.id,
@@ -352,8 +398,10 @@ fn load_plugin(
         skill_dirs: plugin.skill_dirs,
         hooks_path: plugin.hooks_path,
         mcp_config_path: plugin.mcp_config_path,
+        workflow_config_path: plugin.workflow_config_path,
         inline_hooks,
         inline_mcp_servers,
+        inline_workflows,
         conflict: plugin.conflict,
     }
 }

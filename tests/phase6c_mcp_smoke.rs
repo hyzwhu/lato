@@ -482,6 +482,7 @@ fn phase6c_installed_command_smoke_exercises_mcp_runtime() {
                 allowed_servers: Some(BTreeSet::from(["demo".into()])),
                 allowed_tools: Some(BTreeSet::from([qualify_tool("demo", "ping")])),
             },
+            workflows: Default::default(),
         });
         let child_set = materialize_mcp(&child);
         assert_eq!(child_set.servers.len(), 1);
@@ -505,6 +506,7 @@ fn phase6c_installed_command_smoke_exercises_mcp_runtime() {
                     qualify_tool("httpdemo", "echo"),
                 ])),
             },
+            workflows: Default::default(),
         });
         let restored_set = materialize_mcp(&restored);
         assert!(!restored_set.allows_tool(&qualify_tool("httpdemo", "echo")));

@@ -76,6 +76,7 @@ fn child_derivation_can_only_remove_extension_capability() {
         profile: vec![ToolCapability::FileRead],
         workspace: vec![ToolCapability::FileRead],
         mcp: Default::default(),
+        workflows: Default::default(),
     });
     assert!(child.active_plugins().next().is_none());
     assert_eq!(child.parent_generation(), Some(parent.generation()));
@@ -86,6 +87,7 @@ fn child_derivation_can_only_remove_extension_capability() {
         profile: vec![ToolCapability::ExtensionInvoke],
         workspace: vec![ToolCapability::ExtensionInvoke],
         mcp: Default::default(),
+        workflows: Default::default(),
     });
     assert_eq!(allowed.active_names(), vec!["all"]);
 }
@@ -190,6 +192,7 @@ fn child_mcp_ceiling_narrows_and_cannot_restore() {
             allowed_servers: Some(BTreeSet::from(["demo".into()])),
             allowed_tools: Some(BTreeSet::from(["demo__ping".into()])),
         },
+        workflows: Default::default(),
     });
     assert_eq!(
         child.mcp_ceiling().allowed_servers,
@@ -208,6 +211,7 @@ fn child_mcp_ceiling_narrows_and_cannot_restore() {
             allowed_servers: Some(BTreeSet::from(["demo".into(), "other".into()])),
             allowed_tools: Some(BTreeSet::from(["demo__ping".into(), "demo__secret".into()])),
         },
+        workflows: Default::default(),
     });
     assert_eq!(
         grandchild.mcp_ceiling().allowed_servers,
@@ -236,6 +240,7 @@ fn extension_invoke_denial_clears_mcp_ceiling() {
             allowed_servers: None,
             allowed_tools: None,
         },
+        workflows: Default::default(),
     });
     assert_eq!(child.mcp_ceiling(), &McpCapabilityCeiling::deny_all());
     assert!(child.active_plugins().next().is_none());

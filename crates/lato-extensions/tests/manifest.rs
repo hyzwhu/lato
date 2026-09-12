@@ -40,6 +40,38 @@ fn inline_hooks_and_mcp_are_preserved_but_have_no_file_path() {
 }
 
 #[test]
+fn inline_and_file_workflows_resolve() {
+    let root = fixture_plugin(r#"{"name":"wf","workflows":{"review-changes":{}}}"#);
+    let ManifestLoadResult::Found(manifest) = load_manifest(root.path()).unwrap() else {
+        panic!("manifest must be found");
+    };
+    assert!(manifest.inline_workflows().is_some());
+    assert!(manifest.workflow_config_path(root.path()).is_none());
+
+    let file_root = fixture_plugin(r#"{"name":"wf-file","workflows":"workflows.json"}"#);
+    create_file(file_root.path(), "workflows.json", r#"{"ok":{}}"#);
+    let ManifestLoadResult::Found(file_manifest) = load_manifest(file_root.path()).unwrap() else {
+        panic!("manifest must be found");
+    };
+    assert!(
+        file_manifest
+            .workflow_config_path(file_root.path())
+            .is_some()
+    );
+    assert!(file_manifest.inline_workflows().is_none());
+
+    let escaped = fixture_plugin(r#"{"name":"esc","workflows":"../escape.json"}"#);
+    let ManifestLoadResult::Found(escaped_manifest) = load_manifest(escaped.path()).unwrap() else {
+        panic!("manifest must be found");
+    };
+    assert!(
+        escaped_manifest
+            .workflow_config_path(escaped.path())
+            .is_none()
+    );
+}
+
+#[test]
 fn rejects_invalid_names_and_malformed_json() {
     for name in ["", "UPPER", "-leading", "trailing-", "has space"] {
         let root = fixture_plugin(&format!(r#"{{"name":"{name}"}}"#));

@@ -1301,6 +1301,7 @@ dependencies = [
  "futures-util",
  "lato-core",
  "lato-mcp",
+ "lato-workflow",
  "libc",
  "pulldown-cmark",
  "regex",
@@ -1410,6 +1411,19 @@ dependencies = [
  "tokio-util",
  "url",
  "zagens-windows-sandbox",
+]
+
+[[package]]
+name = "lato-workflow"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "lato-core",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]

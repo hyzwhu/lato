@@ -2,7 +2,7 @@
 
 | 字段 | 值 |
 | --- | --- |
-| 状态 | **草案（待评审）** |
+| 状态 | **A-level gate passed**（2026-09-12；见 `docs/testing/reports/phase-7a-workflow-interface-release-gate-2026-09-12.md`） |
 | 日期 | 2026-09-12 |
 | 基线 commit | `master @ be7c450`（Streamable HTTP 客户端已合入工作区） |
 | 上游边界 | 可扩展 Agent 设计 §12.5、§17 Phase 7；Phase 6A 快照契约；`TaskOwner::Workflow` / `cancel_workflow` |

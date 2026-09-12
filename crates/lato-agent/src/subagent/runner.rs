@@ -122,6 +122,7 @@ impl ChildSessionRunner {
             profile: request.node.profile.capabilities.clone(),
             workspace: workspace_capabilities,
             mcp: Default::default(),
+            workflows: Default::default(),
         });
         let trust = self.child_trust(&request);
         let skill_runtime = SkillRuntimeBinding::build(|skill_resolver, mcp_backend| {

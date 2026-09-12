@@ -6,6 +6,7 @@ pub mod registry;
 pub mod reload;
 pub mod skills;
 pub mod trust;
+pub mod workflows;
 
 pub use discovery::{
     DiscoveredPlugin, DiscoveryConfig, DiscoveryDiagnostic, DiscoveryResult, PluginId,
@@ -18,9 +19,10 @@ pub use manifest::{
 pub use mcp::materialize_mcp;
 pub use registry::{
     CapabilityCeiling, LoadedPlugin, McpCapabilityCeiling, PluginComponentKind, PluginConfig,
-    PluginSnapshot, RegistryBuildError, build_snapshot,
+    PluginSnapshot, RegistryBuildError, WorkflowCapabilityCeiling, build_snapshot,
 };
 pub use reload::{ReloadError, ReloadOutcome, ReloadRequest, SharedPluginRegistryHandle};
+pub use workflows::materialize_workflows;
 
 pub const MAX_PLUGIN_NAME_LEN: usize = 64;
 pub const MAX_COMPONENT_PATHS: usize = 64;
