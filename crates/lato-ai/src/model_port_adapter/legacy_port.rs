@@ -195,6 +195,7 @@ async fn forward_piece(
 ) -> bool {
     let event = match piece {
         StreamPiece::Text(text) => Ok(ModelStreamEvent::TextDelta { text }),
+        StreamPiece::Reasoning(text) => Ok(ModelStreamEvent::ReasoningDelta { text }),
         StreamPiece::ToolCall {
             id,
             name,
@@ -639,5 +640,26 @@ mod tests {
         })
         .await
         .expect("cancelled provider future was detached");
+    }
+    #[tokio::test]
+    async fn forwards_reasoning_without_converting_it_to_answer_text() {
+        let port = port(
+            Behavior::Pieces(vec![
+                StreamPiece::Reasoning("checking".into()),
+                StreamPiece::Text("done".into()),
+            ]),
+            Arc::new(AtomicUsize::new(0)),
+        );
+        let events = port
+            .stream(request(selection()), CancellationToken::new())
+            .await
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await;
+        assert_eq!(events.len(), 3);
+        assert!(
+            matches!(&events[0], Ok(ModelStreamEvent::ReasoningDelta { text }) if text == "checking")
+        );
+        assert!(matches!(&events[1], Ok(ModelStreamEvent::TextDelta { text }) if text == "done"));
     }
 }

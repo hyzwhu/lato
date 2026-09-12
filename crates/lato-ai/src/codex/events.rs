@@ -124,7 +124,14 @@ impl CodexEventMapper {
             }
             "response.reasoning_text.delta" | "response.reasoning_summary_text.delta" => {
                 self.started = true;
-                Ok(Vec::new())
+                let delta = value
+                    .get("delta")
+                    .and_then(|value| value.as_str())
+                    .ok_or("Codex reasoning delta is missing delta")?;
+                Ok((!delta.is_empty())
+                    .then(|| StreamPiece::Reasoning(delta.into()))
+                    .into_iter()
+                    .collect())
             }
             "response.output_item.added" if value["item"]["type"] == "function_call" => {
                 self.started = true;
@@ -292,5 +299,26 @@ mod tests {
             .accept(serde_json::json!({"type":"response.function_call_arguments.done","item_id":"item-1","arguments":"{"}))
             .unwrap_err()
             .contains("call-1"));
+    }
+    #[test]
+    fn reasoning_deltas_remain_separate_from_answer_text() {
+        let mut mapper = CodexEventMapper::default();
+        for kind in [
+            "response.reasoning_text.delta",
+            "response.reasoning_summary_text.delta",
+        ] {
+            assert_eq!(
+                mapper
+                    .accept(serde_json::json!({"type":kind,"delta":"检查代码"}))
+                    .unwrap(),
+                vec![StreamPiece::Reasoning("检查代码".into())]
+            );
+        }
+        assert_eq!(
+            mapper
+                .accept(serde_json::json!({"type":"response.output_text.delta","delta":"done"}))
+                .unwrap(),
+            vec![StreamPiece::Text("done".into())]
+        );
     }
 }

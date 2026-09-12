@@ -8,12 +8,22 @@ use tokio::sync::{mpsc, oneshot};
 #[derive(Debug)]
 pub enum BackendCommand {
     Submit(String),
+    InvokeSkill {
+        name: String,
+        args: Option<String>,
+        context: Option<String>,
+    },
+    ListSkills,
+    ListWorkflows,
     Compact(Option<String>),
     SwitchModel(String),
     Cancel,
     NewSession,
     Resume(String),
-    RenameSession { session_id: String, title: String },
+    RenameSession {
+        session_id: String,
+        title: String,
+    },
     DeleteSession(String),
     Shutdown,
 }
@@ -21,6 +31,10 @@ pub enum BackendCommand {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BackendEvent {
     SessionReady(String),
+    Skills(crate::client::SkillListResponse),
+    SkillsError(String),
+    Workflows(crate::client::WorkflowListResponse),
+    WorkflowsError(String),
     Update(ClientUpdate),
     TurnCompleted(String),
     TurnCancelled,
@@ -121,6 +135,9 @@ pub fn spawn(
             let _ = event_tx.send(BackendEvent::SessionReady(session.to_string()));
         }
 
+        if let Some(owned) = client.as_mut() {
+            refresh_skills(owned, &event_tx).await;
+        }
         loop {
             if let Some(turn) = active.as_mut() {
                 tokio::select! {
@@ -136,8 +153,14 @@ pub fn spawn(
                             }
                             break;
                         }
-                        Some(BackendCommand::Submit(_) | BackendCommand::Compact(_) | BackendCommand::SwitchModel(_)) => {
+                        Some(BackendCommand::Submit(_) | BackendCommand::InvokeSkill { .. } | BackendCommand::Compact(_) | BackendCommand::SwitchModel(_)) => {
                             let _ = event_tx.send(BackendEvent::Error("session work is already running".into()));
+                        }
+                        Some(BackendCommand::ListSkills) => {
+                            let _ = event_tx.send(BackendEvent::SkillsError("Wait for the current turn before refreshing skills / 请等待当前回复结束后刷新技能".into()));
+                        }
+                        Some(BackendCommand::ListWorkflows) => {
+                            let _ = event_tx.send(BackendEvent::WorkflowsError("Wait for the current turn before listing workflows / 请等待当前回复结束后查看工作流".into()));
                         }
                         Some(BackendCommand::Resume(_)) => {
                             let _ = event_tx.send(BackendEvent::Error("cannot switch sessions while a turn is running".into()));
@@ -156,6 +179,7 @@ pub fn spawn(
                                 if let Ok(sessions) = returned.list_session_summaries().await {
                                     let _ = event_tx.send(BackendEvent::Sessions(sessions));
                                 }
+                                refresh_skills(&mut returned, &event_tx).await;
                                 client = Some(returned);
                             }
                             Ok((returned, ActiveWorkEnd::Turn(TurnEnd::Cancelled(cancelled)))) => {
@@ -187,7 +211,19 @@ pub fn spawn(
             }
 
             match command_rx.recv().await {
-                Some(BackendCommand::Submit(text)) => {
+                Some(BackendCommand::ListSkills) => {
+                    if let Some(owned) = client.as_mut() {
+                        refresh_skills(owned, &event_tx).await;
+                    }
+                }
+                Some(BackendCommand::ListWorkflows) => {
+                    if let Some(owned) = client.as_mut() {
+                        refresh_workflows(owned, &event_tx).await;
+                    }
+                }
+                Some(
+                    command @ (BackendCommand::Submit(_) | BackendCommand::InvokeSkill { .. }),
+                ) => {
                     let Some(mut owned) = client.take() else {
                         let _ = event_tx.send(BackendEvent::Error("session is unavailable".into()));
                         continue;
@@ -199,12 +235,35 @@ pub fn spawn(
                         let cancelled;
                         let response;
                         {
-                            let send = owned.send_streaming(text, |raw| {
+                            let callback = |raw: &serde_json::Value| {
                                 let update = ClientUpdate::from_json(raw);
                                 if update != ClientUpdate::Unknown {
                                     let _ = updates.send(BackendEvent::Update(update));
                                 }
-                            });
+                            };
+                            let send = async {
+                                match command {
+                                    BackendCommand::Submit(text) => {
+                                        owned.send_streaming(text, callback).await
+                                    }
+                                    BackendCommand::InvokeSkill {
+                                        name,
+                                        args,
+                                        context,
+                                    } => {
+                                        if context.is_some() {
+                                            owned
+                                                .send_skill_streaming_with_context(
+                                                    name, args, context, callback,
+                                                )
+                                                .await
+                                        } else {
+                                            owned.send_skill_streaming(name, args, callback).await
+                                        }
+                                    }
+                                    _ => unreachable!(),
+                                }
+                            };
                             tokio::pin!(send);
                             tokio::select! {
                                 result = &mut send => {
@@ -301,6 +360,7 @@ pub fn spawn(
                     };
                     match owned.clear().await {
                         Ok(()) => {
+                            refresh_skills(owned, &event_tx).await;
                             let _ = event_tx.send(BackendEvent::NewSessionCreated(
                                 owned.session_id().to_string(),
                             ));
@@ -319,6 +379,7 @@ pub fn spawn(
                     };
                     match owned.resume(id).await {
                         Ok(()) => {
+                            refresh_skills(owned, &event_tx).await;
                             let _ = event_tx
                                 .send(BackendEvent::Resumed(owned.session_id().to_string()));
                             if let Ok(sessions) = owned.list_session_summaries().await {
@@ -370,4 +431,26 @@ pub fn spawn(
         }
     });
     (handle, event_rx)
+}
+
+async fn refresh_skills(
+    client: &mut InteractiveAcpClient,
+    events: &mpsc::UnboundedSender<BackendEvent>,
+) {
+    let event = match client.list_skills().await {
+        Ok(response) => BackendEvent::Skills(response),
+        Err(error) => BackendEvent::SkillsError(error),
+    };
+    let _ = events.send(event);
+}
+
+async fn refresh_workflows(
+    client: &mut InteractiveAcpClient,
+    events: &mpsc::UnboundedSender<BackendEvent>,
+) {
+    let event = match client.list_workflows().await {
+        Ok(response) => BackendEvent::Workflows(response),
+        Err(error) => BackendEvent::WorkflowsError(error),
+    };
+    let _ = events.send(event);
 }

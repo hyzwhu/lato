@@ -12,6 +12,7 @@ pub const CONTEXT_HARD_LIMIT_BYTES: usize = 512_000;
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum StreamPiece {
     Text(String),
+    Reasoning(String),
     ToolCall {
         id: String,
         name: String,
@@ -519,6 +520,7 @@ impl ModelEventParser {
         for piece in &pieces {
             match piece {
                 StreamPiece::Text(text) => self.text.push_str(text),
+                StreamPiece::Reasoning(_) => {}
                 StreamPiece::ToolCall { .. } => self.saw_tool = true,
             }
         }
@@ -526,7 +528,10 @@ impl ModelEventParser {
     }
 
     fn push_visible_text(&mut self, text: &str, pieces: &mut Vec<StreamPiece>) {
-        let visible = self.think.push(text);
+        let (visible, reasoning) = self.think.push_parts(text);
+        if !reasoning.is_empty() {
+            pieces.push(StreamPiece::Reasoning(reasoning));
+        }
         if !visible.is_empty() {
             pieces.push(StreamPiece::Text(visible));
         }
@@ -582,6 +587,16 @@ impl ModelEventParser {
                             pieces.push(StreamPiece::Text(text.into()));
                         }
                     }
+                    Some("thinking") => {
+                        if let Some(text) = block
+                            .get("thinking")
+                            .and_then(|v| v.as_str())
+                            .filter(|text| !text.is_empty())
+                        {
+                            self.hidden_text.push_str(text);
+                            pieces.push(StreamPiece::Reasoning(text.into()));
+                        }
+                    }
                     Some("tool_use") => {
                         let id = block
                             .get("id")
@@ -608,6 +623,7 @@ impl ModelEventParser {
         }
         if let Some(text) = reasoning_field_text(&value) {
             self.hidden_text.push_str(text);
+            pieces.push(StreamPiece::Reasoning(text.into()));
         }
         if let Some(text) = json_str_non_empty(&value, "/choices/0/delta/content")
             .or_else(|| json_str_non_empty(&value, "/choices/0/message/content"))
@@ -890,19 +906,27 @@ pub struct ThinkTagFilter {
 
 impl ThinkTagFilter {
     pub fn push(&mut self, chunk: &str) -> String {
+        self.push_parts(chunk).0
+    }
+
+    /// Split model-supplied tagged reasoning from answer text across chunks.
+    pub fn push_parts(&mut self, chunk: &str) -> (String, String) {
         if chunk.is_empty() {
-            return String::new();
+            return (String::new(), String::new());
         }
         self.pending.push_str(chunk);
         let mut visible = String::new();
+        let mut reasoning = String::new();
         loop {
             if self.in_think {
                 if let Some(pos) = self.pending.find(THINK_CLOSE) {
+                    reasoning.push_str(&self.pending[..pos]);
                     self.pending.replace_range(..pos + THINK_CLOSE.len(), "");
                     self.in_think = false;
                     continue;
                 }
                 let keep = suffix_that_is_tag_prefix(&self.pending, THINK_CLOSE);
+                reasoning.push_str(&self.pending[..self.pending.len() - keep]);
                 self.pending.replace_range(..self.pending.len() - keep, "");
                 break;
             }
@@ -932,7 +956,7 @@ impl ThinkTagFilter {
                 }
             }
         }
-        visible
+        (visible, reasoning)
     }
 
     pub fn finish(&mut self) -> String {
@@ -974,6 +998,19 @@ fn reasoning_field_text(value: &serde_json::Value) -> Option<&str> {
         .or_else(|| json_str_non_empty(value, "/choices/0/message/reasoning"))
         .or_else(|| json_str_non_empty(value, "/choices/0/delta/thinking"))
         .or_else(|| json_str_non_empty(value, "/choices/0/message/thinking"))
+        .or_else(|| {
+            (value.pointer("/delta/type").and_then(|v| v.as_str()) == Some("thinking_delta"))
+                .then(|| json_str_non_empty(value, "/delta/thinking"))
+                .flatten()
+        })
+        .or_else(|| {
+            (value
+                .pointer("/content_block/type")
+                .and_then(|v| v.as_str())
+                == Some("thinking"))
+            .then(|| json_str_non_empty(value, "/content_block/thinking"))
+            .flatten()
+        })
 }
 
 pub fn extract_text_embedded_tool_calls(text: &str) -> Vec<StreamPiece> {
@@ -1255,9 +1292,11 @@ data: [DONE]
             r#"{"choices":[{"message":{"reasoning_content":"thinking text","content":""}}]}"#;
         let pieces = parse_stream_body(fixture).unwrap();
         assert!(
-            pieces.is_empty(),
-            "reasoning must not be printed: {pieces:?}"
+            pieces
+                .iter()
+                .all(|piece| matches!(piece, StreamPiece::Reasoning(_)))
         );
+        assert_eq!(pieces.len(), 1);
     }
 
     #[test]
@@ -1265,9 +1304,11 @@ data: [DONE]
         let fixture = "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"The user wants me to write a file.\"}}]}\n";
         let pieces = parse_stream_body(fixture).unwrap();
         assert!(
-            pieces.is_empty(),
-            "reasoning must not be printed: {pieces:?}"
+            pieces
+                .iter()
+                .all(|piece| matches!(piece, StreamPiece::Reasoning(_)))
         );
+        assert_eq!(pieces.len(), 1);
     }
 
     #[test]
@@ -1402,7 +1443,10 @@ data: [DONE]
         let pieces = parse_stream_body(fixture).unwrap();
         assert_eq!(
             pieces,
-            vec![StreamPiece::Text("done".into())],
+            vec![
+                StreamPiece::Reasoning("plan the write".into()),
+                StreamPiece::Text("done".into())
+            ],
             "pieces={pieces:?}"
         );
     }
@@ -1493,5 +1537,43 @@ data: [DONE]
         let pieces = parse_stream_body(fixture).unwrap();
         assert!(matches!(&pieces[0], StreamPiece::Text(v) if v == "hello"));
         assert!(matches!(&pieces[1], StreamPiece::ToolCall { name, .. } if name == "read_file"));
+    }
+    #[test]
+    fn anthropic_thinking_stream_and_message_are_separate_from_answer() {
+        let mut parser = ModelEventParser::default();
+        assert_eq!(parser.accept(serde_json::json!({"type":"content_block_start","content_block":{"type":"thinking","thinking":"检查"}})).unwrap(), vec![StreamPiece::Reasoning("检查".into())]);
+        assert_eq!(parser.accept(serde_json::json!({"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"代码"}})).unwrap(), vec![StreamPiece::Reasoning("代码".into())]);
+        assert_eq!(parser.accept(serde_json::json!({"type":"content_block_delta","delta":{"type":"text_delta","text":"完成"}})).unwrap(), vec![StreamPiece::Text("完成".into())]);
+        let pieces = parse_stream_body(r#"{"type":"message","content":[{"type":"thinking","thinking":"checking"},{"type":"text","text":"done"}]}"#).unwrap();
+        assert_eq!(
+            pieces,
+            vec![
+                StreamPiece::Reasoning("checking".into()),
+                StreamPiece::Text("done".into())
+            ]
+        );
+    }
+
+    #[test]
+    fn tagged_reasoning_splits_unicode_and_fragmented_delimiters() {
+        let mut parser = ModelEventParser::default();
+        let mut pieces = Vec::new();
+        for text in ["<thi", "nk>检查", "代码</th", "ink>答复"] {
+            pieces.extend(
+                parser
+                    .accept(serde_json::json!({"choices":[{"delta":{"content":text}}]}))
+                    .unwrap(),
+            );
+        }
+        pieces.extend(parser.finish().unwrap());
+        assert_eq!(
+            pieces,
+            vec![
+                StreamPiece::Reasoning("检查".into()),
+                StreamPiece::Reasoning("代码".into()),
+                StreamPiece::Text("答复".into())
+            ]
+        );
+        assert_eq!(parser.text, "答复");
     }
 }

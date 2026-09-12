@@ -544,3 +544,33 @@ async fn model_switch_rejects_a_busy_session() {
     session.cancel().await.unwrap();
     prompt.await.unwrap().unwrap();
 }
+
+#[tokio::test]
+async fn reasoning_stream_is_forwarded_once_in_order_without_entering_answer_history() {
+    let (session, mut updates) = session_with_stream(Arc::new(FakeModelStream::new(vec![vec![
+        StreamPiece::Reasoning("reasoning-one ".into()),
+        StreamPiece::Reasoning("reasoning-two".into()),
+        StreamPiece::Text("final-answer".into()),
+    ]])));
+    let outcome = session.prompt("question".into()).await.unwrap();
+    assert_eq!(
+        outcome,
+        RuntimePromptOutcome::Complete {
+            text: "final-answer".into()
+        }
+    );
+    let events = std::iter::from_fn(|| updates.try_recv().ok())
+        .filter(|event| {
+            event["method"] == "session/reasoning" || event["method"] == "session/update"
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(events.len(), 3);
+    assert_eq!(events[0]["method"], "session/reasoning");
+    assert_eq!(events[0]["params"]["delta"], "reasoning-one ");
+    assert_eq!(events[1]["params"]["delta"], "reasoning-two");
+    assert_eq!(events[2]["method"], "session/update");
+    let history = format!("{:?}", session.history_snapshot().await);
+    assert!(!history.contains("reasoning-one"));
+    assert!(!history.contains("reasoning-two"));
+    assert!(history.contains("final-answer"));
+}

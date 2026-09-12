@@ -107,8 +107,29 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         description_zh: "退出（别名）",
         description_en: "Exit (alias)",
     },
+    SlashCommand {
+        name: "/skills",
+        description_zh: "浏览可用技能 · 名称与参数",
+        description_en: "Browse skills · names and arguments",
+    },
+    SlashCommand {
+        name: "/skill",
+        description_zh: "调用技能 <名称> [参数]",
+        description_en: "Run skill <name> [arguments]",
+    },
+    SlashCommand {
+        name: "/files",
+        description_zh: "搜索项目文件 · @",
+        description_en: "Find project files · @",
+    },
+    SlashCommand {
+        name: "/workflows",
+        description_zh: "列出可用工作流",
+        description_en: "List available workflows",
+    },
 ];
 
+#[cfg(test)]
 pub fn matches(input: &str) -> Vec<&'static SlashCommand> {
     if input.is_empty() || !input.starts_with('/') || input.chars().any(char::is_whitespace) {
         return Vec::new();
@@ -135,7 +156,7 @@ mod tests {
     #[test]
     fn slash_lists_every_command_and_alias() {
         let all = matches("/");
-        assert_eq!(all.len(), 18);
+        assert_eq!(all.len(), SLASH_COMMANDS.len());
         assert!(all.iter().any(|command| command.name == "/language"));
         assert!(all.iter().any(|command| command.name == "/quit"));
         assert_eq!(all.len(), SLASH_COMMANDS.len());

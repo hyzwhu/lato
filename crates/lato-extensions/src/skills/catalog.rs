@@ -83,6 +83,14 @@ impl SkillCatalog {
         })
     }
 
+    /// User-visible skills from the same immutable catalog used for invocation.
+    pub fn user_skills(&self) -> impl Iterator<Item = (&str, &DiscoveredSkill)> {
+        self.by_qualified
+            .iter()
+            .filter(|(_, skill)| skill.user_invocable)
+            .map(|(name, skill)| (name.as_str(), skill.as_ref()))
+    }
+
     pub fn generation(&self) -> u64 {
         self.generation
     }

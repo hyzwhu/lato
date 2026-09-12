@@ -16,7 +16,7 @@ use lato_core::{
 use lato_extensions::{
     PluginSnapshot,
     hooks::materialize_hooks,
-    materialize_mcp,
+    materialize_mcp, materialize_workflows,
     skills::{SkillCatalog, discover_skills},
 };
 use lato_runtime::{
@@ -584,6 +584,56 @@ impl RuntimeSession {
         })
     }
 
+    pub async fn list_skills(&self) -> serde_json::Value {
+        let state = self.plugin_state.lock().await;
+        let catalog = &state.current_skills;
+        let skills: Vec<_> = catalog.user_skills().map(|(qualified, skill)| serde_json::json!({
+            "qualifiedName": qualified, "name": skill.name, "description": skill.description,
+            "argumentHint": skill.argument_hint, "source": skill.source_path.to_string_lossy(),
+        })).collect();
+        serde_json::json!({"generation": catalog.generation(), "skills": skills})
+    }
+
+    pub async fn list_workflows(&self) -> serde_json::Value {
+        let state = self.plugin_state.lock().await;
+        let set = materialize_workflows(&state.current);
+        let workflows: Vec<_> = set
+            .workflows
+            .iter()
+            .map(|workflow| {
+                serde_json::json!({
+                    "id": workflow.id,
+                    "name": workflow.name,
+                    "description": workflow.description,
+                    "steps": workflow.steps.len(),
+                    "agentBudget": workflow.agent_budget,
+                })
+            })
+            .collect();
+        serde_json::json!({"generation": set.generation, "workflows": workflows})
+    }
+
+    pub async fn prompt_skill(
+        &self,
+        name: String,
+        args: Option<String>,
+    ) -> Result<RuntimePromptOutcome, AgentError> {
+        self.prompt_skill_with_context(name, args, None).await
+    }
+
+    /// Additional user context is appended after skill expansion, so positional
+    /// argument templates cannot drop file attachments or change their contents.
+    pub async fn prompt_skill_with_context(
+        &self,
+        name: String,
+        args: Option<String>,
+        context: Option<String>,
+    ) -> Result<RuntimePromptOutcome, AgentError> {
+        self.ensure_observation_open()?;
+        self.prompt_with_skill(String::new(), Some((name, args, context)))
+            .await
+    }
+
     pub async fn prompt(&self, input: String) -> Result<RuntimePromptOutcome, AgentError> {
         self.ensure_observation_open()?;
         self.prompt_after_outer_observation_check(input).await
@@ -604,6 +654,14 @@ impl RuntimeSession {
         &self,
         input: String,
     ) -> Result<RuntimePromptOutcome, AgentError> {
+        self.prompt_with_skill(input, None).await
+    }
+
+    async fn prompt_with_skill(
+        &self,
+        mut input: String,
+        skill: Option<(String, Option<String>, Option<String>)>,
+    ) -> Result<RuntimePromptOutcome, AgentError> {
         // Locking before subscribing prevents a waiting prompt from consuming
         // another prompt's start event while preserving subscribe-before-submit.
         let gate = self.submission_gate.lock().await;
@@ -623,6 +681,37 @@ impl RuntimeSession {
             cleanup.disarm();
             return Err(error);
         }
+        let invocation = if let Some((name, args, context)) = skill {
+            let catalog = Arc::clone(&self.plugin_state.lock().await.current_skills);
+            match catalog.invoke(
+                lato_core::SkillInvocationOrigin::User,
+                &name,
+                args.as_deref(),
+                self.session_id.as_str(),
+            ) {
+                Ok(invocation) => {
+                    input = invocation.message.clone();
+                    if let Some(context) = context.filter(|context| !context.is_empty()) {
+                        input.push_str("\n\n");
+                        input.push_str(&context);
+                    }
+                    Some(invocation)
+                }
+                Err(error) => {
+                    self.abort_plugin_turn().await;
+                    cleanup.disarm();
+                    let error = crate::skills::skill_error(error);
+                    return Err(AgentError::new(
+                        error.code,
+                        ErrorCategory::Policy,
+                        error.message,
+                        Retryability::Never,
+                    ));
+                }
+            }
+        } else {
+            None
+        };
         let hook_gate = self.driver.gate_prompt_hook(&input).await;
         for audit in hook_gate.audits {
             if let Err(error) = self
@@ -644,6 +733,18 @@ impl RuntimeSession {
                 message,
                 Retryability::Never,
             ));
+        }
+        if let Some(invocation) = &invocation {
+            if let Err(error) = self.driver.bind_user_skill(invocation).await {
+                self.abort_plugin_turn().await;
+                cleanup.disarm();
+                return Err(AgentError::new(
+                    error.code,
+                    ErrorCategory::Policy,
+                    error.message,
+                    Retryability::Never,
+                ));
+            }
         }
         let mut events = self.handle.subscribe();
         if let Err(error) = self

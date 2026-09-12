@@ -6,6 +6,40 @@ use std::sync::Arc;
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct SkillEntry {
+    pub qualified_name: String,
+    pub name: String,
+    pub description: String,
+    pub argument_hint: Option<String>,
+    pub source: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillListResponse {
+    pub generation: u64,
+    pub skills: Vec<SkillEntry>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkflowEntry {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub steps: u64,
+    pub agent_budget: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkflowListResponse {
+    pub generation: u64,
+    pub workflows: Vec<WorkflowEntry>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SessionSummary {
     pub session_id: String,
     pub title: String,
@@ -370,17 +404,81 @@ impl InteractiveAcpClient {
         })
     }
 
+    pub async fn list_workflows(&mut self) -> Result<WorkflowListResponse, String> {
+        let id = self.take_id();
+        let response = self
+            .host
+            .handle(req(
+                id,
+                "lato/session/workflows",
+                serde_json::json!({"sessionId": self.session_id}),
+            ))
+            .await
+            .ok_or("no response")?;
+        serde_json::from_value(response_result(&response)?.clone())
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn list_skills(&mut self) -> Result<SkillListResponse, String> {
+        let id = self.take_id();
+        let response = self
+            .host
+            .handle(req(
+                id,
+                "lato/session/skills",
+                serde_json::json!({"sessionId": self.session_id}),
+            ))
+            .await
+            .ok_or("no response")?;
+        serde_json::from_value(response_result(&response)?.clone())
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn send_skill_streaming(
+        &mut self,
+        name: String,
+        args: Option<String>,
+        on_event: impl FnMut(&serde_json::Value),
+    ) -> Result<String, String> {
+        self.send_skill_streaming_with_context(name, args, None, on_event)
+            .await
+    }
+
+    pub async fn send_skill_streaming_with_context(
+        &mut self,
+        name: String,
+        args: Option<String>,
+        context: Option<String>,
+        on_event: impl FnMut(&serde_json::Value),
+    ) -> Result<String, String> {
+        self.send_request_streaming(
+            "lato/session/skill",
+            serde_json::json!({"sessionId": self.session_id, "name": name, "args": args, "context": context}),
+            on_event,
+        ).await
+    }
+
     pub async fn send_streaming(
         &mut self,
         text: String,
+        on_event: impl FnMut(&serde_json::Value),
+    ) -> Result<String, String> {
+        self.send_request_streaming(
+            "session/prompt",
+            serde_json::json!({"sessionId": self.session_id, "text": text}),
+            on_event,
+        )
+        .await
+    }
+
+    async fn send_request_streaming(
+        &mut self,
+        method: &str,
+        params: serde_json::Value,
         mut on_event: impl FnMut(&serde_json::Value),
     ) -> Result<String, String> {
         let id = self.take_id();
-        let request = req(
-            id,
-            "session/prompt",
-            serde_json::json!({"sessionId": self.session_id, "text": text}),
-        );
+        let request = req(id, method, params);
         let host = &mut self.host;
         let updates = &mut self.updates;
         let mut response_future = Box::pin(host.handle(request));
@@ -761,6 +859,55 @@ mod tests {
                 ClientUpdate::RecoverySuppression(value.into())
             );
         }
+    }
+
+    #[tokio::test]
+    async fn user_skill_client_lists_catalog_and_streams_explicit_invocation() {
+        use super::*;
+        let workspace = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let plugin = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(plugin.path().join("skills/inspect")).unwrap();
+        std::fs::write(
+            plugin.path().join("plugin.json"),
+            r#"{"name":"demo","skills":"skills"}"#,
+        )
+        .unwrap();
+        std::fs::write(plugin.path().join("skills/inspect/SKILL.md"), "---\nname: inspect\ndescription: Inspect a file.\nargument-hint: <file>\ndisable-model-invocation: true\n---\nInspect $ARGUMENTS.").unwrap();
+        let mut client = InteractiveAcpClient::new_session_with_approval(
+            workspace.path().to_path_buf(),
+            home.path().to_path_buf(),
+            SessionTrust::for_headless_prompt(workspace.path()),
+            default_fake_stream(),
+            None,
+            vec![plugin.path().to_path_buf()],
+        )
+        .await
+        .unwrap();
+        let listing = client.list_skills().await.unwrap();
+        assert_eq!(listing.skills.len(), 1);
+        assert_eq!(listing.skills[0].qualified_name, "demo:inspect");
+        assert_eq!(listing.skills[0].argument_hint.as_deref(), Some("<file>"));
+        let mut events = Vec::new();
+        assert_eq!(
+            client
+                .send_skill_streaming_with_context(
+                    "demo:inspect".into(),
+                    Some("目标.rs".into()),
+                    Some("<file>目标</file>".into()),
+                    |event| { events.push(event.clone()) }
+                )
+                .await
+                .unwrap(),
+            "hi"
+        );
+        assert!(!events.is_empty());
+        assert!(
+            client
+                .send_skill_streaming("missing".into(), None, |_| {})
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

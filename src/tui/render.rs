@@ -4,7 +4,7 @@ use super::{
 };
 use ratatui::{
     Frame,
-    layout::{Constraint, Direction, Layout},
+    layout::{Constraint, Layout},
     widgets::Block,
 };
 
@@ -19,13 +19,15 @@ pub fn render(frame: &mut Frame<'_>, app: &mut AppState) {
     }
     match app.screen {
         Screen::Welcome => {
-            widgets::welcome(frame, frame.area(), app);
+            let mut welcome_area = frame.area();
+            welcome_area.height = welcome_area.height.saturating_sub(3);
+            widgets::welcome(frame, welcome_area, app);
             let footer = frame.area();
             let footer = ratatui::layout::Rect::new(
                 footer.x,
-                footer.bottom().saturating_sub(1),
+                footer.bottom().saturating_sub(3),
                 footer.width,
-                1,
+                3,
             );
             widgets::footer(frame, footer, app);
         }
@@ -40,39 +42,25 @@ pub fn render(frame: &mut Frame<'_>, app: &mut AppState) {
 }
 
 fn main(frame: &mut Frame<'_>, app: &mut AppState) {
-    let rows = Layout::vertical([Constraint::Min(5), Constraint::Length(1)]).split(frame.area());
-    match app.layout {
-        LayoutMode::Wide => {
-            let columns = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([
-                    Constraint::Percentage(20),
-                    Constraint::Percentage(55),
-                    Constraint::Percentage(25),
-                ])
-                .split(rows[0]);
+    let rows = Layout::vertical([Constraint::Min(5), Constraint::Length(3)]).split(frame.area());
+    match (app.layout, app.focus) {
+        (LayoutMode::TooSmall, _) => unreachable!("handled by render"),
+        (_, Focus::Chat) => widgets::chat(frame, rows[0], app),
+        (LayoutMode::Narrow, Focus::Sessions) => widgets::sessions(frame, rows[0], app),
+        (LayoutMode::Narrow, Focus::Tools) => widgets::tools(frame, rows[0], app),
+        (_, Focus::Sessions) => {
+            let columns =
+                Layout::horizontal([Constraint::Length(28), Constraint::Min(40)]).split(rows[0]);
             widgets::sessions(frame, columns[0], app);
             widgets::chat(frame, columns[1], app);
-            widgets::tools(frame, columns[2], app);
         }
-        LayoutMode::Medium => {
+        (_, Focus::Tools) => {
             let columns =
-                Layout::horizontal([Constraint::Percentage(28), Constraint::Percentage(72)])
+                Layout::horizontal([Constraint::Percentage(45), Constraint::Percentage(55)])
                     .split(rows[0]);
-            if app.focus == Focus::Tools {
-                widgets::chat(frame, columns[0], app);
-                widgets::tools(frame, columns[1], app);
-            } else {
-                widgets::sessions(frame, columns[0], app);
-                widgets::chat(frame, columns[1], app);
-            }
+            widgets::chat(frame, columns[0], app);
+            widgets::tools(frame, columns[1], app);
         }
-        LayoutMode::Narrow => match app.focus {
-            Focus::Sessions => widgets::sessions(frame, rows[0], app),
-            Focus::Chat => widgets::chat(frame, rows[0], app),
-            Focus::Tools => widgets::tools(frame, rows[0], app),
-        },
-        LayoutMode::TooSmall => unreachable!("handled by render"),
     }
     widgets::footer(frame, rows[1], app);
 }
@@ -138,8 +126,8 @@ mod tests {
 
     #[test]
     fn narrow_slash_completion_keeps_selected_command_and_composer_visible() {
-        let text = render_text_with_input(Language::En, 60, 24, true, "/", 17);
-        assert!(text.contains("/quit"), "{text}");
+        let text = render_text_with_input(Language::En, 60, 24, true, "/", 18);
+        assert!(text.contains("/files"), "{text}");
         assert!(text.contains("› /"), "{text}");
     }
 
@@ -181,10 +169,10 @@ mod tests {
     }
 
     #[test]
-    fn chinese_wide_layout_renders_three_panels() {
+    fn chinese_wide_layout_prioritizes_chat() {
         let text = render_text(Language::ZhCn, 120, 30, true);
-        assert!(text.contains("会 话"), "{text}");
-        assert!(text.contains("工 具 调 用"));
+        assert!(!text.contains("工 具 调 用"));
+        assert!(text.contains("/skills"));
         assert!(text.contains("输 入 消 息"));
     }
 

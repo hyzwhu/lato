@@ -608,22 +608,59 @@ impl AcpHost {
                 self.sessions.insert(sid.clone(), session);
                 Some(ok(id, serde_json::json!({"sessionId": sid})))
             }
-            "session/prompt" => {
+            "lato/session/skills" => {
+                let p = req.params.unwrap_or_default();
+                let sid = p.get("sessionId").and_then(|v| v.as_str()).unwrap_or("s1");
+                let Some(session) = self.sessions.get(sid) else {
+                    return Some(err(id, -32000, "unknown session"));
+                };
+                Some(ok(id, session.list_skills().await))
+            }
+            "lato/session/workflows" => {
+                let p = req.params.unwrap_or_default();
+                let sid = p.get("sessionId").and_then(|v| v.as_str()).unwrap_or("s1");
+                let Some(session) = self.sessions.get(sid) else {
+                    return Some(err(id, -32000, "unknown session"));
+                };
+                Some(ok(id, session.list_workflows().await))
+            }
+            "session/prompt" | "lato/session/skill" => {
+                let is_skill = req.method == "lato/session/skill";
                 self.prompts_via_acp += 1;
                 let p = req.params.unwrap_or_default();
                 let sid = p.get("sessionId").and_then(|v| v.as_str()).unwrap_or("s1");
-                let text = p
-                    .get("text")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
+                let text = if is_skill {
+                    let name = p.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                    let args = p.get("args").and_then(|v| v.as_str()).unwrap_or("");
+                    format!("/skill {name} {args}").trim_end().to_owned()
+                } else {
+                    p.get("text")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_owned()
+                };
                 let Some(session) = self.sessions.get(sid).cloned() else {
                     return Some(err(id, -32000, "unknown session"));
                 };
                 if self.trust.mode == ApprovalMode::Ask && text.contains("tool") {
                     let _ = self.updates.send(serde_json::json!({"jsonrpc":"2.0","id":format!("permission-{sid}"),"method":"session/request_permission","params":{"sessionId": sid,"options":["allow_once","allow_session","deny","cancel"]}}));
                 }
-                let outcome = session.prompt(text.clone()).await;
+                let outcome = if is_skill {
+                    let Some(name) = p
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .filter(|name| !name.trim().is_empty())
+                    else {
+                        return Some(err(id, -32602, "skill name is required"));
+                    };
+                    let args = p.get("args").and_then(|v| v.as_str()).map(str::to_owned);
+                    let context = p.get("context").and_then(|v| v.as_str()).map(str::to_owned);
+                    session
+                        .prompt_skill_with_context(name.to_owned(), args, context)
+                        .await
+                } else {
+                    session.prompt(text.clone()).await
+                };
                 self.session_plugins
                     .adopt(SessionId::from(sid), session.plugin_snapshot().await)
                     .await;

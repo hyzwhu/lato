@@ -82,7 +82,7 @@ pub enum WorkflowCommand {
     name = "lato",
     version,
     about = "Public Beta coding agent",
-    after_help = "Run without arguments for the interactive coding CLI.\n\nInteractive: lato [--sandbox off|workspace|read-only]\nResume: lato resume ID [--sandbox off|workspace|read-only]\nHeadless: lato -p [--ask] [--sandbox off|workspace|read-only] [--model provider/model] TEXT\nWorkflows: lato workflow list|run ID [--plugin-dir PATH]\nDoctor: lato doctor [--json] [--strict] [--live]"
+    after_help = "Run without arguments for the interactive coding CLI.\n\nInteractive: lato [--sandbox off|workspace|read-only]\nResume: lato resume ID|TITLE [--sandbox off|workspace|read-only]\nHeadless: lato -p [--ask] [--sandbox off|workspace|read-only] [--model provider/model] TEXT\nWorkflows: lato workflow list|run ID [--plugin-dir PATH]\nDoctor: lato doctor [--json] [--strict] [--live]"
 )]
 struct Cli {
     /// Interface language for interactive mode
@@ -132,8 +132,11 @@ enum Command {
         #[command(subcommand)]
         action: Option<SessionsAction>,
     },
-    /// Resume a persisted session in interactive mode
-    Resume { session_id: String },
+    /// Resume a persisted session by exact ID or exact title
+    Resume {
+        #[arg(value_name = "REFERENCE")]
+        session_id: String,
+    },
     /// Store a provider credential
     #[command(group(
         ArgGroup::new("method")

@@ -13,6 +13,9 @@ pub const METHODS_IMPLEMENTED: &[&str] = &[
     "session/set_model",
     "lato/session/info",
     "lato/session/compact",
+    "lato/session/skills",
+    "lato/session/skill",
+    "lato/session/workflows",
     "lato/session/list",
     "lato/session/rename",
     "lato/session/delete",
@@ -50,6 +53,18 @@ mod tests {
             METHODS_IMPLEMENTED
                 .iter()
                 .filter(|method| **method == "lato/plugins/reload")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn session_workflows_is_advertised() {
+        assert!(is_implemented("lato/session/workflows"));
+        assert_eq!(
+            METHODS_IMPLEMENTED
+                .iter()
+                .filter(|method| **method == "lato/session/workflows")
                 .count(),
             1
         );

@@ -141,7 +141,7 @@ impl SkillResolver for SessionSkillHandle {
     }
 }
 
-fn skill_error(error: SkillInvokeError) -> ToolError {
+pub(crate) fn skill_error(error: SkillInvokeError) -> ToolError {
     let code = match &error {
         SkillInvokeError::NotFound { .. } => "skill.not_found",
         SkillInvokeError::Ambiguous { .. } => "skill.ambiguous",

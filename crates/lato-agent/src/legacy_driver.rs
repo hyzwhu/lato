@@ -208,6 +208,13 @@ impl LegacyTurnDriver {
         *self.state.lock().await.actor.history_mut() = history;
     }
 
+    pub async fn bind_user_skill(
+        &self,
+        invocation: &lato_extensions::skills::SkillInvocation,
+    ) -> Result<(), lato_core::ToolError> {
+        self.state.lock().await.actor.bind_user_skill(invocation)
+    }
+
     pub async fn bind_turn_skills(&self, catalog: Arc<SkillCatalog>) {
         self.state
             .lock()
@@ -792,12 +799,15 @@ fn forward_actor_event(
     passthrough: &mpsc::UnboundedSender<serde_json::Value>,
     actor_event: serde_json::Value,
 ) -> Result<(), AgentError> {
-    if actor_event.get("method").and_then(|value| value.as_str()) == Some("session/update")
-        && let Some(delta) = actor_event
-            .pointer("/params/delta")
-            .and_then(|value| value.as_str())
+    if let Some(delta) = actor_event
+        .pointer("/params/delta")
+        .and_then(|value| value.as_str())
     {
-        return events.model_delta(delta);
+        match actor_event.get("method").and_then(|value| value.as_str()) {
+            Some("session/update") => return events.model_delta(delta),
+            Some("session/reasoning") => return events.reasoning_delta(delta),
+            _ => {}
+        }
     }
     let _ = passthrough.send(actor_event);
     Ok(())

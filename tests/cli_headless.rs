@@ -82,16 +82,101 @@ fn sessions_are_listed_newest_first() {
 }
 
 #[test]
-fn resume_requires_a_tty() {
+fn resume_unknown_reference_reports_no_match_before_tty_setup() {
     let home = tempfile::tempdir().unwrap();
+    for reference in ["s1700000000000-1", "Missing Title"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_lato"))
+            .env("LATO_HOME", home.path())
+            .args(["resume", reference])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1), "{reference}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("no session has the supplied ID or title"),
+            "{reference}"
+        );
+    }
+    let sessions = home.path().join("sessions");
+    let created = sessions
+        .exists()
+        .then(|| std::fs::read_dir(&sessions).unwrap().count())
+        .unwrap_or(0);
+    assert_eq!(created, 0, "unknown resume must not create a session");
+}
+
+fn first_session_id(home: &std::path::Path) -> String {
+    let output = Command::new(env!("CARGO_BIN_EXE_lato"))
+        .env("LATO_HOME", home)
+        .args(["sessions", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let body: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    body["sessions"][0]["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+#[test]
+fn resume_existing_id_requires_a_tty() {
+    let home = tempfile::tempdir().unwrap();
+    let prompt = Command::new(env!("CARGO_BIN_EXE_lato"))
+        .env("LATO_HOME", home.path())
+        .args(["-p", "reply with hi only"])
+        .output()
+        .unwrap();
+    assert!(
+        prompt.status.success(),
+        "{}",
+        String::from_utf8_lossy(&prompt.stderr)
+    );
+    let session_id = first_session_id(home.path());
     let output = Command::new(env!("CARGO_BIN_EXE_lato"))
         .env("LATO_HOME", home.path())
-        .args(["resume", "s1700000000000-1"])
+        .args(["resume", &session_id])
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&output.stderr).contains("resume requires a tty"));
-    assert!(!home.path().join("sessions").exists());
+}
+
+#[test]
+fn resume_unique_title_requires_a_tty() {
+    let home = tempfile::tempdir().unwrap();
+    let prompt = Command::new(env!("CARGO_BIN_EXE_lato"))
+        .env("LATO_HOME", home.path())
+        .args(["-p", "reply with hi only"])
+        .output()
+        .unwrap();
+    assert!(
+        prompt.status.success(),
+        "{}",
+        String::from_utf8_lossy(&prompt.stderr)
+    );
+    let session_id = first_session_id(home.path());
+    let renamed = Command::new(env!("CARGO_BIN_EXE_lato"))
+        .env("LATO_HOME", home.path())
+        .args(["sessions", "rename", &session_id, "Exact Title"])
+        .output()
+        .unwrap();
+    assert!(
+        renamed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&renamed.stderr)
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_lato"))
+        .env("LATO_HOME", home.path())
+        .args(["resume", "Exact Title"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("resume requires a tty"));
 }
 
 #[test]

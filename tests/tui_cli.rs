@@ -12,6 +12,7 @@ fn help_advertises_the_bilingual_interactive_interface() {
     assert!(help.contains("zh-CN"), "{help}");
     assert!(help.contains("--sandbox"), "{help}");
     assert!(help.contains("Interactive: lato [--sandbox"), "{help}");
+    assert!(help.contains("lato resume ID|TITLE"), "{help}");
 }
 
 #[test]
@@ -41,9 +42,31 @@ fn interactive_mode_still_fails_cleanly_without_a_tty() {
 #[test]
 fn sandbox_option_reaches_interactive_startup_for_new_and_resumed_sessions() {
     let home = tempfile::tempdir().unwrap();
+    let created = Command::new(env!("CARGO_BIN_EXE_lato"))
+        .env("LATO_HOME", home.path())
+        .args(["-p", "reply with hi only"])
+        .output()
+        .unwrap();
+    assert!(
+        created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let listed = Command::new(env!("CARGO_BIN_EXE_lato"))
+        .env("LATO_HOME", home.path())
+        .args(["sessions", "--json"])
+        .output()
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+    let session_id = body["sessions"][0]["sessionId"].as_str().unwrap();
     for args in [
-        vec!["--sandbox", "off"],
-        vec!["resume", "session-1", "--sandbox", "read-only"],
+        vec!["--sandbox".into(), "off".into()],
+        vec![
+            "resume".into(),
+            session_id.to_string(),
+            "--sandbox".into(),
+            "read-only".into(),
+        ],
     ] {
         let output = Command::new(env!("CARGO_BIN_EXE_lato"))
             .env("LATO_HOME", home.path())

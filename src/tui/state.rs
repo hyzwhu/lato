@@ -1,7 +1,6 @@
 use super::{
     TuiExit,
     backend::{BackendCommand, BackendEvent},
-    commands::{self, SlashCommand},
     i18n::Language,
     input::InputBuffer,
     tool_panel::ToolPanelState,
@@ -177,6 +176,26 @@ pub struct ApprovalState {
     pub response: tokio::sync::oneshot::Sender<bool>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum GenerationPhase {
+    #[default]
+    Idle,
+    Waiting,
+    Thinking,
+    Tools,
+    Answering,
+    Completed,
+    Cancelled,
+    Failed,
+}
+
+#[derive(Debug)]
+pub struct ReasoningSegment {
+    pub message_index: usize,
+    pub started_at: Instant,
+    pub duration: Option<Duration>,
+}
+
 #[derive(Debug)]
 pub struct AppState {
     pub screen: Screen,
@@ -190,6 +209,18 @@ pub struct AppState {
     pub tool_panel: ToolPanelState,
     pub composer: InputBuffer,
     pub search: InputBuffer,
+    pub palette_query: InputBuffer,
+    pub files: Vec<String>,
+    pub files_loading: bool,
+    pub files_error: Option<String>,
+    pub skills: Vec<crate::client::SkillEntry>,
+    pub skills_error: Option<String>,
+    pub skills_loading: bool,
+    pub workflows: Vec<crate::client::WorkflowEntry>,
+    pub history: Vec<String>,
+    pub history_index: Option<usize>,
+    pub history_draft: String,
+    pub parked_draft: Option<String>,
     pub focus: Focus,
     pub overlay: Option<Overlay>,
     pub palette_index: usize,
@@ -198,6 +229,12 @@ pub struct AppState {
     pub approval: Option<ApprovalState>,
     pub layout: LayoutMode,
     pub responding: bool,
+    pub generation_phase: GenerationPhase,
+    pub reasoning_segments: Vec<ReasoningSegment>,
+    pub active_reasoning: Option<usize>,
+    pub reveal_reasoning: Option<usize>,
+    pub turn_message_start: usize,
+    pub animation_frame: usize,
     pub compaction: CompactionUiState,
     pub context_usage: Option<ContextUiState>,
     pub recovery_suppression: String,
@@ -205,6 +242,7 @@ pub struct AppState {
     pub elapsed_seconds: u64,
     pub error: Option<String>,
     pub scroll: u16,
+    pub scroll_max: u16,
     pub session_index: usize,
     pub armed_session_delete: Option<(String, Instant)>,
     pub should_exit: bool,
@@ -239,6 +277,8 @@ pub enum Effect {
     RenameSession { session_id: String, title: String },
     ConfirmDeleteSession(String),
     Login,
+    PrepareSubmit(String),
+    PrepareSkill { name: String, args: String },
 }
 
 impl AppState {
@@ -269,6 +309,18 @@ impl AppState {
             tool_panel: ToolPanelState::default(),
             composer: InputBuffer::new(),
             search: InputBuffer::new(),
+            palette_query: InputBuffer::new(),
+            files: Vec::new(),
+            files_loading: false,
+            files_error: None,
+            skills: Vec::new(),
+            skills_loading: true,
+            skills_error: None,
+            workflows: Vec::new(),
+            history: Vec::new(),
+            history_index: None,
+            history_draft: String::new(),
+            parked_draft: None,
             focus: Focus::Chat,
             overlay: None,
             palette_index: 0,
@@ -277,6 +329,12 @@ impl AppState {
             approval: None,
             layout: LayoutMode::Wide,
             responding: false,
+            generation_phase: GenerationPhase::Idle,
+            reasoning_segments: Vec::new(),
+            active_reasoning: None,
+            reveal_reasoning: None,
+            turn_message_start: 0,
+            animation_frame: 0,
             compaction: CompactionUiState::Idle,
             context_usage: None,
             recovery_suppression: "none".into(),
@@ -284,6 +342,7 @@ impl AppState {
             elapsed_seconds: 0,
             error: None,
             scroll: 0,
+            scroll_max: 0,
             session_index: 0,
             armed_session_delete: None,
             should_exit: false,
@@ -291,19 +350,22 @@ impl AppState {
         }
     }
 
-    pub fn slash_completion(&self) -> Vec<&'static SlashCommand> {
+    pub fn completion_dismissed(&self) -> bool {
+        self.slash_completion_dismissed
+    }
+
+    #[cfg(test)]
+    pub fn slash_completion(&self) -> Vec<&'static super::commands::SlashCommand> {
         if self.slash_completion_dismissed || self.focus != Focus::Chat {
             Vec::new()
         } else {
-            commands::matches(self.composer.as_str())
+            super::commands::matches(self.composer.as_str())
         }
     }
 
     pub fn refresh_slash_completion(&mut self) {
         self.slash_completion_dismissed = false;
-        let last = commands::matches(self.composer.as_str())
-            .len()
-            .saturating_sub(1);
+        let last = self.candidates().len().saturating_sub(1);
         self.slash_completion_index = self.slash_completion_index.min(last);
     }
 
@@ -382,6 +444,9 @@ impl AppState {
             AppEvent::Submit => self.submit(),
             AppEvent::Backend(BackendEvent::ModelSwitched(response)) => {
                 let selection = format!("{}/{}", response.provider, response.model);
+                if self.model != selection {
+                    self.context_usage = None;
+                }
                 self.model = selection.clone();
                 self.error = response.compaction_warning.map(|warning| warning.message);
                 vec![Effect::PersistModel(selection)]
@@ -391,6 +456,7 @@ impl AppState {
                 Vec::new()
             }
             AppEvent::Tick => {
+                self.animation_frame = self.animation_frame.wrapping_add(1);
                 if let Some(started) = self.response_started {
                     self.elapsed_seconds = started.elapsed().as_secs();
                 }
@@ -423,6 +489,8 @@ impl AppState {
                 Vec::new()
             }
             AppEvent::TogglePalette => {
+                self.palette_query.clear();
+                self.palette_index = 0;
                 self.overlay = if self.overlay == Some(Overlay::CommandPalette) {
                     None
                 } else {
@@ -457,9 +525,11 @@ impl AppState {
                     return Vec::new();
                 }
                 self.scroll = if delta.is_negative() {
-                    self.scroll.saturating_sub(delta.unsigned_abs())
+                    self.scroll
+                        .saturating_add(delta.unsigned_abs())
+                        .min(self.scroll_max)
                 } else {
-                    self.scroll.saturating_add(delta as u16)
+                    self.scroll.saturating_sub(delta as u16)
                 };
                 Vec::new()
             }
@@ -486,15 +556,76 @@ impl AppState {
         }
     }
 
-    fn submit(&mut self) -> Vec<Effect> {
-        if self.is_busy() || self.composer.is_empty() {
-            return Vec::new();
+    pub fn restore_parked_draft(&mut self) {
+        if self.composer.is_empty()
+            && let Some(draft) = self.parked_draft.take()
+        {
+            self.composer.replace(&draft);
+            self.refresh_slash_completion();
         }
+    }
+
+    pub fn recall_history(&mut self, delta: i32) {
+        if delta < 0 {
+            let index = match self.history_index {
+                None if !self.history.is_empty() => {
+                    self.history_draft = self.composer.as_str().to_string();
+                    self.history.len() - 1
+                }
+                Some(index) if !self.history.is_empty() => {
+                    index.saturating_sub(1).min(self.history.len() - 1)
+                }
+                _ => return,
+            };
+            self.history_index = Some(index);
+            self.composer.replace(&self.history[index]);
+        } else if let Some(index) = self.history_index {
+            if index + 1 < self.history.len() {
+                self.history_index = Some(index + 1);
+                self.composer.replace(&self.history[index + 1]);
+            } else {
+                self.history_index = None;
+                self.composer.replace(&self.history_draft);
+            }
+        }
+        self.refresh_slash_completion();
+    }
+
+    pub fn begin_skill(&mut self, name: String, args: Option<String>) -> Vec<Effect> {
+        if let Some(args) = &args
+            && args.contains('@')
+        {
+            return vec![Effect::PrepareSkill {
+                name,
+                args: args.clone(),
+            }];
+        }
+        self.begin_submit(BackendCommand::InvokeSkill {
+            name,
+            args,
+            context: None,
+        })
+    }
+
+    pub fn begin_submit(&mut self, command: BackendCommand) -> Vec<Effect> {
         let text = self.composer.clear();
+        if self.history.last() != Some(&text) {
+            self.history.push(text.clone());
+            if self.history.len() > 100 {
+                self.history.remove(0);
+            }
+        }
+        self.history_index = None;
+        self.history_draft.clear();
         self.screen = Screen::Main;
+        self.scroll = 0;
+        self.close_reasoning();
+        self.turn_message_start = self.messages.len();
+        self.generation_phase = GenerationPhase::Waiting;
+        self.animation_frame = 0;
         self.messages.push(Message {
             role: MessageRole::User,
-            content: text.clone(),
+            content: text,
             expanded: true,
         });
         self.messages.push(Message {
@@ -506,17 +637,59 @@ impl AppState {
         self.error = None;
         self.elapsed_seconds = 0;
         self.response_started = Some(Instant::now());
-        vec![Effect::Backend(BackendCommand::Submit(text))]
+        vec![Effect::Backend(command)]
+    }
+
+    fn submit(&mut self) -> Vec<Effect> {
+        if self.is_busy() || self.composer.is_empty() {
+            return Vec::new();
+        }
+        let text = self.composer.as_str().to_string();
+        if text.trim().is_empty() {
+            return Vec::new();
+        }
+        if text.contains('@') {
+            return vec![Effect::PrepareSubmit(text)];
+        }
+        self.begin_submit(BackendCommand::Submit(text))
     }
 
     fn apply_backend(&mut self, event: BackendEvent) {
         match event {
+            BackendEvent::Skills(response) => {
+                self.skills = response.skills;
+                self.skills_loading = false;
+                self.skills_error = None;
+            }
+            BackendEvent::SkillsError(error) => {
+                self.skills_loading = false;
+                self.skills_error = Some(error);
+            }
+            BackendEvent::Workflows(response) => {
+                self.workflows = response.workflows;
+                self.screen = Screen::Main;
+                self.messages.push(Message {
+                    role: MessageRole::System,
+                    content: workflow_list_message(self.language, &self.workflows),
+                    expanded: true,
+                });
+                self.scroll = 0;
+            }
+            BackendEvent::WorkflowsError(error) => {
+                self.error = Some(error);
+            }
             BackendEvent::SessionReady(id) => {
                 self.session_id = id;
             }
             BackendEvent::NewSessionCreated(id) => {
                 self.session_id = id;
                 self.messages.clear();
+                self.reasoning_segments.clear();
+                self.active_reasoning = None;
+                self.reveal_reasoning = None;
+                self.turn_message_start = 0;
+                self.generation_phase = GenerationPhase::Idle;
+                self.elapsed_seconds = 0;
                 self.tools.clear();
                 self.tool_panel = ToolPanelState::default();
                 self.composer.clear();
@@ -534,6 +707,12 @@ impl AppState {
                 self.session_id = id;
                 self.select_current_session();
                 self.messages.clear();
+                self.reasoning_segments.clear();
+                self.active_reasoning = None;
+                self.reveal_reasoning = None;
+                self.turn_message_start = 0;
+                self.generation_phase = GenerationPhase::Idle;
+                self.elapsed_seconds = 0;
                 self.tools.clear();
                 self.tool_panel = ToolPanelState::default();
                 self.scroll = 0;
@@ -571,6 +750,12 @@ impl AppState {
                 if let Some(replacement) = replacement_session_id {
                     self.session_id = replacement;
                     self.messages.clear();
+                    self.reasoning_segments.clear();
+                    self.active_reasoning = None;
+                    self.reveal_reasoning = None;
+                    self.turn_message_start = 0;
+                    self.generation_phase = GenerationPhase::Idle;
+                    self.elapsed_seconds = 0;
                     self.tools.clear();
                     self.tool_panel = ToolPanelState::default();
                     self.screen = Screen::Welcome;
@@ -588,22 +773,27 @@ impl AppState {
                 unreachable!("model switch acknowledgements are reduced before generic updates")
             }
             BackendEvent::TurnCompleted(text) => {
-                if let Some(message) = self
-                    .messages
-                    .iter_mut()
-                    .rev()
-                    .find(|message| message.role == MessageRole::Assistant)
-                    && message.content.is_empty()
+                if !text.is_empty()
+                    && !self.messages[self.turn_message_start.min(self.messages.len())..]
+                        .iter()
+                        .any(|message| {
+                            message.role == MessageRole::Assistant && !message.content.is_empty()
+                        })
                 {
-                    message.content = text;
+                    self.apply_update(ClientUpdate::TextDelta(text));
                 }
+                self.generation_phase = GenerationPhase::Completed;
                 self.finish_turn();
             }
             BackendEvent::TurnCancelled => {
+                self.generation_phase = GenerationPhase::Cancelled;
                 self.error = Some("cancelled".into());
                 self.finish_turn();
             }
             BackendEvent::Error(error) => {
+                if self.responding {
+                    self.generation_phase = GenerationPhase::Failed;
+                }
                 self.error = Some(error);
                 self.finish_turn();
             }
@@ -613,26 +803,48 @@ impl AppState {
     fn apply_update(&mut self, update: ClientUpdate) {
         match update {
             ClientUpdate::TextDelta(text) => {
-                if let Some(message) = self
-                    .messages
-                    .iter_mut()
-                    .rev()
-                    .find(|message| message.role == MessageRole::Assistant)
-                {
-                    message.content.push_str(&text);
+                if text.is_empty() {
+                    return;
                 }
-            }
-            ClientUpdate::ReasoningDelta(text) => {
+                self.close_reasoning();
+                self.generation_phase = GenerationPhase::Answering;
                 if let Some(message) = self.messages.last_mut()
-                    && message.role == MessageRole::Reasoning
+                    && message.role == MessageRole::Assistant
                 {
                     message.content.push_str(&text);
                 } else {
                     self.messages.push(Message {
+                        role: MessageRole::Assistant,
+                        content: text,
+                        expanded: true,
+                    });
+                }
+            }
+            ClientUpdate::ReasoningDelta(text) => {
+                if text.is_empty() {
+                    return;
+                }
+                self.generation_phase = GenerationPhase::Thinking;
+                if let Some(index) = self.active_reasoning {
+                    self.messages[index].content.push_str(&text);
+                } else {
+                    if self.messages.last().is_some_and(|message| {
+                        message.role == MessageRole::Assistant && message.content.is_empty()
+                    }) {
+                        self.messages.pop();
+                    }
+                    let index = self.messages.len();
+                    self.messages.push(Message {
                         role: MessageRole::Reasoning,
                         content: text,
-                        expanded: false,
+                        expanded: true,
                     });
+                    self.reasoning_segments.push(ReasoningSegment {
+                        message_index: index,
+                        started_at: Instant::now(),
+                        duration: None,
+                    });
+                    self.active_reasoning = Some(index);
                 }
             }
             ClientUpdate::ToolStarted {
@@ -640,6 +852,8 @@ impl AppState {
                 name,
                 arguments,
             } => {
+                self.close_reasoning();
+                self.generation_phase = GenerationPhase::Tools;
                 self.tools.push(ToolCard {
                     expanded: false,
                     id,
@@ -754,7 +968,11 @@ impl AppState {
                 model,
                 warning,
             } => {
-                self.model = format!("{provider}/{model}");
+                let selection = format!("{provider}/{model}");
+                if self.model != selection {
+                    self.context_usage = None;
+                }
+                self.model = selection;
                 self.error = warning.map(|warning| warning.message);
             }
             ClientUpdate::PermissionRequested | ClientUpdate::Unknown => {}
@@ -769,7 +987,45 @@ impl AppState {
         }
     }
 
+    pub fn toggle_reasoning(&mut self) {
+        let expand = self
+            .messages
+            .iter()
+            .any(|message| message.role == MessageRole::Reasoning && !message.expanded);
+        for message in &mut self.messages {
+            if message.role == MessageRole::Reasoning {
+                message.expanded = expand;
+            }
+        }
+        if expand {
+            self.reveal_reasoning = self
+                .messages
+                .iter()
+                .rposition(|message| message.role == MessageRole::Reasoning);
+        }
+    }
+
+    fn close_reasoning(&mut self) {
+        if let Some(index) = self.active_reasoning.take() {
+            if let Some(message) = self.messages.get_mut(index) {
+                message.expanded = false;
+            }
+            if let Some(segment) = self
+                .reasoning_segments
+                .iter_mut()
+                .rev()
+                .find(|segment| segment.message_index == index)
+            {
+                segment.duration = Some(segment.started_at.elapsed());
+            }
+        }
+    }
+
     fn finish_turn(&mut self) {
+        self.close_reasoning();
+        if let Some(started) = self.response_started {
+            self.elapsed_seconds = started.elapsed().as_secs();
+        }
         self.responding = false;
         self.response_started = None;
         for tool in &mut self.tools {
@@ -792,6 +1048,33 @@ impl AppState {
             CompactionUiState::Cancelled => "cancelled",
         }
     }
+}
+
+fn workflow_list_message(language: Language, workflows: &[crate::client::WorkflowEntry]) -> String {
+    if workflows.is_empty() {
+        return match language {
+            Language::ZhCn => "没有可用工作流。使用 --plugin-dir 加载受信任插件。".into(),
+            Language::En => {
+                "No materialized workflows. Use --plugin-dir with a trusted plugin.".into()
+            }
+        };
+    }
+    let mut lines = match language {
+        Language::ZhCn => vec!["可用工作流：".to_string()],
+        Language::En => vec!["Available workflows:".to_string()],
+    };
+    for workflow in workflows {
+        let description = if workflow.description.is_empty() {
+            "-"
+        } else {
+            workflow.description.as_str()
+        };
+        lines.push(format!(
+            "{}\t{}\t{} step(s)",
+            workflow.id, description, workflow.steps
+        ));
+    }
+    lines.join("\n")
 }
 
 fn compact_session_title(id: &str) -> String {

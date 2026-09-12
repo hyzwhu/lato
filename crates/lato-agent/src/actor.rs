@@ -99,6 +99,8 @@ pub struct SessionActor {
     skill_handle: Option<SessionSkillHandle>,
     mcp_handle: Option<SessionMcpHandle>,
     skill_listing: String,
+    user_skill_scope: Option<SkillToolScope>,
+    user_skill_audit: Option<ExtensionAuditRecord>,
     skill_catalog_audit: Option<ExtensionAuditRecord>,
     hook_runtime: Option<SessionHookRuntime>,
     session_id: SessionId,
@@ -179,6 +181,8 @@ impl SessionActor {
             skill_handle,
             mcp_handle,
             skill_listing: String::new(),
+            user_skill_scope: None,
+            user_skill_audit: None,
             skill_catalog_audit: None,
             hook_runtime: None,
             session_id: SessionId::from("local-session"),
@@ -221,7 +225,29 @@ impl SessionActor {
         self.journal_events = events;
     }
 
+    pub fn bind_user_skill(
+        &mut self,
+        invocation: &lato_extensions::skills::SkillInvocation,
+    ) -> Result<(), ToolError> {
+        self.user_skill_scope = invocation
+            .allowed_tools
+            .as_deref()
+            .map(|specs| SkillToolScope::compile(specs, &self.tool_runtime))
+            .transpose()?;
+        self.user_skill_audit = Some(ExtensionAuditRecord::SkillInvoked {
+            qualified_name: invocation.qualified_name.clone(),
+            origin: SkillInvocationOrigin::User,
+            body_hash: invocation.body_hash.clone(),
+            allowed_tools_hash: invocation.allowed_tools.as_ref().map(|specs| {
+                journal_request_hash("skill_allowed_tools", &serde_json::json!(specs.as_ref()))
+            }),
+        });
+        Ok(())
+    }
+
     pub async fn bind_turn_skills(&mut self, catalog: Arc<SkillCatalog>) {
+        self.user_skill_scope = None;
+        self.user_skill_audit = None;
         let Some(handle) = &self.skill_handle else {
             self.skill_listing.clear();
             self.skill_catalog_audit = None;
@@ -352,6 +378,13 @@ impl SessionActor {
             )
             .await?;
         }
+        if let Some(audit) = self.user_skill_audit.take() {
+            self.commit(
+                JournalRecord::ExtensionAudit { audit },
+                JournalDurability::Flush,
+            )
+            .await?;
+        }
         let mut sampling_steps = 0usize;
         let mut stop_continuations = 0usize;
         let mut no_tool_retry_used = false;
@@ -359,7 +392,7 @@ impl SessionActor {
         let mut force_workspace_tool = false;
         let mut repeated_calls: HashMap<String, usize> = HashMap::new();
         let mut recovery_budget = SamplingRecoveryBudget::default();
-        let mut next_skill_scope = None;
+        let mut next_skill_scope = self.user_skill_scope.take();
         loop {
             if self.cancelled || self.turn_cancellation.is_cancelled() {
                 self.active = false;
@@ -456,11 +489,23 @@ impl SessionActor {
                     return Ok(TurnOutcome::Cancelled);
                 }
                 match piece {
+                    StreamPiece::Reasoning(text) => {
+                        observed_output = true;
+                        // Reasoning is an ephemeral UI event, never answer/history text.
+                        if let Some((events, session_id)) = &self.events {
+                            let _ = events.send(serde_json::json!({"jsonrpc":"2.0","method":"session/reasoning","params":{"sessionId":session_id,"delta":text}}));
+                        }
+                    }
                     StreamPiece::Text(t) => {
                         observed_output = true;
                         round_text.push_str(&t);
                         self.history.push(HistoryItem::AssistantText(t.clone()));
-                        let visible = think_filter.push(&t);
+                        let (visible, reasoning) = think_filter.push_parts(&t);
+                        if !reasoning.is_empty()
+                            && let Some((events, session_id)) = &self.events
+                        {
+                            let _=events.send(serde_json::json!({"jsonrpc":"2.0","method":"session/reasoning","params":{"sessionId":session_id,"delta":reasoning}}));
+                        }
                         if visible.is_empty() {
                             continue;
                         }

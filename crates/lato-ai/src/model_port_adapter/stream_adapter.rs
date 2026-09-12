@@ -108,7 +108,15 @@ impl ModelStream for ModelPortStreamAdapter {
                     output_started = true;
                     merge_tool_delta(&mut pending_tools, delta)?;
                 }
-                Some(Ok(ModelStreamEvent::ReasoningDelta { .. })) => output_started = true,
+                Some(Ok(ModelStreamEvent::ReasoningDelta { text })) => {
+                    output_started = true;
+                    if !send_piece(&tx, StreamPiece::Reasoning(text)).await {
+                        return Ok(ModelCallReport {
+                            usage,
+                            generation: self.generation,
+                        });
+                    }
+                }
                 Some(Ok(ModelStreamEvent::Usage(current))) => {
                     output_started = true;
                     usage = Some(current);
@@ -599,7 +607,10 @@ mod tests {
 
             let error = adapter.stream(1, context(), tx).await.unwrap_err();
 
-            assert!(rx.recv().await.is_none());
+            if let Some(piece) = rx.recv().await {
+                assert!(matches!(piece, StreamPiece::Reasoning(text) if text == "working"));
+                assert!(rx.recv().await.is_none());
+            }
             assert_eq!(error.code, "model.stream_interrupted");
             assert_eq!(error.output_started, expected_output_started);
         }
@@ -625,5 +636,31 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(stream_dropped.load(Ordering::SeqCst));
+    }
+    #[tokio::test]
+    async fn forwards_canonical_reasoning_without_mixing_answer_text() {
+        let port = Arc::new(ScriptedPort {
+            request: Arc::new(Mutex::new(None)),
+            events: vec![
+                Ok(ModelStreamEvent::ReasoningDelta {
+                    text: "checking".into(),
+                }),
+                Ok(ModelStreamEvent::TextDelta {
+                    text: "done".into(),
+                }),
+                Ok(ModelStreamEvent::Completed {
+                    reason: ModelStopReason::Completed,
+                }),
+            ],
+        });
+        let adapter = ModelPortStreamAdapter::new(active(port));
+        let (tx, mut rx) = mpsc::channel(16);
+        adapter.stream(1, context(), tx).await.unwrap();
+        assert_eq!(
+            rx.recv().await,
+            Some(StreamPiece::Reasoning("checking".into()))
+        );
+        assert_eq!(rx.recv().await, Some(StreamPiece::Text("done".into())));
+        assert!(rx.recv().await.is_none());
     }
 }

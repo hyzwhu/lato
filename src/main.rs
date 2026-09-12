@@ -2,6 +2,7 @@ mod args;
 mod cli;
 mod client;
 mod permissions;
+mod resume;
 mod sessions;
 mod stdio;
 mod tui;

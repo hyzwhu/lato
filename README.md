@@ -67,12 +67,12 @@ lato --lang en
 Interactive commands:
 
 ```text
-/help  /new  /clear  /compact  /sessions  /rename  /delete  /model  /login  /doctor  /search  /lang  /approve  /status  /permissions  /exit
+/help  /new  /clear  /compact  /sessions  /rename  /delete  /model  /login  /doctor  /search  /lang  /approve  /status  /permissions  /skills  /skill  /files  /workflows  /exit
 ```
 
 Tool calls start collapsed, showing their name, status, and duration. Focus the Tool calls panel with Tab, select calls with Up/Down or j/k, and use Enter/Space to toggle details (Left collapses, Right expands). PgUp/PgDn scroll through full arguments and results; Home/End select the first/last call. A scrollbar shows the current position. Incoming calls preserve your place while you are inspecting the panel.
 
-Use Tab/Shift-Tab to move between panels, Up/Down to scroll the focused panel, Enter on a selected session to resume it, Cmd/Ctrl-K to open the command palette, Ctrl-F or `/search` to search, and Ctrl-C to cancel a streaming turn or exit while idle. In the session panel, press `r` to rename the selected session and press `d` twice within three seconds to delete it permanently. `/rename [title]` renames the current session, while `/delete` opens an explicit permanent-delete confirmation. `/model` and `/login` open dialogs inside the TUI. Type to filter providers and models, use arrow keys and Enter to choose, and press Esc to cancel. API keys are masked; OAuth URLs and device codes appear in the dialog. Successful model changes preserve the current session and conversation. `/sessions` opens a filterable session picker that matches titles and IDs; `/doctor` shows the offline diagnostic report in the conversation. Finish or cancel a response before changing models or sessions. The input cursor follows Unicode text and scrolls long input horizontally. The workspace starts untrusted. Mutating tool calls display their name and arguments and request approval exactly at the execution boundary. You can instead trust the workspace for the process or use `/approve` to pre-authorize one call. On smaller terminals, side panels collapse automatically so the conversation remains usable.
+Use Tab/Shift-Tab to move between panels, Up/Down to scroll the focused panel, Enter on a selected session to resume it, Cmd/Ctrl-K to open the command palette, Ctrl-F or `/search` to search, and Ctrl-C to cancel a streaming turn or exit while idle. In the session panel, press `r` to rename the selected session and press `d` twice within three seconds to delete it permanently. `/rename [title]` renames the current session, while `/delete` opens an explicit permanent-delete confirmation. `/model` and `/login` open dialogs inside the TUI. Type to filter providers and models, use arrow keys and Enter to choose, and press Esc to cancel. API keys are masked; OAuth URLs and device codes appear in the dialog. Successful model changes preserve the current session and conversation. `/sessions` opens a filterable session picker that matches titles and IDs; `/doctor` shows the offline diagnostic report in the conversation. Type `/` for grouped command completion (names and descriptions); Ctrl+K opens the same registry in the palette. `@` searches workspace files with gitignore and common build directories excluded, using `rg` or `git`. Tab or Enter inserts a file or command without sending; Esc closes candidates without cancelling a running turn. `/skills` lists user-invokable skills from the current plugin snapshot; `/skill <qualified-name> [args]` runs one. File reads are bounded (64 KiB each, 256 KiB total) and fail closed instead of truncating. The composer grows with the draft up to eight rows; Enter sends, Alt+Enter inserts a newline, and Up/Down move through wrapped lines before history. Streamed reasoning appears as a live card in event order and folds when the answer or a tool starts; F2 expands it. The bottom row keeps context usage, model, and status visible during generation. Finish or cancel a response before changing models or sessions. The workspace starts untrusted. Mutating tool calls display their name and arguments and request approval exactly at the execution boundary. You can instead trust the workspace for the process or use `/approve` to pre-authorize one call. On smaller terminals, side panels collapse automatically so the conversation remains usable.
 
 Sandbox scope and tool approval are separate. The startup sandbox picker defaults to
 `workspace`; select `off` explicitly to allow writes outside the current workspace,
@@ -86,7 +86,10 @@ lato --sandbox off
 lato --sandbox workspace
 lato --sandbox read-only
 lato resume s1788336000000-1 --sandbox off
+lato resume "Exact session title"
 ```
+
+`lato resume` accepts an exact session ID or an exact title. An ID match always wins. A unique title resumes immediately. Duplicate titles open a chooser ordered by most recently updated; Escape cancels without starting a session.
 
 `/permissions` and `/status` display the active scope and approval mode. To change
 scope, exit and resume with the desired `--sandbox` value. `off` removes Lato's OS
@@ -287,6 +290,7 @@ coordinator-backed steps** (`TaskOwner::Workflow`) from `prompt` / `steps` /
 `profile` (`explorer`, `worker`, `reviewer`) with `child_tasks` budgeting and
 `cancel_workflow`. List or run them with `lato workflow list` and
 `lato workflow run plugin/name` (still no script interpreter or model call).
+In the TUI, `/workflows` lists the current session snapshot's descriptors.
 `agentBudget` is a declared cap (default 128, max 1024). Untrusted
 project plugins contribute no workflow descriptors. Child sessions may only
 narrow the parent allowlist. `doctor` does not list workflows.

@@ -1,18 +1,22 @@
 pub mod backend;
 mod commands;
+mod completion;
+mod context;
 pub mod dialog;
-pub mod event;
 pub mod i18n;
 pub mod input;
+mod progress;
 pub mod render;
 pub mod state;
 pub mod terminal;
 pub mod tool_panel;
+#[cfg(test)]
+mod usability_tests;
 pub mod widgets;
 
 use self::{
     backend::{ApprovalPrompt, BackendCommand, BackendHandle},
-    i18n::{Language, TextKey, tr},
+    i18n::Language,
     state::{AppEvent, AppState, ApprovalState, Effect, Message, MessageRole, Overlay},
 };
 use crate::client::{InteractiveAcpClient, SessionSummary};
@@ -66,6 +70,8 @@ pub async fn run(
         .size()
         .map_err(|error| format!("read terminal size: {error}"))?;
     app.reduce(AppEvent::Resize(size.width, size.height));
+    let (index_tx, mut index_rx) = mpsc::unbounded_channel();
+    start_file_index(&mut app, &index_tx);
     let mut tick = tokio::time::interval(std::time::Duration::from_millis(250));
     let mut approvals_open = true;
 
@@ -82,6 +88,12 @@ pub async fn run(
                     (Vec::new(), true)
                 }
                 None => (app.reduce(AppEvent::Exit(TuiExit::Quit)), true),
+            },
+            Some(result) = index_rx.recv() => {
+                app.files_loading = false;
+                match result { Ok(files) => { app.files = files; app.files_error = None; }, Err(error) => app.files_error = Some(error) }
+                app.refresh_slash_completion();
+                (Vec::new(), true)
             },
             event = backend_events.recv() => match event {
                 Some(event) => (app.reduce(AppEvent::Backend(event)), true),
@@ -109,6 +121,12 @@ pub async fn run(
                 (app.reduce(AppEvent::Tick), animating)
             },
         };
+        if app.files_loading
+            && !index_rx.is_closed()
+            && app.files_error.as_deref() == Some("refresh")
+        {
+            start_file_index(&mut app, &index_tx);
+        }
         execute_effects(
             effects,
             &backend,
@@ -138,6 +156,55 @@ async fn execute_effects(
 ) {
     for effect in effects {
         match effect {
+            Effect::PrepareSkill { name, args } => {
+                let workspace = app.workspace.clone();
+                let raw = args.clone();
+                match tokio::task::spawn_blocking(move || {
+                    context::expand_references(&workspace, &raw)
+                })
+                .await
+                {
+                    Ok(Ok(expanded)) => {
+                        let context = expanded
+                            .strip_prefix(&args)
+                            .filter(|value| !value.is_empty())
+                            .map(str::to_string);
+                        for effect in app.begin_submit(BackendCommand::InvokeSkill {
+                            name,
+                            args: Some(args),
+                            context,
+                        }) {
+                            if let Effect::Backend(command) = effect
+                                && let Err(error) = backend.send(command)
+                            {
+                                app.error = Some(error);
+                            }
+                        }
+                    }
+                    Ok(Err(error)) => app.error = Some(error),
+                    Err(error) => app.error = Some(error.to_string()),
+                }
+            }
+            Effect::PrepareSubmit(text) => {
+                let workspace = app.workspace.clone();
+                match tokio::task::spawn_blocking(move || {
+                    context::expand_references(&workspace, &text)
+                })
+                .await
+                {
+                    Ok(Ok(text)) => {
+                        for effect in app.begin_submit(BackendCommand::Submit(text)) {
+                            if let Effect::Backend(command) = effect
+                                && let Err(error) = backend.send(command)
+                            {
+                                app.error = Some(error);
+                            }
+                        }
+                    }
+                    Ok(Err(error)) => app.error = Some(error),
+                    Err(error) => app.error = Some(error.to_string()),
+                }
+            }
             Effect::Backend(command) => {
                 if let Err(error) = backend.send(command) {
                     app.error = Some(error);
@@ -316,6 +383,7 @@ async fn execute_effects(
             }
         }
     }
+    app.restore_parked_draft();
 }
 
 fn handle_terminal_event(
@@ -327,6 +395,12 @@ fn handle_terminal_event(
     match event {
         Event::Resize(width, height) => app.reduce(AppEvent::Resize(width, height)),
         Event::Paste(text) if app.approval.is_none() => {
+            if app.overlay == Some(Overlay::CommandPalette) {
+                app.palette_query
+                    .insert_str(&text.replace(['\n', '\r'], " "));
+                app.palette_index = 0;
+                return Vec::new();
+            }
             let composer_active = app.overlay != Some(Overlay::Search);
             active_input(app).insert_str(&text);
             if composer_active {
@@ -366,6 +440,12 @@ fn handle_key(
         return handle_search_key(app, key);
     }
 
+    if key.code == KeyCode::F(2) {
+        app.focus = state::Focus::Chat;
+        app.toggle_reasoning();
+        return Vec::new();
+    }
+
     if key.code == KeyCode::Char('k')
         && key
             .modifiers
@@ -376,8 +456,38 @@ fn handle_key(
     if app.focus == state::Focus::Tools && tool_panel::handle_key(app, key) {
         return Vec::new();
     }
+    if key.code == KeyCode::Enter
+        && key
+            .modifiers
+            .intersects(KeyModifiers::ALT | KeyModifiers::SHIFT)
+        && app.focus == state::Focus::Chat
+    {
+        app.composer.insert_char('\n');
+        app.refresh_slash_completion();
+        return Vec::new();
+    }
     if let Some(effects) = handle_slash_completion_key(app, key, trust) {
         return effects;
+    }
+    if app.focus == state::Focus::Chat && key.modifiers.contains(KeyModifiers::CONTROL) {
+        match key.code {
+            KeyCode::Char('a') => {
+                app.composer.move_line_home();
+                app.refresh_slash_completion();
+                return Vec::new();
+            }
+            KeyCode::Char('e') => {
+                app.composer.move_line_end();
+                app.refresh_slash_completion();
+                return Vec::new();
+            }
+            KeyCode::Char('u') => {
+                app.composer.clear();
+                app.refresh_slash_completion();
+                return Vec::new();
+            }
+            _ => {}
+        }
     }
     if app.armed_session_delete.is_some() && key.code != KeyCode::Char('d') {
         app.disarm_session_delete();
@@ -385,7 +495,14 @@ fn handle_key(
     match key.code {
         KeyCode::Tab => app.reduce(AppEvent::FocusNext),
         KeyCode::BackTab => app.reduce(AppEvent::FocusPrevious),
-        KeyCode::Esc => app.reduce(AppEvent::Escape),
+        KeyCode::Esc => {
+            app.focus = state::Focus::Chat;
+            if app.parked_draft.is_some() {
+                app.composer.clear();
+                app.restore_parked_draft();
+            }
+            app.reduce(AppEvent::Escape)
+        }
         KeyCode::Enter if app.focus == state::Focus::Sessions => resume_selected_session(app),
         KeyCode::Char('r') if app.focus == state::Focus::Sessions => {
             app.disarm_session_delete();
@@ -414,22 +531,36 @@ fn handle_key(
         }
         KeyCode::Left => {
             app.composer.move_left();
+            app.refresh_slash_completion();
             Vec::new()
         }
         KeyCode::Right => {
             app.composer.move_right();
+            app.refresh_slash_completion();
             Vec::new()
         }
         KeyCode::Home => {
-            app.composer.move_home();
+            app.composer.move_line_home();
+            app.refresh_slash_completion();
             Vec::new()
         }
         KeyCode::End => {
-            app.composer.move_end();
+            app.composer.move_line_end();
+            app.refresh_slash_completion();
+            Vec::new()
+        }
+        KeyCode::Up | KeyCode::Down if app.focus == state::Focus::Chat => {
+            let delta = if key.code == KeyCode::Up { -1 } else { 1 };
+            if !app.composer.move_vertical(delta) {
+                app.recall_history(delta);
+            }
+            app.refresh_slash_completion();
             Vec::new()
         }
         KeyCode::Up => app.reduce(AppEvent::Scroll(-1)),
         KeyCode::Down => app.reduce(AppEvent::Scroll(1)),
+        KeyCode::PageUp => app.reduce(AppEvent::Scroll(-10)),
+        KeyCode::PageDown => app.reduce(AppEvent::Scroll(10)),
         KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.reduce(AppEvent::OpenSearch)
         }
@@ -454,43 +585,56 @@ fn handle_slash_completion_key(
     key: KeyEvent,
     trust: &SessionTrust,
 ) -> Option<Vec<Effect>> {
-    let candidates = app.slash_completion();
-    let selected = candidates.get(app.slash_completion_index).copied()?;
+    let candidates = app.candidates();
+    let Some(selected) = candidates
+        .get(
+            app.slash_completion_index
+                .min(candidates.len().saturating_sub(1)),
+        )
+        .cloned()
+    else {
+        if key.code == KeyCode::Esc && app.completion_hint().is_some() {
+            app.dismiss_slash_completion();
+            return Some(Vec::new());
+        }
+        return None;
+    };
     match key.code {
         KeyCode::Up => {
             app.slash_completion_index = app.slash_completion_index.saturating_sub(1);
             Some(Vec::new())
         }
         KeyCode::Down => {
-            app.slash_completion_index =
-                (app.slash_completion_index + 1).min(candidates.len().saturating_sub(1));
+            app.slash_completion_index = (app.slash_completion_index + 1).min(candidates.len() - 1);
             Some(Vec::new())
         }
         KeyCode::Esc => {
             app.dismiss_slash_completion();
             Some(Vec::new())
         }
-        KeyCode::Enter => {
-            if app.composer.as_str().eq_ignore_ascii_case(selected.name) {
+        KeyCode::Tab | KeyCode::Enter => {
+            if key.code == KeyCode::Enter
+                && selected.kind == "command"
+                && app.composer.as_str().eq_ignore_ascii_case(&selected.name)
+            {
                 if selected.name == "/rename"
                     && let Some(title) = app
                         .sessions
                         .iter()
-                        .find(|session| session.id == app.session_id)
-                        .map(|session| session.title.trim())
-                        .filter(|title| !title.is_empty())
+                        .find(|s| s.id == app.session_id)
+                        .map(|s| s.title.trim())
+                        .filter(|t| !t.is_empty())
                 {
-                    let command = format!("/rename {title}");
-                    app.composer.replace(&command);
+                    app.composer.replace(&format!("/rename {title}"));
                     app.refresh_slash_completion();
                     return Some(Vec::new());
                 }
-                Some(submit_or_command(app, trust))
-            } else {
-                app.composer.replace(selected.name);
-                app.refresh_slash_completion();
-                Some(Vec::new())
+                return Some(submit_or_command(app, trust));
             }
+            app.composer
+                .replace_range(selected.range, &selected.replacement);
+            app.refresh_slash_completion();
+            Some(Vec::new())
         }
         _ => None,
     }
@@ -504,6 +648,53 @@ fn submit_or_command(app: &mut AppState, trust: &SessionTrust) -> Vec<Effect> {
     }
     let name = command.split_whitespace().next().unwrap_or_default();
     match name {
+        "/skills" => {
+            app.composer.replace("/skill ");
+            app.focus = state::Focus::Chat;
+            app.skills_loading = true;
+            app.refresh_slash_completion();
+            vec![Effect::Backend(BackendCommand::ListSkills)]
+        }
+        "/files" => {
+            app.composer.replace("@");
+            app.focus = state::Focus::Chat;
+            app.files_loading = true;
+            app.files_error = Some("refresh".into());
+            app.refresh_slash_completion();
+            Vec::new()
+        }
+        "/workflows" => {
+            app.composer.clear();
+            app.focus = state::Focus::Chat;
+            vec![Effect::Backend(BackendCommand::ListWorkflows)]
+        }
+        "/skill" => {
+            if app.is_busy() {
+                return Vec::new();
+            }
+            let raw = raw_command
+                .strip_prefix(&raw_command[..name.len()])
+                .unwrap_or_default()
+                .trim();
+            let (skill, args) = raw
+                .split_once(char::is_whitespace)
+                .map(|(n, a)| (n, Some(a.trim().to_string())))
+                .unwrap_or((raw, None));
+            if skill.is_empty() {
+                app.composer.replace("/skill ");
+                app.refresh_slash_completion();
+                return Vec::new();
+            }
+            if !app
+                .skills
+                .iter()
+                .any(|s| s.qualified_name == skill || s.name == skill)
+            {
+                app.error = Some("Unknown or unavailable skill / 技能不存在或不可调用".into());
+                return Vec::new();
+            }
+            app.begin_skill(skill.to_string(), args)
+        }
         "/exit" | "/quit" => {
             app.composer.clear();
             app.reduce(AppEvent::Exit(TuiExit::Quit))
@@ -606,8 +797,27 @@ fn submit_or_command(app: &mut AppState, trust: &SessionTrust) -> Vec<Effect> {
             Vec::new()
         }
         _ => {
-            app.error = Some(format!("{}: {command}", tr(app.language, TextKey::Command)));
-            app.composer.clear();
+            let requested = raw_command
+                .split_whitespace()
+                .next()
+                .unwrap_or_default()
+                .trim_start_matches('/');
+            if let Some(skill) = app
+                .skills
+                .iter()
+                .find(|skill| skill.qualified_name == requested)
+                .cloned()
+            {
+                if app.is_busy() {
+                    return Vec::new();
+                }
+                let args = raw_command
+                    .find(char::is_whitespace)
+                    .map(|i| raw_command[i..].trim().to_string())
+                    .filter(|s| !s.is_empty());
+                return app.begin_skill(skill.qualified_name, args);
+            }
+            app.error = Some(format!("Unknown command / 未知命令: {command} · /help"));
             Vec::new()
         }
     }
@@ -645,6 +855,10 @@ fn handle_approval_key(app: &mut AppState, key: KeyEvent) -> Vec<Effect> {
 }
 
 fn handle_palette_key(app: &mut AppState, key: KeyEvent, trust: &SessionTrust) -> Vec<Effect> {
+    let candidates = app.command_candidates(
+        app.palette_query.as_str().trim_start_matches('/'),
+        0..app.composer.as_str().len(),
+    );
     match key.code {
         KeyCode::Esc => app.reduce(AppEvent::Escape),
         KeyCode::Up => {
@@ -652,40 +866,44 @@ fn handle_palette_key(app: &mut AppState, key: KeyEvent, trust: &SessionTrust) -
             Vec::new()
         }
         KeyCode::Down => {
-            app.palette_index = (app.palette_index + 1).min(event::COMMAND_COUNT - 1);
+            app.palette_index = (app.palette_index + 1).min(candidates.len().saturating_sub(1));
             Vec::new()
         }
-        KeyCode::Enter => match app.palette_index {
-            0 => app.reduce(AppEvent::NewSession),
-            1 => vec![Effect::Sessions],
-            2 => app.reduce(AppEvent::NewSession),
-            3 => vec![Effect::ConfigureModel],
-            4 => vec![Effect::Login],
-            5 => {
-                let language = match app.language {
-                    Language::ZhCn => Language::En,
-                    Language::En => Language::ZhCn,
-                };
-                app.reduce(AppEvent::SwitchLanguage(language))
-            }
-            6 => app.reduce(AppEvent::OpenSearch),
-            7 => {
-                trust.allow_once();
-                app.overlay = None;
+        KeyCode::Enter | KeyCode::Tab => {
+            let Some(selected) = candidates.get(app.palette_index) else {
+                return Vec::new();
+            };
+            // Preserve an existing draft: choosing an action first fills the composer only when it is empty.
+            let draft = app.composer.as_str().to_string();
+            app.overlay = None;
+            app.focus = state::Focus::Chat;
+            app.composer.replace(&selected.replacement);
+            app.refresh_slash_completion();
+            if selected.kind == "command" && key.code == KeyCode::Enter && draft.is_empty() {
+                submit_or_command(app, trust)
+            } else {
+                if !draft.is_empty() {
+                    if let Some(previous) = app.parked_draft.replace(draft) {
+                        app.history.push(previous);
+                    }
+                }
                 Vec::new()
             }
-            8 => {
-                app.overlay = None;
-                app.screen = state::Screen::Main;
-                app.messages.push(Message {
-                    role: MessageRole::System,
-                    content: format!("{} · {}", app.model, app.workspace.display()),
-                    expanded: true,
-                });
-                Vec::new()
-            }
-            _ => app.reduce(AppEvent::Exit(TuiExit::Quit)),
-        },
+        }
+        KeyCode::Backspace => {
+            app.palette_query.backspace();
+            app.palette_index = 0;
+            Vec::new()
+        }
+        KeyCode::Char(ch)
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER) =>
+        {
+            app.palette_query.insert_char(ch);
+            app.palette_index = 0;
+            Vec::new()
+        }
         _ => Vec::new(),
     }
 }
@@ -917,7 +1135,10 @@ mod tests {
 
         app.composer.insert_str("/");
         app.refresh_slash_completion();
-        assert_eq!(app.slash_completion().len(), 18);
+        assert_eq!(
+            app.slash_completion().len(),
+            super::commands::SLASH_COMMANDS.len()
+        );
         assert!(
             handle_slash_completion_key(
                 &mut app,
@@ -1032,7 +1253,9 @@ mod tests {
                     [Effect::ConfigureModel]
                 ));
                 assert!(!app.should_exit);
-                app.palette_index = 4;
+                app.composer.clear();
+                app.palette_query.replace("login");
+                app.palette_index = 0;
                 assert!(matches!(
                     &handle_palette_key(
                         &mut app,
@@ -1076,4 +1299,17 @@ mod tests {
             })
             .await;
     }
+}
+
+fn start_file_index(
+    app: &mut AppState,
+    sender: &mpsc::UnboundedSender<Result<Vec<String>, String>>,
+) {
+    app.files_loading = true;
+    app.files_error = None;
+    let workspace = app.workspace.clone();
+    let sender = sender.clone();
+    tokio::task::spawn_blocking(move || {
+        let _ = sender.send(context::index_files(&workspace));
+    });
 }

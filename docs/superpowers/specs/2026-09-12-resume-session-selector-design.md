@@ -1,5 +1,7 @@
 # Resume Session Selector Design
 
+**Status:** Implemented (2026-09-12)
+
 ## Goal
 
 Make `lato resume <reference>` restore an existing session when the reference is either its exact session ID or its exact title. When several sessions share that title, let the user choose which session to restore.

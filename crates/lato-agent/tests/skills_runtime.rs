@@ -872,3 +872,188 @@ async fn audit_rejection_hashes_requested_name_without_raw_payload() {
     assert!(!encoded.contains("secret-missing-skill"));
     assert!(!encoded.contains("secret rejected arguments"));
 }
+
+#[tokio::test]
+async fn explicit_user_skill_expands_arguments_and_enforces_first_round_scope() {
+    let fixture = PluginFixture::new("demo", "Review safely.", &["read_file"]);
+    let path = fixture.plugin.join("skills/inspect/SKILL.md");
+    let body = fs::read_to_string(&path).unwrap();
+    fs::write(
+        &path,
+        body.replace(
+            "name: inspect",
+            "name: inspect\ndisable-model-invocation: true\nargument-hint: <file>",
+        ),
+    )
+    .unwrap();
+    let stream = Arc::new(RecordingStream::scripted(vec![
+        vec![StreamPiece::ToolCall {
+            id: "denied-user-skill-call".into(),
+            name: "list_dir".into(),
+            arguments: serde_json::json!({"path":"."}),
+        }],
+        vec![StreamPiece::Text("done".into())],
+        vec![StreamPiece::Text("normal".into())],
+    ]));
+    let session = runtime_session(&fixture, stream.clone());
+    session
+        .stage_plugin_snapshot(fixture.snapshot(7, true, true))
+        .await
+        .unwrap();
+    let listing = session.list_skills().await;
+    assert_eq!(listing["generation"], 7);
+    assert_eq!(listing["skills"][0]["qualifiedName"], "demo:inspect");
+    assert_eq!(listing["skills"][0]["argumentHint"], "<file>");
+    session
+        .prompt_skill("demo:inspect".into(), Some("目标.txt".into()))
+        .await
+        .unwrap();
+    session.prompt("hello".into()).await.unwrap();
+    let contexts = stream.contexts().await;
+    assert_eq!(tool_names(&contexts[0]), vec!["read_file"]);
+    assert!(
+        contexts[0]["messages"]
+            .to_string()
+            .contains("Inspect 目标.txt.")
+    );
+    assert!(tool_names(&contexts[1]).contains(&"list_dir"));
+    assert!(tool_names(&contexts[2]).contains(&"list_dir"));
+    let history = session.history_snapshot().await;
+    assert!(history.iter().any(|item| matches!(item, HistoryItem::ToolResult { output, .. } if output.contains("tool.not_allowed_by_skill"))));
+}
+
+#[tokio::test]
+async fn explicit_user_skill_rejects_hidden_skills_and_recovers_for_next_prompt() {
+    let fixture = PluginFixture::new("demo", "Internal only.", &["read_file"]);
+    let path = fixture.plugin.join("skills/inspect/SKILL.md");
+    let body = fs::read_to_string(&path).unwrap();
+    fs::write(
+        &path,
+        body.replace("name: inspect", "name: inspect\nuser-invocable: false"),
+    )
+    .unwrap();
+    let stream = Arc::new(RecordingStream::scripted(vec![vec![StreamPiece::Text(
+        "normal".into(),
+    )]]));
+    let session = runtime_session(&fixture, stream.clone());
+    session
+        .stage_plugin_snapshot(fixture.snapshot(8, true, true))
+        .await
+        .unwrap();
+    assert_eq!(session.list_skills().await["skills"], serde_json::json!([]));
+    let error = session
+        .prompt_skill("demo:inspect".into(), None)
+        .await
+        .unwrap_err();
+    assert!(error.message.contains("cannot be invoked by a user"));
+    assert!(stream.contexts().await.is_empty());
+    session.prompt("hello".into()).await.unwrap();
+    assert!(tool_names(&stream.contexts().await[0]).contains(&"list_dir"));
+}
+
+#[tokio::test]
+async fn session_lists_trusted_workflows_from_the_current_snapshot() {
+    let fixture = PluginFixture::new("demo", "Inspect.", &["read_file"]);
+    fs::write(
+        fixture.plugin.join("plugin.json"),
+        r#"{"name":"demo","skills":"skills","workflows":{"review":{"description":"Review the diff","prompt":"Review"}}}"#,
+    )
+    .unwrap();
+    let session = runtime_session(&fixture, Arc::new(RecordingStream::default()));
+    session
+        .stage_plugin_snapshot(fixture.snapshot(3, true, true))
+        .await
+        .unwrap();
+    let listing = session.list_workflows().await;
+    assert_eq!(listing["generation"], 3);
+    assert_eq!(listing["workflows"][0]["id"], "demo/review");
+    assert_eq!(listing["workflows"][0]["description"], "Review the diff");
+    session
+        .stage_plugin_snapshot(fixture.snapshot(4, true, false))
+        .await
+        .unwrap();
+    assert_eq!(
+        session.list_workflows().await["workflows"],
+        serde_json::json!([])
+    );
+}
+
+#[tokio::test]
+async fn cancelling_user_skill_clears_scope_before_next_prompt() {
+    let fixture = PluginFixture::new("demo", "Review safely.", &["read_file"]);
+    let stream = Arc::new(GatedRecordingStream::default());
+    let session = Arc::new(runtime_session(&fixture, stream.clone()));
+    session
+        .stage_plugin_snapshot(fixture.snapshot(9, true, true))
+        .await
+        .unwrap();
+    let running = {
+        let session = session.clone();
+        tokio::spawn(async move { session.prompt_skill("demo:inspect".into(), None).await })
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(5), stream.started.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    session.cancel().await.unwrap();
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), running)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        outcome,
+        lato_agent::RuntimePromptOutcome::Cancelled { .. }
+    ));
+    // Legacy ModelStream producers finish independently after cancellation.
+    stream.release.add_permits(2);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        session.prompt("hello".into()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let contexts = stream.contexts.lock().await;
+    assert_eq!(tool_names(&contexts[0]), vec!["read_file"]);
+    assert!(tool_names(&contexts[1]).contains(&"list_dir"));
+}
+
+#[tokio::test]
+async fn positional_user_skill_preserves_separate_file_context_and_scope() {
+    let fixture = PluginFixture::new("demo", "Review safely.", &["read_file"]);
+    let path = fixture.plugin.join("skills/inspect/SKILL.md");
+    let body = fs::read_to_string(&path).unwrap();
+    fs::write(&path, body.replace("Inspect $ARGUMENTS.", "Inspect $1.")).unwrap();
+    let stream = Arc::new(RecordingStream::scripted(vec![vec![StreamPiece::Text(
+        "done".into(),
+    )]]));
+    let session = runtime_session(&fixture, stream.clone());
+    session
+        .stage_plugin_snapshot(fixture.snapshot(10, true, true))
+        .await
+        .unwrap();
+    let attachment =
+        "<file path=\"目标.rs\">\nconst TEXT: &str = \"$ARGUMENTS $(shell)\";\n</file>";
+    session
+        .prompt_skill_with_context(
+            "demo:inspect".into(),
+            Some("unused target.rs".into()),
+            Some(attachment.into()),
+        )
+        .await
+        .unwrap();
+    let contexts = stream.contexts().await;
+    assert_eq!(tool_names(&contexts[0]), vec!["read_file"]);
+    let messages = contexts[0]["messages"].as_array().unwrap();
+    let user = messages
+        .iter()
+        .find(|message| message["role"] == "user")
+        .unwrap()["content"]
+        .as_str()
+        .unwrap();
+    assert!(user.contains("Inspect target.rs."));
+    assert!(user.ends_with(attachment));
+    assert!(user.find("</skill>").unwrap() < user.find("<file path=").unwrap());
+}

@@ -198,15 +198,7 @@ pub async fn run(args: Vec<String>) -> i32 {
             language,
             sandbox,
             plugin_dirs,
-        } => {
-            interactive(
-                InteractiveStartup::Resume(session_id),
-                language,
-                sandbox,
-                plugin_dirs,
-            )
-            .await
-        }
+        } => resume_interactive(session_id, language, sandbox, plugin_dirs).await,
         Invocation::Login { provider, method } => login(provider, method).await,
         Invocation::Doctor(args) => doctor_cmd(args).await,
         Invocation::Acp { plugin_dirs } => crate::stdio::run(plugin_dirs).await,
@@ -409,6 +401,52 @@ async fn prompt(args: PromptArgs) -> i32 {
 enum InteractiveStartup {
     New,
     Resume(String),
+    ChooseResume(Vec<crate::client::SessionSummary>),
+}
+
+async fn resume_interactive(
+    reference: String,
+    language: Option<Language>,
+    sandbox: Option<SandboxArg>,
+    plugin_dirs: Vec<PathBuf>,
+) -> i32 {
+    let home = lato_home();
+    if let Err(error) = std::fs::create_dir_all(&home) {
+        eprintln!("error: cannot create {}: {error}", home.display());
+        return 1;
+    }
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let sessions = match crate::client::list_session_summaries_over_acp(cwd, home).await {
+        Ok(sessions) => sessions,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return 1;
+        }
+    };
+    match crate::resume::resolve_resume_reference(&reference, &sessions) {
+        crate::resume::ResumeResolution::Match(session_id) => {
+            interactive(
+                InteractiveStartup::Resume(session_id),
+                language,
+                sandbox,
+                plugin_dirs,
+            )
+            .await
+        }
+        crate::resume::ResumeResolution::Ambiguous(candidates) => {
+            interactive(
+                InteractiveStartup::ChooseResume(candidates),
+                language,
+                sandbox,
+                plugin_dirs,
+            )
+            .await
+        }
+        crate::resume::ResumeResolution::Missing => {
+            eprintln!("error: no session has the supplied ID or title");
+            1
+        }
+    }
 }
 
 async fn interactive(
@@ -422,7 +460,9 @@ async fn interactive(
             InteractiveStartup::New => {
                 "interactive mode requires a tty; use lato -p TEXT for headless mode"
             }
-            InteractiveStartup::Resume(_) => "resume requires a tty",
+            InteractiveStartup::Resume(_) | InteractiveStartup::ChooseResume(_) => {
+                "resume requires a tty"
+            }
         };
         eprintln!("error: {message}");
         return 2;
@@ -456,6 +496,33 @@ async fn interactive(
     let result = tokio::task::LocalSet::new()
         .run_until(async {
             let prepared = dialog::run(&mut terminal, &mut events, None, |ui| async move {
+                let resume_id = match startup {
+                    InteractiveStartup::New => None,
+                    InteractiveStartup::Resume(session_id) => Some(session_id),
+                    InteractiveStartup::ChooseResume(candidates) => {
+                        let choices = candidates
+                            .iter()
+                            .map(crate::resume::resume_choice_label)
+                            .collect::<Vec<_>>();
+                        let selected = ui
+                            .choose(
+                                "Several sessions share that title. Choose one / 多个会话使用同一标题，请选择",
+                                &choices,
+                            )
+                            .await?;
+                        Some(
+                            candidates
+                                .iter()
+                                .find(|session| {
+                                    crate::resume::resume_choice_label(session) == selected
+                                })
+                                .map(|session| session.session_id.clone())
+                                .ok_or_else(|| {
+                                    "selected session is no longer available".to_string()
+                                })?,
+                        )
+                    }
+                };
                 let selection = if tui_test_mode {
                     "built-in/fake".to_string()
                 } else {
@@ -521,8 +588,8 @@ async fn interactive(
                 let trust = crate::permissions::interactive_trust(&cwd, trusted, sandbox);
                 let (tui_approval, approvals) = crate::tui::backend::TuiToolApproval::channel();
                 let inline_approval = (trust.mode == ApprovalMode::Ask).then_some(tui_approval);
-                let client = match &startup {
-                    InteractiveStartup::New => {
+                let client = match &resume_id {
+                    None => {
                         crate::client::InteractiveAcpClient::new_session_with_approval(
                             cwd.clone(),
                             home.clone(),
@@ -533,7 +600,7 @@ async fn interactive(
                         )
                         .await?
                     }
-                    InteractiveStartup::Resume(id) => {
+                    Some(id) => {
                         crate::client::InteractiveAcpClient::resume_session_with_approval(
                             cwd.clone(),
                             home.clone(),
@@ -577,7 +644,7 @@ async fn interactive(
                     model: selection,
                     home: home.clone(),
                     sessions,
-                    resumed: matches!(startup, InteractiveStartup::Resume(_)),
+                    resumed: resume_id.is_some(),
                 })
             })
             .await;

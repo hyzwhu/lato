@@ -1,6 +1,6 @@
 use super::{
     i18n::{Language, TextKey, tr},
-    state::{AppState, CompactionUiState, Focus, MessageRole},
+    state::{AppState, Focus, MessageRole},
 };
 use ratatui::{
     Frame,
@@ -28,7 +28,7 @@ pub fn welcome(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
             Constraint::Length(6),
             Constraint::Length(1),
             Constraint::Length(5),
-            Constraint::Length(3),
+            Constraint::Length(composer_height(app, centered_rect(area, 90, 1).width)),
             Constraint::Min(2),
         ])
         .split(area);
@@ -69,7 +69,11 @@ pub fn welcome(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
             .style(Style::default().fg(TEXT).bg(BG)),
         rows[3],
     );
-    let input_area = centered_rect(rows[4], 70, 3);
+    let input_area = centered_rect(
+        rows[4],
+        90,
+        composer_height(app, centered_rect(area, 90, 1).width),
+    );
     composer(frame, input_area, app, true);
     if let Some(error) = &app.error {
         let error_area = Rect::new(area.x, area.bottom().saturating_sub(3), area.width, 1);
@@ -139,12 +143,12 @@ pub fn sessions(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
     }
 }
 
-pub fn chat(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
+pub fn chat(frame: &mut Frame<'_>, area: Rect, app: &mut AppState) {
     let active = app.focus == Focus::Chat;
     let rows = Layout::vertical([
         Constraint::Length(2),
         Constraint::Min(4),
-        Constraint::Length(4),
+        Constraint::Length(composer_height(app, area.width)),
     ])
     .split(area);
     let background = panel_style(active);
@@ -166,7 +170,11 @@ pub fn chat(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
         rows[0],
     );
     let mut lines = Vec::new();
-    for message in &app.messages {
+    let mut reveal_line = None;
+    for (message_index, message) in app.messages.iter().enumerate() {
+        if app.reveal_reasoning == Some(message_index) {
+            reveal_line = Some(lines.len());
+        }
         match message.role {
             MessageRole::User => {
                 lines.push(Line::from(vec![
@@ -186,15 +194,77 @@ pub fn chat(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
                 }
             }
             MessageRole::Reasoning => {
-                let body = if message.expanded {
-                    message.content.clone()
+                let active = app.active_reasoning == Some(message_index);
+                let segment = app
+                    .reasoning_segments
+                    .iter()
+                    .find(|segment| segment.message_index == message_index);
+                let seconds = segment
+                    .map(|segment| {
+                        segment
+                            .duration
+                            .unwrap_or_else(|| segment.started_at.elapsed())
+                            .as_secs_f32()
+                    })
+                    .unwrap_or(0.0);
+                let label = match (app.language, active) {
+                    (Language::ZhCn, true) => "思考中",
+                    (Language::ZhCn, false) => "思考记录",
+                    (Language::En, true) => "Thinking",
+                    (Language::En, false) => "Thought",
+                };
+                let marker = if active {
+                    super::progress::spinner(app)
+                } else if message.expanded {
+                    "▾"
                 } else {
-                    format!("{}…", message.content.chars().take(42).collect::<String>())
+                    "▸"
                 };
                 lines.push(Line::styled(
-                    format!("◆ {}  {body}", tr(app.language, TextKey::Thinking)),
+                    format!(
+                        "{marker} {label} · {seconds:.1}s · {} {} · F2",
+                        message.content.chars().count(),
+                        if app.language == Language::ZhCn {
+                            "字"
+                        } else {
+                            "chars"
+                        }
+                    ),
                     Style::default().fg(AMBER),
                 ));
+                if message.expanded {
+                    let body = wrap_transcript(
+                        vec![Line::from(Span::styled(
+                            message.content.clone(),
+                            Style::default().fg(MUTED),
+                        ))],
+                        rows[1].width.saturating_sub(4) as usize,
+                    );
+                    let start = if active {
+                        body.len().saturating_sub(6)
+                    } else {
+                        0
+                    };
+                    if start > 0 {
+                        lines.push(Line::styled(
+                            format!(
+                                "  │ … {start} {}",
+                                if app.language == Language::ZhCn {
+                                    "行"
+                                } else {
+                                    "earlier lines"
+                                }
+                            ),
+                            Style::default().fg(MUTED),
+                        ));
+                    }
+                    for mut line in body.into_iter().skip(start) {
+                        line.spans
+                            .insert(0, Span::styled("  │ ", Style::default().fg(AMBER)));
+                        lines.push(line);
+                    }
+                    lines.push(Line::styled("  ╰─", Style::default().fg(AMBER)));
+                }
             }
             MessageRole::System => {
                 for line in message.content.lines() {
@@ -205,26 +275,49 @@ pub fn chat(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
         lines.push(Line::raw(""));
     }
     if let Some(error) = &app.error {
-        lines.insert(
-            0,
-            Line::styled(
-                format!("{}: {error}", tr(app.language, TextKey::Error)),
-                Style::default().fg(ERROR),
-            ),
-        );
+        lines.push(Line::styled(
+            format!("{}: {error}", tr(app.language, TextKey::Error)),
+            Style::default().fg(ERROR),
+        ));
     }
+    let reveal_line = reveal_line
+        .map(|index| wrap_transcript(lines[..index].to_vec(), rows[1].width as usize).len());
+    let lines = wrap_transcript(lines, rows[1].width as usize);
+    let max_scroll = lines
+        .len()
+        .saturating_sub(rows[1].height as usize)
+        .min(u16::MAX as usize) as u16;
+    if app.scroll > 0 {
+        app.scroll = app
+            .scroll
+            .saturating_add(max_scroll.saturating_sub(app.scroll_max))
+            .min(max_scroll);
+    }
+    app.scroll_max = max_scroll;
+    if let Some(line) = reveal_line {
+        app.scroll = max_scroll.saturating_sub(line.min(u16::MAX as usize) as u16);
+        app.reveal_reasoning = None;
+    }
+    let start = lines
+        .len()
+        .saturating_sub(rows[1].height as usize)
+        .saturating_sub(app.scroll as usize);
     frame.render_widget(
-        Paragraph::new(lines)
-            .style(background)
-            .wrap(Wrap { trim: false })
-            .scroll((app.scroll, 0)),
+        Paragraph::new(
+            lines
+                .into_iter()
+                .skip(start)
+                .take(rows[1].height as usize)
+                .collect::<Vec<_>>(),
+        )
+        .style(background),
         rows[1],
     );
     composer(frame, rows[2], app, false);
 }
 
 fn composer(frame: &mut Frame<'_>, area: Rect, app: &AppState, welcome: bool) {
-    let rows = Layout::vertical([Constraint::Length(2), Constraint::Length(1)]).split(area);
+    let rows = Layout::vertical([Constraint::Min(2), Constraint::Length(1)]).split(area);
     let placeholder = if welcome {
         tr(app.language, TextKey::StartPrompt)
     } else {
@@ -235,60 +328,57 @@ fn composer(frame: &mut Frame<'_>, area: Rect, app: &AppState, welcome: bool) {
         .border_style(Style::default().fg(GLASS));
     let inner = block.inner(rows[0]);
     frame.render_widget(block.style(Style::default().bg(BG)), rows[0]);
-    let (visible, cursor) = app
-        .composer
-        .viewport(inner.width.saturating_sub(2) as usize, false);
-    let content = if app.composer.is_empty() {
-        Span::styled(placeholder, Style::default().fg(MUTED))
-    } else {
-        Span::styled(visible, Style::default().fg(TEXT))
-    };
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(
-                "› ",
-                Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
-            ),
-            content,
-        ]))
-        .style(Style::default().bg(BG)),
-        inner,
+    let (visible, cursor, cursor_row) = app.composer.multiline_viewport(
+        inner.width.saturating_sub(2) as usize,
+        inner.height as usize,
     );
-    let status = if let CompactionUiState::Running {
-        started_at,
-        trigger,
-    } = &app.compaction
-    {
-        let elapsed = started_at.elapsed().as_secs();
-        let trigger = compaction_trigger_label(trigger, app.language);
-        match app.language {
-            super::i18n::Language::ZhCn => {
-                format!("● 正在压缩上下文（{trigger}）… {elapsed}s [Ctrl-C 取消]")
-            }
-            super::i18n::Language::En => {
-                format!("● Compacting context ({trigger})… {elapsed}s [Ctrl-C stop]")
-            }
-        }
-    } else if app.responding {
-        format!(
-            "● {}… {}s                                      [{}]",
-            tr(app.language, TextKey::Responding),
-            app.elapsed_seconds,
-            tr(app.language, TextKey::Stop)
-        )
-    } else if welcome {
-        tr(app.language, TextKey::WelcomeHint).to_string()
-    } else if let Some(usage) = &app.context_usage {
-        match (usage.context_window, usage.utilization_percent) {
-            (Some(window), Some(percent)) => format!(
-                "context: {} / {} ({}%)",
-                usage.estimated_input_tokens, window, percent
-            ),
-            _ => format!("context: {}", usage.estimated_input_tokens),
-        }
+    let lines = if app.composer.is_empty() {
+        vec![Line::from(vec![
+            Span::styled("› ", Style::default().fg(AMBER)),
+            Span::styled(placeholder, Style::default().fg(MUTED)),
+        ])]
     } else {
-        tr(app.language, TextKey::Ready).to_string()
+        visible
+            .into_iter()
+            .enumerate()
+            .map(|(row, text)| {
+                Line::from(vec![
+                    Span::styled(
+                        if row == cursor_row { "› " } else { "  " },
+                        Style::default().fg(AMBER),
+                    ),
+                    Span::styled(text, Style::default().fg(TEXT)),
+                ])
+            })
+            .collect()
     };
+    frame.render_widget(Paragraph::new(lines).style(Style::default().bg(BG)), inner);
+    let mut status = if app.is_busy() {
+        format!(
+            "{} · Ctrl+C {}",
+            super::progress::status_line(app),
+            if app.language == Language::ZhCn {
+                "取消"
+            } else {
+                "stop"
+            }
+        )
+    } else {
+        match app.language {
+            Language::ZhCn => "/ 命令 · @ 文件 · /skills 技能".into(),
+            Language::En => "/ commands · @ files · /skills skills".into(),
+        }
+    };
+    let references = super::context::reference_count(app.composer.as_str());
+    if references > 0 {
+        status = format!(
+            "@ {references} {} · {status}",
+            match app.language {
+                Language::ZhCn => "个文件",
+                Language::En => "files",
+            }
+        );
+    }
     frame.render_widget(
         Paragraph::new(status)
             .alignment(if welcome {
@@ -310,10 +400,11 @@ fn composer(frame: &mut Frame<'_>, area: Rect, app: &AppState, welcome: bool) {
         && inner.width > 2
         && inner.height > 0
     {
-        frame.set_cursor_position((inner.x + 2 + cursor as u16, inner.y));
+        frame.set_cursor_position((inner.x + 2 + cursor as u16, inner.y + cursor_row as u16));
     }
 }
 
+#[cfg(test)]
 fn compaction_trigger_label(trigger: &str, language: Language) -> &'static str {
     match (language, trigger) {
         (Language::ZhCn, "model_switch") => "模型切换",
@@ -329,58 +420,123 @@ fn compaction_trigger_label(trigger: &str, language: Language) -> &'static str {
     }
 }
 
+fn composer_height(app: &AppState, width: u16) -> u16 {
+    app.composer
+        .visual_line_count(width.saturating_sub(2) as usize)
+        .clamp(1, 8) as u16
+        + 2
+}
+
 pub fn slash_completion(frame: &mut Frame<'_>, composer_area: Rect, app: &AppState) {
     if app.overlay.is_some() || app.approval.is_some() {
         return;
     }
-    let candidates = app.slash_completion();
-    if candidates.is_empty() {
+    let candidates = app.candidates();
+    let hint = app.completion_hint();
+    if candidates.is_empty() && hint.is_none() {
         return;
     }
-    let available_height = composer_area.y.saturating_sub(frame.area().y);
-    let popup_height = (candidates.len() as u16 + 2).min(available_height);
+    let popup_height = (candidates.len().max(1) as u16 + 2)
+        .min(10)
+        .min(composer_area.y.saturating_sub(frame.area().y));
     if popup_height < 3 {
         return;
     }
-    let visible_rows = popup_height.saturating_sub(2) as usize;
-    let selected = app
-        .slash_completion_index
-        .min(candidates.len().saturating_sub(1));
-    let start = selected
-        .saturating_add(1)
-        .saturating_sub(visible_rows)
-        .min(candidates.len().saturating_sub(visible_rows));
     let area = Rect::new(
         composer_area.x,
         composer_area.y.saturating_sub(popup_height),
         composer_area.width,
         popup_height,
     );
-    let items = candidates
-        .iter()
-        .enumerate()
-        .skip(start)
-        .take(visible_rows)
-        .map(|(index, command)| {
-            let selected_style = if index == selected {
-                Style::default()
-                    .fg(BG)
-                    .bg(AMBER)
-                    .add_modifier(Modifier::BOLD)
+    render_candidates(
+        frame,
+        area,
+        app,
+        &candidates,
+        app.slash_completion_index,
+        hint.as_deref(),
+        None,
+    );
+}
+
+fn render_candidates(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &AppState,
+    candidates: &[super::completion::Candidate],
+    index: usize,
+    hint: Option<&str>,
+    query: Option<&str>,
+) {
+    let selected = index.min(candidates.len().saturating_sub(1));
+    let visible = area.height.saturating_sub(2) as usize;
+    let start = selected.saturating_add(1).saturating_sub(visible);
+    let items: Vec<_> = if candidates.is_empty() {
+        vec![
+            ListItem::new(hint.unwrap_or("No results / 没有匹配结果").to_string())
+                .style(Style::default().fg(MUTED)),
+        ]
+    } else {
+        candidates
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(visible)
+            .map(|(i, candidate)| {
+                let style = if i == selected {
+                    Style::default()
+                        .fg(TEXT)
+                        .bg(GLASS)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(TEXT).bg(RAISED)
+                };
+                ListItem::new(Line::from(vec![
+                    Span::styled(
+                        if i == selected { " › " } else { "   " },
+                        Style::default().fg(AMBER),
+                    ),
+                    Span::styled(format!("{}  ", candidate.name), style),
+                    Span::styled(
+                        format!(
+                            "[{}] {}",
+                            super::completion::kind_label(candidate.kind, app.language),
+                            candidate.description
+                        ),
+                        Style::default().fg(if i == selected { TEXT } else { MUTED }),
+                    ),
+                ]))
+                .style(style)
+            })
+            .collect()
+    };
+    let title = if let Some(query) = query {
+        format!(
+            " {} › {} ",
+            tr(app.language, TextKey::CommandPalette),
+            query
+        )
+    } else {
+        format!(
+            " {} · {}/{} ",
+            tr(app.language, TextKey::Command),
+            if candidates.is_empty() {
+                0
             } else {
-                Style::default().fg(TEXT).bg(RAISED)
-            };
-            ListItem::new(Line::from(vec![
-                Span::styled(format!("  {:<14}", command.name), selected_style),
-                Span::styled(command.description(app.language), selected_style),
-            ]))
-            .style(selected_style)
-        });
+                selected + 1
+            },
+            candidates.len()
+        )
+    };
     frame.render_widget(Clear, area);
     frame.render_widget(
         List::new(items).block(
             Block::default()
-                .title(format!(" {} ", tr(app.language, TextKey::Command)))
+                .title(title)
+                .title_bottom(match app.language {
+                    Language::ZhCn => " ↑↓ 选择 · Tab 补全 · Esc 关闭 ",
+                    Language::En => " ↑↓ select · Tab complete · Esc close ",
+                })
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(MUTED))
                 .style(Style::default().bg(RAISED)),
@@ -392,6 +548,8 @@ pub fn slash_completion(frame: &mut Frame<'_>, composer_area: Rect, app: &AppSta
 pub use super::tool_panel::render as tools;
 
 pub fn footer(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
+    super::progress::render(frame, area, app);
+    let area = Rect::new(area.x, area.bottom().saturating_sub(1), area.width, 1);
     let text = if app.armed_session_delete.is_some() {
         match app.language {
             super::i18n::Language::ZhCn => "再次按 d 永久删除 · Esc 取消".to_string(),
@@ -401,9 +559,32 @@ pub fn footer(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
         }
     } else if app.focus == Focus::Tools {
         tr(app.language, TextKey::ToolControls).to_string()
+    } else if app.focus == Focus::Chat {
+        if app.is_busy() {
+            match app.language {
+                Language::ZhCn => "Ctrl+C 取消 · F2 思考记录 · Tab 工具".into(),
+                Language::En => "Ctrl+C stop · F2 reasoning · Tab tools".into(),
+            }
+        } else if app
+            .messages
+            .iter()
+            .any(|message| message.role == MessageRole::Reasoning)
+        {
+            match app.language {
+                Language::ZhCn => "Enter 发送 · Alt+Enter 换行 · F2 思考记录".into(),
+                Language::En => "Enter send · Alt+Enter newline · F2 reasoning".into(),
+            }
+        } else {
+            match app.language {
+                Language::ZhCn => "Enter 发送 · Alt+Enter 换行 · Tab 面板 · Ctrl+K 命令".into(),
+                Language::En => {
+                    "Enter send · Alt+Enter newline · Tab panels · Ctrl+K commands".into()
+                }
+            }
+        }
     } else {
         format!(
-            "Tab:{}  |  Cmd/Ctrl+K:{}  |  Ctrl+C:{}  |  Ctrl+F:{}",
+            "Tab:{} · Ctrl+K:{} · Ctrl+C:{} · Ctrl+F:{}",
             tr(app.language, TextKey::SwitchPanel),
             tr(app.language, TextKey::Command),
             tr(app.language, TextKey::Cancel),
@@ -427,40 +608,19 @@ fn compact_id(id: &str) -> String {
 }
 
 pub fn command_palette(frame: &mut Frame<'_>, app: &AppState) {
-    let area = centered_rect(frame.area(), 58, 13);
-    frame.render_widget(Clear, area);
-    let commands = [
-        tr(app.language, TextKey::NewSession),
-        tr(app.language, TextKey::SwitchSession),
-        tr(app.language, TextKey::ClearConversation),
-        tr(app.language, TextKey::SwitchModel),
-        tr(app.language, TextKey::Login),
-        tr(app.language, TextKey::SwitchLanguage),
-        tr(app.language, TextKey::Search),
-        tr(app.language, TextKey::ApproveOnce),
-        tr(app.language, TextKey::Status),
-        tr(app.language, TextKey::Exit),
-    ];
-    let items = commands.iter().enumerate().map(|(index, command)| {
-        let style = if index == app.palette_index {
-            Style::default()
-                .fg(BG)
-                .bg(AMBER)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(TEXT).bg(RAISED)
-        };
-        ListItem::new(format!("  {command}")).style(style)
-    });
-    frame.render_widget(
-        List::new(items).block(
-            Block::default()
-                .title(format!(" {} ", tr(app.language, TextKey::CommandPalette)))
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(MUTED))
-                .style(Style::default().bg(RAISED)),
-        ),
+    let candidates = app.command_candidates(
+        app.palette_query.as_str().trim_start_matches('/'),
+        0..app.composer.as_str().len(),
+    );
+    let area = centered_rect(frame.area(), 90, 14);
+    render_candidates(
+        frame,
         area,
+        app,
+        &candidates,
+        app.palette_index,
+        None,
+        Some(app.palette_query.as_str()),
     );
 }
 
@@ -583,4 +743,36 @@ mod recovery_label_tests {
             "服务端上下文溢出恢复"
         );
     }
+}
+
+fn wrap_transcript(lines: Vec<Line<'_>>, width: usize) -> Vec<Line<'static>> {
+    use unicode_segmentation::UnicodeSegmentation;
+    use unicode_width::UnicodeWidthStr;
+    let mut output = Vec::new();
+    for line in lines {
+        let mut spans = Vec::new();
+        let mut columns = 0;
+        for span in line.spans {
+            for grapheme in span.content.graphemes(true) {
+                if grapheme == "\n" || grapheme == "\r\n" {
+                    output.push(Line::from(std::mem::take(&mut spans)));
+                    columns = 0;
+                    continue;
+                }
+                let text = if grapheme == "\t" { "    " } else { grapheme };
+                if text.chars().any(char::is_control) {
+                    continue;
+                }
+                let size = text.width();
+                if columns + size > width && !spans.is_empty() {
+                    output.push(Line::from(std::mem::take(&mut spans)));
+                    columns = 0;
+                }
+                spans.push(Span::styled(text.to_string(), line.style.patch(span.style)));
+                columns += size;
+            }
+        }
+        output.push(Line::from(spans));
+    }
+    output
 }
