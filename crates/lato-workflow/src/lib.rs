@@ -2,6 +2,7 @@
 //!
 //! Parsing/materialization of JSON workflow configs lives in `lato-extensions`.
 
+pub mod compile;
 pub mod completing;
 pub mod config;
 pub mod engine;
@@ -11,6 +12,7 @@ pub mod names;
 pub mod script;
 pub mod types;
 
+pub use compile::compile_declarative_workflow;
 pub use completing::CompletingTaskRunner;
 pub use config::{ParseContext, parse_workflow_config};
 pub use engine::WorkflowEngine;
