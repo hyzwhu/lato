@@ -19,7 +19,8 @@ pub use names::{
 };
 pub use types::{
     DEFAULT_AGENT_BUDGET, MAX_AGENT_BUDGET, MAX_DESCRIPTION_BYTES, MAX_WORKFLOW_DIAGNOSTIC_BYTES,
-    MAX_WORKFLOW_DIAGNOSTICS, MAX_WORKFLOWS_PER_PLUGIN, MIN_AGENT_BUDGET, Workflow,
-    WorkflowContext, WorkflowDescriptor, WorkflowDescriptorSet, WorkflowDiagnostic,
-    WorkflowOutcome, WorkflowStatus, push_diagnostic, truncate_description,
+    MAX_WORKFLOW_DIAGNOSTICS, MAX_WORKFLOW_STEPS, MAX_WORKFLOWS_PER_PLUGIN, MIN_AGENT_BUDGET,
+    Workflow, WorkflowContext, WorkflowDescriptor, WorkflowDescriptorSet, WorkflowDiagnostic,
+    WorkflowOutcome, WorkflowProfile, WorkflowStatus, WorkflowStep, push_diagnostic,
+    truncate_description,
 };

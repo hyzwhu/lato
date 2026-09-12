@@ -1,4 +1,8 @@
-use std::{future::ready, path::PathBuf, sync::Arc};
+use std::{
+    future::ready,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+};
 
 use futures_util::future::BoxFuture;
 use lato_core::{
@@ -10,7 +14,8 @@ use lato_runtime::{
     spawn_task_coordinator,
 };
 use lato_workflow::{
-    DEFAULT_AGENT_BUDGET, WorkflowDescriptor, WorkflowDescriptorSet, WorkflowEngine, WorkflowStatus,
+    DEFAULT_AGENT_BUDGET, WorkflowDescriptor, WorkflowDescriptorSet, WorkflowEngine,
+    WorkflowProfile, WorkflowStatus, WorkflowStep,
 };
 use lato_workspace::MemoryWorkspaceAllocator;
 
@@ -35,7 +40,17 @@ impl TaskChildControl for InstantControl {
     fn cancel(&self) {}
 }
 
-struct InstantRunner;
+struct InstantRunner {
+    objectives: Mutex<Vec<String>>,
+}
+
+impl InstantRunner {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            objectives: Mutex::new(Vec::new()),
+        })
+    }
+}
 
 #[async_trait::async_trait]
 impl TaskRunner for InstantRunner {
@@ -46,6 +61,10 @@ impl TaskRunner for InstantRunner {
         request: TaskRunRequest,
         reporter: TaskReporter<Self::Control>,
     ) -> TaskRunOutput {
+        self.objectives
+            .lock()
+            .unwrap()
+            .push(request.node.scope.objective.clone());
         let _ = reporter
             .started(StartedTask::new(
                 Arc::new(InstantControl),
@@ -120,6 +139,10 @@ fn descriptor(id: &str) -> WorkflowDescriptor {
         description: String::new(),
         when_to_use: String::new(),
         agent_budget: DEFAULT_AGENT_BUDGET,
+        steps: vec![WorkflowStep {
+            prompt: format!("Run {id}"),
+            profile: WorkflowProfile::Worker,
+        }],
         source_dir: PathBuf::from("."),
         generation: 1,
     }
@@ -150,7 +173,7 @@ async fn unknown_workflow_is_not_found() {
     let allocator = Arc::new(MemoryWorkspaceAllocator::new(workspace.path()).unwrap());
     let (handle, _actor) = spawn_task_coordinator(
         CoordinatorConfig::default(),
-        Arc::new(InstantRunner),
+        InstantRunner::new(),
         allocator,
         Arc::new(NoopTaskEventSink),
     );
@@ -174,7 +197,7 @@ async fn successful_run_settles_child_task_budget() {
     let allocator = Arc::new(MemoryWorkspaceAllocator::new(workspace.path()).unwrap());
     let (handle, _actor) = spawn_task_coordinator(
         CoordinatorConfig::default(),
-        Arc::new(InstantRunner),
+        InstantRunner::new(),
         allocator,
         Arc::new(NoopTaskEventSink),
     );
@@ -262,4 +285,54 @@ async fn cancel_unblocks_wait_and_releases_reservation() {
     assert_eq!(err.code(), "workflow.cancelled");
     assert_eq!(engine.budget_reserved().child_tasks, 0);
     assert_eq!(engine.budget_spent().child_tasks, 0);
+}
+
+#[tokio::test]
+async fn sequential_steps_use_declared_prompts() {
+    let workspace = tempfile::tempdir().unwrap();
+    let allocator = Arc::new(MemoryWorkspaceAllocator::new(workspace.path()).unwrap());
+    let runner = InstantRunner::new();
+    let (handle, _actor) = spawn_task_coordinator(
+        CoordinatorConfig::default(),
+        runner.clone(),
+        allocator,
+        Arc::new(NoopTaskEventSink),
+    );
+    let mut review = descriptor("demo/review");
+    review.steps = vec![
+        WorkflowStep {
+            prompt: "Scan".into(),
+            profile: WorkflowProfile::Explorer,
+        },
+        WorkflowStep {
+            prompt: "Patch".into(),
+            profile: WorkflowProfile::Worker,
+        },
+    ];
+    let set = Arc::new(WorkflowDescriptorSet {
+        generation: 1,
+        workflows: vec![review].into(),
+        diagnostics: Arc::from([]),
+    });
+    let mut limits = BudgetLimits::unlimited();
+    limits.child_tasks = Some(2);
+    let engine = WorkflowEngine::new(set, handle, BudgetAccount::new(limits));
+    let outcome = engine
+        .run(
+            "demo/review",
+            SessionId::from("sess"),
+            serde_json::json!({"path": "src/lib.rs"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(outcome.status, WorkflowStatus::Completed);
+    assert_eq!(
+        outcome.output["steps"],
+        serde_json::json!(["Scan", "Patch"])
+    );
+    assert_eq!(engine.budget_spent().child_tasks, 2);
+    let objectives = runner.objectives.lock().unwrap().clone();
+    assert_eq!(objectives.len(), 2);
+    assert!(objectives[0].contains("Scan"));
+    assert!(objectives[1].contains("Patch"));
 }

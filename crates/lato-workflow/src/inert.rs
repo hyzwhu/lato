@@ -50,6 +50,10 @@ mod tests {
             description: String::new(),
             when_to_use: String::new(),
             agent_budget: DEFAULT_AGENT_BUDGET,
+            steps: vec![crate::WorkflowStep {
+                prompt: "Run demo/review".into(),
+                profile: crate::WorkflowProfile::Worker,
+            }],
             source_dir: PathBuf::from("."),
             generation: 1,
         });

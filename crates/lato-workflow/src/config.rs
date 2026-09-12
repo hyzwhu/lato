@@ -11,8 +11,9 @@ use std::{collections::BTreeSet, path::Path};
 use serde_json::Value;
 
 use crate::{
-    MAX_WORKFLOWS_PER_PLUGIN, WorkflowDescriptor, WorkflowDiagnostic, clamp_agent_budget,
-    normalize_workflow_name, push_diagnostic, qualify_workflow, truncate_description,
+    MAX_WORKFLOW_STEPS, MAX_WORKFLOWS_PER_PLUGIN, WorkflowDescriptor, WorkflowDiagnostic,
+    WorkflowProfile, WorkflowStep, clamp_agent_budget, normalize_workflow_name, push_diagnostic,
+    qualify_workflow, truncate_description,
 };
 
 pub struct ParseContext<'a> {
@@ -131,6 +132,33 @@ fn parse_entry(
         Ok(value) => value,
         Err(error) => return Err(("workflow.invalid_budget", error.to_string())),
     };
+    let default_profile = match object
+        .get("profile")
+        .and_then(Value::as_str)
+        .map(WorkflowProfile::parse)
+    {
+        None => WorkflowProfile::Worker,
+        Some(Some(profile)) => profile,
+        Some(None) => {
+            return Err((
+                "workflow.invalid_profile",
+                format!("workflow {name} has invalid profile"),
+            ));
+        }
+    };
+    let prompt = object
+        .get("prompt")
+        .or_else(|| object.get("objective"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .filter(|value| !value.is_empty());
+    let steps = parse_steps(
+        object.get("steps"),
+        prompt.as_deref(),
+        &description,
+        id,
+        default_profile,
+    )?;
     Ok(WorkflowDescriptor {
         id: id.to_owned(),
         plugin_name: context.plugin_name.to_owned(),
@@ -138,7 +166,156 @@ fn parse_entry(
         description: truncate_description(&description),
         when_to_use: truncate_description(&when_to_use),
         agent_budget,
+        steps,
         source_dir: context.plugin_root.to_path_buf(),
         generation: context.generation,
     })
+}
+
+fn parse_steps(
+    raw: Option<&Value>,
+    prompt: Option<&str>,
+    description: &str,
+    id: &str,
+    default_profile: WorkflowProfile,
+) -> Result<Vec<WorkflowStep>, (&'static str, String)> {
+    if let Some(Value::Array(items)) = raw {
+        if items.is_empty() {
+            return Ok(vec![default_step(prompt, description, id, default_profile)]);
+        }
+        let mut steps = Vec::new();
+        for (index, item) in items.iter().enumerate() {
+            if steps.len() >= MAX_WORKFLOW_STEPS {
+                break;
+            }
+            let object = item.as_object().ok_or_else(|| {
+                (
+                    "workflow.invalid_step",
+                    format!("workflow {id} step {index} must be an object"),
+                )
+            })?;
+            let step_prompt = object
+                .get("prompt")
+                .or_else(|| object.get("objective"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    (
+                        "workflow.invalid_step",
+                        format!("workflow {id} step {index} requires prompt"),
+                    )
+                })?;
+            let profile = match object.get("profile").and_then(Value::as_str) {
+                None => default_profile,
+                Some(raw) => WorkflowProfile::parse(raw).ok_or_else(|| {
+                    (
+                        "workflow.invalid_profile",
+                        format!("workflow {id} step {index} has invalid profile {raw:?}"),
+                    )
+                })?,
+            };
+            steps.push(WorkflowStep {
+                prompt: truncate_description(&step_prompt),
+                profile,
+            });
+        }
+        return Ok(steps);
+    }
+    if raw.is_some() {
+        return Err((
+            "workflow.invalid_step",
+            format!("workflow {id} steps must be an array"),
+        ));
+    }
+    Ok(vec![default_step(prompt, description, id, default_profile)])
+}
+
+fn default_step(
+    prompt: Option<&str>,
+    description: &str,
+    id: &str,
+    profile: WorkflowProfile,
+) -> WorkflowStep {
+    let prompt = prompt
+        .map(str::to_owned)
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            let trimmed = description.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_owned())
+        })
+        .unwrap_or_else(|| format!("Run {id}"));
+    WorkflowStep {
+        prompt: truncate_description(&prompt),
+        profile,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::BTreeSet, path::Path};
+
+    use serde_json::json;
+
+    use super::*;
+    use crate::WorkflowProfile;
+
+    fn parse(value: serde_json::Value) -> (Vec<WorkflowDescriptor>, Vec<WorkflowDiagnostic>) {
+        let mut seen = BTreeSet::new();
+        let mut workflows = Vec::new();
+        let mut diagnostics = Vec::new();
+        parse_workflow_config(
+            &value,
+            &ParseContext {
+                plugin_name: "demo",
+                plugin_root: Path::new("."),
+                source_path: None,
+                generation: 1,
+            },
+            &mut seen,
+            &mut workflows,
+            &mut diagnostics,
+        );
+        (workflows, diagnostics)
+    }
+
+    #[test]
+    fn default_step_uses_prompt_then_description() {
+        let (workflows, diagnostics) = parse(json!({
+            "review": { "prompt": "Inspect the diff", "profile": "explorer" }
+        }));
+        assert!(diagnostics.is_empty());
+        assert_eq!(workflows[0].steps.len(), 1);
+        assert_eq!(workflows[0].steps[0].prompt, "Inspect the diff");
+        assert_eq!(workflows[0].steps[0].profile, WorkflowProfile::Explorer);
+    }
+
+    #[test]
+    fn steps_array_is_parsed() {
+        let (workflows, diagnostics) = parse(json!({
+            "review": {
+                "steps": [
+                    { "prompt": "Scan", "profile": "explorer" },
+                    { "prompt": "Patch", "profile": "worker" }
+                ]
+            }
+        }));
+        assert!(diagnostics.is_empty());
+        assert_eq!(workflows[0].steps.len(), 2);
+        assert_eq!(workflows[0].steps[1].prompt, "Patch");
+        assert_eq!(workflows[0].steps[1].profile, WorkflowProfile::Worker);
+    }
+
+    #[test]
+    fn invalid_profile_is_isolated() {
+        let (workflows, diagnostics) = parse(json!({
+            "review": { "profile": "god-mode" }
+        }));
+        assert!(workflows.is_empty());
+        assert!(
+            diagnostics
+                .iter()
+                .any(|item| item.code == "workflow.invalid_profile")
+        );
+    }
 }

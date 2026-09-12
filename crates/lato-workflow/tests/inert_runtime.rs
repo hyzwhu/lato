@@ -18,6 +18,10 @@ async fn inert_run_does_not_reserve_budget() {
         description: String::new(),
         when_to_use: String::new(),
         agent_budget: DEFAULT_AGENT_BUDGET,
+        steps: vec![lato_workflow::WorkflowStep {
+            prompt: "Run demo/review".into(),
+            profile: lato_workflow::WorkflowProfile::Worker,
+        }],
         source_dir: PathBuf::from("."),
         generation: 1,
     });

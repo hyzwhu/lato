@@ -16,6 +16,39 @@ pub const MAX_DESCRIPTION_BYTES: usize = 4 * 1024;
 pub const MAX_WORKFLOWS_PER_PLUGIN: usize = 32;
 pub const MAX_WORKFLOW_DIAGNOSTICS: usize = 128;
 pub const MAX_WORKFLOW_DIAGNOSTIC_BYTES: usize = 512;
+pub const MAX_WORKFLOW_STEPS: usize = 16;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WorkflowProfile {
+    Explorer,
+    Worker,
+    Reviewer,
+}
+
+impl WorkflowProfile {
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "explorer" => Some(Self::Explorer),
+            "worker" | "" => Some(Self::Worker),
+            "reviewer" => Some(Self::Reviewer),
+            _ => None,
+        }
+    }
+
+    pub fn agent_profile(self) -> lato_core::AgentProfile {
+        match self {
+            Self::Explorer => lato_core::AgentProfile::explorer(),
+            Self::Worker => lato_core::AgentProfile::worker(),
+            Self::Reviewer => lato_core::AgentProfile::reviewer(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkflowStep {
+    pub prompt: String,
+    pub profile: WorkflowProfile,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorkflowDescriptor {
@@ -25,6 +58,7 @@ pub struct WorkflowDescriptor {
     pub description: String,
     pub when_to_use: String,
     pub agent_budget: u32,
+    pub steps: Vec<WorkflowStep>,
     pub source_dir: PathBuf,
     pub generation: u64,
 }

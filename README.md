@@ -282,10 +282,11 @@ older `~/.local/bin/lato` may shadow PATH and exercise a stale build.
 
 Trusted, enabled plugins may declare workflows in `plugin.json` (`workflows`
 inline map or a `workflows.json` path under the plugin root). Qualified ids are
-`plugin/workflow`. Phase 7A materializes descriptors. Phase 7B1 can **start a
-single coordinator-backed step** (`TaskOwner::Workflow`) with `child_tasks`
-budgeting and `cancel_workflow`; it still does not interpret scripts or call a
-model. `agentBudget` is a declared cap (default 128, max 1024). Untrusted
+`plugin/workflow`. Phase 7A materializes descriptors. Phase 7B can **start
+coordinator-backed steps** (`TaskOwner::Workflow`) from `prompt` / `steps` /
+`profile` (`explorer`, `worker`, `reviewer`) with `child_tasks` budgeting and
+`cancel_workflow`. It still does not interpret scripts or call a model.
+`agentBudget` is a declared cap (default 128, max 1024). Untrusted
 project plugins contribute no workflow descriptors. Child sessions may only
 narrow the parent allowlist. `doctor` does not list workflows.
 
