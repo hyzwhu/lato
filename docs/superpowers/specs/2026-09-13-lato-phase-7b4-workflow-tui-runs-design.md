@@ -2,7 +2,7 @@
 
 | 字段 | 值 |
 | --- | --- |
-| 状态 | **待实施** |
+| 状态 | **已实施（2026-09-15，Phase 7B4 gate 通过）** |
 | 日期 | 2026-09-13 |
 | 基线 | 7B3 Rhai host + `lato workflow run` + TUI `/workflows` 仅列出插件 JSON 描述符 |
 | 上游 | Grok Build `bb7f39d5858cbf5e00de639367f59debbdcb0138`：`xai-grok-shell/src/session/workflow/{manager,tracker,notify}.rs` + user-guide `/workflow` |

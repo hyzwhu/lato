@@ -600,7 +600,7 @@ fn workflow_argument_completion_offers_subcommands_and_display_names() {
 
     // Workflow ids are offered for the launch form.
     app.composer.replace("/workflow rev");
-    let mut app = app_with_workflow(app);
+    let app = app_with_workflow(app);
     let names: Vec<String> = app
         .candidates()
         .into_iter()

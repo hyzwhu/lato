@@ -98,10 +98,11 @@ fn resume_unknown_reference_reports_no_match_before_tty_setup() {
         );
     }
     let sessions = home.path().join("sessions");
-    let created = sessions
-        .exists()
-        .then(|| std::fs::read_dir(&sessions).unwrap().count())
-        .unwrap_or(0);
+    let created = if sessions.exists() {
+        std::fs::read_dir(&sessions).unwrap().count()
+    } else {
+        0
+    };
     assert_eq!(created, 0, "unknown resume must not create a session");
 }
 

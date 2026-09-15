@@ -105,7 +105,7 @@ pub fn spawn_workflow_host_service(
                     break;
                 }
             };
-            service.clone().dispatch(req);
+            service.clone().handle_request(req);
         }
         service.cancel_and_drain_children().await;
         let _ = service.coordinator.shutdown().await;
@@ -270,7 +270,7 @@ struct HostService {
 }
 
 impl HostService {
-    fn dispatch(self: Arc<Self>, req: WorkflowHostRequest) {
+    fn handle_request(self: Arc<Self>, req: WorkflowHostRequest) {
         match req {
             WorkflowHostRequest::ReserveAgentCalls { count, reply } => {
                 let _ = reply.send(self.reserve_agent_calls(count));

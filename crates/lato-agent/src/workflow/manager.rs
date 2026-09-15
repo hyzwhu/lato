@@ -172,11 +172,11 @@ impl WorkflowManager {
             .tracker
             .by_display_name(display_name)
             .ok_or_else(|| LaunchError::UnknownRun(display_name.to_owned()))?;
-        if state.status == WorkflowRunStatus::Active {
-            if let Some(active) = inner.active.get(&state.run_id) {
-                active.pause_intent.store(true, Ordering::Release);
-                active.cancel.cancel();
-            }
+        if state.status == WorkflowRunStatus::Active
+            && let Some(active) = inner.active.get(&state.run_id)
+        {
+            active.pause_intent.store(true, Ordering::Release);
+            active.cancel.cancel();
         }
         Ok(stamp(&inner, state))
     }
@@ -487,7 +487,7 @@ mod tests {
         let manager = WorkflowManager::new(
             "s-test",
             std::env::temp_dir(),
-            SessionTrust::for_headless_prompt(&std::env::temp_dir()),
+            SessionTrust::for_headless_prompt(std::env::temp_dir()),
             Arc::new(FileLocks::new()),
             crate::default_fake_stream(),
             None,

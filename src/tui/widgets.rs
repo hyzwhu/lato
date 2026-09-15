@@ -721,11 +721,11 @@ pub fn workflow_runs_overlay(frame: &mut Frame<'_>, app: &AppState) {
         inner,
         &mut ListState::default().with_selected(Some(selected)),
     );
-    let footer = match app.workflow_runs.get(selected).and_then(|run| run.pause_message.clone())
-    {
-        Some(message) => message,
-        None => String::new(),
-    };
+    let footer = app
+        .workflow_runs
+        .get(selected)
+        .and_then(|run| run.pause_message.clone())
+        .unwrap_or_default();
     if !footer.is_empty() {
         let rows = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(inner);
         frame.render_widget(Paragraph::new(footer).style(Style::default().fg(AMBER)), rows[1]);
@@ -807,31 +807,6 @@ fn centered_rect(area: Rect, percent_x: u16, height: u16) -> Rect {
     )
 }
 
-#[cfg(test)]
-mod recovery_label_tests {
-    use super::*;
-
-    #[test]
-    fn overflow_compaction_triggers_are_localized() {
-        assert_eq!(
-            compaction_trigger_label("preflight_overflow", Language::En),
-            "tool-output overflow"
-        );
-        assert_eq!(
-            compaction_trigger_label("provider_overflow", Language::En),
-            "provider overflow recovery"
-        );
-        assert_eq!(
-            compaction_trigger_label("preflight_overflow", Language::ZhCn),
-            "工具输出溢出"
-        );
-        assert_eq!(
-            compaction_trigger_label("provider_overflow", Language::ZhCn),
-            "服务端上下文溢出恢复"
-        );
-    }
-}
-
 fn wrap_transcript(lines: Vec<Line<'_>>, width: usize) -> Vec<Line<'static>> {
     use unicode_segmentation::UnicodeSegmentation;
     use unicode_width::UnicodeWidthStr;
@@ -862,4 +837,30 @@ fn wrap_transcript(lines: Vec<Line<'_>>, width: usize) -> Vec<Line<'static>> {
         output.push(Line::from(spans));
     }
     output
+}
+
+
+#[cfg(test)]
+mod recovery_label_tests {
+    use super::*;
+
+    #[test]
+    fn overflow_compaction_triggers_are_localized() {
+        assert_eq!(
+            compaction_trigger_label("preflight_overflow", Language::En),
+            "tool-output overflow"
+        );
+        assert_eq!(
+            compaction_trigger_label("provider_overflow", Language::En),
+            "provider overflow recovery"
+        );
+        assert_eq!(
+            compaction_trigger_label("preflight_overflow", Language::ZhCn),
+            "工具输出溢出"
+        );
+        assert_eq!(
+            compaction_trigger_label("provider_overflow", Language::ZhCn),
+            "服务端上下文溢出恢复"
+        );
+    }
 }

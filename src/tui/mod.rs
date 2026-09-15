@@ -10,6 +10,7 @@ pub mod render;
 pub mod state;
 pub mod terminal;
 pub mod tool_panel;
+
 #[cfg(test)]
 mod usability_tests;
 pub mod widgets;
@@ -966,10 +967,10 @@ fn handle_palette_key(app: &mut AppState, key: KeyEvent, trust: &SessionTrust) -
             if selected.kind == "command" && key.code == KeyCode::Enter && draft.is_empty() {
                 submit_or_command(app, trust)
             } else {
-                if !draft.is_empty() {
-                    if let Some(previous) = app.parked_draft.replace(draft) {
-                        app.history.push(previous);
-                    }
+                if !draft.is_empty()
+                    && let Some(previous) = app.parked_draft.replace(draft)
+                {
+                    app.history.push(previous);
                 }
                 Vec::new()
             }
@@ -1077,6 +1078,20 @@ fn active_input(app: &mut AppState) -> &mut input::InputBuffer {
         &mut app.composer
     }
 }
+
+fn start_file_index(
+    app: &mut AppState,
+    sender: &mpsc::UnboundedSender<Result<Vec<String>, String>>,
+) {
+    app.files_loading = true;
+    app.files_error = None;
+    let workspace = app.workspace.clone();
+    let sender = sender.clone();
+    tokio::task::spawn_blocking(move || {
+        let _ = sender.send(context::index_files(&workspace));
+    });
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -1288,6 +1303,7 @@ mod tests {
         assert_eq!(app.composer.as_str(), "/new");
 
         app.composer.replace("/MO");
+        app.slash_completion_index = 0;
         app.refresh_slash_completion();
         assert_eq!(app.slash_completion()[0].name, "/model");
         assert!(
@@ -1429,17 +1445,4 @@ mod tests {
             })
             .await;
     }
-}
-
-fn start_file_index(
-    app: &mut AppState,
-    sender: &mpsc::UnboundedSender<Result<Vec<String>, String>>,
-) {
-    app.files_loading = true;
-    app.files_error = None;
-    let workspace = app.workspace.clone();
-    let sender = sender.clone();
-    tokio::task::spawn_blocking(move || {
-        let _ = sender.send(context::index_files(&workspace));
-    });
 }

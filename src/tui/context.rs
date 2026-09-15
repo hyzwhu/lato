@@ -179,11 +179,7 @@ fn references(text: &str) -> Vec<Reference> {
                     complete = true;
                     break;
                 }
-                if c == '\\' && !escaped {
-                    escaped = true;
-                } else {
-                    escaped = false;
-                }
+                escaped = c == '\\' && !escaped;
             }
             let raw = &text[start + 1..cursor];
             let path = if complete {

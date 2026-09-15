@@ -300,8 +300,31 @@ fake stream. `--validate-only` compiles and walks one canned path without
 spawning child sessions or calling a model. `agentBudget` is a logical-agent
 cap (default 128, max 1024). Untrusted project plugins and untrusted
 `.lato/workflows` contribute nothing. Child sessions may only narrow the parent
-allowlist. The TUI `/workflows` command still only lists descriptors; there is
-no in-session `/workflow run`. `doctor` does not list workflows.
+allowlist. A run that pauses reports the stable `workflow.paused` error code
+(not `workflow.failed`); resuming a paused CLI run is cross-process and is
+deferred to a later phase. `doctor` does not list workflows.
+
+### In-session workflow runs (Phase 7B4)
+
+Each ACP/TUI session owns an in-memory `WorkflowManager`: at most 4 active
+runs, session-unique display names (`review`, `review-2`, …), and a same-process
+journal so `await_user` / `pause` runs replay in place on `resume`. Child
+agents inherit the parent session's `ToolApproval`.
+
+- `/workflows` lists saved workflow definitions (keep-first: user → trusted
+  project → trusted plugins) with id, name, description, source, budget.
+- `/workflow <id> [json-args]` starts a background run and immediately reports
+  `{ displayName, runId, status: "active" }`; the internal `runId` (`wf_…`)
+  never appears in slash arguments.
+- `/workflow runs` opens the live board overlay: display name, status, phase,
+  agents used / budget, elapsed, pause message. Hotkeys: `p` pause, `r` resume,
+  `x` stop, `Esc`/`q` close. `/workflow pause|resume|stop <displayName>` is
+  equivalent. `BudgetLimited` runs resume only with a higher budget.
+- Progress arrives as `session/update` notifications
+  (`sessionUpdate: "lato/workflow"`); the main prompt turn is never occupied by
+  a workflow. Process exit or `session/close` cancels active runs and records
+  them as `interrupted` (not resumable this phase); `CLI lato workflow
+  resume|pause|stop` does not exist (no resident process).
 
 ## Doctor
 
