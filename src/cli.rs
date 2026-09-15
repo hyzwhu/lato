@@ -1108,16 +1108,24 @@ async fn login(provider: String, method: LoginMethod) -> i32 {
             return 1;
         }
         if std::env::var_os("LATO_MOCK_OAUTH").is_some() {
-            let mut store = CredentialStore::open(&home).unwrap();
-            store_oauth(
+            let mut store = match CredentialStore::open(&home) {
+                Ok(store) => store,
+                Err(e) => {
+                    eprintln!("error: cannot open credential store: {e}");
+                    return 1;
+                }
+            };
+            if let Err(e) = store_oauth(
                 &mut store,
                 &provider,
                 "mock-access",
                 "mock-refresh",
                 4_102_444_800_000,
                 (provider == "openai-codex").then_some("mock-account"),
-            )
-            .unwrap();
+            ) {
+                eprintln!("error: {e}");
+                return 1;
+            }
             println!("oauth logged in {provider}");
             return 0;
         }
@@ -1145,7 +1153,13 @@ async fn login(provider: String, method: LoginMethod) -> i32 {
         .await
         {
             Ok(tokens) => {
-                let mut store = CredentialStore::open(&home).unwrap();
+                let mut store = match CredentialStore::open(&home) {
+                    Ok(store) => store,
+                    Err(e) => {
+                        eprintln!("error: cannot open credential store: {e}");
+                        return 1;
+                    }
+                };
                 if let Err(e) = store_oauth(
                     &mut store,
                     &provider,
@@ -1177,15 +1191,22 @@ async fn login(provider: String, method: LoginMethod) -> i32 {
             );
             return 1;
         }
-        let mut store = CredentialStore::open(&home).unwrap();
-        store
-            .modify(|m| {
-                m.insert(
-                    provider.clone(),
-                    serde_json::json!({"type":"api_key","key":key}),
-                );
-            })
-            .unwrap();
+        let mut store = match CredentialStore::open(&home) {
+            Ok(store) => store,
+            Err(e) => {
+                eprintln!("error: cannot open credential store: {e}");
+                return 1;
+            }
+        };
+        if let Err(e) = store.modify(|m| {
+            m.insert(
+                provider.clone(),
+                serde_json::json!({"type":"api_key","key":key}),
+            );
+        }) {
+            eprintln!("error: {e}");
+            return 1;
+        }
         println!("logged in {provider}");
         return 0;
     }
