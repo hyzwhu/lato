@@ -16,6 +16,11 @@ pub const METHODS_IMPLEMENTED: &[&str] = &[
     "lato/session/skills",
     "lato/session/skill",
     "lato/session/workflows",
+    "lato/session/workflow",
+    "lato/session/workflow/runs",
+    "lato/session/workflow/pause",
+    "lato/session/workflow/resume",
+    "lato/session/workflow/stop",
     "lato/session/list",
     "lato/session/rename",
     "lato/session/delete",
@@ -68,5 +73,25 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn workflow_lifecycle_methods_are_advertised_exactly_once() {
+        for method in [
+            "lato/session/workflow",
+            "lato/session/workflow/runs",
+            "lato/session/workflow/pause",
+            "lato/session/workflow/resume",
+            "lato/session/workflow/stop",
+        ] {
+            assert!(is_implemented(method), "{method} must be advertised");
+            assert_eq!(
+                METHODS_IMPLEMENTED.iter().filter(|m| **m == method).count(),
+                1,
+                "{method} must appear exactly once"
+            );
+        }
+        // Out of scope for 7B4: no CLI subcommands, no model-facing tool.
+        assert!(!METHODS_IMPLEMENTED.contains(&"lato/workflow/save"));
     }
 }

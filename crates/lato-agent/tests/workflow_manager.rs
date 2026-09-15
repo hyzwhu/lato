@@ -14,6 +14,7 @@ fn resolved(name: &str, script: &str) -> ResolvedWorkflow {
     ResolvedWorkflow {
         id: format!("demo/{name}"),
         display_name: name.to_owned(),
+        description: "test".to_owned(),
         script: script.to_owned(),
         agent_budget: 8,
         source: "plugin",

@@ -20,6 +20,7 @@ serde_json = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt"] }
+dirs = "6"
 fs2 = "0.4"
 reqwest = "0.12"
 async-trait = "0.1"

@@ -1314,6 +1314,7 @@ name = "lato-agent"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "dirs",
  "fs2",
  "futures-util",
  "jsonschema 0.30.0",

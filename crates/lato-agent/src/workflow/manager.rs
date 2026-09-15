@@ -167,7 +167,7 @@ impl WorkflowManager {
     }
 
     pub fn pause(&self, display_name: &str) -> Result<WorkflowRunState, LaunchError> {
-        let mut inner = self.core.inner.lock().unwrap();
+        let inner = self.core.inner.lock().unwrap();
         let state = inner
             .tracker
             .by_display_name(display_name)
@@ -251,16 +251,9 @@ impl WorkflowManager {
         } else if !state.status.is_resumable() {
             return Err(LaunchError::NotResumable(display_name.to_owned()));
         }
-        let resolved = inner
-            .workflows
-            .get(&state.run_id)
-            .cloned()
-            .ok_or_else(|| LaunchError::UnknownRun(state.run_id.clone()))?;
-        let args = inner
-            .args
-            .get(&state.run_id)
-            .cloned()
-            .unwrap_or(serde_json::json!({}));
+        if !inner.workflows.contains_key(&state.run_id) {
+            return Err(LaunchError::UnknownRun(state.run_id.clone()));
+        }
         // The journal stays in `inner.journals`; the run task removes it when
         // it launches and stores the advanced copy back when the run settles.
         inner
@@ -297,7 +290,7 @@ impl WorkflowManager {
     /// `interrupted` (process exit / session close, not resumable this phase).
     pub async fn shutdown(&self) {
         let triggers: Vec<(String, ActiveRun)> = {
-            let mut inner = self.core.inner.lock().unwrap();
+            let inner = self.core.inner.lock().unwrap();
             inner
                 .active
                 .iter()
@@ -503,6 +496,7 @@ mod tests {
         let resolved = super::super::ResolvedWorkflow {
             id: "demo/hold".into(),
             display_name: "hold".into(),
+            description: "d".into(),
             script: r#"
                 let meta = #{ name: "hold", description: "d" };
                 await_user("user", "need human");

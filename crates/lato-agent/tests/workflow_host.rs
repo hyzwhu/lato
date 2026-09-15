@@ -81,6 +81,8 @@ fn start_host(
         trust: SessionTrust::for_headless_prompt(&cwd),
         snapshot: PluginSnapshot::empty(),
         cancel: cancel.clone(),
+        approval: None,
+        notify: None,
     };
     let join = spawn_workflow_host_service(params, rx);
     (tx, join, cancel)
