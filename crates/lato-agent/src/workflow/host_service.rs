@@ -29,6 +29,7 @@ use super::schema_contract::{
 };
 use crate::{
     BuiltinProfileName, ChildSessionRunner, ProfileResultVerifier, SessionPluginSnapshots,
+    ToolApproval,
 };
 
 pub const DEFAULT_WORKFLOW_MAX_CONCURRENT_AGENTS: usize = 32;
@@ -37,6 +38,14 @@ const WORKFLOW_MAX_AGENT_PROMPT_BYTES: usize = 1024 * 1024;
 const WORKFLOW_MAX_PHASE_BYTES: usize = 256;
 const WORKFLOW_CHILD_DRAIN_TIMEOUT: Duration = Duration::from_secs(20);
 const CONTRACT_OUTPUT_MAX_BYTES: usize = 2 * 1024 * 1024;
+
+/// Live run progress emitted by the host service so a session-level manager
+/// can update the tracker without intercepting host traffic.
+#[derive(Clone, Debug)]
+pub enum RunEvent {
+    Phase { title: String },
+    AgentSpawned,
+}
 
 pub struct WorkflowHostParams {
     pub run_id: String,
@@ -49,6 +58,8 @@ pub struct WorkflowHostParams {
     pub trust: SessionTrust,
     pub snapshot: Arc<PluginSnapshot>,
     pub cancel: CancellationToken,
+    pub approval: Option<Arc<dyn ToolApproval>>,
+    pub notify: Option<mpsc::UnboundedSender<RunEvent>>,
 }
 
 /// The configured cap clamped to the machine's parallelism, so small hosts run fewer agents at once.
@@ -116,7 +127,7 @@ async fn setup_host(
             Arc::clone(&params.locks),
             params.trust.clone(),
             updates,
-            None,
+            params.approval.clone(),
         )
         .with_session_plugins(session_plugins),
     );
@@ -268,12 +279,20 @@ impl HostService {
                 let _ = reply.send(self.release_agent_calls(count));
             }
             WorkflowHostRequest::SpawnAgent { opts, reply } => {
+                if let Some(notify) = &self.params.notify {
+                    let _ = notify.send(RunEvent::AgentSpawned);
+                }
                 tokio::spawn(async move {
                     let result = self.spawn_agent(opts).await;
                     let _ = reply.send(result);
                 });
             }
-            WorkflowHostRequest::Phase { .. } | WorkflowHostRequest::Log { .. } => {}
+            WorkflowHostRequest::Phase { title, .. } => {
+                if let Some(notify) = &self.params.notify {
+                    let _ = notify.send(RunEvent::Phase { title });
+                }
+            }
+            WorkflowHostRequest::Log { .. } => {}
             WorkflowHostRequest::Telemetry { .. } => {}
             WorkflowHostRequest::BudgetQuery { reply } => {
                 let _ = reply.send(Ok(self.budget_state()));

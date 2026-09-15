@@ -210,6 +210,8 @@ async fn execute(
             trust,
             snapshot,
             cancel: cancel.clone(),
+            approval: None,
+            notify: None,
         },
         host_rx,
     );
