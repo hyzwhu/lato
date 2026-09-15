@@ -212,11 +212,16 @@ fn write_hook_script(dir: &Path, name: &str, json_stdout: &str) -> PathBuf {
     // short-lived process exit (EPIPE → fail-open Allow).
     if cfg!(windows) {
         // Windows cannot execute shebang scripts; use a batch file instead.
-        // The echo appends CRLF, which the JSON parser tolerates.
+        // The payload goes into a side file and is printed with `type`,
+        // because a 30 KiB echo line exceeds cmd's 8191-character command
+        // line limit. `more > NUL` drains stdin so the hook runner's payload
+        // write cannot race with the process exit.
         let path = dir.join(format!("{name}.cmd"));
+        let payload_path = dir.join(format!("{name}.payload"));
+        std::fs::write(&payload_path, json_stdout).unwrap();
         std::fs::write(
             &path,
-            format!("@echo off\r\nmore > NUL\r\necho {json_stdout}\r\n"),
+            format!("@echo off\r\nmore > NUL\r\ntype \"%~dp0{name}.payload\"\r\n"),
         )
         .unwrap();
         return path;
