@@ -52,12 +52,14 @@ impl GitWorkspaceAllocator {
         worktrees_root: impl AsRef<Path>,
     ) -> Result<Self, TaskError> {
         let configured_repository = repository.as_ref();
-        let repository = std::fs::canonicalize(configured_repository).map_err(|error| {
-            workspace_error(
-                TaskErrorCode::WorkspaceAllocation,
-                format!("failed to resolve Git repository: {error}"),
-            )
-        })?;
+        let repository = normalize_path(std::fs::canonicalize(configured_repository).map_err(
+            |error| {
+                workspace_error(
+                    TaskErrorCode::WorkspaceAllocation,
+                    format!("failed to resolve Git repository: {error}"),
+                )
+            },
+        )?);
         let git_dir = std::process::Command::new("git")
             .current_dir(&repository)
             .args(["rev-parse", "--git-dir"])
@@ -76,7 +78,7 @@ impl GitWorkspaceAllocator {
         }
 
         let configured = worktrees_root.as_ref();
-        let worktrees_root = if configured.is_absolute() {
+        let worktrees_root = normalize_path(if configured.is_absolute() {
             if let Ok(relative) = configured.strip_prefix(configured_repository) {
                 repository.join(relative)
             } else {
@@ -84,7 +86,7 @@ impl GitWorkspaceAllocator {
             }
         } else {
             repository.join(configured)
-        };
+        });
         if !worktrees_root.starts_with(&repository) {
             return Err(workspace_error(
                 TaskErrorCode::WorkspaceAllocation,
@@ -370,4 +372,25 @@ fn sanitize_task_id(task_id: &str) -> Result<String, TaskError> {
 
 fn workspace_error(code: TaskErrorCode, message: impl Into<String>) -> TaskError {
     TaskError::new(code, message)
+}
+
+/// Strips the verbatim prefix that `std::fs::canonicalize` produces on Windows
+/// (`\\?\C:\...`, `\\?\UNC\server\share`). Git rejects verbatim paths when
+/// creating worktrees ("could not create leading directories ... Invalid
+/// argument"), so paths handed to git or used as worktree roots must be
+/// plain DOS paths.
+fn normalize_path(path: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let text = path.as_os_str().to_string_lossy();
+        if let Some(unc) = text.strip_prefix(r"\\?\UNC\") {
+            return PathBuf::from(format!(r"\\{unc}"));
+        }
+        if let Some(plain) = text.strip_prefix(r"\\?\") {
+            return PathBuf::from(plain);
+        }
+        path
+    }
+    #[cfg(not(windows))]
+    path
 }
