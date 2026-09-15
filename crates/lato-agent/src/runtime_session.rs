@@ -600,20 +600,24 @@ impl RuntimeSession {
         serde_json::json!({"generation": catalog.generation(), "skills": skills})
     }
 
-    /// Attach the session-owned in-memory [`WorkflowManager`] (Phase 7B4).
+    /// Attach the session-owned [`WorkflowManager`] (Phase 7B4; on-disk
+    /// journals since Phase 7B5).
     ///
     /// Also spawns the forwarding task that turns manager run snapshots into
-    /// `session/update` notifications (`sessionUpdate: "lato/workflow"`).
+    /// `session/update` notifications (`sessionUpdate: "lato/workflow"`), and
+    /// emits one current snapshot per already-restored run so the TUI board
+    /// shows runs recovered from disk right after `session/resume`.
     pub fn attach_workflow_manager(&self, manager: Arc<crate::workflow::WorkflowManager>) {
         if self.workflow_manager.set(manager.clone()).is_err() {
             return;
         }
         let mut rx = manager.subscribe();
         let updates = self.updates.clone();
+        let forward_updates = updates.clone();
         let session_id = self.session_id.to_string();
         tokio::spawn(async move {
             while let Some(state) = rx.recv().await {
-                let _ = updates.send(serde_json::json!({
+                let _ = forward_updates.send(serde_json::json!({
                     "jsonrpc": "2.0",
                     "method": "session/update",
                     "params": {
@@ -624,6 +628,19 @@ impl RuntimeSession {
                 }));
             }
         });
+        // Restore happened before the subscriber above was attached, so the
+        // restored runs have no live events: push their current snapshots.
+        for state in manager.list() {
+            let _ = updates.send(serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": self.session_id.to_string(),
+                    "sessionUpdate": "lato/workflow",
+                    "run": state,
+                },
+            }));
+        }
     }
 
     pub fn workflow_manager(&self) -> Option<Arc<crate::workflow::WorkflowManager>> {

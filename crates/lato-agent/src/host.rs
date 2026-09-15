@@ -2031,4 +2031,139 @@ mod tests {
             .unwrap();
         assert_eq!(listed["result"]["sessions"], serde_json::json!([]));
     }
+
+    /// Phase 7B5 (spec §3.6/§8): a paused in-session run survives
+    /// `session/close` on disk and comes back resumable after
+    /// `session/resume`, with one `lato/workflow` snapshot per restored run.
+    #[tokio::test]
+    async fn workflow_paused_run_survives_session_resume() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join("workflows")).unwrap();
+        std::fs::write(
+            home.path().join("workflows").join("gated.rhai"),
+            r#"
+            let meta = #{ name: "gated", description: "d" };
+            await_user("user", "need human");
+            complete("ok");
+            "#,
+        )
+        .unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut h = AcpHost::new_with_home(
+            cwd.path().to_path_buf(),
+            SessionTrust::for_headless_prompt(cwd.path()),
+            tx,
+            default_fake_stream(),
+            home.path().to_path_buf(),
+        );
+        h.events = Some(Arc::new(FileEventStore::open(home.path()).unwrap()));
+
+        let created = h
+            .handle(req(1, "session/new", serde_json::json!({})))
+            .await
+            .unwrap();
+        let sid = created["result"]["sessionId"].as_str().unwrap().to_string();
+        let launch = h
+            .handle(req(
+                2,
+                "lato/session/workflow",
+                serde_json::json!({"sessionId": sid, "name": "gated"}),
+            ))
+            .await
+            .unwrap();
+        let run_id = launch["result"]["runId"].as_str().unwrap().to_string();
+
+        let mut paused = false;
+        for _ in 0..400 {
+            let runs = h
+                .handle(req(
+                    3,
+                    "lato/session/workflow/runs",
+                    serde_json::json!({"sessionId": sid}),
+                ))
+                .await
+                .unwrap();
+            if runs["result"]["runs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|run| run["status"] == "user_paused")
+            {
+                paused = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(paused, "run never paused");
+
+        h.handle(req(4, "session/close", serde_json::json!({"sessionId": sid})))
+            .await
+            .unwrap();
+        h.handle(req(5, "session/resume", serde_json::json!({"sessionId": sid})))
+            .await
+            .unwrap();
+
+        let runs = h
+            .handle(req(
+                6,
+                "lato/session/workflow/runs",
+                serde_json::json!({"sessionId": sid}),
+            ))
+            .await
+            .unwrap();
+        let restored = runs["result"]["runs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|run| run["displayName"] == "gated")
+            .expect("restored paused run after session/resume");
+        assert_eq!(restored["runId"], run_id.as_str());
+        assert_eq!(restored["status"], "user_paused");
+
+        // One `lato/workflow` snapshot per restored run (current state only).
+        let mut snapshot_restored = false;
+        while let Ok(update) = rx.try_recv() {
+            if update["params"]["sessionUpdate"] == "lato/workflow"
+                && update["params"]["run"]["runId"] == run_id.as_str()
+                && update["params"]["run"]["status"] == "user_paused"
+            {
+                snapshot_restored = true;
+                break;
+            }
+        }
+        assert!(snapshot_restored, "no restored workflow snapshot");
+
+        let resumed = h
+            .handle(req(
+                7,
+                "lato/session/workflow/resume",
+                serde_json::json!({"sessionId": sid, "name": "gated"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resumed["result"]["status"], "active", "{resumed}");
+        let mut completed = false;
+        for _ in 0..400 {
+            let runs = h
+                .handle(req(
+                    8,
+                    "lato/session/workflow/runs",
+                    serde_json::json!({"sessionId": sid}),
+                ))
+                .await
+                .unwrap();
+            if runs["result"]["runs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|run| run["status"] == "complete")
+            {
+                completed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(completed, "restored run never completed");
+    }
 }
