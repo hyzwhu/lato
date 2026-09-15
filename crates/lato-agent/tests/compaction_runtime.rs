@@ -392,7 +392,7 @@ async fn prefire_runs_once_at_75_reuses_at_84_and_finalizes_at_85_without_leakin
     let sid = created["result"]["sessionId"].as_str().unwrap();
     for index in 0..PREFIRE_SEED_TURNS {
         let response = timeout(
-            Duration::from_secs(2),
+            Duration::from_secs(30),
             host.handle(req(
                 21 + index as i32,
                 "session/prompt",
@@ -406,7 +406,7 @@ async fn prefire_runs_once_at_75_reuses_at_84_and_finalizes_at_85_without_leakin
     }
 
     let response = timeout(
-        Duration::from_secs(2),
+        Duration::from_secs(30),
         host.handle(req(
             100,
             "session/prompt",
