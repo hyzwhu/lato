@@ -375,6 +375,11 @@ fn e4_1_cli_custom_model_http_sse_end_to_end() {
                 Err(error) => panic!("fixture accept failed: {error}"),
             }
         };
+        // Accepted sockets inherit the listener's non-blocking mode on
+        // Windows; restore blocking mode so reads wait for data.
+        socket
+            .set_nonblocking(false)
+            .expect("restore blocking socket");
         let mut request = [0u8; 32 * 1024];
         let count = socket.read(&mut request).unwrap();
         let request = String::from_utf8_lossy(&request[..count]);

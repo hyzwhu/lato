@@ -210,6 +210,11 @@ fn accept_before(listener: &TcpListener, deadline: Instant) -> TcpStream {
     loop {
         match listener.accept() {
             Ok((stream, _)) => {
+                // Accepted sockets inherit the listener's non-blocking mode
+                // on Windows; restore blocking mode so reads wait for data.
+                stream
+                    .set_nonblocking(false)
+                    .expect("restore blocking socket");
                 stream
                     .set_read_timeout(Some(Duration::from_secs(5)))
                     .unwrap();
