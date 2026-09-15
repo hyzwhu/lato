@@ -2515,8 +2515,8 @@ mod tests {
                 vec![StreamPiece::Text("我来为你创建。".into())],
                 vec![StreamPiece::ToolCall {
                     id: "create".into(),
-                    name: "run_terminal_command".into(),
-                    arguments: json!({"command":"cat > hello.go <<'EOF'\npackage main\n\nimport \"fmt\"\n\nfunc main() {\n    fmt.Println(\"Hello, World!\")\n}\nEOF"}),
+                    name: "write_file".into(),
+                    arguments: json!({"path":"hello.go","contents":"package main\n\nimport \"fmt\"\n\nfunc main() {\n    fmt.Println(\"Hello, World!\")\n}\n"}),
                 }],
                 vec![StreamPiece::Text("已创建 hello.go".into())],
             ],
