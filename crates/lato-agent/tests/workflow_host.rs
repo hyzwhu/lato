@@ -393,7 +393,9 @@ async fn isolation_worktree_applies_to_read_only_child() {
     let system = system_content(&captured[0]);
     let workspace = workspace_root_from_system(&system).expect("workspace root in system prompt");
     assert!(
-        workspace.contains(".lato/worktrees"),
+        workspace
+            .replace(std::path::MAIN_SEPARATOR, "/")
+            .contains(".lato/worktrees"),
         "expected IsolatedWorktree path, got {workspace}"
     );
     assert_ne!(workspace, repo.path().to_string_lossy().as_ref());

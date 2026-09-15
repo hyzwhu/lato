@@ -514,7 +514,11 @@ async fn oversized_mcp_result_is_truncated_and_spilled() {
         .unwrap();
     assert!(output.truncated, "expected truncated flag");
     let artifact = output.artifact_path.expect("spill path");
-    assert!(artifact.contains(".lato/tool-output/"));
+    assert!(
+        artifact
+            .replace(std::path::MAIN_SEPARATOR, "/")
+            .contains(".lato/tool-output/")
+    );
     assert_eq!(std::fs::read_to_string(&artifact).unwrap(), huge);
     assert!(output.content.len() < huge.len());
     assert!(output.content.contains("[tool output truncated"));
