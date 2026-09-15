@@ -33,12 +33,29 @@ fn envelope() -> HookEventEnvelope {
     .unwrap()
 }
 
+/// Long-running command used by the timeout/cancellation tests; the shell
+/// differs per platform.
+fn slow_command() -> String {
+    if cfg!(windows) {
+        "ping -n 3 127.0.0.1 > NUL".into()
+    } else {
+        "sleep 2".into()
+    }
+}
+
 #[tokio::test]
 async fn command_receives_json_identity_and_workspace() {
     let root = tempdir().unwrap();
-    let command = "read body; printf '%s|%s|%s|%s' \"$LATO_HOOK_EVENT\" \"$LATO_SESSION_ID\" \"$PWD\" \"$body\"";
+    let command = if cfg!(windows) {
+        // cmd runs this line natively; the script uses only single-quoted
+        // PowerShell strings so nothing needs escaping for cmd.
+        "powershell -NoProfile -Command \"$b=[Console]::In.ReadToEnd(); '{0}|{1}|{2}|{3}' -f $env:LATO_HOOK_EVENT,$env:LATO_SESSION_ID,(Get-Location).Path,$b\"".to_string()
+    } else {
+        "read body; printf '%s|%s|%s|%s' \"$LATO_HOOK_EVENT\" \"$LATO_SESSION_ID\" \"$PWD\" \"$body\""
+            .to_string()
+    };
     let result = run_command_hook(
-        &spec(command.into(), root.path(), 2_000),
+        &spec(command, root.path(), 30_000),
         &envelope(),
         &HookRunContext {
             session_id: "session",
@@ -87,8 +104,9 @@ async fn relative_executable_uses_source_dir_and_environment_cannot_spoof_identi
 #[tokio::test]
 async fn timeout_and_cancellation_are_typed() {
     let root = tempdir().unwrap();
+    let command = slow_command();
     let timeout = run_command_hook(
-        &spec("sleep 2".into(), root.path(), 20),
+        &spec(command.clone(), root.path(), 20),
         &envelope(),
         &HookRunContext {
             session_id: "s",
@@ -102,7 +120,7 @@ async fn timeout_and_cancellation_are_typed() {
     let token = CancellationToken::new();
     token.cancel();
     let cancelled = run_command_hook(
-        &spec("sleep 2".into(), root.path(), 2_000),
+        &spec(command, root.path(), 2_000),
         &envelope(),
         &HookRunContext {
             session_id: "s",
@@ -119,8 +137,13 @@ async fn timeout_and_cancellation_are_typed() {
 #[tokio::test]
 async fn combined_output_is_bounded() {
     let root = tempdir().unwrap();
+    let command = if cfg!(windows) {
+        "powershell -NoProfile -Command \"[Console]::Out.Write('x' * 1048577)\"".to_string()
+    } else {
+        "head -c 1048577 /dev/zero".to_string()
+    };
     let error = run_command_hook(
-        &spec("head -c 1048577 /dev/zero".into(), root.path(), 2_000),
+        &spec(command, root.path(), 30_000),
         &envelope(),
         &HookRunContext {
             session_id: "s",
