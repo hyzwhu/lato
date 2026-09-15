@@ -207,10 +207,21 @@ impl ToolApproval for DenyAll {
 }
 
 fn write_hook_script(dir: &Path, name: &str, json_stdout: &str) -> PathBuf {
-    let path = dir.join(name);
     // Emit JSON via a here-doc so nested quotes/braces stay intact.
     // Drain stdin first so the hook runner's payload write cannot race with a
     // short-lived process exit (EPIPE → fail-open Allow).
+    if cfg!(windows) {
+        // Windows cannot execute shebang scripts; use a batch file instead.
+        // The echo appends CRLF, which the JSON parser tolerates.
+        let path = dir.join(format!("{name}.cmd"));
+        std::fs::write(
+            &path,
+            format!("@echo off\r\nmore > NUL\r\necho {json_stdout}\r\n"),
+        )
+        .unwrap();
+        return path;
+    }
+    let path = dir.join(name);
     let body =
         format!("#!/bin/sh\ncat >/dev/null\ncat <<'LATO_HOOK_EOF'\n{json_stdout}\nLATO_HOOK_EOF\n");
     std::fs::write(&path, body).unwrap();
