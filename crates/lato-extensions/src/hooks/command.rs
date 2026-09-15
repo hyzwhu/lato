@@ -107,8 +107,10 @@ pub async fn run_command_hook(
     ));
     let mut stdin = child.stdin.take().ok_or(HookRunError::Io)?;
     let stdin_task = tokio::spawn(async move {
-        stdin.write_all(&payload).await?;
-        stdin.shutdown().await
+        // The hook may legitimately exit without reading its stdin; a failed
+        // write to a closed pipe is not a hook failure.
+        let _ = stdin.write_all(&payload).await;
+        let _ = stdin.shutdown().await;
     });
     let timeout = Duration::from_millis(spec.timeout_ms);
     let status = tokio::select! {
@@ -123,10 +125,7 @@ pub async fn run_command_hook(
         }
         status = child.wait() => status.map_err(|_| HookRunError::Io)?,
     };
-    stdin_task
-        .await
-        .map_err(|_| HookRunError::Io)?
-        .map_err(|_| HookRunError::Io)?;
+    stdin_task.await.map_err(|_| HookRunError::Io)?;
     let stdout = stdout_task
         .await
         .map_err(|_| HookRunError::Io)?
