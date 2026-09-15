@@ -484,3 +484,45 @@ async fn restored_display_name_is_not_reallocated() {
     assert_eq!(second_launch.display_name, "gated-2");
     second.shutdown().await;
 }
+
+#[tokio::test]
+async fn scratch_written_before_pause_is_live_after_restore() {
+    let workflows = persist_dir();
+    let first = persistent_manager(lato_agent::default_fake_stream(), workflows.path());
+    first
+        .launch(
+            resolved(
+                "scratchy",
+                r#"
+                let meta = #{ name: "scratchy", description: "d" };
+                write_scratch_file("note.md", "persisted body");
+                await_user("user", "need human");
+                // Deliberately after await_user: this live read is not in the
+                // journal and only succeeds if restore finds the file on disk.
+                let body = read_scratch_file("note.md");
+                write_scratch_file("echo.md", body);
+                complete("ok");
+                "#,
+            ),
+            spec(serde_json::json!({})),
+        )
+        .unwrap();
+    wait_for(&first, "scratchy", WorkflowRunStatus::UserPaused).await;
+    // The journaled pre-pause write already landed on the run's scratch dir.
+    let run_dir = find_run_dir(workflows.path(), "scratchy");
+    assert_eq!(
+        std::fs::read_to_string(run_dir.join("scratch").join("note.md")).unwrap(),
+        "persisted body"
+    );
+    drop(first);
+
+    let second = persistent_manager(lato_agent::default_fake_stream(), workflows.path());
+    second.resume("scratchy", None).unwrap();
+    wait_for(&second, "scratchy", WorkflowRunStatus::Complete).await;
+    second.shutdown().await;
+
+    assert_eq!(
+        std::fs::read_to_string(run_dir.join("scratch").join("echo.md")).unwrap(),
+        "persisted body"
+    );
+}

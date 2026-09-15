@@ -2,7 +2,7 @@
 
 | 字段 | 值 |
 | --- | --- |
-| 状态 | **待实施** |
+| 状态 | **已实施** |
 | 日期 | 2026-09-15 |
 | 基线 | 7B5：ACP 会话 journal 落盘 + 同进程/跨进程 resume；HostService 对 scratch/template/git_diff 仍 `Unsupported` |
 | 上游 | Grok Build `bb7f39d5858cbf5e00de639367f59debbdcb0138` host helpers + create-workflow skill：`write_scratch_file` / `read_scratch_file` / `render_template` / `git_diff_since` |

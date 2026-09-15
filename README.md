@@ -332,6 +332,13 @@ agents inherit the parent session's `ToolApproval`.
   `session/close` also marks still-active runs `interrupted` while paused
   runs stay on disk. `CLI lato workflow resume|pause|stop` does not exist (no
   resident process; cross-process resume is session-bound).
+- Workflow scripts get live host helpers: `write_scratch_file(name, body)` /
+  `read_scratch_file(name)` (single-component names; 1 MiB per file, 8 MiB and
+  64 files per run; failure codes are stable, e.g. `scratch byte quota
+  exceeded`), the builtin `render_template` catalog (`identity`), and
+  `git_diff_since(commit)` on the session cwd. In-session scratch files live
+  under the run directory (`…/workflows/<runId>/scratch/`) and survive
+  `session/resume`; `fork_context` stays unsupported.
 
 ## Doctor
 
