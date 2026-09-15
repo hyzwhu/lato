@@ -13,10 +13,11 @@ use lato_core::{
     PluginSnapshotSummary, Retryability, SessionId, SessionStore, StartBehavior, StartTurn, TurnId,
     UserInput,
 };
+use lato_workflow::WorkflowError;
 use lato_extensions::{
     PluginSnapshot,
     hooks::materialize_hooks,
-    materialize_mcp, materialize_workflows,
+    materialize_mcp,
     skills::{SkillCatalog, discover_skills},
 };
 use lato_runtime::{
@@ -91,6 +92,7 @@ pub struct RuntimeSession {
     failed_closed: Arc<AtomicBool>,
     hooks_started: AtomicBool,
     hooks_ended: AtomicBool,
+    workflow_manager: Arc<std::sync::OnceLock<Arc<crate::workflow::WorkflowManager>>>,
 }
 
 struct PromptCleanupGuard {
@@ -229,6 +231,7 @@ impl RuntimeSession {
             failed_closed: Arc::new(AtomicBool::new(false)),
             hooks_started: AtomicBool::new(false),
             hooks_ended: AtomicBool::new(false),
+            workflow_manager: Arc::new(std::sync::OnceLock::new()),
         }
     }
 
@@ -282,6 +285,7 @@ impl RuntimeSession {
             failed_closed: Arc::new(AtomicBool::new(false)),
             hooks_started: AtomicBool::new(false),
             hooks_ended: AtomicBool::new(false),
+            workflow_manager: Arc::new(std::sync::OnceLock::new()),
         };
         session
             .stage_plugin_snapshot(config.plugin_snapshot)
@@ -343,6 +347,7 @@ impl RuntimeSession {
             failed_closed: Arc::new(AtomicBool::new(false)),
             hooks_started: AtomicBool::new(false),
             hooks_ended: AtomicBool::new(false),
+            workflow_manager: Arc::new(std::sync::OnceLock::new()),
         }
     }
 
@@ -581,6 +586,7 @@ impl RuntimeSession {
             failed_closed: Arc::new(AtomicBool::new(false)),
             hooks_started: AtomicBool::new(false),
             hooks_ended: AtomicBool::new(false),
+            workflow_manager: Arc::new(std::sync::OnceLock::new()),
         })
     }
 
@@ -594,23 +600,124 @@ impl RuntimeSession {
         serde_json::json!({"generation": catalog.generation(), "skills": skills})
     }
 
-    pub async fn list_workflows(&self) -> serde_json::Value {
-        let state = self.plugin_state.lock().await;
-        let set = materialize_workflows(&state.current);
-        let workflows: Vec<_> = set
-            .workflows
-            .iter()
-            .map(|workflow| {
-                serde_json::json!({
-                    "id": workflow.id,
-                    "name": workflow.name,
-                    "description": workflow.description,
-                    "steps": workflow.steps.len(),
-                    "agentBudget": workflow.agent_budget,
-                })
-            })
-            .collect();
-        serde_json::json!({"generation": set.generation, "workflows": workflows})
+    /// Attach the session-owned in-memory [`WorkflowManager`] (Phase 7B4).
+    ///
+    /// Also spawns the forwarding task that turns manager run snapshots into
+    /// `session/update` notifications (`sessionUpdate: "lato/workflow"`).
+    pub fn attach_workflow_manager(&self, manager: Arc<crate::workflow::WorkflowManager>) {
+        if self.workflow_manager.set(manager.clone()).is_err() {
+            return;
+        }
+        let mut rx = manager.subscribe();
+        let updates = self.updates.clone();
+        let session_id = self.session_id.to_string();
+        tokio::spawn(async move {
+            while let Some(state) = rx.recv().await {
+                let _ = updates.send(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {
+                        "sessionId": session_id,
+                        "sessionUpdate": "lato/workflow",
+                        "run": state,
+                    },
+                }));
+            }
+        });
+    }
+
+    pub fn workflow_manager(&self) -> Option<Arc<crate::workflow::WorkflowManager>> {
+        self.workflow_manager.get().cloned()
+    }
+
+    fn require_workflow_manager(
+        &self,
+    ) -> Result<Arc<crate::workflow::WorkflowManager>, AgentError> {
+        self.workflow_manager.get().cloned().ok_or_else(|| {
+            AgentError::new(
+                "workflow.unavailable",
+                ErrorCategory::Task,
+                "workflow runs are not available in this session",
+                Retryability::Never,
+            )
+        })
+    }
+
+    async fn workflow_manager_with_snapshot(
+        &self,
+    ) -> Result<Arc<crate::workflow::WorkflowManager>, AgentError> {
+        let manager = self.require_workflow_manager()?;
+        manager.set_snapshot(self.plugin_snapshot().await);
+        Ok(manager)
+    }
+
+    pub async fn workflow_launch(
+        &self,
+        resolved: crate::workflow::ResolvedWorkflow,
+        args: serde_json::Value,
+        agent_budget: Option<u64>,
+    ) -> Result<crate::workflow::WorkflowRunState, crate::workflow::LaunchError> {
+        let manager = self
+            .workflow_manager_with_snapshot()
+            .await
+            .map_err(|error| crate::workflow::LaunchError::Resolve(WorkflowError::Failed(error.to_string())))?;
+        manager.launch(
+            resolved,
+            crate::workflow::LaunchSpec {
+                args,
+                agent_budget,
+                resume_display_name: None,
+            },
+        )
+    }
+
+    pub async fn workflow_runs(&self) -> Vec<crate::workflow::WorkflowRunState> {
+        match self.workflow_manager_with_snapshot().await {
+            Ok(manager) => manager.list(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    pub async fn workflow_pause(
+        &self,
+        display_name: &str,
+    ) -> Result<crate::workflow::WorkflowRunState, crate::workflow::LaunchError> {
+        let manager = self
+            .workflow_manager_with_snapshot()
+            .await
+            .map_err(|error| crate::workflow::LaunchError::Resolve(WorkflowError::Failed(error.to_string())))?;
+        manager.pause(display_name)
+    }
+
+    pub async fn workflow_resume(
+        &self,
+        display_name: &str,
+        agent_budget: Option<u64>,
+    ) -> Result<crate::workflow::WorkflowRunState, crate::workflow::LaunchError> {
+        let manager = self
+            .workflow_manager_with_snapshot()
+            .await
+            .map_err(|error| crate::workflow::LaunchError::Resolve(WorkflowError::Failed(error.to_string())))?;
+        manager.resume(display_name, agent_budget)
+    }
+
+    pub async fn workflow_stop(
+        &self,
+        display_name: &str,
+    ) -> Result<crate::workflow::WorkflowRunState, crate::workflow::LaunchError> {
+        let manager = self
+            .workflow_manager_with_snapshot()
+            .await
+            .map_err(|error| crate::workflow::LaunchError::Resolve(WorkflowError::Failed(error.to_string())))?;
+        manager.stop(display_name).await
+    }
+
+    /// Cancel every active workflow run and mark survivors `interrupted`
+    /// (session close; spec §3.6).
+    pub async fn workflow_shutdown(&self) {
+        if let Some(manager) = self.workflow_manager() {
+            manager.shutdown().await;
+        }
     }
 
     pub async fn prompt_skill(
@@ -1017,6 +1124,7 @@ impl RuntimeSession {
     }
 
     pub async fn shutdown(&self) -> Result<(), AgentError> {
+        self.workflow_shutdown().await;
         let _gate = self.submission_gate.lock().await;
         if self.hooks_started.load(Ordering::Acquire)
             && !self.hooks_ended.swap(true, Ordering::AcqRel)

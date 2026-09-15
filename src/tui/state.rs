@@ -217,6 +217,7 @@ pub struct AppState {
     pub skills_error: Option<String>,
     pub skills_loading: bool,
     pub workflows: Vec<crate::client::WorkflowEntry>,
+    pub workflow_runs: Vec<crate::client::WorkflowRunView>,
     pub history: Vec<String>,
     pub history_index: Option<usize>,
     pub history_draft: String,
@@ -317,6 +318,7 @@ impl AppState {
             skills_loading: true,
             skills_error: None,
             workflows: Vec::new(),
+            workflow_runs: Vec::new(),
             history: Vec::new(),
             history_index: None,
             history_draft: String::new(),
@@ -975,8 +977,27 @@ impl AppState {
                 self.model = selection;
                 self.error = warning.map(|warning| warning.message);
             }
+            ClientUpdate::WorkflowRun(run) => {
+                self.apply_workflow_run(run);
+            }
             ClientUpdate::PermissionRequested | ClientUpdate::Unknown => {}
         }
+    }
+
+    /// Upsert a live workflow run snapshot delivered via `session/update`
+    /// (`sessionUpdate: "lato/workflow"`, Phase 7B4).
+    fn apply_workflow_run(&mut self, run: crate::client::WorkflowRunView) {
+        if let Some(existing) = self
+            .workflow_runs
+            .iter_mut()
+            .find(|state| state.run_id == run.run_id)
+        {
+            *existing = run;
+        } else {
+            self.workflow_runs.push(run);
+        }
+        self.workflow_runs
+            .sort_by(|left, right| left.display_name.cmp(&right.display_name));
     }
 
     fn finish_tool(&mut self, id: &str, status: ToolStatus, result: String) {
@@ -1070,8 +1091,11 @@ fn workflow_list_message(language: Language, workflows: &[crate::client::Workflo
             workflow.description.as_str()
         };
         lines.push(format!(
-            "{}\t{}\t{} step(s)",
-            workflow.id, description, workflow.steps
+            "{}\t{}\t{}{}",
+            workflow.id,
+            description,
+            workflow.source,
+            if workflow.compiled { "\tcompiled" } else { "" }
         ));
     }
     lines.join("\n")

@@ -23,6 +23,15 @@ use lato_tools::{
 };
 use lato_workspace::{FileLocks, SessionTrust};
 use tokio::sync::{Mutex, Semaphore, mpsc};
+fn req(id: i32, method: &str, params: serde_json::Value) -> JsonRpcReq {
+    JsonRpcReq {
+        jsonrpc: "2.0".into(),
+        id: Some(serde_json::json!(id)),
+        method: method.into(),
+        params: Some(params),
+    }
+}
+
 use tokio_util::sync::CancellationToken;
 
 struct PluginFixture {
@@ -953,29 +962,42 @@ async fn explicit_user_skill_rejects_hidden_skills_and_recovers_for_next_prompt(
 
 #[tokio::test]
 async fn session_lists_trusted_workflows_from_the_current_snapshot() {
+    // Phase 7B4: the ACP catalog uses the same keep-first registry as the CLI,
+    // so the assertion runs through AcpHost's `lato/session/workflows`.
     let fixture = PluginFixture::new("demo", "Inspect.", &["read_file"]);
     fs::write(
         fixture.plugin.join("plugin.json"),
         r#"{"name":"demo","skills":"skills","workflows":{"review":{"description":"Review the diff","prompt":"Review"}}}"#,
     )
     .unwrap();
-    let session = runtime_session(&fixture, Arc::new(RecordingStream::default()));
-    session
-        .stage_plugin_snapshot(fixture.snapshot(3, true, true))
-        .await
-        .unwrap();
-    let listing = session.list_workflows().await;
-    assert_eq!(listing["generation"], 3);
-    assert_eq!(listing["workflows"][0]["id"], "demo/review");
-    assert_eq!(listing["workflows"][0]["description"], "Review the diff");
-    session
-        .stage_plugin_snapshot(fixture.snapshot(4, true, false))
-        .await
-        .unwrap();
-    assert_eq!(
-        session.list_workflows().await["workflows"],
-        serde_json::json!([])
+    let (updates, _updates_rx) = mpsc::unbounded_channel();
+    let mut host = lato_agent::AcpHost::new_with_home_and_plugin_dirs(
+        fixture.workspace.clone(),
+        SessionTrust::for_headless_prompt(&fixture.workspace),
+        updates,
+        Arc::new(RecordingStream::default()),
+        fixture.home.clone(),
+        vec![fixture.plugin.clone()],
     );
+    let created = host
+        .handle(req(1, "session/new", serde_json::json!({})))
+        .await
+        .unwrap();
+    let sid = created["result"]["sessionId"].as_str().unwrap().to_string();
+    let listing = host
+        .handle(req(
+            2,
+            "lato/session/workflows",
+            serde_json::json!({"sessionId": sid}),
+        ))
+        .await
+        .unwrap();
+    let workflows = &listing["result"]["workflows"];
+    assert_eq!(workflows[0]["id"], "demo/review");
+    assert_eq!(workflows[0]["name"], "review");
+    assert_eq!(workflows[0]["description"], "Review the diff");
+    assert_eq!(workflows[0]["source"], "plugin");
+    assert_eq!(workflows[0]["compiled"], true);
 }
 
 #[tokio::test]

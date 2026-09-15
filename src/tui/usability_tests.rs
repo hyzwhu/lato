@@ -92,6 +92,8 @@ fn workflows_command_requests_a_backend_list() {
                 id: "demo/review".into(),
                 name: "review".into(),
                 description: "Review the diff".into(),
+                source: "plugin".into(),
+                compiled: true,
                 steps: 1,
                 agent_budget: 128,
             }],

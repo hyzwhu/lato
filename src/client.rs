@@ -26,7 +26,13 @@ pub struct SkillListResponse {
 pub struct WorkflowEntry {
     pub id: String,
     pub name: String,
+    #[serde(default)]
     pub description: String,
+    #[serde(default)]
+    pub source: String,
+    #[serde(default)]
+    pub compiled: bool,
+    #[serde(default)]
     pub steps: u64,
     pub agent_budget: u32,
 }
@@ -36,6 +42,33 @@ pub struct WorkflowEntry {
 pub struct WorkflowListResponse {
     pub generation: u64,
     pub workflows: Vec<WorkflowEntry>,
+}
+
+/// Live workflow run snapshot delivered via `session/update`
+/// (`sessionUpdate: "lato/workflow"`) and lifecycle responses (Phase 7B4).
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkflowRunView {
+    pub run_id: String,
+    pub display_name: String,
+    pub status: String,
+    #[serde(default)]
+    pub phase: Option<String>,
+    #[serde(default)]
+    pub agent_budget: Option<u64>,
+    #[serde(default)]
+    pub agents_used: u64,
+    #[serde(default)]
+    pub pause_message: Option<String>,
+    #[serde(default)]
+    pub elapsed_ms_floor: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkflowRunsResponse {
+    #[serde(default)]
+    pub runs: Vec<WorkflowRunView>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -118,6 +151,7 @@ pub enum ClientUpdate {
         model: String,
         warning: Option<lato_core::AgentError>,
     },
+    WorkflowRun(WorkflowRunView),
     Unknown,
 }
 
@@ -126,11 +160,21 @@ impl ClientUpdate {
         let method = value.get("method").and_then(serde_json::Value::as_str);
         let params = value.get("params").unwrap_or(&serde_json::Value::Null);
         match method {
-            Some("session/update") => params
-                .get("delta")
-                .and_then(serde_json::Value::as_str)
-                .map(|text| Self::TextDelta(text.to_string()))
-                .unwrap_or(Self::Unknown),
+            Some("session/update") => {
+                if params.get("sessionUpdate").and_then(serde_json::Value::as_str)
+                    == Some("lato/workflow")
+                {
+                    return match serde_json::from_value::<WorkflowRunView>(params["run"].clone()) {
+                        Ok(run) => Self::WorkflowRun(run),
+                        Err(_) => Self::Unknown,
+                    };
+                }
+                params
+                    .get("delta")
+                    .and_then(serde_json::Value::as_str)
+                    .map(|text| Self::TextDelta(text.to_string()))
+                    .unwrap_or(Self::Unknown)
+            }
             Some("session/reasoning") => params
                 .get("delta")
                 .and_then(serde_json::Value::as_str)
@@ -412,6 +456,90 @@ impl InteractiveAcpClient {
                 id,
                 "lato/session/workflows",
                 serde_json::json!({"sessionId": self.session_id}),
+            ))
+            .await
+            .ok_or("no response")?;
+        serde_json::from_value(response_result(&response)?.clone())
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn launch_workflow(
+        &mut self,
+        name: &str,
+        args: serde_json::Value,
+        agent_budget: Option<u64>,
+    ) -> Result<WorkflowRunView, String> {
+        let id = self.take_id();
+        let response = self
+            .host
+            .handle(req(
+                id,
+                "lato/session/workflow",
+                serde_json::json!({
+                    "sessionId": self.session_id,
+                    "name": name,
+                    "args": args,
+                    "agentBudget": agent_budget,
+                }),
+            ))
+            .await
+            .ok_or("no response")?;
+        serde_json::from_value(response_result(&response)?.clone())
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn list_workflow_runs(&mut self) -> Result<Vec<WorkflowRunView>, String> {
+        let id = self.take_id();
+        let response = self
+            .host
+            .handle(req(
+                id,
+                "lato/session/workflow/runs",
+                serde_json::json!({"sessionId": self.session_id}),
+            ))
+            .await
+            .ok_or("no response")?;
+        serde_json::from_value::<WorkflowRunsResponse>(response_result(&response)?.clone())
+            .map(|payload| payload.runs)
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn pause_workflow(&mut self, display_name: &str) -> Result<WorkflowRunView, String> {
+        self.workflow_named_request("lato/session/workflow/pause", display_name, None)
+            .await
+    }
+
+    pub async fn resume_workflow(
+        &mut self,
+        display_name: &str,
+        agent_budget: Option<u64>,
+    ) -> Result<WorkflowRunView, String> {
+        self.workflow_named_request("lato/session/workflow/resume", display_name, agent_budget)
+            .await
+    }
+
+    pub async fn stop_workflow(&mut self, display_name: &str) -> Result<WorkflowRunView, String> {
+        self.workflow_named_request("lato/session/workflow/stop", display_name, None)
+            .await
+    }
+
+    async fn workflow_named_request(
+        &mut self,
+        method: &str,
+        display_name: &str,
+        agent_budget: Option<u64>,
+    ) -> Result<WorkflowRunView, String> {
+        let id = self.take_id();
+        let response = self
+            .host
+            .handle(req(
+                id,
+                method,
+                serde_json::json!({
+                    "sessionId": self.session_id,
+                    "name": display_name,
+                    "agentBudget": agent_budget,
+                }),
             ))
             .await
             .ok_or("no response")?;

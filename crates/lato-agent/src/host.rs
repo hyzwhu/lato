@@ -7,6 +7,7 @@ use crate::{
     ChildSessionRunner, PreparedModelSwitch, ProfileResultVerifier, RuntimeCompactionOutcome,
     RuntimePromptOutcome, RuntimeSession, SessionPluginSnapshots, SkillRuntimeBinding,
     ToolApproval, TranscriptStore, import_legacy_if_needed,
+    workflow::{WorkflowManager, list_workflows, resolve_workflow},
 };
 use lato_ai::{
     ActiveModelStream, CATALOG, CredentialStore, CustomHttpModelStream, CustomModel,
@@ -406,6 +407,7 @@ impl AcpHost {
                     .map_err(|error| format!("model.unavailable_on_resume: {error}"))?,
                 None => self.default_endpoint.clone(),
             };
+            let endpoint_stream = endpoint.stream.clone();
             let session = RuntimeSession::new_with_store_endpoint_skill_runtime(
                 sid.to_string(),
                 endpoint,
@@ -422,6 +424,7 @@ impl AcpHost {
             return match session {
                 Ok(session) => {
                     let session = Arc::new(session);
+                    self.attach_workflow_manager(sid, &session, endpoint_stream);
                     if let Err(error) = self.attach_session_plugins(sid, &session).await {
                         let _ = self.teardown_task_root(sid).await;
                         return Err(error);
@@ -444,11 +447,73 @@ impl AcpHost {
             self.tool_approval.clone(),
             skill_runtime,
         ));
+        self.attach_workflow_manager(sid, &session, self.default_endpoint.stream.clone());
         if let Err(error) = self.attach_session_plugins(sid, &session).await {
             let _ = self.teardown_task_root(sid).await;
             return Err(error);
         }
         Ok(session)
+    }
+
+    fn attach_workflow_manager(
+        &self,
+        sid: &str,
+        session: &RuntimeSession,
+        stream: std::sync::Arc<dyn ModelStream>,
+    ) {
+        let manager = Arc::new(WorkflowManager::new(
+            sid,
+            self.cwd.clone(),
+            self.trust.clone(),
+            self.locks.clone(),
+            stream,
+            self.tool_approval.clone(),
+        ));
+        session.attach_workflow_manager(manager);
+    }
+
+    /// Same home fallback the CLI uses (env `LATO_HOME`, else `~/.lato`) so the
+    /// ACP catalog matches `lato workflow list` (spec §3.1).
+    fn effective_lato_home(&self) -> PathBuf {
+        if self.lato_home.as_os_str().is_empty() {
+            return std::env::var_os("LATO_HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| {
+                    dirs::home_dir()
+                        .unwrap_or_else(|| PathBuf::from("."))
+                        .join(".lato")
+                });
+        }
+        self.lato_home.clone()
+    }
+
+    fn workflow_target(
+        &self,
+        req: &JsonRpcReq,
+    ) -> Option<(std::sync::Arc<RuntimeSession>, serde_json::Value)> {
+        let params = req.params.clone().unwrap_or_default();
+        let sid = params
+            .get("sessionId")
+            .and_then(|v| v.as_str())
+            .unwrap_or("s1");
+        let session = self.sessions.get(sid)?.clone();
+        Some((session, params))
+    }
+
+    async fn resolve_session_workflow(
+        &self,
+        session: &RuntimeSession,
+        name: &str,
+    ) -> Result<crate::workflow::ResolvedWorkflow, String> {
+        let snapshot = session.plugin_snapshot().await;
+        resolve_workflow(
+            &self.cwd,
+            &self.effective_lato_home(),
+            &snapshot,
+            self.trust.cwd_trusted(),
+            name,
+        )
+        .map_err(|error| error.to_string())
     }
 
     async fn attach_session_plugins(
@@ -622,7 +687,112 @@ impl AcpHost {
                 let Some(session) = self.sessions.get(sid) else {
                     return Some(err(id, -32000, "unknown session"));
                 };
-                Some(ok(id, session.list_workflows().await))
+                // Same keep-first registry the CLI uses: user → trusted project
+                // → trusted plugins (spec §3.1).
+                let snapshot = session.plugin_snapshot().await;
+                let workflows = list_workflows(
+                    &self.cwd,
+                    &self.effective_lato_home(),
+                    &snapshot,
+                    self.trust.cwd_trusted(),
+                );
+                Some(ok(
+                    id,
+                    serde_json::json!({
+                        "generation": snapshot.generation(),
+                        "workflows": workflows
+                            .iter()
+                            .map(|workflow| {
+                                serde_json::json!({
+                                    "id": workflow.id,
+                                    "name": workflow.display_name,
+                                    "description": workflow.description,
+                                    "source": workflow.source,
+                                    "compiled": workflow.compiled,
+                                    "agentBudget": workflow.agent_budget,
+                                })
+                            })
+                            .collect::<Vec<_>>(),
+                    }),
+                ))
+            }
+            "lato/session/workflow" => {
+                let Some((session, params)) = self.workflow_target(&req) else {
+                    return Some(err(id, -32000, "unknown session"));
+                };
+                let Some(name) = params.get("name").and_then(|v| v.as_str()) else {
+                    return Some(err(id, -32602, "workflow name is required"));
+                };
+                let resolved = match self.resolve_session_workflow(&session, name).await {
+                    Ok(resolved) => resolved,
+                    Err(error) => return Some(err(id, -32000, error)),
+                };
+                let args = params.get("args").cloned().unwrap_or(serde_json::json!({}));
+                let agent_budget = match params
+                    .get("agentBudget")
+                    .and_then(serde_json::Value::as_u64)
+                {
+                    Some(raw) => match lato_workflow::clamp_agent_budget(Some(raw)) {
+                        Ok(clamped) => Some(u64::from(clamped)),
+                        Err(error) => return Some(err(id, -32602, error.to_string())),
+                    },
+                    None => None,
+                };
+                match session.workflow_launch(resolved, args, agent_budget).await {
+                    Ok(state) => Some(ok(id, serde_json::to_value(&state).unwrap_or_default())),
+                    Err(error) => Some(err(id, -32000, error.to_string())),
+                }
+            }
+            "lato/session/workflow/runs" => {
+                let Some((session, _)) = self.workflow_target(&req) else {
+                    return Some(err(id, -32000, "unknown session"));
+                };
+                let runs: Vec<_> = session
+                    .workflow_runs()
+                    .await
+                    .iter()
+                    .map(|state| serde_json::to_value(state).unwrap_or_default())
+                    .collect();
+                Some(ok(id, serde_json::json!({ "runs": runs })))
+            }
+            "lato/session/workflow/pause" => {
+                let Some((session, params)) = self.workflow_target(&req) else {
+                    return Some(err(id, -32000, "unknown session"));
+                };
+                let Some(name) = params.get("name").and_then(|v| v.as_str()) else {
+                    return Some(err(id, -32602, "display name is required"));
+                };
+                match session.workflow_pause(name).await {
+                    Ok(state) => Some(ok(id, serde_json::to_value(&state).unwrap_or_default())),
+                    Err(error) => Some(err(id, -32000, error.to_string())),
+                }
+            }
+            "lato/session/workflow/resume" => {
+                let Some((session, params)) = self.workflow_target(&req) else {
+                    return Some(err(id, -32000, "unknown session"));
+                };
+                let Some(name) = params.get("name").and_then(|v| v.as_str()) else {
+                    return Some(err(id, -32602, "display name is required"));
+                };
+                let agent_budget = params
+                    .get("agentBudget")
+                    .and_then(serde_json::Value::as_u64);
+                match session.workflow_resume(name, agent_budget).await {
+                    Ok(state) => Some(ok(id, serde_json::to_value(&state).unwrap_or_default())),
+                    Err(error) => Some(err(id, -32000, error.to_string())),
+                }
+            }
+            "lato/session/workflow/stop" => {
+                let Some((session, params)) = self.workflow_target(&req) else {
+                    return Some(err(id, -32000, "unknown session"));
+                };
+                let Some(name) = params.get("name").and_then(|v| v.as_str()) else {
+                    return Some(err(id, -32602, "display name is required"));
+                };
+                match session.workflow_stop(name).await {
+                    Ok(state) => Some(ok(id, serde_json::to_value(&state).unwrap_or_default())),
+                    Err(error) => Some(err(id, -32000, error.to_string())),
+                }
             }
             "session/prompt" | "lato/session/skill" => {
                 let is_skill = req.method == "lato/session/skill";

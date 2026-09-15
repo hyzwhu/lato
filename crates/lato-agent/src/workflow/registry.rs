@@ -16,6 +16,7 @@ const MAX_WORKFLOW_SOURCE_BYTES: u64 = 1024 * 1024;
 pub struct ResolvedWorkflow {
     pub id: String,
     pub display_name: String,
+    pub description: String,
     pub script: String,
     pub agent_budget: u32,
     pub source: &'static str,
@@ -166,6 +167,7 @@ fn plugin_entries(snapshot: &PluginSnapshot) -> Vec<CatalogEntry> {
                 workflow: ResolvedWorkflow {
                     id: descriptor.id.clone(),
                     display_name: short_name.clone(),
+                    description: descriptor.description.clone(),
                     script,
                     agent_budget: descriptor.agent_budget,
                     source: "plugin",
@@ -220,6 +222,7 @@ fn load_file_workflow(path: &Path, source: &'static str) -> Option<CatalogEntry>
         workflow: ResolvedWorkflow {
             id: workflow_meta.name.clone(),
             display_name: workflow_meta.name.clone(),
+            description: workflow_meta.description.clone(),
             script,
             agent_budget: DEFAULT_AGENT_BUDGET,
             source,
