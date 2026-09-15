@@ -8,7 +8,15 @@ Prebuilt binaries are available for macOS Intel, macOS Apple Silicon, Linux x86-
 
 ## Install a prebuilt binary
 
-Download the archive for your platform and `SHA256SUMS` from the [v0.1.0-beta.2 release](../../releases/tag/v0.1.0-beta.2). Verify the archive before extracting it.
+On macOS and Linux, the fastest path is the install script. It detects your platform, downloads the archive from the latest release, verifies its SHA256 checksum, and installs to `~/.local/bin` (override with `LATO_INSTALL_DIR`):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/hyzwhu/lato/master/scripts/install.sh | sh
+```
+
+To pin a version: `sh install.sh v0.1.0-beta.2`. Then run `lato doctor` to verify the setup.
+
+Windows users (or anyone preferring a manual path): download the archive for your platform and `SHA256SUMS` from the [v0.1.0-beta.2 release](../../releases/tag/v0.1.0-beta.2). Verify the archive before extracting it.
 
 macOS example for Apple Silicon:
 
