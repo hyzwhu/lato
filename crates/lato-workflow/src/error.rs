@@ -16,6 +16,8 @@ pub enum WorkflowError {
     BudgetExceeded(String),
     #[error("workflow run was cancelled")]
     Cancelled,
+    #[error("workflow paused: {0}")]
+    Paused(String),
     #[error("workflow failed: {0}")]
     Failed(String),
 }
@@ -29,6 +31,7 @@ impl WorkflowError {
             Self::NotFound(_) => "workflow.not_found",
             Self::BudgetExceeded(_) => "workflow.budget_exceeded",
             Self::Cancelled => "workflow.cancelled",
+            Self::Paused(_) => "workflow.paused",
             Self::Failed(_) => "workflow.failed",
         }
     }
@@ -47,6 +50,15 @@ mod tests {
         assert_eq!(
             WorkflowError::CapabilityDenied("x".into()).code(),
             "workflow.capability_denied"
+        );
+    }
+
+    #[test]
+    fn paused_code_is_stable() {
+        assert_eq!(WorkflowError::Paused("hold".into()).code(), "workflow.paused");
+        assert_eq!(
+            WorkflowError::Paused("hold".into()).to_string(),
+            "workflow paused: hold"
         );
     }
 }

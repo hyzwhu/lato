@@ -105,6 +105,12 @@ fn drain_parallel_replies(pending: Vec<PendingAgent>) {
 }
 
 pub fn run_workflow(params: WorkflowRunParams) -> ScriptOutcome {
+    run_workflow_recovering(params).0
+}
+
+/// Like [`run_workflow`], but hands the (possibly advanced) journal back so an
+/// in-process manager can resume the same run later without a journal file.
+pub fn run_workflow_recovering(params: WorkflowRunParams) -> (ScriptOutcome, Journal) {
     let WorkflowRunParams {
         script,
         args,
@@ -166,9 +172,13 @@ pub fn run_workflow(params: WorkflowRunParams) -> ScriptOutcome {
     let ast = match engine.compile(&script) {
         Ok(ast) => ast,
         Err(e) => {
-            return ScriptOutcome::Failed {
-                error: format!("script failed to compile: {e}"),
-            };
+            let journal = ctx.borrow().journal.clone();
+            return (
+                ScriptOutcome::Failed {
+                    error: format!("script failed to compile: {e}"),
+                },
+                journal,
+            );
         }
     };
 
@@ -176,19 +186,25 @@ pub fn run_workflow(params: WorkflowRunParams) -> ScriptOutcome {
     let args_dyn = match rhai::serde::to_dynamic(&args) {
         Ok(d) => d,
         Err(e) => {
-            return ScriptOutcome::Failed {
-                error: format!("invalid workflow args: {e}"),
-            };
+            let journal = ctx.borrow().journal.clone();
+            return (
+                ScriptOutcome::Failed {
+                    error: format!("invalid workflow args: {e}"),
+                },
+                journal,
+            );
         }
     };
     scope.push_dynamic("args", args_dyn);
 
-    match engine.eval_ast_with_scope::<Dynamic>(&mut scope, &ast) {
+    let outcome = match engine.eval_ast_with_scope::<Dynamic>(&mut scope, &ast) {
         Ok(value) => ScriptOutcome::Completed {
             result: dynamic_to_value(value),
         },
         Err(err) => outcome_from_error(*err),
-    }
+    };
+    let journal = ctx.borrow().journal.clone();
+    (outcome, journal)
 }
 
 fn outcome_from_error(err: EvalAltResult) -> ScriptOutcome {

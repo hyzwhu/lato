@@ -16,7 +16,7 @@ pub const MAX_WORKFLOW_PHASES: usize = 64;
 pub const MAX_PHASE_TITLE_LEN: usize = 128;
 pub const MAX_PHASE_DETAIL_LEN: usize = 1_024;
 
-pub use engine::{WorkflowRunParams, run_workflow};
+pub use engine::{WorkflowRunParams, run_workflow, run_workflow_recovering};
 pub use host::{AgentOpts, AgentResult, BudgetState, HostError, WorkflowHostRequest};
 pub use journal::Journal;
 pub use meta::extract_meta;

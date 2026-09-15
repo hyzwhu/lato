@@ -47,7 +47,7 @@ pub enum JournalError {
     Divergence { seq: u64, kind: String },
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct Journal {
     entries: Vec<JournalEntry>,
     path: Option<PathBuf>,

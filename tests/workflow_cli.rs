@@ -158,3 +158,35 @@ fn workflow_run_unknown_id_fails() {
     let err = String::from_utf8_lossy(&output.stderr);
     assert!(err.contains("workflow.not_found"), "{err}");
 }
+
+#[test]
+fn workflow_run_paused_reports_workflow_paused_not_failed() {
+    let fixture = tempfile::tempdir().unwrap();
+    let home = fixture.path().join("home");
+    fs::create_dir_all(home.join("workflows")).unwrap();
+    fs::write(
+        home.join("workflows").join("pausey.rhai"),
+        r#"
+let meta = #{
+    name: "pausey",
+    description: "Pause immediately",
+};
+pause("user", "need human");
+"#,
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_lato"))
+        .current_dir(fixture.path())
+        .env("LATO_HOME", &home)
+        .env_remove("LATO_MODEL")
+        .args(["workflow", "run", "pausey"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(err.contains("workflow.paused"), "{err}");
+    assert!(
+        !err.contains("workflow.failed"),
+        "pause must not masquerade as failed: {err}"
+    );
+}

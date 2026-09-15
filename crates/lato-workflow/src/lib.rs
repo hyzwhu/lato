@@ -24,7 +24,7 @@ pub use names::{
 pub use script::{
     AgentOpts, AgentResult, BudgetState, HostError, Journal, ScriptOutcome, ValidationError,
     ValidationReport, WorkflowHostRequest, WorkflowRunParams, extract_meta, run::PauseKind,
-    run_workflow, validate_script, validate_script_with_agent_budget,
+    run_workflow, run_workflow_recovering, validate_script, validate_script_with_agent_budget,
 };
 pub use types::{
     DEFAULT_AGENT_BUDGET, MAX_AGENT_BUDGET, MAX_DESCRIPTION_BYTES, MAX_WORKFLOW_DIAGNOSTIC_BYTES,
