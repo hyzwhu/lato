@@ -210,6 +210,10 @@ with tempfile.TemporaryDirectory(prefix="lato-tui-smoke-") as root:
         assert len(requests) == count, "Alt-Enter submitted a prompt"
         start = send("\r")
         expect("switched-ok", start)
+        # Poll briefly: the request may land just after the response renders.
+        deadline = time.monotonic() + 5
+        while "first line\\nsecond line" not in json.dumps(requests[-1]) and time.monotonic() < deadline:
+            drain(0.1)
         assert "first line\\nsecond line" in json.dumps(requests[-1]), "multiline prompt lost newline"
         start = send("\x1b[A")
         expect("second line", start)

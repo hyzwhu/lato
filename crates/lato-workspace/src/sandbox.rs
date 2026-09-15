@@ -81,6 +81,14 @@ impl SandboxBackend for HostSandboxBackend {
         if profile == SandboxProfile::Off {
             return SandboxReadiness::Ready;
         }
+        // Windows sandboxing uses restricted tokens rather than a wrapper
+        // binary, so without an explicit override the platform is simply
+        // Unsupported; the wrapper file check below only applies to
+        // override-based (and Unix) setups.
+        #[cfg(windows)]
+        if self.wrapper_override.is_none() {
+            return SandboxReadiness::Unsupported;
+        }
         let wrapper = self
             .wrapper_override
             .as_deref()
