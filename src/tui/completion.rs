@@ -47,10 +47,81 @@ impl AppState {
             }
             return self.skill_candidates(query, 0..input.len(), true);
         }
+        if let Some(rest) = input.strip_prefix("/workflow ") {
+            return self.workflow_argument_candidates(rest, "/workflow ".len()..input.len());
+        }
         if !input.starts_with('/') || input.chars().any(char::is_whitespace) {
             return vec![];
         }
         self.command_candidates(input.trim_start_matches('/'), 0..input.len())
+    }
+
+    /// Subcommand completion for `/workflow`: `runs`, `pause`, `resume`,
+    /// `stop`, and `<workflowId>`; display-name completion for pause/resume/stop.
+    fn workflow_argument_candidates(&self, rest: &str, range: std::ops::Range<usize>) -> Vec<Candidate> {
+        let (head, arg) = match rest.split_once(char::is_whitespace) {
+            Some((head, arg)) => (head, arg.trim()),
+            None => (rest, ""),
+        };
+        if matches!(head, "pause" | "resume" | "stop") && !arg.is_empty() {
+            let mut result: Vec<_> = self
+                .workflow_runs
+                .iter()
+                .filter_map(|run| score(&run.display_name, arg).map(|rank| (rank, run)))
+                .collect();
+            result.sort_by_key(|(rank, _)| *rank);
+            return result
+                .into_iter()
+                .map(|(_, run)| Candidate {
+                    name: run.display_name.clone(),
+                    description: run.status.clone(),
+                    kind: "workflow-run",
+                    replacement: format!("/workflow {head} {} ", run.display_name),
+                    range: range.clone(),
+                })
+                .collect();
+        }
+        if !arg.is_empty() {
+            return vec![];
+        }
+        let mut ranked: Vec<(usize, Candidate)> = Vec::new();
+        for (name, description) in [
+            ("runs", "open the runs board / 打开运行看板"),
+            ("pause", "pause <displayName>"),
+            ("resume", "resume <displayName> [budget]"),
+            ("stop", "stop <displayName>"),
+        ] {
+            if let Some(rank) = score(name, head) {
+                ranked.push((
+                    rank,
+                    Candidate {
+                        name: format!("/workflow {name}"),
+                        description: description.into(),
+                        kind: "command",
+                        replacement: format!("/workflow {name} "),
+                        range: range.clone(),
+                    },
+                ));
+            }
+        }
+        for workflow in &self.workflows {
+            if let Some(rank) = score(&workflow.name, head)
+                .or_else(|| score(&workflow.id, head).map(|n| n + 1))
+            {
+                ranked.push((
+                    rank,
+                    Candidate {
+                        name: workflow.id.clone(),
+                        description: workflow.description.clone(),
+                        kind: "workflow",
+                        replacement: format!("/workflow {} ", workflow.name),
+                        range: range.clone(),
+                    },
+                ));
+            }
+        }
+        ranked.sort_by_key(|(rank, _)| *rank);
+        ranked.into_iter().map(|(_, candidate)| candidate).collect()
     }
 
     pub fn command_candidates(&self, query: &str, range: Range<usize>) -> Vec<Candidate> {

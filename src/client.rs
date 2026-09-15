@@ -448,6 +448,19 @@ impl InteractiveAcpClient {
         })
     }
 
+    /// Drain pending out-of-turn notifications (e.g. background
+    /// `lato/workflow` run updates) without blocking.
+    pub fn drain_updates(&mut self) -> Vec<ClientUpdate> {
+        let mut updates = Vec::new();
+        while let Ok(raw) = self.updates.try_recv() {
+            let update = ClientUpdate::from_json(&raw);
+            if update != ClientUpdate::Unknown {
+                updates.push(update);
+            }
+        }
+        updates
+    }
+
     pub async fn list_workflows(&mut self) -> Result<WorkflowListResponse, String> {
         let id = self.take_id();
         let response = self

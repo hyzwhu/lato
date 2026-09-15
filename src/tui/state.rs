@@ -70,6 +70,7 @@ impl LayoutMode {
 pub enum Overlay {
     CommandPalette,
     Search,
+    WorkflowRuns,
     Configuration,
 }
 
@@ -218,6 +219,7 @@ pub struct AppState {
     pub skills_loading: bool,
     pub workflows: Vec<crate::client::WorkflowEntry>,
     pub workflow_runs: Vec<crate::client::WorkflowRunView>,
+    pub workflow_runs_index: usize,
     pub history: Vec<String>,
     pub history_index: Option<usize>,
     pub history_draft: String,
@@ -319,6 +321,7 @@ impl AppState {
             skills_error: None,
             workflows: Vec::new(),
             workflow_runs: Vec::new(),
+            workflow_runs_index: 0,
             history: Vec::new(),
             history_index: None,
             history_draft: String::new(),
@@ -680,6 +683,37 @@ impl AppState {
             BackendEvent::WorkflowsError(error) => {
                 self.error = Some(error);
             }
+            BackendEvent::WorkflowRuns(runs) => {
+                self.workflow_runs_index = self
+                    .workflow_runs_index
+                    .min(runs.len().saturating_sub(1));
+                self.workflow_runs = runs;
+            }
+            BackendEvent::WorkflowLaunched(result) => match result {
+                Ok(run) => {
+                    self.apply_workflow_run(run.clone());
+                    self.messages.push(Message {
+                        role: MessageRole::System,
+                        content: format!(
+                            "{} → {} ({})",
+                            match self.language {
+                                Language::ZhCn => "工作流已启动",
+                                Language::En => "Workflow launched",
+                            },
+                            run.display_name,
+                            run.run_id
+                        ),
+                        expanded: true,
+                    });
+                }
+                Err(error) => self.error = Some(error),
+            },
+            BackendEvent::WorkflowAction(result) => match result {
+                Ok(run) => {
+                    self.apply_workflow_run(run);
+                }
+                Err(error) => self.error = Some(error),
+            },
             BackendEvent::SessionReady(id) => {
                 self.session_id = id;
             }
@@ -998,6 +1032,13 @@ impl AppState {
         }
         self.workflow_runs
             .sort_by(|left, right| left.display_name.cmp(&right.display_name));
+    }
+
+    pub fn open_workflow_runs(&mut self) {
+        self.overlay = Some(Overlay::WorkflowRuns);
+        self.workflow_runs_index = self
+            .workflow_runs_index
+            .min(self.workflow_runs.len().saturating_sub(1));
     }
 
     fn finish_tool(&mut self, id: &str, status: ToolStatus, result: String) {

@@ -15,6 +15,18 @@ pub enum BackendCommand {
     },
     ListSkills,
     ListWorkflows,
+    LaunchWorkflow {
+        id: String,
+        args: serde_json::Value,
+        agent_budget: Option<u64>,
+    },
+    WorkflowRuns,
+    WorkflowPause(String),
+    WorkflowResume {
+        name: String,
+        agent_budget: Option<u64>,
+    },
+    WorkflowStop(String),
     Compact(Option<String>),
     SwitchModel(String),
     Cancel,
@@ -35,6 +47,9 @@ pub enum BackendEvent {
     SkillsError(String),
     Workflows(crate::client::WorkflowListResponse),
     WorkflowsError(String),
+    WorkflowLaunched(Result<crate::client::WorkflowRunView, String>),
+    WorkflowRuns(Vec<crate::client::WorkflowRunView>),
+    WorkflowAction(Result<crate::client::WorkflowRunView, String>),
     Update(ClientUpdate),
     TurnCompleted(String),
     TurnCancelled,
@@ -106,6 +121,14 @@ impl BackendHandle {
 
 type ActiveWork = tokio::task::JoinHandle<(InteractiveAcpClient, ActiveWorkEnd)>;
 
+#[cfg(test)]
+impl BackendHandle {
+    pub(crate) fn test_handle() -> (Self, tokio::sync::mpsc::UnboundedReceiver<BackendCommand>) {
+        let (commands, receiver) = mpsc::unbounded_channel();
+        (BackendHandle { commands }, receiver)
+    }
+}
+
 #[derive(Debug)]
 enum ActiveWorkEnd {
     Turn(TurnEnd),
@@ -138,6 +161,9 @@ pub fn spawn(
         if let Some(owned) = client.as_mut() {
             refresh_skills(owned, &event_tx).await;
         }
+        // Poll out-of-turn notifications (background `lato/workflow` updates).
+        let mut update_tick = tokio::time::interval(std::time::Duration::from_millis(250));
+        update_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             if let Some(turn) = active.as_mut() {
                 tokio::select! {
@@ -161,6 +187,21 @@ pub fn spawn(
                         }
                         Some(BackendCommand::ListWorkflows) => {
                             let _ = event_tx.send(BackendEvent::WorkflowsError("Wait for the current turn before listing workflows / 请等待当前回复结束后查看工作流".into()));
+                        }
+                        Some(command @ (BackendCommand::LaunchWorkflow { .. }
+                        | BackendCommand::WorkflowRuns
+                        | BackendCommand::WorkflowPause(_)
+                        | BackendCommand::WorkflowResume { .. }
+                        | BackendCommand::WorkflowStop(_))) => {
+                            // The ACP client is owned by the active turn task;
+                            // workflow commands need it, so queue a clear error
+                            // instead of silently dropping the request.
+                            let _ = event_tx.send(match command {
+                                BackendCommand::WorkflowRuns => {
+                                    BackendEvent::Error("wait for the current turn before listing workflow runs / 请等待当前回复结束后查看运行".into())
+                                }
+                                _ => BackendEvent::Error("wait for the current turn before managing workflows / 请等待当前回复结束后操作工作流".into()),
+                            });
                         }
                         Some(BackendCommand::Resume(_)) => {
                             let _ = event_tx.send(BackendEvent::Error("cannot switch sessions while a turn is running".into()));
@@ -210,7 +251,18 @@ pub fn spawn(
                 continue;
             }
 
-            match command_rx.recv().await {
+            let received = tokio::select! {
+                command = command_rx.recv() => command,
+                _ = update_tick.tick() => {
+                    if let Some(owned) = client.as_mut() {
+                        for update in owned.drain_updates() {
+                            let _ = event_tx.send(BackendEvent::Update(update));
+                        }
+                    }
+                    continue;
+                }
+            };
+            match received {
                 Some(BackendCommand::ListSkills) => {
                     if let Some(owned) = client.as_mut() {
                         refresh_skills(owned, &event_tx).await;
@@ -220,6 +272,13 @@ pub fn spawn(
                     if let Some(owned) = client.as_mut() {
                         refresh_workflows(owned, &event_tx).await;
                     }
+                }
+                Some(command @ (BackendCommand::LaunchWorkflow { .. }
+                | BackendCommand::WorkflowRuns
+                | BackendCommand::WorkflowPause(_)
+                | BackendCommand::WorkflowResume { .. }
+                | BackendCommand::WorkflowStop(_))) => {
+                    handle_workflow_command(command, &mut client, &event_tx).await;
                 }
                 Some(
                     command @ (BackendCommand::Submit(_) | BackendCommand::InvokeSkill { .. }),
@@ -453,4 +512,52 @@ async fn refresh_workflows(
         Err(error) => BackendEvent::WorkflowsError(error),
     };
     let _ = events.send(event);
+}
+
+async fn handle_workflow_command(
+    command: BackendCommand,
+    client: &mut Option<InteractiveAcpClient>,
+    event_tx: &mpsc::UnboundedSender<BackendEvent>,
+) {
+    let Some(owned) = client.as_mut() else {
+        let _ = event_tx.send(BackendEvent::Error("session is unavailable".into()));
+        return;
+    };
+    match command {
+        BackendCommand::LaunchWorkflow {
+            id,
+            args,
+            agent_budget,
+        } => {
+            let _ = event_tx.send(BackendEvent::WorkflowLaunched(
+                owned.launch_workflow(&id, args, agent_budget).await,
+            ));
+        }
+        BackendCommand::WorkflowRuns => {
+            let _ = event_tx.send(BackendEvent::WorkflowRuns(match owned.list_workflow_runs().await
+            {
+                Ok(runs) => runs,
+                Err(error) => {
+                    let _ = event_tx.send(BackendEvent::Error(error));
+                    return;
+                }
+            }));
+        }
+        BackendCommand::WorkflowPause(name) => {
+            let _ = event_tx.send(BackendEvent::WorkflowAction(
+                owned.pause_workflow(&name).await,
+            ));
+        }
+        BackendCommand::WorkflowResume { name, agent_budget } => {
+            let _ = event_tx.send(BackendEvent::WorkflowAction(
+                owned.resume_workflow(&name, agent_budget).await,
+            ));
+        }
+        BackendCommand::WorkflowStop(name) => {
+            let _ = event_tx.send(BackendEvent::WorkflowAction(
+                owned.stop_workflow(&name).await,
+            ));
+        }
+        _ => unreachable!("handle_workflow_command only receives workflow commands"),
+    }
 }

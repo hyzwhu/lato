@@ -127,6 +127,11 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         description_zh: "列出可用工作流",
         description_en: "List available workflows",
     },
+    SlashCommand {
+        name: "/workflow",
+        description_zh: "启动/管理工作流运行 · /workflow runs 打开看板",
+        description_en: "Launch/manage workflow runs · /workflow runs opens the board",
+    },
 ];
 
 #[cfg(test)]

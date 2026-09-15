@@ -483,3 +483,154 @@ fn expanding_reasoning_reveals_it_above_a_long_answer() {
     assert!(text.contains("reveal-reasoning-marker"));
     assert!(app.scroll > 0);
 }
+
+#[test]
+fn workflow_runs_command_opens_the_board_overlay() {
+    let root = tempfile::tempdir().unwrap();
+    let trust = SessionTrust::for_interactive(root.path(), false);
+    let mut app = app(root.path());
+    app.composer.replace("/workflow runs");
+    let effects = submit_or_command(&mut app, &trust);
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Backend(BackendCommand::WorkflowRuns)]
+    ));
+    assert_eq!(app.overlay, Some(Overlay::WorkflowRuns));
+    assert!(app.composer.as_str().is_empty());
+}
+
+#[test]
+fn workflow_runs_hotkeys_dispatch_pause_resume_and_stop() {
+    let root = tempfile::tempdir().unwrap();
+    let mut app = app(root.path());
+    app.workflow_runs = vec![run_view("alpha", "active"), run_view("beta", "user_paused")];
+    app.open_workflow_runs();
+    let (backend, mut commands) = BackendHandle::test_handle();
+
+    // `p` pauses the highlighted run.
+    let _ = handle_workflow_runs_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE),
+        &backend,
+    );
+    assert!(matches!(
+        commands.try_recv().unwrap(),
+        BackendCommand::WorkflowPause(name) if name == "alpha"
+    ));
+
+    // Down + `r` resumes the next run (bare resume; ACP enforces budget rules).
+    let _ = handle_workflow_runs_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+        &backend,
+    );
+    let _ = handle_workflow_runs_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+        &backend,
+    );
+    assert!(matches!(
+        commands.try_recv().unwrap(),
+        BackendCommand::WorkflowResume { name, agent_budget: None } if name == "beta"
+    ));
+
+    // `x` stops the highlighted run.
+    let _ = handle_workflow_runs_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+        &backend,
+    );
+    assert!(matches!(
+        commands.try_recv().unwrap(),
+        BackendCommand::WorkflowStop(name) if name == "beta"
+    ));
+
+    // Esc closes the board.
+    let effects = handle_workflow_runs_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        &backend,
+    );
+    assert!(effects.is_empty());
+    assert!(app.overlay.is_none());
+    assert!(commands.try_recv().is_err());
+}
+
+#[test]
+fn workflow_updates_upsert_by_run_id() {
+    let root = tempfile::tempdir().unwrap();
+    let mut app = app(root.path());
+    app.reduce(AppEvent::Backend(crate::tui::backend::BackendEvent::Update(
+        crate::client::ClientUpdate::WorkflowRun(run_view("alpha", "active")),
+    )));
+    app.reduce(AppEvent::Backend(crate::tui::backend::BackendEvent::Update(
+        crate::client::ClientUpdate::WorkflowRun(run_view("alpha", "user_paused")),
+    )));
+    app.reduce(AppEvent::Backend(crate::tui::backend::BackendEvent::Update(
+        crate::client::ClientUpdate::WorkflowRun(run_view("beta", "complete")),
+    )));
+    assert_eq!(app.workflow_runs.len(), 2);
+    assert_eq!(app.workflow_runs[0].display_name, "alpha");
+    assert_eq!(app.workflow_runs[0].status, "user_paused");
+    assert_eq!(app.workflow_runs[1].status, "complete");
+}
+
+#[test]
+fn workflow_argument_completion_offers_subcommands_and_display_names() {
+    let root = tempfile::tempdir().unwrap();
+    let mut app = app(root.path());
+    app.composer.replace("/workflow ");
+    let names: Vec<String> = app
+        .candidates()
+        .into_iter()
+        .map(|candidate| candidate.name)
+        .collect();
+    for expected in ["/workflow runs", "/workflow pause", "/workflow resume", "/workflow stop"] {
+        assert!(names.contains(&expected.to_string()), "missing {expected}: {names:?}");
+    }
+
+    app.workflow_runs = vec![run_view("alpha", "active")];
+    app.composer.replace("/workflow pause al");
+    let names: Vec<String> = app
+        .candidates()
+        .into_iter()
+        .map(|candidate| candidate.name)
+        .collect();
+    assert!(names.contains(&"alpha".to_string()), "names: {names:?}");
+
+    // Workflow ids are offered for the launch form.
+    app.composer.replace("/workflow rev");
+    let mut app = app_with_workflow(app);
+    let names: Vec<String> = app
+        .candidates()
+        .into_iter()
+        .map(|candidate| candidate.name)
+        .collect();
+    assert!(names.contains(&"demo/review".to_string()), "names: {names:?}");
+}
+
+fn app_with_workflow(mut app: AppState) -> AppState {
+    app.workflows = vec![crate::client::WorkflowEntry {
+        id: "demo/review".into(),
+        name: "review".into(),
+        description: "Review the diff".into(),
+        source: "plugin".into(),
+        compiled: true,
+        steps: 0,
+        agent_budget: 32,
+    }];
+    app
+}
+
+fn run_view(name: &str, status: &str) -> crate::client::WorkflowRunView {
+    crate::client::WorkflowRunView {
+        run_id: format!("wf-{name}"),
+        display_name: name.to_string(),
+        status: status.to_string(),
+        phase: None,
+        agent_budget: Some(8),
+        agents_used: 1,
+        pause_message: None,
+        elapsed_ms_floor: 100,
+    }
+}

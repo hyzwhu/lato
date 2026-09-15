@@ -7,7 +7,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
 
 pub const BG: Color = Color::Rgb(26, 27, 30);
@@ -18,6 +18,7 @@ pub const BLUE: Color = Color::Rgb(91, 156, 246);
 pub const TEXT: Color = Color::Rgb(201, 209, 217);
 pub const MUTED: Color = Color::Rgb(110, 118, 129);
 pub const ERROR: Color = Color::Rgb(248, 113, 113);
+pub const GREEN: Color = Color::Rgb(106, 204, 138);
 
 pub fn welcome(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
     frame.render_widget(Block::default().style(Style::default().bg(BG)), area);
@@ -642,6 +643,92 @@ pub fn search_overlay(frame: &mut Frame<'_>, app: &AppState) {
     );
     if inner.width > 2 && inner.height > 0 && app.approval.is_none() {
         frame.set_cursor_position((inner.x + 2 + cursor as u16, inner.y));
+    }
+}
+
+/// `/workflow runs` board overlay (Phase 7B4): live runs with hotkeys
+/// `p` pause - `r` resume - `x` stop - `Esc`/`q` close.
+pub fn workflow_runs_overlay(frame: &mut Frame<'_>, app: &AppState) {
+    let area = centered_rect(frame.area(), 92, 18);
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .title(" Workflow runs · p pause · r resume · x stop · Esc close ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(BLUE))
+        .style(Style::default().fg(TEXT).bg(RAISED));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if app.workflow_runs.is_empty() {
+        frame.render_widget(
+            Paragraph::new(
+                "No workflow runs in this session. Start one with /workflow <id>\n本会话暂无工作流运行，用 /workflow <id> 启动",
+            )
+            .style(Style::default().fg(MUTED)),
+            inner,
+        );
+        return;
+    }
+    let selected = app.workflow_runs_index.min(app.workflow_runs.len() - 1);
+    let items: Vec<ListItem<'_>> = app
+        .workflow_runs
+        .iter()
+        .enumerate()
+        .map(|(index, run)| {
+            let status = run.status.as_str();
+            let highlighted = index == selected;
+            let line = Line::from(vec![
+                ratatui::text::Span::styled(
+                    format!("{:<16}", run.display_name),
+                    Style::default()
+                        .fg(TEXT)
+                        .add_modifier(if highlighted {
+                            Modifier::BOLD
+                        } else {
+                            Modifier::empty()
+                        }),
+                ),
+                ratatui::text::Span::styled(
+                    format!("{:<18}", status),
+                    Style::default().fg(
+                        if status.ends_with("paused") || status == "blocked" {
+                            AMBER
+                        } else if status == "active" {
+                            GREEN
+                        } else {
+                            MUTED
+                        },
+                    ),
+                ),
+                ratatui::text::Span::styled(
+                    format!(
+                        "{}/{}  {}  {}ms",
+                        run.agents_used,
+                        run.agent_budget
+                            .map(|budget| budget.to_string())
+                            .unwrap_or_else(|| "unlimited".into()),
+                        run.phase.as_deref().unwrap_or("-"),
+                        run.elapsed_ms_floor
+                    ),
+                    Style::default().fg(MUTED),
+                ),
+            ]);
+            ListItem::new(line)
+        })
+        .collect();
+    let list = List::new(items);
+    frame.render_stateful_widget(
+        list,
+        inner,
+        &mut ListState::default().with_selected(Some(selected)),
+    );
+    let footer = match app.workflow_runs.get(selected).and_then(|run| run.pause_message.clone())
+    {
+        Some(message) => message,
+        None => String::new(),
+    };
+    if !footer.is_empty() {
+        let rows = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(inner);
+        frame.render_widget(Paragraph::new(footer).style(Style::default().fg(AMBER)), rows[1]);
     }
 }
 

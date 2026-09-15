@@ -439,6 +439,9 @@ fn handle_key(
     if app.overlay == Some(Overlay::Search) {
         return handle_search_key(app, key);
     }
+    if app.overlay == Some(Overlay::WorkflowRuns) {
+        return handle_workflow_runs_key(app, key, backend);
+    }
 
     if key.code == KeyCode::F(2) {
         app.focus = state::Focus::Chat;
@@ -667,6 +670,87 @@ fn submit_or_command(app: &mut AppState, trust: &SessionTrust) -> Vec<Effect> {
             app.composer.clear();
             app.focus = state::Focus::Chat;
             vec![Effect::Backend(BackendCommand::ListWorkflows)]
+        }
+        "/workflow" => {
+            let rest = raw_command
+                .find(char::is_whitespace)
+                .map(|index| raw_command[index..].trim())
+                .unwrap_or_default();
+            if rest.is_empty() {
+                app.composer.replace("/workflow ");
+                app.refresh_slash_completion();
+                return Vec::new();
+            }
+            app.composer.clear();
+            app.focus = state::Focus::Chat;
+            let (head, arg) = rest
+                .split_once(char::is_whitespace)
+                .map(|(head, arg)| (head, arg.trim()))
+                .unwrap_or((rest, ""));
+            match head {
+                "runs" => {
+                    app.open_workflow_runs();
+                    vec![Effect::Backend(BackendCommand::WorkflowRuns)]
+                }
+                "pause" | "resume" | "stop" => {
+                    if arg.is_empty() {
+                        app.error = Some(match app.language {
+                            Language::ZhCn => format!("用法：/workflow {head} <displayName>"),
+                            Language::En => format!("Usage: /workflow {head} <displayName>"),
+                        });
+                        Vec::new()
+                    } else {
+                        let command = match head {
+                            "pause" => BackendCommand::WorkflowPause(arg.to_string()),
+                            "stop" => BackendCommand::WorkflowStop(arg.to_string()),
+                            _ => {
+                                let (name, budget) = arg
+                                    .split_once(char::is_whitespace)
+                                    .map(|(name, budget)| {
+                                        (name.trim(), budget.trim().parse::<u64>().ok())
+                                    })
+                                    .unwrap_or((arg, None));
+                                BackendCommand::WorkflowResume {
+                                    name: name.to_string(),
+                                    agent_budget: budget,
+                                }
+                            }
+                        };
+                        vec![Effect::Backend(command)]
+                    }
+                }
+                _ => {
+                    // `/workflow <id> [json-args]` starts a background run.
+                    let (id, args_json) = rest
+                        .split_once(char::is_whitespace)
+                        .map(|(id, args)| (id.trim(), args.trim()))
+                        .unwrap_or((rest, ""));
+                    let args = if args_json.is_empty() {
+                        serde_json::json!({})
+                    } else {
+                        match serde_json::from_str(args_json) {
+                            Ok(value) => value,
+                            Err(error) => {
+                                app.error = Some(format!("invalid workflow args JSON: {error}"));
+                                return Vec::new();
+                            }
+                        }
+                    };
+                    let known = app
+                        .workflows
+                        .iter()
+                        .find(|workflow| workflow.name == id || workflow.id == id);
+                    let (workflow_id, budget) = match known {
+                        Some(entry) => (entry.id.clone(), Some(u64::from(entry.agent_budget))),
+                        None => (id.to_string(), None),
+                    };
+                    vec![Effect::Backend(BackendCommand::LaunchWorkflow {
+                        id: workflow_id,
+                        args,
+                        agent_budget: budget,
+                    })]
+                }
+            }
         }
         "/skill" => {
             if app.is_busy() {
@@ -906,6 +990,52 @@ fn handle_palette_key(app: &mut AppState, key: KeyEvent, trust: &SessionTrust) -
         }
         _ => Vec::new(),
     }
+}
+
+fn handle_workflow_runs_key(
+    app: &mut AppState,
+    key: KeyEvent,
+    backend: &BackendHandle,
+) -> Vec<Effect> {
+    // Board hotkeys p / r / x act on the highlighted run (spec §8).
+    let action = match key.code {
+        KeyCode::Char('p') => Some("pause"),
+        KeyCode::Char('r') => Some("resume"),
+        KeyCode::Char('x') => Some("stop"),
+        KeyCode::Esc | KeyCode::Char('q') => {
+            app.overlay = None;
+            return Vec::new();
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            app.workflow_runs_index = app.workflow_runs_index.saturating_sub(1);
+            return Vec::new();
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            app.workflow_runs_index = (app.workflow_runs_index + 1)
+                .min(app.workflow_runs.len().saturating_sub(1));
+            return Vec::new();
+        }
+        _ => None,
+    };
+    let Some(action) = action else {
+        return Vec::new();
+    };
+    let Some(run) = app.workflow_runs.get(app.workflow_runs_index) else {
+        return Vec::new();
+    };
+    let name = run.display_name.clone();
+    let command = match action {
+        "pause" => BackendCommand::WorkflowPause(name),
+        "stop" => BackendCommand::WorkflowStop(name),
+        _ => BackendCommand::WorkflowResume {
+            name,
+            agent_budget: None,
+        },
+    };
+    if let Err(error) = backend.send(command) {
+        app.error = Some(error);
+    }
+    Vec::new()
 }
 
 fn handle_search_key(app: &mut AppState, key: KeyEvent) -> Vec<Effect> {
