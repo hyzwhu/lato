@@ -330,7 +330,7 @@ fn pgrep_script(script_name: &str) -> Vec<u32> {
                 "-NoProfile",
                 "-Command",
                 &format!(
-                    "(Get-CimInstance Win32_Process | Where-Object {{ $_.CommandLine -like '*{script_name}*' }}).ProcessId"
+                    "(Get-CimInstance Win32_Process | Where-Object {{ $_.ProcessId -ne $PID -and $_.CommandLine -like '*{script_name}*' }}).ProcessId"
                 ),
             ])
             .output()
