@@ -42,9 +42,28 @@ fn phase6b_installed_command_smoke_exercises_hook_lifecycle() {
             hook("post", HookEventName::PostToolUse, r#"{"hookSpecificOutput":{"updatedToolOutput":{"text":"replacement"}}}"#),
             hook("stop", HookEventName::Stop, r#"{"continue":false,"stopReason":"done"}"#),
         ]), PathBuf::from("."), "smoke-session".into());
-        assert!(hooks.prompt_submit("turn", "hello", CancellationToken::new()).await.block.is_none());
-        let pre = hooks.pre_tool_use("turn", "read_file", serde_json::json!({"path":"unsafe"}), CancellationToken::new()).await;
-        assert_eq!(pre.updated_input.unwrap()["path"], "safe.txt");
+        assert!(
+            hooks
+                .prompt_submit("turn", "hello", CancellationToken::new())
+                .await
+                .block
+                .is_none()
+        );
+        let pre = hooks
+            .pre_tool_use(
+                "turn",
+                "read_file",
+                serde_json::json!({"path":"unsafe"}),
+                CancellationToken::new(),
+            )
+            .await;
+        assert_eq!(
+            pre.updated_input.as_ref().map(|value| &value["path"]),
+            Some(&serde_json::json!("safe.txt")),
+            "pre hook returned no/invalid updated_input; decision={:?} runs={:?}",
+            pre.decision,
+            pre.runs,
+        );
         assert!(matches!(pre.decision, HookDecision::Ask { .. }));
         let post = hooks.post_tool_use("turn", serde_json::json!({"toolName":"read_file","arguments":{},"output":"old"}), CancellationToken::new()).await;
         assert_eq!(post.replacement.unwrap()["text"], "replacement");

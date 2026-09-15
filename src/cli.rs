@@ -1275,6 +1275,12 @@ mod tests {
     };
     use lato_ai::{CustomModel, ModelApi};
 
+    /// Tests in this binary run in parallel threads; login() reads LATO_HOME
+    /// through the process environment, so env mutation must be serialized
+    /// across all login tests. A tokio Mutex because the tests await login()
+    /// while holding the guard.
+    static LATO_HOME_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     #[test]
     fn interactive_exit_commands_accept_plain_slash_and_case_variants() {
         for command in ["exit", "quit", "/exit", "/quit", "EXIT"] {
@@ -1395,11 +1401,7 @@ mod tests {
         use crate::args::LoginMethod;
         use lato_ai::CredentialStore;
 
-        // Tests in this binary run in parallel threads; login() reads
-        // LATO_HOME through the process environment, so env mutation must
-        // be serialized to avoid cross-test interference.
-        static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-        let _env_guard = ENV_LOCK.lock().await;
+        let _env_guard = LATO_HOME_LOCK.lock().await;
 
         for provider in ["openai", "anthropic", "minimax", "kimi-coding"] {
             for key in ["", " ", "   ", "\t", "\n"] {
@@ -1436,10 +1438,8 @@ mod tests {
         use crate::args::LoginMethod;
         use lato_ai::CredentialStore;
 
-        // Serializes LATO_HOME mutation with the other login tests; see the
-        // reject test above.
-        static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-        let _env_guard = ENV_LOCK.lock().await;
+        // Serializes LATO_HOME mutation with the other login tests.
+        let _env_guard = LATO_HOME_LOCK.lock().await;
 
         let temp = tempfile::tempdir().unwrap();
         let previous = std::env::var_os("LATO_HOME");
