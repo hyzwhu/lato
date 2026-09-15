@@ -455,6 +455,7 @@ where
         output_load_event_tx,
         output_load_drained_tx,
         tokio::runtime::Handle::current(),
+        config.max_output_loads,
         Arc::clone(&output_load_supervisors),
     );
     let next_queue_reap = Instant::now() + config.queued_reap_interval;
@@ -4463,6 +4464,7 @@ fn spawn_output_load_dispatcher<R: TaskRunner>(
     event_tx: mpsc::UnboundedSender<OutputLoadEvent>,
     drained: oneshot::Sender<()>,
     runtime: tokio::runtime::Handle,
+    max_output_loads: usize,
     active_supervisors: Arc<AtomicUsize>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
@@ -4476,7 +4478,24 @@ fn spawn_output_load_dispatcher<R: TaskRunner>(
                 reap_output_supervisors(&mut supervisors, &done_rx);
                 match work_rx.recv_timeout(std::time::Duration::from_millis(1)) {
                     Ok(work) => {
-                        reap_output_supervisors(&mut supervisors, &done_rx);
+                        wait_for_output_supervisor_slot(
+                            &mut supervisors,
+                            &done_rx,
+                            max_output_loads,
+                        );
+                        if supervisors.len() >= max_output_loads {
+                            // Fail closed rather than spawning past the OS-thread
+                            // cap if a supervisor exited without notifying us.
+                            let _ = event_tx.send(OutputLoadEvent::Reply {
+                                reply: work.reply,
+                                result: Box::new(Err(TaskError::new(
+                                    TaskErrorCode::RetentionLimit,
+                                    "persisted output load dispatcher is unavailable",
+                                ))),
+                                release_slot: true,
+                            });
+                            continue;
+                        }
                         let supervisor_id = next_supervisor_id;
                         next_supervisor_id = next_supervisor_id.wrapping_add(1);
                         let runner = Arc::clone(&runner);
@@ -4486,7 +4505,11 @@ fn spawn_output_load_dispatcher<R: TaskRunner>(
                         active_supervisors.fetch_add(1, Ordering::AcqRel);
                         let active_supervisors = Arc::clone(&active_supervisors);
                         let supervisor = std::thread::spawn(move || {
-                            let _active_guard = AtomicCountGuard(active_supervisors);
+                            let _done_guard = SupervisorCompletionGuard {
+                                supervisor_id,
+                                done_tx,
+                            };
+                            let active_guard = AtomicCountGuard(active_supervisors);
                             let (value_tx, value_rx) = std::sync::mpsc::sync_channel(1);
                             let output_ref = work.output_ref.clone();
                             let execution = std::thread::spawn(move || {
@@ -4527,7 +4550,6 @@ fn spawn_output_load_dispatcher<R: TaskRunner>(
                                 let _ = value_rx.recv();
                                 let _ = execution.join();
                                 let _ = event_tx.send(OutputLoadEvent::SlotReleased);
-                                let _ = done_tx.send(supervisor_id);
                                 return;
                             }
                             let response = response.expect("non-timeout response is present");
@@ -4545,15 +4567,16 @@ fn spawn_output_load_dispatcher<R: TaskRunner>(
                                 Err(error) => Err(error),
                             };
                             let _ = execution.join();
-                            // Release actor-owned capacity before waking the
-                            // requester so a sequential follow-up cannot race
-                            // stale bookkeeping.
+                            // Drop supervisor bookkeeping before waking the
+                            // requester. Actor-owned inflight capacity is
+                            // released by the Reply; live OS threads stay
+                            // capped by wait_for_output_supervisor_slot.
+                            drop(active_guard);
                             let _ = event_tx.send(OutputLoadEvent::Reply {
                                 reply: work.reply,
                                 result: Box::new(reply),
                                 release_slot: true,
                             });
-                            let _ = done_tx.send(supervisor_id);
                         });
                         supervisors.insert(supervisor_id, supervisor);
                     }
@@ -4568,11 +4591,30 @@ fn spawn_output_load_dispatcher<R: TaskRunner>(
                     && let Some(supervisor) = supervisors.remove(&supervisor_id)
                 {
                     let _ = supervisor.join();
+                } else {
+                    break;
                 }
             }
             let _ = drained.send(());
         })
         .expect("task output-load dispatcher thread must start")
+}
+
+fn wait_for_output_supervisor_slot(
+    supervisors: &mut HashMap<usize, std::thread::JoinHandle<()>>,
+    done_rx: &std::sync::mpsc::Receiver<usize>,
+    max_output_loads: usize,
+) {
+    reap_output_supervisors(supervisors, done_rx);
+    while supervisors.len() >= max_output_loads {
+        let Ok(supervisor_id) = done_rx.recv() else {
+            return;
+        };
+        if let Some(supervisor) = supervisors.remove(&supervisor_id) {
+            let _ = supervisor.join();
+        }
+        reap_output_supervisors(supervisors, done_rx);
+    }
 }
 
 fn reap_output_supervisors(
@@ -4583,6 +4625,17 @@ fn reap_output_supervisors(
         if let Some(supervisor) = supervisors.remove(&supervisor_id) {
             let _ = supervisor.join();
         }
+    }
+}
+
+struct SupervisorCompletionGuard {
+    supervisor_id: usize,
+    done_tx: std::sync::mpsc::Sender<usize>,
+}
+
+impl Drop for SupervisorCompletionGuard {
+    fn drop(&mut self) {
+        let _ = self.done_tx.send(self.supervisor_id);
     }
 }
 

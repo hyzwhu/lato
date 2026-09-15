@@ -37,10 +37,21 @@ pub fn build_hook_http_client() -> Result<Client, HookRunError> {
         .map_err(|_| HookRunError::Http)
 }
 
+pub fn build_pinned_hook_http_client(
+    host: &str,
+    addresses: &[SocketAddr],
+) -> Result<Client, HookRunError> {
+    Client::builder()
+        .redirect(Policy::none())
+        .resolve_to_addrs(host, addresses)
+        .build()
+        .map_err(|_| HookRunError::Http)
+}
+
 pub async fn validate_hook_url(
     url: &Url,
     resolver: &dyn HookDnsResolver,
-) -> Result<(), HookRunError> {
+) -> Result<Vec<SocketAddr>, HookRunError> {
     if url.scheme() != "https" || url.username() != "" || url.password().is_some() {
         return Err(HookRunError::UnsafeUrl);
     }
@@ -53,14 +64,13 @@ pub async fn validate_hook_url(
     if addresses.is_empty() || addresses.iter().any(|address| blocked(address.ip())) {
         return Err(HookRunError::UnsafeUrl);
     }
-    Ok(())
+    Ok(addresses)
 }
 
 pub async fn run_http_hook(
     spec: &HookSpec,
     envelope: &HookEventEnvelope,
     context: &HookRunContext<'_>,
-    client: &Client,
     resolver: &dyn HookDnsResolver,
 ) -> Result<RawHookRun, HookRunError> {
     let payload = serde_json::to_vec(envelope).map_err(|_| HookRunError::PayloadTooLarge)?;
@@ -76,7 +86,9 @@ pub async fn run_http_hook(
     let started = Instant::now();
     let timeout = Duration::from_millis(spec.timeout_ms);
     let operation = async {
-        validate_hook_url(&url, resolver).await?;
+        let addresses = validate_hook_url(&url, resolver).await?;
+        let host = url.host_str().ok_or(HookRunError::UnsafeUrl)?;
+        let client = build_pinned_hook_http_client(host, &addresses)?;
         let response = client
             .post(url)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
