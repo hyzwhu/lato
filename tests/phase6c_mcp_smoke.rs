@@ -322,10 +322,25 @@ fn build_trusted_plugin_snapshot(
 }
 
 fn pgrep_script(script_name: &str) -> Vec<u32> {
-    let output = Command::new("pgrep")
-        .args(["-f", script_name])
-        .output()
-        .unwrap();
+    let output = if cfg!(windows) {
+        // pgrep does not exist on Windows; enumerate process command lines
+        // via CIM instead.
+        Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                &format!(
+                    "(Get-CimInstance Win32_Process | Where-Object {{ $_.CommandLine -like '*{script_name}*' }}).ProcessId"
+                ),
+            ])
+            .output()
+            .unwrap()
+    } else {
+        Command::new("pgrep")
+            .args(["-f", script_name])
+            .output()
+            .unwrap()
+    };
     String::from_utf8_lossy(&output.stdout)
         .lines()
         .filter_map(|line| line.trim().parse::<u32>().ok())
