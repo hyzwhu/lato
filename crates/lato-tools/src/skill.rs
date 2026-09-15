@@ -530,7 +530,12 @@ struct ResolvedScopedPath {
 
 fn resolve_scoped_path(path: &str, cwd: &Path, allow_missing: bool) -> Option<ResolvedScopedPath> {
     let lexical_cwd = absolute_lexical_cwd(cwd);
-    let resolved_cwd = std::fs::canonicalize(&lexical_cwd).ok()?;
+    // On Windows std::fs::canonicalize returns a \\?\ verbatim path. Compare
+    // and strip prefixes only in plain (simplified) space: a plain absolute
+    // path matches neither a verbatim prefix nor the 8.3 short-form lexical
+    // cwd, which would reject every already-rewritten scoped call.
+    let resolved_cwd =
+        dunce::simplified(std::fs::canonicalize(&lexical_cwd).ok()?.as_path()).to_owned();
     let raw = Path::new(path);
     if is_tilde_path(raw) {
         return None;
@@ -540,6 +545,7 @@ fn resolve_scoped_path(path: &str, cwd: &Path, allow_missing: bool) -> Option<Re
     } else {
         normalize_lexically(&lexical_cwd.join(raw))
     };
+    let lexical = dunce::simplified(&lexical).to_owned();
     let lexical_forms = if lexical.starts_with(&lexical_cwd) {
         path_forms(&lexical, &lexical_cwd)
     } else if lexical.starts_with(&resolved_cwd) {
@@ -561,6 +567,7 @@ fn resolve_scoped_path(path: &str, cwd: &Path, allow_missing: bool) -> Option<Re
         }
         Err(_) => return None,
     };
+    let resolved = dunce::simplified(&resolved).to_owned();
     if !resolved.starts_with(&resolved_cwd) {
         return None;
     }
