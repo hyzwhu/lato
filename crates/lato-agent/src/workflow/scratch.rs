@@ -106,7 +106,17 @@ mod tests {
     fn names_reject_path_traversal_and_bad_chars() {
         assert!(validate_scratch_name("report.md").is_ok());
         assert!(validate_scratch_name("a-b_c.d").is_ok());
-        for bad in ["", "..", ".", "../x", "a/b", "a\\b", "a b", "a\0b", &"x".repeat(MAX_SCRATCH_NAME + 1)] {
+        for bad in [
+            "",
+            "..",
+            ".",
+            "../x",
+            "a/b",
+            "a\\b",
+            "a b",
+            "a\0b",
+            &"x".repeat(MAX_SCRATCH_NAME + 1),
+        ] {
             assert!(
                 matches!(validate_scratch_name(bad), Err(HostError::Failed(message)) if message == "invalid scratch name"),
                 "expected reject: {bad}"
@@ -140,24 +150,20 @@ mod tests {
     fn oversize_single_file_and_total_cap_fail_with_stable_message() {
         let dir = tempfile::tempdir().unwrap();
         let one_mib_plus = "x".repeat(MAX_SCRATCH_FILE_BYTES as usize + 1);
-        assert!(
-            matches!(
-                write_scratch(dir.path(), "big.txt", &one_mib_plus),
-                Err(HostError::Failed(message)) if message == "scratch byte quota exceeded"
-            )
-        );
+        assert!(matches!(
+            write_scratch(dir.path(), "big.txt", &one_mib_plus),
+            Err(HostError::Failed(message)) if message == "scratch byte quota exceeded"
+        ));
 
         // Fill the 8 MiB total with exactly 8 × 1 MiB files, then one more fails.
         let one_mib = "x".repeat(MAX_SCRATCH_FILE_BYTES as usize);
         for seq in 0..8 {
             write_scratch(dir.path(), &format!("f{seq}.txt"), &one_mib).unwrap();
         }
-        assert!(
-            matches!(
-                write_scratch(dir.path(), "c.txt", "tiny"),
-                Err(HostError::Failed(message)) if message == "scratch byte quota exceeded"
-            )
-        );
+        assert!(matches!(
+            write_scratch(dir.path(), "c.txt", "tiny"),
+            Err(HostError::Failed(message)) if message == "scratch byte quota exceeded"
+        ));
     }
 
     #[test]
@@ -166,12 +172,10 @@ mod tests {
         for seq in 0..MAX_SCRATCH_FILES {
             write_scratch(dir.path(), &format!("f{seq:03}.txt"), "x").unwrap();
         }
-        assert!(
-            matches!(
-                write_scratch(dir.path(), "overflow.txt", "x"),
-                Err(HostError::Failed(message)) if message == "scratch file quota exceeded"
-            )
-        );
+        assert!(matches!(
+            write_scratch(dir.path(), "overflow.txt", "x"),
+            Err(HostError::Failed(message)) if message == "scratch file quota exceeded"
+        ));
         // Overwrite of an existing name still works at the cap.
         assert!(write_scratch(dir.path(), "f000.txt", "y").is_ok());
     }
@@ -179,34 +183,26 @@ mod tests {
     #[test]
     fn missing_or_nonregular_reads_report_not_found() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(
-            matches!(
-                read_scratch(dir.path(), "missing.md"),
-                Err(HostError::Failed(message)) if message == "scratch file not found: missing.md"
-            )
-        );
+        assert!(matches!(
+            read_scratch(dir.path(), "missing.md"),
+            Err(HostError::Failed(message)) if message == "scratch file not found: missing.md"
+        ));
         #[cfg(unix)]
         {
             std::os::unix::fs::symlink("../outside.txt", dir.path().join("link.txt")).unwrap();
-            assert!(
-                matches!(
-                    read_scratch(dir.path(), "link.txt"),
-                    Err(HostError::Failed(message)) if message == "scratch file not found: link.txt"
-                )
-            );
-            assert!(
-                matches!(
-                    write_scratch(dir.path(), "link.txt", "x"),
-                    Err(HostError::Failed(message)) if message == "invalid scratch name"
-                )
-            );
+            assert!(matches!(
+                read_scratch(dir.path(), "link.txt"),
+                Err(HostError::Failed(message)) if message == "scratch file not found: link.txt"
+            ));
+            assert!(matches!(
+                write_scratch(dir.path(), "link.txt", "x"),
+                Err(HostError::Failed(message)) if message == "invalid scratch name"
+            ));
         }
         std::fs::create_dir(dir.path().join("subdir")).unwrap();
-        assert!(
-            matches!(
-                read_scratch(dir.path(), "subdir"),
-                Err(HostError::Failed(message)) if message == "scratch file not found: subdir"
-            )
-        );
+        assert!(matches!(
+            read_scratch(dir.path(), "subdir"),
+            Err(HostError::Failed(message)) if message == "scratch file not found: subdir"
+        ));
     }
 }

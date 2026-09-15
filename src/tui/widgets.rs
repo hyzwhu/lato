@@ -679,25 +679,21 @@ pub fn workflow_runs_overlay(frame: &mut Frame<'_>, app: &AppState) {
             let line = Line::from(vec![
                 ratatui::text::Span::styled(
                     format!("{:<16}", run.display_name),
-                    Style::default()
-                        .fg(TEXT)
-                        .add_modifier(if highlighted {
-                            Modifier::BOLD
-                        } else {
-                            Modifier::empty()
-                        }),
+                    Style::default().fg(TEXT).add_modifier(if highlighted {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
                 ),
                 ratatui::text::Span::styled(
                     format!("{:<18}", status),
-                    Style::default().fg(
-                        if status.ends_with("paused") || status == "blocked" {
-                            AMBER
-                        } else if status == "active" {
-                            GREEN
-                        } else {
-                            MUTED
-                        },
-                    ),
+                    Style::default().fg(if status.ends_with("paused") || status == "blocked" {
+                        AMBER
+                    } else if status == "active" {
+                        GREEN
+                    } else {
+                        MUTED
+                    }),
                 ),
                 ratatui::text::Span::styled(
                     format!(
@@ -728,7 +724,10 @@ pub fn workflow_runs_overlay(frame: &mut Frame<'_>, app: &AppState) {
         .unwrap_or_default();
     if !footer.is_empty() {
         let rows = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(inner);
-        frame.render_widget(Paragraph::new(footer).style(Style::default().fg(AMBER)), rows[1]);
+        frame.render_widget(
+            Paragraph::new(footer).style(Style::default().fg(AMBER)),
+            rows[1],
+        );
     }
 }
 
@@ -838,7 +837,6 @@ fn wrap_transcript(lines: Vec<Line<'_>>, width: usize) -> Vec<Line<'static>> {
     }
     output
 }
-
 
 #[cfg(test)]
 mod recovery_label_tests {

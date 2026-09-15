@@ -118,10 +118,7 @@ impl WorkflowTracker {
     }
 
     pub fn get(&self, run_id: &str) -> Option<WorkflowRunState> {
-        self.runs
-            .iter()
-            .find(|run| run.run_id == run_id)
-            .cloned()
+        self.runs.iter().find(|run| run.run_id == run_id).cloned()
     }
 
     /// Cross-process restore: insert a run keeping its stored display name
@@ -216,7 +213,11 @@ impl WorkflowTracker {
         )
     }
 
-    pub fn resume_run(&mut self, run_id: &str, new_budget: Option<u64>) -> Option<WorkflowRunState> {
+    pub fn resume_run(
+        &mut self,
+        run_id: &str,
+        new_budget: Option<u64>,
+    ) -> Option<WorkflowRunState> {
         let run = self.get(run_id)?;
         if run.status == WorkflowRunStatus::BudgetLimited {
             // Budget-limited runs resume only with a strictly higher budget.
@@ -330,7 +331,10 @@ mod tests {
         assert!(tracker.resume_run("wf_1", None).is_none());
         assert!(tracker.resume_run("wf_1", Some(1)).is_none());
         assert!(tracker.resume_run("wf_1", Some(2)).is_some());
-        assert_eq!(tracker.get("wf_1").unwrap().status, WorkflowRunStatus::Active);
+        assert_eq!(
+            tracker.get("wf_1").unwrap().status,
+            WorkflowRunStatus::Active
+        );
         assert_eq!(tracker.get("wf_1").unwrap().agent_budget, Some(2));
     }
 

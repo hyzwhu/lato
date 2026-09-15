@@ -273,11 +273,13 @@ pub fn spawn(
                         refresh_workflows(owned, &event_tx).await;
                     }
                 }
-                Some(command @ (BackendCommand::LaunchWorkflow { .. }
-                | BackendCommand::WorkflowRuns
-                | BackendCommand::WorkflowPause(_)
-                | BackendCommand::WorkflowResume { .. }
-                | BackendCommand::WorkflowStop(_))) => {
+                Some(
+                    command @ (BackendCommand::LaunchWorkflow { .. }
+                    | BackendCommand::WorkflowRuns
+                    | BackendCommand::WorkflowPause(_)
+                    | BackendCommand::WorkflowResume { .. }
+                    | BackendCommand::WorkflowStop(_)),
+                ) => {
                     handle_workflow_command(command, &mut client, &event_tx).await;
                 }
                 Some(
@@ -534,14 +536,15 @@ async fn handle_workflow_command(
             ));
         }
         BackendCommand::WorkflowRuns => {
-            let _ = event_tx.send(BackendEvent::WorkflowRuns(match owned.list_workflow_runs().await
-            {
-                Ok(runs) => runs,
-                Err(error) => {
-                    let _ = event_tx.send(BackendEvent::Error(error));
-                    return;
-                }
-            }));
+            let _ = event_tx.send(BackendEvent::WorkflowRuns(
+                match owned.list_workflow_runs().await {
+                    Ok(runs) => runs,
+                    Err(error) => {
+                        let _ = event_tx.send(BackendEvent::Error(error));
+                        return;
+                    }
+                },
+            ));
         }
         BackendCommand::WorkflowPause(name) => {
             let _ = event_tx.send(BackendEvent::WorkflowAction(

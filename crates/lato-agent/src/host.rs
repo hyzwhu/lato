@@ -2097,12 +2097,20 @@ mod tests {
         }
         assert!(paused, "run never paused");
 
-        h.handle(req(4, "session/close", serde_json::json!({"sessionId": sid})))
-            .await
-            .unwrap();
-        h.handle(req(5, "session/resume", serde_json::json!({"sessionId": sid})))
-            .await
-            .unwrap();
+        h.handle(req(
+            4,
+            "session/close",
+            serde_json::json!({"sessionId": sid}),
+        ))
+        .await
+        .unwrap();
+        h.handle(req(
+            5,
+            "session/resume",
+            serde_json::json!({"sessionId": sid}),
+        ))
+        .await
+        .unwrap();
 
         let runs = h
             .handle(req(

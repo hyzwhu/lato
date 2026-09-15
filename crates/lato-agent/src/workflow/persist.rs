@@ -109,7 +109,11 @@ pub fn scan_restore_candidates(workflows_dir: &Path) -> Vec<RestoredRun> {
             .then_with(|| left.1.record.run_id.cmp(&right.1.record.run_id))
     });
     let skip = candidates.len().saturating_sub(WORKFLOW_HISTORY_MAX);
-    candidates.into_iter().skip(skip).map(|(_, run)| run).collect()
+    candidates
+        .into_iter()
+        .skip(skip)
+        .map(|(_, run)| run)
+        .collect()
 }
 
 #[cfg(test)]
@@ -176,8 +180,11 @@ mod tests {
 
         let big = dir.path().join("wf_big");
         std::fs::create_dir_all(&big).unwrap();
-        std::fs::write(big.join(SCRIPT_FILE), "x".repeat(MAX_WORKFLOW_SOURCE_BYTES as usize + 1))
-            .unwrap();
+        std::fs::write(
+            big.join(SCRIPT_FILE),
+            "x".repeat(MAX_WORKFLOW_SOURCE_BYTES as usize + 1),
+        )
+        .unwrap();
         assert!(read_script(&big).is_none());
     }
 
@@ -187,8 +194,11 @@ mod tests {
         for seq in 0..(WORKFLOW_HISTORY_MAX + 4) {
             let run_id = format!("wf_{seq:06}");
             let run_dir = dir.path().join(&run_id);
-            write_run_record(&run_dir, &sample(&run_id, &run_id, WorkflowRunStatus::Complete))
-                .unwrap();
+            write_run_record(
+                &run_dir,
+                &sample(&run_id, &run_id, WorkflowRunStatus::Complete),
+            )
+            .unwrap();
         }
         let broken = dir.path().join("wf_broken");
         std::fs::create_dir_all(&broken).unwrap();
@@ -201,10 +211,6 @@ mod tests {
             scanned.last().unwrap().record.run_id,
             format!("wf_{:06}", WORKFLOW_HISTORY_MAX + 3)
         );
-        assert!(
-            scanned
-                .iter()
-                .all(|run| run.record.run_id != "wf_broken")
-        );
+        assert!(scanned.iter().all(|run| run.record.run_id != "wf_broken"));
     }
 }

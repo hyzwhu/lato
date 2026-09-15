@@ -82,7 +82,10 @@ fn manager(stream: Arc<dyn ModelStream>) -> WorkflowManager {
 }
 
 /// Manager with a persistent workflows directory (Phase 7B5 restore tests).
-fn persistent_manager(stream: Arc<dyn ModelStream>, workflows_dir: &std::path::Path) -> WorkflowManager {
+fn persistent_manager(
+    stream: Arc<dyn ModelStream>,
+    workflows_dir: &std::path::Path,
+) -> WorkflowManager {
     let cwd = std::env::temp_dir();
     WorkflowManager::new(
         "s-manager-test",
@@ -117,13 +120,19 @@ async fn second_launch_gets_numbered_display_name() {
     let manager = manager(lato_agent::default_fake_stream());
     let first = manager
         .launch(
-            resolved("hold", r#"let meta = #{ name: "hold", description: "d" }; complete("ok");"#),
+            resolved(
+                "hold",
+                r#"let meta = #{ name: "hold", description: "d" }; complete("ok");"#,
+            ),
             spec(serde_json::json!({})),
         )
         .unwrap();
     let second = manager
         .launch(
-            resolved("hold", r#"let meta = #{ name: "hold", description: "d" }; complete("ok");"#),
+            resolved(
+                "hold",
+                r#"let meta = #{ name: "hold", description: "d" }; complete("ok");"#,
+            ),
             spec(serde_json::json!({})),
         )
         .unwrap();
@@ -143,7 +152,9 @@ async fn fifth_active_run_is_rejected() {
         complete(r.output);
     "#;
     for _ in 0..4 {
-        let state = manager.launch(resolved("hang", script), spec(serde_json::json!({}))).unwrap();
+        let state = manager
+            .launch(resolved("hang", script), spec(serde_json::json!({})))
+            .unwrap();
         assert_eq!(state.status, WorkflowRunStatus::Active);
     }
     let fifth = manager.launch(resolved("hang", script), spec(serde_json::json!({})));
@@ -279,14 +290,16 @@ fn find_run_dir(workflows: &std::path::Path, display_name: &str) -> std::path::P
             continue;
         }
         if let Ok(body) = std::fs::read_to_string(dir.join("run.json"))
-            && let Ok(record) =
-                serde_json::from_str::<serde_json::Value>(&body)
+            && let Ok(record) = serde_json::from_str::<serde_json::Value>(&body)
             && record["displayName"] == display_name
         {
             return dir;
         }
     }
-    panic!("no persisted run named {display_name} under {}", workflows.display());
+    panic!(
+        "no persisted run named {display_name} under {}",
+        workflows.display()
+    );
 }
 
 const GATED_SCRIPT: &str = r#"
@@ -385,10 +398,8 @@ async fn active_on_disk_restores_as_interrupted() {
     );
 
     // The rewritten record is terminal on disk too.
-    let record: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(run_dir.join("run.json")).unwrap(),
-    )
-    .unwrap();
+    let record: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(run_dir.join("run.json")).unwrap()).unwrap();
     assert_eq!(record["status"], "interrupted");
 
     match manager.resume("crashed", None) {
@@ -444,10 +455,7 @@ async fn corrupt_journal_skips_that_run_only() {
         .launch(resolved("gated", GATED_SCRIPT), spec(serde_json::json!({})))
         .unwrap();
     first
-        .launch(
-            resolved("sick", GATED_SCRIPT),
-            spec(serde_json::json!({})),
-        )
+        .launch(resolved("sick", GATED_SCRIPT), spec(serde_json::json!({})))
         .unwrap();
     wait_for(&first, "gated", WorkflowRunStatus::UserPaused).await;
     wait_for(&first, "sick", WorkflowRunStatus::UserPaused).await;

@@ -1012,8 +1012,8 @@ fn handle_workflow_runs_key(
             return Vec::new();
         }
         KeyCode::Down | KeyCode::Char('j') => {
-            app.workflow_runs_index = (app.workflow_runs_index + 1)
-                .min(app.workflow_runs.len().saturating_sub(1));
+            app.workflow_runs_index =
+                (app.workflow_runs_index + 1).min(app.workflow_runs.len().saturating_sub(1));
             return Vec::new();
         }
         _ => None,
@@ -1091,7 +1091,6 @@ fn start_file_index(
         let _ = sender.send(context::index_files(&workspace));
     });
 }
-
 
 #[cfg(test)]
 mod tests {

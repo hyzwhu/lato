@@ -161,7 +161,9 @@ impl ClientUpdate {
         let params = value.get("params").unwrap_or(&serde_json::Value::Null);
         match method {
             Some("session/update") => {
-                if params.get("sessionUpdate").and_then(serde_json::Value::as_str)
+                if params
+                    .get("sessionUpdate")
+                    .and_then(serde_json::Value::as_str)
                     == Some("lato/workflow")
                 {
                     return match serde_json::from_value::<WorkflowRunView>(params["run"].clone()) {

@@ -27,7 +27,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use super::host_service::DEFAULT_WORKFLOW_MAX_CONCURRENT_AGENTS;
-use super::persist::{self, PersistedRun, RestoredRun, RUN_RECORD_VERSION};
+use super::persist::{self, PersistedRun, RUN_RECORD_VERSION, RestoredRun};
 use super::{
     RunEvent, WorkflowHostParams, WorkflowRunState, WorkflowRunStatus, WorkflowTracker,
     spawn_workflow_host_service, workflow_max_concurrent_agents,
@@ -51,9 +51,7 @@ pub enum LaunchError {
     UnknownRun(String),
     #[error("workflow run '{0}' cannot be resumed")]
     NotResumable(String),
-    #[error(
-        "budget-limited run needs a higher agent budget: used {used}, current limit {limit}"
-    )]
+    #[error("budget-limited run needs a higher agent budget: used {used}, current limit {limit}")]
     BudgetNotRaised { used: u64, limit: u64 },
     #[error("too many active workflow runs (maximum 4 per session)")]
     TooManyActiveRuns,
@@ -149,7 +147,10 @@ impl WorkflowManager {
         if let Some(name) = spec.resume_display_name {
             return self.resume(&name, spec.agent_budget);
         }
-        let budget = Some(spec.agent_budget.unwrap_or(u64::from(resolved.agent_budget)));
+        let budget = Some(
+            spec.agent_budget
+                .unwrap_or(u64::from(resolved.agent_budget)),
+        );
         let mut inner = self.core.inner.lock().unwrap();
         if inner.tracker.active_count() >= super::WORKFLOW_MAX_ACTIVE_RUNS_PER_SESSION {
             return Err(LaunchError::TooManyActiveRuns);
@@ -181,8 +182,8 @@ impl WorkflowManager {
                 .get(&run_id)
                 .map(|resolved| resolved.script.clone())
                 .unwrap_or_default();
-            if let Err(error) =
-                persist::write_script(&dir, &script).and_then(|()| persist_run(&self.core, &inner, &state))
+            if let Err(error) = persist::write_script(&dir, &script)
+                .and_then(|()| persist_run(&self.core, &inner, &state))
             {
                 // No memory-only fallback: undo the launch and report the failure.
                 inner.tracker.remove_run(&run_id);
@@ -380,11 +381,7 @@ fn stamp(inner: &Inner, mut state: WorkflowRunState) -> WorkflowRunState {
 
 /// Mirror a tracker status change into the run's `run.json`. A no-op when the
 /// manager has no `workflows_dir` or the run never reached the tracker.
-fn persist_run(
-    core: &ManagerCore,
-    inner: &Inner,
-    state: &WorkflowRunState,
-) -> std::io::Result<()> {
+fn persist_run(core: &ManagerCore, inner: &Inner, state: &WorkflowRunState) -> std::io::Result<()> {
     let Some(root) = &core.workflows_dir else {
         return Ok(());
     };
@@ -479,7 +476,9 @@ fn restore_runs(core: &ManagerCore) {
             && let Ok(seq) = u64::from_str_radix(seq, 16)
         {
             let current = inner.seq.load(Ordering::Relaxed);
-            inner.seq.fetch_max(seq.saturating_add(1).max(current), Ordering::Relaxed);
+            inner
+                .seq
+                .fetch_max(seq.saturating_add(1).max(current), Ordering::Relaxed);
         }
     }
 }

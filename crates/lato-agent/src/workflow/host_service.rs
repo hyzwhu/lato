@@ -226,10 +226,9 @@ impl ScratchArea {
                     .map_err(|error| HostError::Failed(format!("scratch dir: {error}")))?;
                 Ok(Self::Dir(dir))
             }
-            None => Ok(Self::Temp(
-                tempfile::TempDir::new()
-                    .map_err(|error| HostError::Failed(format!("scratch temp dir: {error}")))?,
-            )),
+            None => Ok(Self::Temp(tempfile::TempDir::new().map_err(|error| {
+                HostError::Failed(format!("scratch temp dir: {error}"))
+            })?)),
         }
     }
 
@@ -374,7 +373,11 @@ impl HostService {
             WorkflowHostRequest::RenderTemplate { name, vars, reply } => {
                 let _ = reply.send(templates::render_template(&name, &vars));
             }
-            WorkflowHostRequest::WriteScratchFile { name, content, reply } => {
+            WorkflowHostRequest::WriteScratchFile {
+                name,
+                content,
+                reply,
+            } => {
                 let _ = reply.send(scratch::write_scratch(self.scratch.path(), &name, &content));
             }
             WorkflowHostRequest::ReadScratchFile { name, reply } => {

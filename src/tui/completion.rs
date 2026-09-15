@@ -58,7 +58,11 @@ impl AppState {
 
     /// Subcommand completion for `/workflow`: `runs`, `pause`, `resume`,
     /// `stop`, and `<workflowId>`; display-name completion for pause/resume/stop.
-    fn workflow_argument_candidates(&self, rest: &str, range: std::ops::Range<usize>) -> Vec<Candidate> {
+    fn workflow_argument_candidates(
+        &self,
+        rest: &str,
+        range: std::ops::Range<usize>,
+    ) -> Vec<Candidate> {
         let (head, arg) = match rest.split_once(char::is_whitespace) {
             Some((head, arg)) => (head, arg.trim()),
             None => (rest, ""),
@@ -105,8 +109,8 @@ impl AppState {
             }
         }
         for workflow in &self.workflows {
-            if let Some(rank) = score(&workflow.name, head)
-                .or_else(|| score(&workflow.id, head).map(|n| n + 1))
+            if let Some(rank) =
+                score(&workflow.name, head).or_else(|| score(&workflow.id, head).map(|n| n + 1))
             {
                 ranked.push((
                     rank,

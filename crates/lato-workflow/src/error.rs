@@ -55,7 +55,10 @@ mod tests {
 
     #[test]
     fn paused_code_is_stable() {
-        assert_eq!(WorkflowError::Paused("hold".into()).code(), "workflow.paused");
+        assert_eq!(
+            WorkflowError::Paused("hold".into()).code(),
+            "workflow.paused"
+        );
         assert_eq!(
             WorkflowError::Paused("hold".into()).to_string(),
             "workflow paused: hold"

@@ -560,15 +560,21 @@ fn workflow_runs_hotkeys_dispatch_pause_resume_and_stop() {
 fn workflow_updates_upsert_by_run_id() {
     let root = tempfile::tempdir().unwrap();
     let mut app = app(root.path());
-    app.reduce(AppEvent::Backend(crate::tui::backend::BackendEvent::Update(
-        crate::client::ClientUpdate::WorkflowRun(run_view("alpha", "active")),
-    )));
-    app.reduce(AppEvent::Backend(crate::tui::backend::BackendEvent::Update(
-        crate::client::ClientUpdate::WorkflowRun(run_view("alpha", "user_paused")),
-    )));
-    app.reduce(AppEvent::Backend(crate::tui::backend::BackendEvent::Update(
-        crate::client::ClientUpdate::WorkflowRun(run_view("beta", "complete")),
-    )));
+    app.reduce(AppEvent::Backend(
+        crate::tui::backend::BackendEvent::Update(crate::client::ClientUpdate::WorkflowRun(
+            run_view("alpha", "active"),
+        )),
+    ));
+    app.reduce(AppEvent::Backend(
+        crate::tui::backend::BackendEvent::Update(crate::client::ClientUpdate::WorkflowRun(
+            run_view("alpha", "user_paused"),
+        )),
+    ));
+    app.reduce(AppEvent::Backend(
+        crate::tui::backend::BackendEvent::Update(crate::client::ClientUpdate::WorkflowRun(
+            run_view("beta", "complete"),
+        )),
+    ));
     assert_eq!(app.workflow_runs.len(), 2);
     assert_eq!(app.workflow_runs[0].display_name, "alpha");
     assert_eq!(app.workflow_runs[0].status, "user_paused");
@@ -585,8 +591,16 @@ fn workflow_argument_completion_offers_subcommands_and_display_names() {
         .into_iter()
         .map(|candidate| candidate.name)
         .collect();
-    for expected in ["/workflow runs", "/workflow pause", "/workflow resume", "/workflow stop"] {
-        assert!(names.contains(&expected.to_string()), "missing {expected}: {names:?}");
+    for expected in [
+        "/workflow runs",
+        "/workflow pause",
+        "/workflow resume",
+        "/workflow stop",
+    ] {
+        assert!(
+            names.contains(&expected.to_string()),
+            "missing {expected}: {names:?}"
+        );
     }
 
     app.workflow_runs = vec![run_view("alpha", "active")];
@@ -606,7 +620,10 @@ fn workflow_argument_completion_offers_subcommands_and_display_names() {
         .into_iter()
         .map(|candidate| candidate.name)
         .collect();
-    assert!(names.contains(&"demo/review".to_string()), "names: {names:?}");
+    assert!(
+        names.contains(&"demo/review".to_string()),
+        "names: {names:?}"
+    );
 }
 
 fn app_with_workflow(mut app: AppState) -> AppState {

@@ -425,7 +425,11 @@ async fn ask(
 #[tokio::test]
 async fn scratch_write_and_read_round_trip_in_host_temp_dir() {
     let repo = init_git_repo();
-    let (tx, join, _cancel) = start_host(8, Arc::new(FakeModelStream::new(Vec::new())), repo.path().to_path_buf());
+    let (tx, join, _cancel) = start_host(
+        8,
+        Arc::new(FakeModelStream::new(Vec::new())),
+        repo.path().to_path_buf(),
+    );
     let id = ask(&tx, |reply| WorkflowHostRequest::WriteScratchFile {
         name: "report.md".into(),
         content: "hello body".into(),
@@ -447,7 +451,11 @@ async fn scratch_write_and_read_round_trip_in_host_temp_dir() {
 #[tokio::test]
 async fn scratch_errors_are_stable_failures() {
     let repo = init_git_repo();
-    let (tx, join, _cancel) = start_host(8, Arc::new(FakeModelStream::new(Vec::new())), repo.path().to_path_buf());
+    let (tx, join, _cancel) = start_host(
+        8,
+        Arc::new(FakeModelStream::new(Vec::new())),
+        repo.path().to_path_buf(),
+    );
     for bad in ["../x", "a/b", "", "a b"] {
         let err = ask(&tx, |reply| WorkflowHostRequest::WriteScratchFile {
             name: bad.into(),
@@ -513,7 +521,11 @@ async fn scratch_persists_under_an_explicit_dir() {
 #[tokio::test]
 async fn render_template_identity_and_unknown() {
     let repo = init_git_repo();
-    let (tx, join, _cancel) = start_host(8, Arc::new(FakeModelStream::new(Vec::new())), repo.path().to_path_buf());
+    let (tx, join, _cancel) = start_host(
+        8,
+        Arc::new(FakeModelStream::new(Vec::new())),
+        repo.path().to_path_buf(),
+    );
     let rendered = ask(&tx, |reply| WorkflowHostRequest::RenderTemplate {
         name: "identity".into(),
         vars: serde_json::json!({"text": "hi"}),
@@ -540,7 +552,11 @@ async fn render_template_identity_and_unknown() {
 async fn git_diff_since_returns_working_tree_changes() {
     let repo = init_git_repo();
     std::fs::write(repo.path().join("README.md"), "root\nedited line\n").unwrap();
-    let (tx, join, _cancel) = start_host(8, Arc::new(FakeModelStream::new(Vec::new())), repo.path().to_path_buf());
+    let (tx, join, _cancel) = start_host(
+        8,
+        Arc::new(FakeModelStream::new(Vec::new())),
+        repo.path().to_path_buf(),
+    );
     let diff = ask(&tx, |reply| WorkflowHostRequest::GitDiffSince {
         commit: "HEAD".into(),
         reply,
@@ -554,7 +570,11 @@ async fn git_diff_since_returns_working_tree_changes() {
 #[tokio::test]
 async fn git_diff_since_rejects_bad_commit_and_non_repo() {
     let repo = init_git_repo();
-    let (tx, join, _cancel) = start_host(8, Arc::new(FakeModelStream::new(Vec::new())), repo.path().to_path_buf());
+    let (tx, join, _cancel) = start_host(
+        8,
+        Arc::new(FakeModelStream::new(Vec::new())),
+        repo.path().to_path_buf(),
+    );
     for bad in ["-evil", "has space", ""] {
         let err = ask(&tx, |reply| WorkflowHostRequest::GitDiffSince {
             commit: bad.into(),
@@ -570,7 +590,11 @@ async fn git_diff_since_rejects_bad_commit_and_non_repo() {
     shutdown_host(tx, join).await;
 
     let not_a_repo = tempfile::tempdir().unwrap();
-    let (tx, join, _cancel) = start_host(8, Arc::new(FakeModelStream::new(Vec::new())), not_a_repo.path().to_path_buf());
+    let (tx, join, _cancel) = start_host(
+        8,
+        Arc::new(FakeModelStream::new(Vec::new())),
+        not_a_repo.path().to_path_buf(),
+    );
     let err = ask(&tx, |reply| WorkflowHostRequest::GitDiffSince {
         commit: "HEAD".into(),
         reply,

@@ -246,9 +246,9 @@ async fn execute(
             );
             0
         }
-        ScriptOutcome::Paused { kind, message } => {
-            print_workflow_error(WorkflowError::Paused(format!("{}: {message}", kind.as_str())))
-        }
+        ScriptOutcome::Paused { kind, message } => print_workflow_error(WorkflowError::Paused(
+            format!("{}: {message}", kind.as_str()),
+        )),
         ScriptOutcome::BudgetExceeded { message } => {
             print_workflow_error(WorkflowError::BudgetExceeded(message))
         }

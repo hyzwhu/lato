@@ -14,6 +14,6 @@ pub use manager::{LaunchError, LaunchSpec, WorkflowManager};
 pub use persist::{MAX_WORKFLOW_SOURCE_BYTES, PersistedRun, RUN_RECORD_VERSION};
 pub use registry::{ResolvedWorkflow, list_workflows, resolve_workflow};
 pub use tracker::{
-    WORKFLOW_HISTORY_MAX, WORKFLOW_MAX_ACTIVE_RUNS_PER_SESSION, WorkflowRunState, WorkflowRunStatus,
-    WorkflowTracker,
+    WORKFLOW_HISTORY_MAX, WORKFLOW_MAX_ACTIVE_RUNS_PER_SESSION, WorkflowRunState,
+    WorkflowRunStatus, WorkflowTracker,
 };

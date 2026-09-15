@@ -684,9 +684,8 @@ impl AppState {
                 self.error = Some(error);
             }
             BackendEvent::WorkflowRuns(runs) => {
-                self.workflow_runs_index = self
-                    .workflow_runs_index
-                    .min(runs.len().saturating_sub(1));
+                self.workflow_runs_index =
+                    self.workflow_runs_index.min(runs.len().saturating_sub(1));
                 self.workflow_runs = runs;
             }
             BackendEvent::WorkflowLaunched(result) => match result {

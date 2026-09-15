@@ -13,7 +13,6 @@ use lato_core::{
     PluginSnapshotSummary, Retryability, SessionId, SessionStore, StartBehavior, StartTurn, TurnId,
     UserInput,
 };
-use lato_workflow::WorkflowError;
 use lato_extensions::{
     PluginSnapshot,
     hooks::materialize_hooks,
@@ -23,6 +22,7 @@ use lato_extensions::{
 use lato_runtime::{
     SessionBootstrap, SessionHandle, TurnDriver, spawn_session, spawn_session_with_store,
 };
+use lato_workflow::WorkflowError;
 use lato_workspace::{FileLocks, SessionTrust};
 use std::{
     path::PathBuf,
@@ -677,7 +677,9 @@ impl RuntimeSession {
         let manager = self
             .workflow_manager_with_snapshot()
             .await
-            .map_err(|error| crate::workflow::LaunchError::Resolve(WorkflowError::Failed(error.to_string())))?;
+            .map_err(|error| {
+                crate::workflow::LaunchError::Resolve(WorkflowError::Failed(error.to_string()))
+            })?;
         manager.launch(
             resolved,
             crate::workflow::LaunchSpec {
@@ -702,7 +704,9 @@ impl RuntimeSession {
         let manager = self
             .workflow_manager_with_snapshot()
             .await
-            .map_err(|error| crate::workflow::LaunchError::Resolve(WorkflowError::Failed(error.to_string())))?;
+            .map_err(|error| {
+                crate::workflow::LaunchError::Resolve(WorkflowError::Failed(error.to_string()))
+            })?;
         manager.pause(display_name)
     }
 
@@ -714,7 +718,9 @@ impl RuntimeSession {
         let manager = self
             .workflow_manager_with_snapshot()
             .await
-            .map_err(|error| crate::workflow::LaunchError::Resolve(WorkflowError::Failed(error.to_string())))?;
+            .map_err(|error| {
+                crate::workflow::LaunchError::Resolve(WorkflowError::Failed(error.to_string()))
+            })?;
         manager.resume(display_name, agent_budget)
     }
 
@@ -725,7 +731,9 @@ impl RuntimeSession {
         let manager = self
             .workflow_manager_with_snapshot()
             .await
-            .map_err(|error| crate::workflow::LaunchError::Resolve(WorkflowError::Failed(error.to_string())))?;
+            .map_err(|error| {
+                crate::workflow::LaunchError::Resolve(WorkflowError::Failed(error.to_string()))
+            })?;
         manager.stop(display_name).await
     }
 

@@ -89,18 +89,14 @@ mod tests {
 
     #[test]
     fn unknown_templates_fail_with_stable_message() {
-        assert!(
-            matches!(
-                render_template("nope", &json!({})),
-                Err(HostError::Failed(message)) if message == "unknown template: nope"
-            )
-        );
-        assert!(
-            matches!(
-                render_template("", &json!({})),
-                Err(HostError::Failed(message)) if message == "unknown template: "
-            )
-        );
+        assert!(matches!(
+            render_template("nope", &json!({})),
+            Err(HostError::Failed(message)) if message == "unknown template: nope"
+        ));
+        assert!(matches!(
+            render_template("", &json!({})),
+            Err(HostError::Failed(message)) if message == "unknown template: "
+        ));
     }
 
     #[test]
@@ -112,7 +108,8 @@ mod tests {
             "nested": {"a": [1, 2]},
             "blank": null
         });
-        let body = "{text}|{count}|{flag}|{nested}|{blank}|{missing}|{9bad}|{bad ident}|{}|{unclosed";
+        let body =
+            "{text}|{count}|{flag}|{nested}|{blank}|{missing}|{9bad}|{bad ident}|{}|{unclosed";
         assert_eq!(
             render_body(body, &vars),
             "hello|3|true|{\"a\":[1,2]}|null||{9bad}|{bad ident}|{}|{unclosed"
