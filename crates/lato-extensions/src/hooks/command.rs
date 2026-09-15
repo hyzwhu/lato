@@ -168,8 +168,11 @@ fn build_command(command: &str, source_dir: &Path) -> Result<Command, HookRunErr
     } else {
         #[cfg(windows)]
         {
+            // raw_arg hands the command line to cmd unescaped: std's
+            // default MSVCRT quoting escapes quotes as \", which cmd then
+            // passes through literally and corrupts any quoted argument.
             let mut process = Command::new("cmd");
-            process.args(["/C", command]);
+            process.raw_arg("/C").raw_arg(command);
             Ok(process)
         }
         #[cfg(not(windows))]

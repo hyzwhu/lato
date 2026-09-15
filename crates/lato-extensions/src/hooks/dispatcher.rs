@@ -382,8 +382,13 @@ async fn execute_parsed(
             runs.push(failed(spec, HookRunOutcome::Cancelled, started));
             None
         }
-        Err(_) => {
-            runs.push(failed(spec, HookRunOutcome::Failed, started));
+        Err(error) => {
+            runs.push(failed_with(
+                spec,
+                HookRunOutcome::Failed,
+                started,
+                Some(error.to_string()),
+            ));
             None
         }
     }
@@ -426,11 +431,20 @@ fn skipped(spec: &HookSpec) -> HookRunRecord {
     }
 }
 fn failed(spec: &HookSpec, outcome: HookRunOutcome, started: Instant) -> HookRunRecord {
+    failed_with(spec, outcome, started, None)
+}
+
+fn failed_with(
+    spec: &HookSpec,
+    outcome: HookRunOutcome,
+    started: Instant,
+    feedback: Option<String>,
+) -> HookRunRecord {
     HookRunRecord {
         hook_id: spec.id.clone(),
         outcome,
         duration_ms: millis(started.elapsed()),
-        feedback: None,
+        feedback,
     }
 }
 fn millis(duration: std::time::Duration) -> u64 {
