@@ -449,8 +449,9 @@ fn directory_visit_limit_is_bounded_and_deterministic() {
         .filter(|diagnostic| diagnostic.code == "skill.directory_limit")
         .collect::<Vec<_>>();
     assert_eq!(diagnostics.len(), 1);
+    let normalized = diagnostics[0].path.replace(std::path::MAIN_SEPARATOR, "/");
     assert!(
-        diagnostics[0].path.ends_with("skills/directory-2047"),
+        normalized.ends_with("skills/directory-2047"),
         "first excluded directory must be stable: {}",
         diagnostics[0].path
     );
