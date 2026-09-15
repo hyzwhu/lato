@@ -127,6 +127,10 @@ fn run_scripted_task_smoke(binary: &Path) -> SmokeOutcome {
         thread::sleep(Duration::from_millis(20));
     }
     let output = child.wait_with_output().unwrap();
+    eprintln!(
+        "phase5 smoke lato stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     server.join().unwrap();
 
     let session_journal = find_session_journal(home.path());
@@ -164,15 +168,40 @@ fn assert_request(index: usize, body: &Value) {
     }
 
     let serialized = body.to_string();
+    let context = |message: String| format!("{message}; request body: {serialized}");
     match index {
-        0 => assert!(!serialized.contains("phase5-child")),
+        0 => assert!(
+            !serialized.contains("phase5-child"),
+            "{}",
+            context("request 0 leaked the child task id".into())
+        ),
         1 => {
-            assert!(serialized.contains("inspect the fixture"));
-            assert!(serialized.contains("changed_files"));
+            assert!(
+                serialized.contains("inspect the fixture"),
+                "{}",
+                context("request 1 lost the delegated task".into())
+            );
+            assert!(
+                serialized.contains("changed_files"),
+                "{}",
+                context("request 1 lost the worker result contract".into())
+            );
         }
-        2 => assert!(serialized.contains("phase5-child")),
-        3 => assert!(serialized.contains("inspect-1")),
-        4 => assert!(serialized.contains("wait-1")),
+        2 => assert!(
+            serialized.contains("phase5-child"),
+            "{}",
+            context("request 2 lost the child task id".into())
+        ),
+        3 => assert!(
+            serialized.contains("inspect-1"),
+            "{}",
+            context("request 3 lost the inspect tool call id".into())
+        ),
+        4 => assert!(
+            serialized.contains("wait-1"),
+            "{}",
+            context("request 4 lost the wait tool call id".into())
+        ),
         _ => unreachable!(),
     }
 }
