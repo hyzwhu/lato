@@ -556,6 +556,13 @@ fn spawn_run_task(core: Arc<ManagerCore>, run_id: String) {
                 cancel: active.cancel.clone(),
                 approval: core.approval.clone(),
                 notify: Some(notify_tx),
+                // Phase 7B6: scratch files live under this run's directory so
+                // they survive cross-process resume; memory-only runs (CLI)
+                // get None and the host uses a temp dir.
+                scratch_dir: core
+                    .workflows_dir
+                    .as_ref()
+                    .map(|root| persist::run_dir(root, &run_id).join("scratch")),
             },
             host_rx,
         );

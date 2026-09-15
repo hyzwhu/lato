@@ -3,6 +3,8 @@ pub mod manager;
 pub mod persist;
 pub mod registry;
 mod schema_contract;
+pub mod scratch;
+pub mod templates;
 pub mod tracker;
 
 pub use host_service::{

@@ -212,6 +212,8 @@ async fn execute(
             cancel: cancel.clone(),
             approval: None,
             notify: None,
+            // CLI one-shot run: host-owned temp dir; no session directory to persist.
+            scratch_dir: None,
         },
         host_rx,
     );

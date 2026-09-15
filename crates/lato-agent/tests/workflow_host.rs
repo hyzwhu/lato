@@ -68,6 +68,19 @@ fn start_host(
     tokio::task::JoinHandle<()>,
     CancellationToken,
 ) {
+    start_host_with_scratch(agent_budget, stream, cwd, None)
+}
+
+fn start_host_with_scratch(
+    agent_budget: u64,
+    stream: Arc<dyn ModelStream>,
+    cwd: std::path::PathBuf,
+    scratch_dir: Option<std::path::PathBuf>,
+) -> (
+    mpsc::UnboundedSender<WorkflowHostRequest>,
+    tokio::task::JoinHandle<()>,
+    CancellationToken,
+) {
     let (tx, rx) = mpsc::unbounded_channel();
     let cancel = CancellationToken::new();
     let params = WorkflowHostParams {
@@ -83,6 +96,7 @@ fn start_host(
         cancel: cancel.clone(),
         approval: None,
         notify: None,
+        scratch_dir,
     };
     let join = spawn_workflow_host_service(params, rx);
     (tx, join, cancel)
@@ -394,5 +408,199 @@ async fn isolation_worktree_applies_to_read_only_child() {
             .any(|name| name == "write_file" || name == "run_terminal_command"),
         "read-only isolation must not expose write/execute tools: {names:?}"
     );
+    shutdown_host(tx, join).await;
+}
+
+// --- Phase 7B6: host helpers (scratch / templates / git diff) ---------------
+
+async fn ask(
+    tx: &mpsc::UnboundedSender<WorkflowHostRequest>,
+    make: impl FnOnce(oneshot::Sender<Result<String, HostError>>) -> WorkflowHostRequest,
+) -> Result<String, HostError> {
+    let (reply_tx, reply_rx) = oneshot::channel();
+    tx.send(make(reply_tx)).unwrap();
+    reply_rx.await.unwrap()
+}
+
+#[tokio::test]
+async fn scratch_write_and_read_round_trip_in_host_temp_dir() {
+    let repo = init_git_repo();
+    let (tx, join, _cancel) = start_host(8, Arc::new(FakeModelStream::new(Vec::new())), repo.path().to_path_buf());
+    let id = ask(&tx, |reply| WorkflowHostRequest::WriteScratchFile {
+        name: "report.md".into(),
+        content: "hello body".into(),
+        reply,
+    })
+    .await
+    .expect("write scratch");
+    assert_eq!(id, "scratch/report.md");
+    let body = ask(&tx, |reply| WorkflowHostRequest::ReadScratchFile {
+        name: "report.md".into(),
+        reply,
+    })
+    .await
+    .expect("read scratch");
+    assert_eq!(body, "hello body");
+    shutdown_host(tx, join).await;
+}
+
+#[tokio::test]
+async fn scratch_errors_are_stable_failures() {
+    let repo = init_git_repo();
+    let (tx, join, _cancel) = start_host(8, Arc::new(FakeModelStream::new(Vec::new())), repo.path().to_path_buf());
+    for bad in ["../x", "a/b", "", "a b"] {
+        let err = ask(&tx, |reply| WorkflowHostRequest::WriteScratchFile {
+            name: bad.into(),
+            content: "x".into(),
+            reply,
+        })
+        .await
+        .expect_err(bad);
+        assert!(
+            matches!(err, HostError::Failed(ref message) if message == "invalid scratch name"),
+            "{bad}: {err:?}"
+        );
+    }
+    let err = ask(&tx, |reply| WorkflowHostRequest::ReadScratchFile {
+        name: "missing.md".into(),
+        reply,
+    })
+    .await
+    .expect_err("missing read");
+    assert!(
+        matches!(err, HostError::Failed(ref message) if message == "scratch file not found: missing.md"),
+        "{err:?}"
+    );
+    let err = ask(&tx, |reply| WorkflowHostRequest::WriteScratchFile {
+        name: "big.txt".into(),
+        content: "x".repeat(1024 * 1024 + 1),
+        reply,
+    })
+    .await
+    .expect_err("oversize write");
+    assert!(
+        matches!(err, HostError::Failed(ref message) if message == "scratch byte quota exceeded"),
+        "{err:?}"
+    );
+    shutdown_host(tx, join).await;
+}
+
+#[tokio::test]
+async fn scratch_persists_under_an_explicit_dir() {
+    let repo = init_git_repo();
+    let scratch = tempfile::tempdir().unwrap();
+    let (tx, join, _cancel) = start_host_with_scratch(
+        8,
+        Arc::new(FakeModelStream::new(Vec::new())),
+        repo.path().to_path_buf(),
+        Some(scratch.path().to_path_buf()),
+    );
+    let id = ask(&tx, |reply| WorkflowHostRequest::WriteScratchFile {
+        name: "kept.md".into(),
+        content: "on disk".into(),
+        reply,
+    })
+    .await
+    .expect("write scratch");
+    assert_eq!(id, "scratch/kept.md");
+    assert_eq!(
+        std::fs::read_to_string(scratch.path().join("kept.md")).unwrap(),
+        "on disk"
+    );
+    shutdown_host(tx, join).await;
+}
+
+#[tokio::test]
+async fn render_template_identity_and_unknown() {
+    let repo = init_git_repo();
+    let (tx, join, _cancel) = start_host(8, Arc::new(FakeModelStream::new(Vec::new())), repo.path().to_path_buf());
+    let rendered = ask(&tx, |reply| WorkflowHostRequest::RenderTemplate {
+        name: "identity".into(),
+        vars: serde_json::json!({"text": "hi"}),
+        reply,
+    })
+    .await
+    .expect("identity template");
+    assert_eq!(rendered, "hi");
+    let err = ask(&tx, |reply| WorkflowHostRequest::RenderTemplate {
+        name: "nope".into(),
+        vars: serde_json::json!({}),
+        reply,
+    })
+    .await
+    .expect_err("unknown template");
+    assert!(
+        matches!(err, HostError::Failed(ref message) if message == "unknown template: nope"),
+        "{err:?}"
+    );
+    shutdown_host(tx, join).await;
+}
+
+#[tokio::test]
+async fn git_diff_since_returns_working_tree_changes() {
+    let repo = init_git_repo();
+    std::fs::write(repo.path().join("README.md"), "root\nedited line\n").unwrap();
+    let (tx, join, _cancel) = start_host(8, Arc::new(FakeModelStream::new(Vec::new())), repo.path().to_path_buf());
+    let diff = ask(&tx, |reply| WorkflowHostRequest::GitDiffSince {
+        commit: "HEAD".into(),
+        reply,
+    })
+    .await
+    .expect("git diff");
+    assert!(diff.contains("edited line"), "{diff}");
+    shutdown_host(tx, join).await;
+}
+
+#[tokio::test]
+async fn git_diff_since_rejects_bad_commit_and_non_repo() {
+    let repo = init_git_repo();
+    let (tx, join, _cancel) = start_host(8, Arc::new(FakeModelStream::new(Vec::new())), repo.path().to_path_buf());
+    for bad in ["-evil", "has space", ""] {
+        let err = ask(&tx, |reply| WorkflowHostRequest::GitDiffSince {
+            commit: bad.into(),
+            reply,
+        })
+        .await
+        .expect_err(bad);
+        assert!(
+            matches!(err, HostError::Failed(ref message) if message == "invalid git diff commit"),
+            "{bad}: {err:?}"
+        );
+    }
+    shutdown_host(tx, join).await;
+
+    let not_a_repo = tempfile::tempdir().unwrap();
+    let (tx, join, _cancel) = start_host(8, Arc::new(FakeModelStream::new(Vec::new())), not_a_repo.path().to_path_buf());
+    let err = ask(&tx, |reply| WorkflowHostRequest::GitDiffSince {
+        commit: "HEAD".into(),
+        reply,
+    })
+    .await
+    .expect_err("non repo");
+    assert!(matches!(err, HostError::Failed(_)), "{err:?}");
+    shutdown_host(tx, join).await;
+}
+
+#[tokio::test]
+async fn fork_context_is_still_unsupported_after_helpers() {
+    let repo = init_git_repo();
+    let stream = Arc::new(FakeModelStream::new(vec![vec![StreamPiece::Text(
+        worker_output_text(),
+    )]]));
+    let (tx, join, _cancel) = start_host(8, stream, repo.path().to_path_buf());
+    let (reply_tx, reply_rx) = oneshot::channel();
+    tx.send(WorkflowHostRequest::SpawnAgent {
+        opts: AgentOpts {
+            prompt: "forked child".into(),
+            fork_context: true,
+            ..AgentOpts::default()
+        },
+        reply: reply_tx,
+    })
+    .unwrap();
+    assert!(matches!(
+        reply_rx.await.unwrap(),
+        Err(HostError::Unsupported(_))
+    ));
     shutdown_host(tx, join).await;
 }

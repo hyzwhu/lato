@@ -1,8 +1,12 @@
 // Derived from: Grok Build@bb7f39d5858cbf5e00de639367f59debbdcb0138:crates/codegen/xai-grok-shell/src/session/workflow/host_service.rs
 // License: Apache-2.0
-// Lato changes: SpawnAgent uses TaskCoordinator + ChildSessionRunner instead of SubagentRequest.
+// Lato changes: SpawnAgent uses TaskCoordinator + ChildSessionRunner instead of
+// SubagentRequest. Phase 7B6: write_scratch_file / read_scratch_file /
+// render_template / git_diff_since are live here (scratch under the 7B5 run
+// directory for ACP sessions, a host-owned temp dir for the CLI); fork_context
+// stays Unsupported.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
@@ -27,6 +31,8 @@ use tokio_util::sync::CancellationToken;
 use super::schema_contract::{
     SCHEMA_CONTRACT_RETRIES, compile_contract_schema, contract_prompt, validate_contract_output,
 };
+use super::scratch::{self};
+use super::templates;
 use crate::{
     BuiltinProfileName, ChildSessionRunner, ProfileResultVerifier, SessionPluginSnapshots,
     ToolApproval,
@@ -38,6 +44,7 @@ const WORKFLOW_MAX_AGENT_PROMPT_BYTES: usize = 1024 * 1024;
 const WORKFLOW_MAX_PHASE_BYTES: usize = 256;
 const WORKFLOW_CHILD_DRAIN_TIMEOUT: Duration = Duration::from_secs(20);
 const CONTRACT_OUTPUT_MAX_BYTES: usize = 2 * 1024 * 1024;
+const WORKFLOW_MAX_GIT_DIFF_BYTES: u64 = 1024 * 1024;
 
 /// Live run progress emitted by the host service so a session-level manager
 /// can update the tracker without intercepting host traffic.
@@ -60,6 +67,10 @@ pub struct WorkflowHostParams {
     pub cancel: CancellationToken,
     pub approval: Option<Arc<dyn ToolApproval>>,
     pub notify: Option<mpsc::UnboundedSender<RunEvent>>,
+    /// Phase 7B6: where `write_scratch_file` / `read_scratch_file` operate.
+    /// `Some` — the ACP session's run directory (`<runDir>/scratch`); `None` —
+    /// the host creates a temp dir that dies with the host service (CLI run).
+    pub scratch_dir: Option<PathBuf>,
 }
 
 /// The configured cap clamped to the machine's parallelism, so small hosts run fewer agents at once.
@@ -163,6 +174,7 @@ async fn setup_host(
             }
         };
     let root_id = TaskId::from(format!("wf-root-{}", params.run_id));
+    let scratch = ScratchArea::open(params.scratch_dir.clone())?;
     let mut budget = BudgetLimits::unlimited();
     // Schema correction re-spawns one child under the same logical agent_budget.
     budget.child_tasks = Some(
@@ -193,9 +205,74 @@ async fn setup_host(
             scoped: tokio::sync::Mutex::new(Some(scoped)),
             root_id,
             params,
+            scratch,
         }),
         actor,
     ))
+}
+
+/// Where scratch files live for one host service. `Temp` dies with the
+/// service (CLI one-shot runs); `Dir` persists under the 7B5 run directory.
+enum ScratchArea {
+    Dir(PathBuf),
+    Temp(tempfile::TempDir),
+}
+
+impl ScratchArea {
+    fn open(scratch_dir: Option<PathBuf>) -> Result<Self, HostError> {
+        match scratch_dir {
+            Some(dir) => {
+                std::fs::create_dir_all(&dir)
+                    .map_err(|error| HostError::Failed(format!("scratch dir: {error}")))?;
+                Ok(Self::Dir(dir))
+            }
+            None => Ok(Self::Temp(
+                tempfile::TempDir::new()
+                    .map_err(|error| HostError::Failed(format!("scratch temp dir: {error}")))?,
+            )),
+        }
+    }
+
+    fn path(&self) -> &Path {
+        match self {
+            Self::Dir(dir) => dir.as_path(),
+            Self::Temp(temp) => temp.path(),
+        }
+    }
+}
+
+/// `git diff <commit> --` on the host cwd. The commit is a single argument
+/// (no leading `-`, no whitespace/NUL) and stdout+stderr is capped at 1 MiB.
+fn git_diff_since(cwd: &Path, commit: &str) -> Result<String, HostError> {
+    if commit.is_empty()
+        || commit.starts_with('-')
+        || commit.contains(|c: char| c.is_whitespace() || c == '\0')
+    {
+        return Err(HostError::Failed("invalid git diff commit".into()));
+    }
+    let output = std::process::Command::new("git")
+        .arg("diff")
+        .arg(commit)
+        .arg("--")
+        .current_dir(cwd)
+        .output()
+        .map_err(|error| HostError::Failed(format!("git diff failed: {error}")))?;
+    if output.stdout.len() as u64 + output.stderr.len() as u64 > WORKFLOW_MAX_GIT_DIFF_BYTES {
+        return Err(HostError::Failed(
+            "git diff output exceeded the 1 MiB cap".into(),
+        ));
+    }
+    if !output.status.success() {
+        let brief: String = String::from_utf8_lossy(&output.stderr)
+            .lines()
+            .next()
+            .unwrap_or("git exited with an error")
+            .chars()
+            .take(200)
+            .collect();
+        return Err(HostError::Failed(format!("git diff failed: {brief}")));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 fn workflow_root_profile() -> AgentProfile {
@@ -254,10 +331,6 @@ fn reply_failed(req: WorkflowHostRequest, message: &str) {
     }
 }
 
-fn unsupported(feature: &str) -> HostError {
-    HostError::Unsupported(format!("{feature} is not implemented for this host"))
-}
-
 struct HostService {
     agent_runs: AtomicU32,
     agent_seq: AtomicU64,
@@ -267,6 +340,7 @@ struct HostService {
     scoped: tokio::sync::Mutex<Option<ScopedTaskHandle>>,
     root_id: TaskId,
     params: WorkflowHostParams,
+    scratch: ScratchArea,
 }
 
 impl HostService {
@@ -297,17 +371,17 @@ impl HostService {
             WorkflowHostRequest::BudgetQuery { reply } => {
                 let _ = reply.send(Ok(self.budget_state()));
             }
-            WorkflowHostRequest::RenderTemplate { reply, .. } => {
-                let _ = reply.send(Err(unsupported("render_template")));
+            WorkflowHostRequest::RenderTemplate { name, vars, reply } => {
+                let _ = reply.send(templates::render_template(&name, &vars));
             }
-            WorkflowHostRequest::WriteScratchFile { reply, .. } => {
-                let _ = reply.send(Err(unsupported("write_scratch_file")));
+            WorkflowHostRequest::WriteScratchFile { name, content, reply } => {
+                let _ = reply.send(scratch::write_scratch(self.scratch.path(), &name, &content));
             }
-            WorkflowHostRequest::ReadScratchFile { reply, .. } => {
-                let _ = reply.send(Err(unsupported("read_scratch_file")));
+            WorkflowHostRequest::ReadScratchFile { name, reply } => {
+                let _ = reply.send(scratch::read_scratch(self.scratch.path(), &name));
             }
-            WorkflowHostRequest::GitDiffSince { reply, .. } => {
-                let _ = reply.send(Err(unsupported("git_diff_since")));
+            WorkflowHostRequest::GitDiffSince { commit, reply } => {
+                let _ = reply.send(git_diff_since(&self.params.cwd, &commit));
             }
         }
     }
