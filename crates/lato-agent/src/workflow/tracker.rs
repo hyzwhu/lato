@@ -1,6 +1,10 @@
 // Derived from: Grok Build@bb7f39d5858cbf5e00de639367f59debbdcb0138:crates/codegen/xai-grok-shell/src/session/workflow/tracker.rs
 // License: Apache-2.0
-// Lato changes: drop token leases and persistence fields; journals stay in memory (Phase 7B4).
+// Lato changes: drop token leases; journals live in memory with an on-disk
+// mirror under the session workflows directory (Phase 7B5) — the tracker also
+// accepts restored runs so the cross-process resumable set (paused family,
+// blocked, failed, cancelled; budget_limited gated) survives a restart while
+// runs that were active on disk come back as `interrupted`.
 
 use lato_workflow::{PauseKind, ScriptOutcome};
 use serde::{Deserialize, Serialize};
@@ -118,6 +122,25 @@ impl WorkflowTracker {
             .iter()
             .find(|run| run.run_id == run_id)
             .cloned()
+    }
+
+    /// Cross-process restore: insert a run keeping its stored display name
+    /// (no reallocation). Rejected when the run id or name is already taken.
+    pub fn insert_restored(&mut self, state: WorkflowRunState) -> bool {
+        if self
+            .runs
+            .iter()
+            .any(|run| run.run_id == state.run_id || run.display_name == state.display_name)
+        {
+            return false;
+        }
+        self.runs.push(state);
+        true
+    }
+
+    /// Undo a launch whose on-disk persistence failed before it could spawn.
+    pub fn remove_run(&mut self, run_id: &str) {
+        self.runs.retain(|run| run.run_id != run_id);
     }
 
     pub fn by_display_name(&self, name: &str) -> Option<WorkflowRunState> {

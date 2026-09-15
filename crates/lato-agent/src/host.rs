@@ -461,6 +461,14 @@ impl AcpHost {
         session: &RuntimeSession,
         stream: std::sync::Arc<dyn ModelStream>,
     ) {
+        // Phase 7B5: journals persist under the session directory so
+        // `session/resume` can restore paused runs in a later process.
+        let workflows_dir = Some(
+            self.effective_lato_home()
+                .join("sessions")
+                .join(sid)
+                .join("workflows"),
+        );
         let manager = Arc::new(WorkflowManager::new(
             sid,
             self.cwd.clone(),
@@ -468,6 +476,7 @@ impl AcpHost {
             self.locks.clone(),
             stream,
             self.tool_approval.clone(),
+            workflows_dir,
         ));
         session.attach_workflow_manager(manager);
     }

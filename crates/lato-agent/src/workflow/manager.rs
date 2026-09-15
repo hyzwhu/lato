@@ -1,11 +1,15 @@
 // Derived from: Grok Build@bb7f39d5858cbf5e00de639367f59debbdcb0138:crates/codegen/xai-grok-shell/src/session/workflow/manager.rs
 // License: Apache-2.0
-// Lato changes: session-owned in-memory manager (Phase 7B4) — no persistence,
-// journals stay in memory via run_workflow_recovering, pause is a cancel plus
-// pause_intent observed at the next host boundary.
+// Lato changes: session-owned manager (Phase 7B4) — pause is a cancel plus
+// pause_intent observed at the next host boundary. Phase 7B5 adds an optional
+// `workflows_dir`: launch persists `run.json` + `script.rhai` + the journal
+// under `<dir>/<runId>/`, every tracker status change rewrites `run.json`, and
+// `new` restores paused runs from disk (active-at-exit becomes `interrupted`).
+// `workflows_dir = None` keeps the 7B4 in-memory behavior (tests, CLI run).
 
 use std::{
     collections::HashMap,
+    path::PathBuf,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -23,11 +27,15 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use super::host_service::DEFAULT_WORKFLOW_MAX_CONCURRENT_AGENTS;
+use super::persist::{self, PersistedRun, RestoredRun, RUN_RECORD_VERSION};
 use super::{
     RunEvent, WorkflowHostParams, WorkflowRunState, WorkflowRunStatus, WorkflowTracker,
     spawn_workflow_host_service, workflow_max_concurrent_agents,
 };
 use crate::ToolApproval;
+
+/// Default agent budget when a restored `run.json` has no recorded budget.
+const RESTORED_FALLBACK_BUDGET: u64 = 128;
 
 const STOP_DRAIN_TIMEOUT: Duration = Duration::from_secs(25);
 
@@ -49,6 +57,8 @@ pub enum LaunchError {
     BudgetNotRaised { used: u64, limit: u64 },
     #[error("too many active workflow runs (maximum 4 per session)")]
     TooManyActiveRuns,
+    #[error("workflow persistence failed: {0}")]
+    Persist(String),
     #[error(transparent)]
     Resolve(#[from] WorkflowError),
 }
@@ -81,6 +91,9 @@ struct ManagerCore {
     snapshot: std::sync::RwLock<Option<Arc<PluginSnapshot>>>,
     subs: Mutex<Vec<mpsc::UnboundedSender<WorkflowRunState>>>,
     inner: Mutex<Inner>,
+    /// `Some` enables cross-process journal resume (Phase 7B5); `None` keeps
+    /// the 7B4 purely in-memory behavior.
+    workflows_dir: Option<PathBuf>,
 }
 
 pub struct WorkflowManager {
@@ -96,23 +109,25 @@ impl WorkflowManager {
         locks: Arc<FileLocks>,
         stream: Arc<dyn ModelStream>,
         approval: Option<Arc<dyn ToolApproval>>,
+        workflows_dir: Option<PathBuf>,
     ) -> Self {
-        Self {
-            core: Arc::new(ManagerCore {
-                session_id: lato_core::SessionId::from(session_id.to_owned()),
-                cwd,
-                trust,
-                locks,
-                stream,
-                approval,
-                max_concurrent_agents: workflow_max_concurrent_agents(
-                    DEFAULT_WORKFLOW_MAX_CONCURRENT_AGENTS,
-                ),
-                snapshot: std::sync::RwLock::new(None),
-                subs: Mutex::new(Vec::new()),
-                inner: Mutex::new(Inner::default()),
-            }),
-        }
+        let core = Arc::new(ManagerCore {
+            session_id: lato_core::SessionId::from(session_id.to_owned()),
+            cwd,
+            trust,
+            locks,
+            stream,
+            approval,
+            max_concurrent_agents: workflow_max_concurrent_agents(
+                DEFAULT_WORKFLOW_MAX_CONCURRENT_AGENTS,
+            ),
+            snapshot: std::sync::RwLock::new(None),
+            subs: Mutex::new(Vec::new()),
+            inner: Mutex::new(Inner::default()),
+            workflows_dir,
+        });
+        restore_runs(&core);
+        Self { core }
     }
 
     pub fn set_snapshot(&self, snapshot: Arc<PluginSnapshot>) {
@@ -159,6 +174,29 @@ impl WorkflowManager {
                 settled: Arc::new(tokio::sync::Notify::new()),
             },
         );
+        if let Some(root) = self.core.workflows_dir.clone() {
+            let dir = persist::run_dir(&root, &run_id);
+            let script = inner
+                .workflows
+                .get(&run_id)
+                .map(|resolved| resolved.script.clone())
+                .unwrap_or_default();
+            if let Err(error) =
+                persist::write_script(&dir, &script).and_then(|()| persist_run(&self.core, &inner, &state))
+            {
+                // No memory-only fallback: undo the launch and report the failure.
+                inner.tracker.remove_run(&run_id);
+                inner.workflows.remove(&run_id);
+                inner.args.remove(&run_id);
+                inner.starts.remove(&run_id);
+                inner.active.remove(&run_id);
+                return Err(LaunchError::Persist(error.to_string()));
+            }
+            inner.journals.insert(
+                run_id.clone(),
+                Journal::new(Some(dir.join(persist::JOURNAL_FILE))),
+            );
+        }
         stamp(&inner, state.clone());
         emit(&self.core, &state);
         drop(inner);
@@ -208,6 +246,7 @@ impl WorkflowManager {
                             .tracker
                             .set_status(&state.run_id, WorkflowRunStatus::Cancelled, None)
                     {
+                        let _ = persist_run(&self.core, &inner, &updated);
                         emit(&self.core, &stamp(&inner, updated));
                     }
                     None
@@ -271,6 +310,7 @@ impl WorkflowManager {
         let run_id = state.run_id.clone();
         let mut updated = inner.tracker.get(&run_id).unwrap_or(state);
         updated = stamp(&inner, updated);
+        let _ = persist_run(&self.core, &inner, &updated);
         drop(inner);
         spawn_run_task(Arc::clone(&self.core), run_id);
         Ok(updated)
@@ -314,6 +354,7 @@ impl WorkflowManager {
             .collect();
         for run_id in still_active {
             if let Some(updated) = inner.tracker.interrupt(&run_id, "session closed") {
+                let _ = persist_run(&self.core, &inner, &updated);
                 emit(&self.core, &stamp(&inner, updated));
             }
         }
@@ -335,6 +376,121 @@ fn stamp(inner: &Inner, mut state: WorkflowRunState) -> WorkflowRunState {
         state.elapsed_ms_floor = start.elapsed().as_millis() as u64;
     }
     state
+}
+
+/// Mirror a tracker status change into the run's `run.json`. A no-op when the
+/// manager has no `workflows_dir` or the run never reached the tracker.
+fn persist_run(
+    core: &ManagerCore,
+    inner: &Inner,
+    state: &WorkflowRunState,
+) -> std::io::Result<()> {
+    let Some(root) = &core.workflows_dir else {
+        return Ok(());
+    };
+    let Some(resolved) = inner.workflows.get(&state.run_id) else {
+        return Ok(());
+    };
+    let record = PersistedRun {
+        version: RUN_RECORD_VERSION,
+        run_id: state.run_id.clone(),
+        display_name: state.display_name.clone(),
+        status: state.status,
+        phase: state.current_phase.clone(),
+        agent_budget: state.agent_budget,
+        agents_used: state.agents_used,
+        pause_message: state.pause_message.clone(),
+        elapsed_ms_floor: state.elapsed_ms_floor,
+        workflow_id: resolved.id.clone(),
+        source: resolved.source.to_owned(),
+        compiled: resolved.compiled,
+        description: resolved.description.clone(),
+        args: inner
+            .args
+            .get(&state.run_id)
+            .cloned()
+            .unwrap_or(serde_json::json!({})),
+    };
+    persist::write_run_record(&persist::run_dir(root, &state.run_id), &record)
+}
+
+/// Phase 7B5 restore (spec §7): scan the session workflows directory and
+/// rebuild tracker / workflows / args / journals from disk. Damaged runs are
+/// skipped; `active` on disk comes back as terminal `interrupted`.
+fn restore_runs(core: &ManagerCore) {
+    let Some(root) = &core.workflows_dir else {
+        return;
+    };
+    let candidates: Vec<RestoredRun> = persist::scan_restore_candidates(root);
+    let mut inner = core.inner.lock().unwrap();
+    for restored in candidates {
+        let record = restored.record;
+        let Some(script) = persist::read_script(&restored.dir) else {
+            continue;
+        };
+        let journal = match Journal::load(restored.dir.join(persist::JOURNAL_FILE)) {
+            Ok(journal) => journal,
+            Err(_) => continue,
+        };
+        let mut state = WorkflowRunState {
+            run_id: record.run_id.clone(),
+            display_name: record.display_name.clone(),
+            status: record.status,
+            current_phase: record.phase.clone(),
+            agent_budget: record.agent_budget,
+            agents_used: record.agents_used,
+            pause_message: record.pause_message.clone(),
+            elapsed_ms_floor: record.elapsed_ms_floor,
+        };
+        if state.status == WorkflowRunStatus::Active {
+            state.status = WorkflowRunStatus::Interrupted;
+            state.pause_message = Some("process exited while active".to_owned());
+            state.current_phase = None;
+            let rewritten = PersistedRun {
+                status: state.status,
+                phase: None,
+                pause_message: state.pause_message.clone(),
+                ..record.clone()
+            };
+            let _ = persist::write_run_record(&restored.dir, &rewritten);
+        }
+        if !inner.tracker.insert_restored(state.clone()) {
+            continue;
+        }
+        inner.workflows.insert(
+            state.run_id.clone(),
+            super::ResolvedWorkflow {
+                id: record.workflow_id.clone(),
+                display_name: record.display_name.clone(),
+                description: record.description.clone(),
+                script,
+                agent_budget: u32::try_from(
+                    record.agent_budget.unwrap_or(RESTORED_FALLBACK_BUDGET),
+                )
+                .unwrap_or(u32::MAX),
+                source: restored_source(&record.source),
+                compiled: record.compiled,
+            },
+        );
+        inner.args.insert(state.run_id.clone(), record.args.clone());
+        inner.journals.insert(state.run_id.clone(), journal);
+        // Keep new `wf_<ms>-<seq>` ids from colliding with restored ones.
+        if let Some((_, seq)) = state.run_id.rsplit_once('-')
+            && let Ok(seq) = u64::from_str_radix(seq, 16)
+        {
+            let current = inner.seq.load(Ordering::Relaxed);
+            inner.seq.fetch_max(seq.saturating_add(1).max(current), Ordering::Relaxed);
+        }
+    }
+}
+
+/// Map a persisted source label back onto the static catalog labels.
+fn restored_source(source: &str) -> &'static str {
+    match source {
+        "project" => "project",
+        "plugin" => "plugin",
+        _ => "user",
+    }
 }
 
 fn emit(core: &ManagerCore, state: &WorkflowRunState) {
@@ -463,6 +619,9 @@ fn spawn_run_task(core: Arc<ManagerCore>, run_id: String) {
             } else {
                 inner.tracker.apply_outcome(&run_id, &outcome);
             }
+            if let Some(state) = inner.tracker.get(&run_id) {
+                let _ = persist_run(&core, &inner, &state);
+            }
             inner.active.remove(&run_id).map(|active| active.settled)
         };
         {
@@ -490,6 +649,7 @@ mod tests {
             SessionTrust::for_headless_prompt(std::env::temp_dir()),
             Arc::new(FileLocks::new()),
             crate::default_fake_stream(),
+            None,
             None,
         );
         let mut rx = manager.subscribe();
