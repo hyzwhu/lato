@@ -1395,6 +1395,12 @@ mod tests {
         use crate::args::LoginMethod;
         use lato_ai::CredentialStore;
 
+        // Tests in this binary run in parallel threads; login() reads
+        // LATO_HOME through the process environment, so env mutation must
+        // be serialized to avoid cross-test interference.
+        static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        let _env_guard = ENV_LOCK.lock().await;
+
         for provider in ["openai", "anthropic", "minimax", "kimi-coding"] {
             for key in ["", " ", "   ", "\t", "\n"] {
                 let temp = tempfile::tempdir().unwrap();
@@ -1429,6 +1435,11 @@ mod tests {
     async fn login_api_key_writes_non_empty_key() {
         use crate::args::LoginMethod;
         use lato_ai::CredentialStore;
+
+        // Serializes LATO_HOME mutation with the other login tests; see the
+        // reject test above.
+        static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        let _env_guard = ENV_LOCK.lock().await;
 
         let temp = tempfile::tempdir().unwrap();
         let previous = std::env::var_os("LATO_HOME");

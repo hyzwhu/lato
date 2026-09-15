@@ -476,7 +476,7 @@ mod tests {
     fn index_respects_gitignore_and_common_generated_directories() {
         let temp = tempfile::tempdir().unwrap();
         fs::write(temp.path().join(".gitignore"), "ignored.txt\n").unwrap();
-        for path in ["visible.txt", "ignored.txt", ".hidden", "control\u{1b}.txt"] {
+        for path in ["visible.txt", "ignored.txt", ".hidden"] {
             fs::write(temp.path().join(path), "ok").unwrap();
         }
         fs::create_dir(temp.path().join("target")).unwrap();
@@ -486,6 +486,12 @@ mod tests {
             .args(["init", "-q"])
             .current_dir(temp.path())
             .status();
+        // NTFS forbids control characters in file names, so this fixture only
+        // exists on Unix; the index filter is exercised below regardless.
+        #[cfg(unix)]
+        {
+            fs::write(temp.path().join("control\u{1b}.txt"), "ok").unwrap();
+        }
         let files = index_files(temp.path()).unwrap();
         assert!(files.contains(&"visible.txt".into()));
         assert!(files.contains(&".hidden".into()));
