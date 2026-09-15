@@ -306,7 +306,7 @@ fn process_signal_alive(pid: u32) -> bool {
             let mut exit_code: u32 = 0;
             let queried = GetExitCodeProcess(handle, &mut exit_code);
             CloseHandle(handle);
-            queried != 0 && exit_code == STILL_ACTIVE
+            queried != 0 && exit_code == STILL_ACTIVE as u32
         }
     }
     #[cfg(not(any(unix, windows)))]
