@@ -43,19 +43,22 @@ fn collect_dispatch_call_sites(path: &std::path::Path, call_sites: &mut Vec<Stri
         }
         return;
     }
+    let normalized = path
+        .to_string_lossy()
+        .replace(std::path::MAIN_SEPARATOR, "/");
     if path.extension().and_then(std::ffi::OsStr::to_str) != Some("rs")
         || path.ends_with("lato-tools/src/dispatch.rs")
-        || !path.to_string_lossy().contains("/src/")
+        || !normalized.contains("/src/")
     {
         return;
     }
 
     let source = std::fs::read_to_string(path).unwrap();
     if contains_bare_call(&source, "dispatch") {
-        let relative = path
-            .strip_prefix(env!("CARGO_MANIFEST_DIR"))
-            .unwrap()
-            .to_string_lossy()
+        let manifest = env!("CARGO_MANIFEST_DIR").replace(std::path::MAIN_SEPARATOR, "/");
+        let relative = normalized
+            .strip_prefix(&manifest)
+            .unwrap_or(&normalized)
             .trim_start_matches('/')
             .to_owned();
         call_sites.push(relative);
