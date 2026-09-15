@@ -79,7 +79,10 @@ async fn read_only_lease_uses_shared_repository_without_creating_worktree() {
         ))
         .await
         .unwrap();
-    assert_eq!(lease.root, std::fs::canonicalize(repo.root()).unwrap());
+    assert_eq!(
+        lease.root,
+        dunce::simplified(&std::fs::canonicalize(repo.root()).unwrap()).to_path_buf()
+    );
     allocator.release(&lease).await.unwrap();
     assert_eq!(allocator.live_count().await, 0);
 }

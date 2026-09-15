@@ -1531,6 +1531,7 @@ name = "lato-workspace"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "dunce",
  "lato-core",
  "serde",
  "serde_json",
