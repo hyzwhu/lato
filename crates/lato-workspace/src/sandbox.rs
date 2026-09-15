@@ -186,7 +186,6 @@ fn probe_bwrap(wrapper: &Path) -> bool {
         .unwrap_or(false)
 }
 
-#[cfg(not(windows))]
 fn default_wrapper() -> PathBuf {
     #[cfg(target_os = "macos")]
     {
