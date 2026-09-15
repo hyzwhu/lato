@@ -5,14 +5,22 @@ use lato_core::{ExtensionAuditRecord, HookAuditOutcome, HookAuditPhase};
 use lato_extensions::hooks::{HandlerType, HookDecision, HookEventName, HookRegistry, HookSpec};
 use tokio_util::sync::CancellationToken;
 
-fn spec(id: &str, event: HookEventName, command: &str) -> HookSpec {
+fn spec(id: &str, event: HookEventName, payload: &str) -> HookSpec {
+    // The runtime executes commands via /bin/sh on Unix and cmd /C on
+    // Windows, so the fixture emits the payload with a per-platform command.
+    // cmd's echo appends CRLF, which the JSON parser tolerates.
+    let command = if cfg!(windows) {
+        format!("echo {payload}")
+    } else {
+        format!("cat >/dev/null; printf '%s' '{payload}'")
+    };
     HookSpec {
         id: id.into(),
         plugin_name: "test-plugin".into(),
         event,
         handler_type: HandlerType::Command,
         matcher: None,
-        command: Some(command.into()),
+        command: Some(command),
         url: None,
         timeout_ms: 1_000,
         source_dir: PathBuf::from("."),
@@ -39,7 +47,7 @@ async fn prompt_block_is_explicit_and_runner_failure_fails_open() {
         spec(
             "block",
             HookEventName::UserPromptSubmit,
-            "cat >/dev/null; printf '%s' '{\"decision\":\"block\",\"reason\":\"no prompts\"}'",
+            r#"{"decision":"block","reason":"no prompts"}"#,
         ),
     ]);
     let result = hooks
@@ -54,7 +62,7 @@ async fn pre_tool_rewrites_only_arguments_and_preserves_gate() {
     let hooks = runtime(vec![spec(
         "rewrite",
         HookEventName::PreToolUse,
-        "cat >/dev/null; printf '%s' '{\"hookSpecificOutput\":{\"permissionDecision\":\"ask\",\"updatedInput\":{\"path\":\"safe.txt\"}}}'",
+        r#"{"hookSpecificOutput":{"permissionDecision":"ask","updatedInput":{"path":"safe.txt"}}}"#,
     )]);
     let result = hooks
         .pre_tool_use(
@@ -74,12 +82,12 @@ async fn post_tool_replacement_and_stop_force_stop_are_typed() {
         spec(
             "post",
             HookEventName::PostToolUse,
-            "cat >/dev/null; printf '%s' '{\"hookSpecificOutput\":{\"updatedToolOutput\":{\"text\":\"bounded replacement\"}}}'",
+            r#"{"hookSpecificOutput":{"updatedToolOutput":{"text":"bounded replacement"}}}"#,
         ),
         spec(
             "stop",
             HookEventName::Stop,
-            "cat >/dev/null; printf '%s' '{\"decision\":\"block\",\"reason\":\"continue\",\"continue\":false,\"stopReason\":\"finished\"}'",
+            r#"{"decision":"block","reason":"continue","continue":false,"stopReason":"finished"}"#,
         ),
     ]);
     let post = hooks
