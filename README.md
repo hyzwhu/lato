@@ -322,9 +322,16 @@ agents inherit the parent session's `ToolApproval`.
   equivalent. `BudgetLimited` runs resume only with a higher budget.
 - Progress arrives as `session/update` notifications
   (`sessionUpdate: "lato/workflow"`); the main prompt turn is never occupied by
-  a workflow. Process exit or `session/close` cancels active runs and records
-  them as `interrupted` (not resumable this phase); `CLI lato workflow
-  resume|pause|stop` does not exist (no resident process).
+  a workflow. Every run journals under
+  `$LATO_HOME/sessions/<sessionId>/workflows/<runId>/` (`run.json`,
+  `script.rhai`, `journal.jsonl`). After `session/resume` the board rebuilds
+  from disk with the original display names, and paused / blocked / failed /
+  cancelled runs resume in-session (`/workflow resume`); `budget_limited`
+  still needs a higher budget. Runs that were still active at process exit
+  are restored as terminal `interrupted` and are not resumable;
+  `session/close` also marks still-active runs `interrupted` while paused
+  runs stay on disk. `CLI lato workflow resume|pause|stop` does not exist (no
+  resident process; cross-process resume is session-bound).
 
 ## Doctor
 

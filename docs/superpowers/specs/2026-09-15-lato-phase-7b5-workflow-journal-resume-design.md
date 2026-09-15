@@ -2,7 +2,7 @@
 
 | 字段 | 值 |
 | --- | --- |
-| 状态 | **待实施** |
+| 状态 | **已实施** |
 | 日期 | 2026-09-15 |
 | 基线 | 7B4 in-memory `WorkflowManager` + ACP `/workflow` 看板 + `Journal::new(None)` |
 | 上游 | Grok Build `bb7f39d5858cbf5e00de639367f59debbdcb0138`：session `workflows/` 落盘、paused journal replay、active-at-exit → `Interrupted` |
