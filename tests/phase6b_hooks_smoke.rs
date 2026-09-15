@@ -4,14 +4,22 @@ use lato_agent::SessionHookRuntime;
 use lato_extensions::hooks::{HandlerType, HookDecision, HookEventName, HookRegistry, HookSpec};
 use tokio_util::sync::CancellationToken;
 
-fn hook(id: &str, event: HookEventName, command: &str) -> HookSpec {
+fn hook(id: &str, event: HookEventName, payload: &str) -> HookSpec {
+    // The runtime executes commands via /bin/sh on Unix and cmd /C on
+    // Windows, so the fixture emits the payload with a per-platform command.
+    // cmd's echo appends CRLF, which the JSON parser tolerates.
+    let command = if cfg!(windows) {
+        format!("echo {payload}")
+    } else {
+        format!("cat >/dev/null; printf '%s' '{payload}'")
+    };
     HookSpec {
         id: id.into(),
         plugin_name: "smoke".into(),
         event,
         handler_type: HandlerType::Command,
         matcher: None,
-        command: Some(command.into()),
+        command: Some(command),
         url: None,
         timeout_ms: 1_000,
         source_dir: PathBuf::from("."),
@@ -29,10 +37,10 @@ fn phase6b_installed_command_smoke_exercises_hook_lifecycle() {
     let runtime = tokio::runtime::Runtime::new().unwrap();
     runtime.block_on(async {
         let hooks = SessionHookRuntime::new(HookRegistry::from_specs(1, vec![
-            hook("prompt", HookEventName::UserPromptSubmit, "cat >/dev/null; printf '%s' '{}'") ,
-            hook("pre", HookEventName::PreToolUse, "cat >/dev/null; printf '%s' '{\"hookSpecificOutput\":{\"permissionDecision\":\"ask\",\"updatedInput\":{\"path\":\"safe.txt\"}}}'"),
-            hook("post", HookEventName::PostToolUse, "cat >/dev/null; printf '%s' '{\"hookSpecificOutput\":{\"updatedToolOutput\":{\"text\":\"replacement\"}}}'"),
-            hook("stop", HookEventName::Stop, "cat >/dev/null; printf '%s' '{\"continue\":false,\"stopReason\":\"done\"}'"),
+            hook("prompt", HookEventName::UserPromptSubmit, "{}"),
+            hook("pre", HookEventName::PreToolUse, r#"{"hookSpecificOutput":{"permissionDecision":"ask","updatedInput":{"path":"safe.txt"}}}"#),
+            hook("post", HookEventName::PostToolUse, r#"{"hookSpecificOutput":{"updatedToolOutput":{"text":"replacement"}}}"#),
+            hook("stop", HookEventName::Stop, r#"{"continue":false,"stopReason":"done"}"#),
         ]), PathBuf::from("."), "smoke-session".into());
         assert!(hooks.prompt_submit("turn", "hello", CancellationToken::new()).await.block.is_none());
         let pre = hooks.pre_tool_use("turn", "read_file", serde_json::json!({"path":"unsafe"}), CancellationToken::new()).await;
