@@ -87,6 +87,10 @@ mod tests {
         }
     }
 
+    // The relative/absolute equivalence relies on Unix lock-key semantics
+    // (canonicalize); Windows keys are spelling-normalized instead and are
+    // covered by a3_1/a3_4.
+    #[cfg(not(windows))]
     #[test]
     fn a3_3_unix_relative_and_absolute() {
         let old = std::env::current_dir().unwrap();
