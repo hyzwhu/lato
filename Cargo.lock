@@ -1484,6 +1484,7 @@ name = "lato-tools"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "dunce",
  "glob",
  "jsonschema 0.55.0",
  "lato-core",

@@ -251,7 +251,11 @@ impl SkillToolScope {
             let mut canonical = arguments.clone();
             canonical.as_object_mut()?.insert(
                 field.to_owned(),
-                Value::String(path_match_string(&resolved)),
+                // dunce strips the \\?\ verbatim prefix std::fs::canonicalize
+                // produces on Windows; re-resolving a verbatim path spelled
+                // with forward slashes is not reliable, and the scoped
+                // execute-time re-check compares against this rewrite.
+                Value::String(path_match_string(dunce::simplified(&resolved))),
             );
             Some(canonical)
         })
