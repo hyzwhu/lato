@@ -197,6 +197,12 @@ with tempfile.TemporaryDirectory(prefix="lato-tui-smoke-") as root:
         send("demo:inspect\t")
         start = send('@"context note.txt" \r')
         expect("switched-ok", start)
+        # The skill request is usually requests[-1] once the response is
+        # visible, but response rendering can beat the request bookkeeping;
+        # poll briefly instead of asserting a snapshot.
+        deadline = time.monotonic() + 5
+        while "Skill-marker-violet" not in json.dumps(requests[-1]) and time.monotonic() < deadline:
+            drain(0.1)
         assert "Skill-marker-violet" in json.dumps(requests[-1]), "skill body absent from request"
         assert "reference-marker-indigo" in json.dumps(requests[-1]), "skill attachment missing"
         count = len(requests)

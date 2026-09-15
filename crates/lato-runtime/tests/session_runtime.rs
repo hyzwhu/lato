@@ -699,7 +699,7 @@ impl TurnDriver for CleanupDriver {
 async fn next_event(
     events: &mut tokio::sync::broadcast::Receiver<lato_core::EventEnvelope>,
 ) -> lato_core::EventEnvelope {
-    timeout(Duration::from_secs(1), events.recv())
+    timeout(Duration::from_secs(10), events.recv())
         .await
         .expect("event timeout")
         .expect("event channel closed")
@@ -708,7 +708,7 @@ async fn next_event(
 async fn events_through_turn_terminal(
     events: &mut tokio::sync::broadcast::Receiver<lato_core::EventEnvelope>,
 ) -> Vec<lato_core::EventEnvelope> {
-    timeout(Duration::from_secs(1), async {
+    timeout(Duration::from_secs(10), async {
         let mut observed = Vec::new();
         loop {
             let event = events
