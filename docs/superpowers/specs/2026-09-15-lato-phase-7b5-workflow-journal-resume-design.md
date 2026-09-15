@@ -6,7 +6,7 @@
 | 日期 | 2026-09-15 |
 | 基线 | 7B4 in-memory `WorkflowManager` + ACP `/workflow` 看板 + `Journal::new(None)` |
 | 上游 | Grok Build `bb7f39d5858cbf5e00de639367f59debbdcb0138`：session `workflows/` 落盘、paused journal replay、active-at-exit → `Interrupted` |
-| 后续 | scratch/templates/git_diff；模型可见 `workflow` tool；7C AgentField |
+| 后续 | 7B6 host helpers（scratch/templates/git_diff）；模型可见 `workflow` tool；7C AgentField |
 
 ## 1. 背景
 
@@ -54,7 +54,7 @@ Grok 的跨进程语义（create-workflow skill / journal resume）：
 
 ### 4.2 明确非范围
 
-- `write_scratch_file` / `read_scratch_file` / `render_template` / `git_diff_since`（仍 `Unsupported`；WIN-24 下一刀）
+- `write_scratch_file` / `read_scratch_file` / `render_template` / `git_diff_since`（7B6）
 - 模型可见 `workflow` tool、把 named 脚本注入 skill listing
 - AgentField、`fork_context`、embedded builtin
 - `/workflow save`、把 run 脚本存成可发现的 named workflow
