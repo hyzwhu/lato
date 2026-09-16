@@ -180,6 +180,27 @@ mod handle {
         io::Error::last_os_error().to_string()
     }
 
+    /// Platform-neutral identity widening: `st_dev` is `i32` on macOS, `u64`
+    /// on Linux, `u32` on Windows, and `st_ino` is `u64` on the Unix targets
+    /// but `u32` on Windows. Every platform widens both to `u64` here, so
+    /// all identity comparisons in this module are type-stable across
+    /// platforms (device numbers and inode numbers are non-negative, so a
+    /// plain numeric widening is lossless).
+    // The cast is a real `i32 -> u64` widening on macOS (and a `u32 -> u64`
+    // widening on Windows), so it must stay despite being a no-op on Linux.
+    #[allow(clippy::unnecessary_cast)]
+    fn widen_dev(dev: libc::dev_t) -> u64 {
+        dev as u64
+    }
+
+    #[allow(clippy::unnecessary_cast)]
+    fn widen_ino(ino: libc::ino_t) -> u64 {
+        ino as u64
+    }
+
+    /// The `(device, inode)` identity in the platform-neutral widened form.
+    type FileIdentity = (u64, u64);
+
     impl ParentHandle {
         /// Opens the directory this path currently refers to.
         pub fn capture(root: &Path) -> Result<Self, String> {
@@ -202,14 +223,14 @@ mod handle {
             })
         }
 
-        fn identity(&self) -> (u64, u64) {
+        fn identity(&self) -> FileIdentity {
             // Safe: fd metadata read; failure yields zeros and the caller
             // fails closed on the first use of the handle.
             let mut stat = unsafe { std::mem::zeroed() };
             if unsafe { libc::fstat(self.fd.as_raw_fd(), &mut stat) } != 0 {
                 return (0, 0);
             }
-            (stat.st_dev, stat.st_ino)
+            (widen_dev(stat.st_dev), widen_ino(stat.st_ino))
         }
 
         /// The path's parent must still resolve to the pinned directory.
@@ -228,7 +249,7 @@ mod handle {
                     last_os_error()
                 ));
             }
-            if (stat.st_dev, stat.st_ino) != self.identity() {
+            if (widen_dev(stat.st_dev), widen_ino(stat.st_ino)) != self.identity() {
                 return Err(
                     "plan_draft: parent directory was replaced between checks; refusing to publish"
                         .into(),
@@ -306,7 +327,9 @@ mod handle {
             if unsafe { libc::fstatat(self.fd.as_raw_fd(), cname.as_ptr(), &mut current, 0) } != 0 {
                 return Err(()); // already gone
             }
-            if (current.st_dev, current.st_ino) != (own.st_dev, own.st_ino) {
+            if (widen_dev(current.st_dev), widen_ino(current.st_ino))
+                != (widen_dev(own.st_dev), widen_ino(own.st_ino))
+            {
                 return Err(()); // swapped: never delete someone else's file
             }
             // Safe: unlink on a handle-relative name; failure is harmless.
@@ -324,6 +347,45 @@ mod handle {
                 ));
             }
             Ok(())
+        }
+    }
+
+    #[cfg(test)]
+    mod identity_tests {
+        use super::*;
+
+        fn widened_stat(path: &Path) -> FileIdentity {
+            let cpath = cstring(path.as_os_str().as_bytes()).unwrap();
+            let mut stat = unsafe { std::mem::zeroed() };
+            // Safe: pure metadata read.
+            assert_eq!(unsafe { libc::stat(cpath.as_ptr(), &mut stat) }, 0);
+            (widen_dev(stat.st_dev), widen_ino(stat.st_ino))
+        }
+
+        /// Platform-neutral semantics: the same file always widens to the
+        /// same `(u64, u64)` identity, and two distinct files never collapse
+        /// into one — regardless of the platform's native `st_dev`/`st_ino`
+        /// widths (macOS `i32`/`u64`, Linux `u64`/`u64`).
+        #[test]
+        fn widened_identity_is_stable_for_one_file_and_distinct_across_files() {
+            let directory = tempfile::tempdir().unwrap();
+            let a = directory.path().join("a");
+            let b = directory.path().join("b");
+            std::fs::write(&a, b"one").unwrap();
+            std::fs::write(&b, b"two").unwrap();
+
+            let identity_a_first = widened_stat(&a);
+            let identity_a_again = widened_stat(&a);
+            let identity_b = widened_stat(&b);
+
+            assert_eq!(
+                identity_a_first, identity_a_again,
+                "the same file must widen to the same identity"
+            );
+            assert_ne!(
+                identity_a_first, identity_b,
+                "distinct files must never share a widened identity"
+            );
         }
     }
 }
