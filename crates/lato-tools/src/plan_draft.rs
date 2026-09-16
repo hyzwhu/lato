@@ -1414,6 +1414,7 @@ mod tests {
 
             let name = pinned_temp_name("swap");
             struct SwapAfterCheck {
+                workspace_root: PathBuf,
                 temp_name: String,
             }
             impl PlanDraftFaults for SwapAfterCheck {
@@ -1431,10 +1432,12 @@ mod tests {
                 fn on_before_removal(&self, isolated_path: &str) -> Result<(), String> {
                     // Exactly the reviewer's window: the identity check has
                     // passed, the removal has not happened yet. Swap a
-                    // bystander in and abort the removal.
+                    // bystander in and abort the removal. The isolated path
+                    // is handle-relative, so anchor it at the workspace root.
                     assert!(isolated_path.contains(".reap-"), "{isolated_path}");
-                    std::fs::remove_file(isolated_path).unwrap();
-                    std::fs::write(isolated_path, "swapped-in-bystander").unwrap();
+                    let isolated = self.workspace_root.join(isolated_path);
+                    std::fs::remove_file(&isolated).unwrap();
+                    std::fs::write(&isolated, "swapped-in-bystander").unwrap();
                     Err("bystander swapped in after the identity check".into())
                 }
             }
@@ -1444,6 +1447,7 @@ mod tests {
                 &root,
                 "replacement",
                 &SwapAfterCheck {
+                    workspace_root: root.clone(),
                     temp_name: name.clone(),
                 },
             )
