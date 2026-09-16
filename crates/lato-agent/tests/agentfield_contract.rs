@@ -630,3 +630,73 @@ async fn oversized_bodies_are_rejected() {
     let error = client.status("exec_1").await.unwrap_err();
     assert!(matches!(error, AgentFieldError::BodyTooLarge(_)));
 }
+
+// ---- Round 1 verification probes: pinned status/cancel strictness ----
+
+#[tokio::test]
+async fn cancel_rejects_html_and_non_cancelled_success_status() {
+    // text/html + 200 is a protocol violation, never a success (AC-14 probe).
+    let client = HttpAgentFieldClient::new(
+        lato_agent::agentfield::config::ControlPlaneOrigin {
+            base: "https://agents.example.internal/".parse().unwrap(),
+            loopback_dev_mode: false,
+        },
+        None,
+        Arc::new(FakeHtmlTransport),
+    );
+    let error = client
+        .cancel("exec_redacted", "cancelled by Lato user")
+        .await
+        .unwrap_err();
+    assert!(matches!(error, AgentFieldError::RemoteProtocol(_)));
+
+    // 200 with `status=running` is not a confirmed cancellation.
+    let mut running = fixture_str("/cancel/success_envelope");
+    running["status"] = json!("running");
+    let client = client_with(FakeTransport::with_status(200, running));
+    let error = client
+        .cancel("exec_redacted", "cancelled by Lato user")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, AgentFieldError::RemoteProtocol(_)),
+        "{error:?}"
+    );
+}
+
+#[tokio::test]
+async fn status_rejects_a_foreign_execution_id_echo() {
+    let mut envelope = fixture_str("/status/success_envelope");
+    envelope["execution_id"] = json!("exec_foreign");
+    let client = client_with(FakeTransport::with_status(200, envelope));
+    let error = client.status("exec_redacted").await.unwrap_err();
+    assert!(
+        matches!(error, AgentFieldError::RemoteProtocol(_)),
+        "{error:?}"
+    );
+
+    // The matching echo still decodes.
+    let client = client_with(FakeTransport::with_status(
+        200,
+        fixture_str("/status/success_envelope"),
+    ));
+    assert!(client.status("exec_redacted").await.is_ok());
+}
+
+#[tokio::test]
+async fn async_start_rejects_an_unpinned_success_status() {
+    // The pinned async contract answers 202; a 200 success envelope must be
+    // rejected before decoding (AC-14 probe).
+    let client = client_with(FakeTransport::with_status(
+        200,
+        fixture_str("/async_start/success_envelope"),
+    ));
+    let error = client
+        .start_async("legal-agent.review_contract", &json!({}))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, AgentFieldError::RemoteProtocol(_)),
+        "{error:?}"
+    );
+}

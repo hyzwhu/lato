@@ -148,6 +148,7 @@ impl<T: HttpTransport> HttpAgentFieldClient<T> {
         method: &'static str,
         path: &str,
         body: Option<Value>,
+        expected_status: u16,
     ) -> Result<Value, AgentFieldError> {
         let response = self
             .transport
@@ -164,6 +165,20 @@ impl<T: HttpTransport> HttpAgentFieldClient<T> {
                     AgentFieldError::Unavailable(format!("redirect rejected: {message}"))
                 }
             })?;
+        let value = self.check_transport_contract(&response)?;
+        if response.status != expected_status {
+            return Err(AgentFieldError::RemoteProtocol(format!(
+                "pinned contract expects HTTP {expected_status}, got {}",
+                response.status
+            )));
+        }
+        Ok(value)
+    }
+
+    /// Shared transport-layer contract: credential mapping, JSON
+    /// content-type, body cap, and JSON body parse. The pinned per-operation
+    /// success status is enforced by the callers.
+    fn check_transport_contract(&self, response: &RawResponse) -> Result<Value, AgentFieldError> {
         if response.status == 401 || response.status == 403 {
             return Err(AgentFieldError::Unauthorized);
         }
@@ -192,7 +207,7 @@ impl<T: HttpTransport> HttpAgentFieldClient<T> {
 impl<T: HttpTransport + 'static> AgentFieldClient for HttpAgentFieldClient<T> {
     async fn discovery(&self) -> Result<DiscoveryEnvelope, AgentFieldError> {
         let envelope = self
-            .send_json("GET", "/api/v1/discovery/capabilities", None)
+            .send_json("GET", "/api/v1/discovery/capabilities", None, 200)
             .await?;
         let decoded =
             DiscoveryEnvelope::decode(&envelope).map_err(AgentFieldError::RemoteProtocol)?;
@@ -223,6 +238,8 @@ impl<T: HttpTransport + 'static> AgentFieldClient for HttpAgentFieldClient<T> {
                 "POST",
                 &format!("/api/v1/execute/async/{execute_target}"),
                 Some(input.clone()),
+                // Pinned contract: async enqueue answers 202, never 200.
+                202,
             )
             .await?;
         if response.get("error").is_some() && response.get("execution_id").is_none() {
@@ -248,9 +265,23 @@ impl<T: HttpTransport + 'static> AgentFieldClient for HttpAgentFieldClient<T> {
 
     async fn status(&self, execution_id: &str) -> Result<StatusEnvelope, AgentFieldError> {
         let envelope = self
-            .send_json("GET", &format!("/api/v1/executions/{execution_id}"), None)
+            .send_json(
+                "GET",
+                &format!("/api/v1/executions/{execution_id}"),
+                None,
+                200,
+            )
             .await?;
-        StatusEnvelope::decode(&envelope).map_err(AgentFieldError::RemoteProtocol)
+        let decoded = StatusEnvelope::decode(&envelope).map_err(AgentFieldError::RemoteProtocol)?;
+        // The status envelope must echo the requested execution ID; a
+        // foreign ID is a protocol violation, never silently accepted.
+        if decoded.execution_id != execution_id {
+            return Err(AgentFieldError::RemoteProtocol(format!(
+                "status envelope execution_id `{}` does not match the requested `{execution_id}`",
+                decoded.execution_id
+            )));
+        }
+        Ok(decoded)
     }
 
     async fn cancel(
@@ -258,6 +289,9 @@ impl<T: HttpTransport + 'static> AgentFieldClient for HttpAgentFieldClient<T> {
         execution_id: &str,
         reason: &str,
     ) -> Result<Option<CancelSuccessEnvelope>, AgentFieldError> {
+        // Cancel shares the exact transport contract of every other
+        // operation (401/403, JSON content-type, body cap); only the pinned
+        // success/conflict status pair differs.
         let response = self
             .transport
             .send(OutboundRequest {
@@ -273,18 +307,7 @@ impl<T: HttpTransport + 'static> AgentFieldClient for HttpAgentFieldClient<T> {
                     AgentFieldError::Unavailable(format!("redirect rejected: {message}"))
                 }
             })?;
-        if response.status == 401 || response.status == 403 {
-            return Err(AgentFieldError::Unauthorized);
-        }
-        if response.status >= 500 || response.status == 429 {
-            return Err(AgentFieldError::Unavailable(format!(
-                "control plane answered {}",
-                response.status
-            )));
-        }
-        let parsed: Value = serde_json::from_slice(&response.body).map_err(|error| {
-            AgentFieldError::RemoteProtocol(format!("invalid JSON body: {error}"))
-        })?;
+        let parsed = self.check_transport_contract(&response)?;
         match response.status {
             200 => {
                 let decoded = CancelSuccessEnvelope::decode(&parsed)
@@ -293,6 +316,14 @@ impl<T: HttpTransport + 'static> AgentFieldClient for HttpAgentFieldClient<T> {
                     return Err(AgentFieldError::RemoteProtocol(format!(
                         "cancel envelope execution_id `{}` does not match `{execution_id}`",
                         decoded.execution_id
+                    )));
+                }
+                // A confirmed cancellation must answer `cancelled`; a running
+                // or any other status is a protocol violation, not a success.
+                if decoded.status != crate::agentfield::types::RemoteExecutionStatus::Cancelled {
+                    return Err(AgentFieldError::RemoteProtocol(format!(
+                        "cancel success status must be `cancelled`, got `{}`",
+                        decoded.status.as_str()
                     )));
                 }
                 Ok(Some(decoded))
