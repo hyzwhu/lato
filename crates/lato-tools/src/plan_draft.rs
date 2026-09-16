@@ -9,31 +9,78 @@
 //! 3. hold the session-shared [`FileLocks`] entry for the derived target
 //!    through publication and directory sync (all aliases share the key via
 //!    `lock_key` canonicalization);
-//! 4. re-resolve the target parent and require it to be the canonical
-//!    workspace root (rejects missing/non-directory parents, path escapes and
-//!    changed parent identity);
+//! 4. capture the parent identity (canonical path and, on Unix, device and
+//!    inode) and require it to be the canonical workspace root — rejects
+//!    missing/non-directory parents, path escapes, and a parent directory
+//!    swapped between checks;
 //! 5. inspect the destination with non-following metadata; reject symlinks
 //!    and any existing non-regular file;
 //! 6. create a collision-resistant sibling temporary file with create-new
 //!    semantics and user-only permissions, write, flush and sync it;
 //! 7. repeat the parent-identity and non-following destination checks, then
 //!    atomically rename the sibling over `plan.md` (rename never follows the
-//!    final destination component);
-//! 8. sync the workspace-root directory before releasing the lock.
+//!    final destination component) — the rename is the atomic commit point;
+//! 8. sync the workspace-root directory before releasing the lock; the sync
+//!    error is propagated to the caller, never swallowed.
 //!
-//! On any error only the temporary file created by this call is removed and
-//! the previous `plan.md` is left intact. No `create_dir_all`, no
-//! canonicalization through symlinks, no cross-directory temporary file, no
-//! in-place truncate, no silent content truncation.
+//! Failure semantics: every error before the rename leaves the previous
+//! `plan.md` intact and removes only the temporary file created by this call.
+//! Once the rename has committed, a later directory-sync failure cannot
+//! restore the previous content; the freshly published plan remains on disk
+//! and the error is reported to the caller instead of being silently
+//! swallowed. No `create_dir_all`, no canonicalization through symlinks, no
+//! cross-directory temporary file, no in-place truncate, no silent content
+//! truncation.
 
 use lato_core::{PLAN_DRAFT_MAX_BYTES, PLAN_FILE_NAME};
 use lato_workspace::FileLocks;
 use std::path::{Path, PathBuf};
 
+/// Publication stages at which a test or fault drill can inject an error.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PlanDraftStage {
+    ParentCheck,
+    DestinationCheck,
+    CreateTemp,
+    Write,
+    Flush,
+    FileSync,
+    SecondParentCheck,
+    SecondDestinationCheck,
+    Rename,
+    DirSync,
+}
+
+/// Deterministic injection seam: return `Err(message)` to fail the given
+/// stage with that message (the publication then follows the ordinary
+/// failure path), or `Ok(())` to proceed. Production always uses
+/// [`NO_PLAN_DRAFT_FAULTS`].
+pub trait PlanDraftFaults: Send + Sync {
+    fn on_stage(&self, stage: PlanDraftStage) -> Result<(), String>;
+}
+
+/// Production seam: never injects anything.
+pub struct NoPlanDraftFaults;
+
+impl PlanDraftFaults for NoPlanDraftFaults {
+    fn on_stage(&self, _stage: PlanDraftStage) -> Result<(), String> {
+        Ok(())
+    }
+}
+
 pub async fn plan_draft(
     locks: &FileLocks,
     workspace_root: &Path,
     contents: &str,
+) -> Result<String, String> {
+    plan_draft_with_faults(locks, workspace_root, contents, &NO_PLAN_DRAFT_FAULTS).await
+}
+
+pub async fn plan_draft_with_faults(
+    locks: &FileLocks,
+    workspace_root: &Path,
+    contents: &str,
+    faults: &dyn PlanDraftFaults,
 ) -> Result<String, String> {
     // (1) immutable canonical root, derived once; the payload carries no path.
     let canonical_root = std::fs::canonicalize(workspace_root)
@@ -51,49 +98,77 @@ pub async fn plan_draft(
     // (3) session-shared lock held through publication and directory sync.
     let _guard = locks.acquire(&target).await;
 
-    // (4) parent identity: must still be the canonical workspace root.
-    verify_parent(&canonical_root, &target)?;
+    // (4) capture the parent identity once; both checks compare against it.
+    let parent = capture_parent_identity(&canonical_root)?;
+    faults
+        .on_stage(PlanDraftStage::ParentCheck)
+        .map_err(|message| stage_error(PlanDraftStage::ParentCheck, message))?;
+    verify_parent(&parent, &target)?;
 
     // (5) destination must not be a symlink or any non-regular file.
+    faults
+        .on_stage(PlanDraftStage::DestinationCheck)
+        .map_err(|message| stage_error(PlanDraftStage::DestinationCheck, message))?;
     verify_destination(&target)?;
 
     // (6) collision-resistant sibling temporary file, create-new semantics.
     let temp_path = sibling_temp_path(&target);
-    {
-        use std::io::Write as _;
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            options.mode(0o600);
-        }
-        let mut file = options
-            .open(&temp_path)
-            .map_err(|error| format!("plan_draft: could not create temporary file: {error}"))?;
-        file.write_all(contents.as_bytes())
-            .and_then(|()| file.flush())
-            .and_then(|()| file.sync_all())
-            .map_err(|error| {
-                let _ = std::fs::remove_file(&temp_path);
-                format!("plan_draft: could not write temporary file: {error}")
-            })?;
-    }
+    faults
+        .on_stage(PlanDraftStage::CreateTemp)
+        .map_err(|message| fail_stage(&temp_path, PlanDraftStage::CreateTemp, message))?;
+    let mut file = create_temp_file(&temp_path)
+        .map_err(|error| fail_stage(&temp_path, PlanDraftStage::CreateTemp, error))?;
+    faults
+        .on_stage(PlanDraftStage::Write)
+        .map_err(|message| fail_stage(&temp_path, PlanDraftStage::Write, message))?;
+    use std::io::Write as _;
+    file.write_all(contents.as_bytes())
+        .map_err(|error| fail_stage(&temp_path, PlanDraftStage::Write, error.to_string()))?;
+    faults
+        .on_stage(PlanDraftStage::Flush)
+        .map_err(|message| fail_stage(&temp_path, PlanDraftStage::Flush, message))?;
+    file.flush()
+        .map_err(|error| fail_stage(&temp_path, PlanDraftStage::Flush, error.to_string()))?;
+    faults
+        .on_stage(PlanDraftStage::FileSync)
+        .map_err(|message| fail_stage(&temp_path, PlanDraftStage::FileSync, message))?;
+    file.sync_all()
+        .map_err(|error| fail_stage(&temp_path, PlanDraftStage::FileSync, error.to_string()))?;
+    drop(file);
 
-    // (7) repeat both checks, then atomic same-directory rename.
-    if let Err(error) =
-        verify_parent(&canonical_root, &target).and_then(|()| verify_destination(&target))
-    {
+    // (7) repeat both checks against the captured identity, then atomic
+    // same-directory rename — the commit point of the publication.
+    faults
+        .on_stage(PlanDraftStage::SecondParentCheck)
+        .map_err(|message| fail_stage(&temp_path, PlanDraftStage::SecondParentCheck, message))?;
+    if let Err(error) = verify_parent(&parent, &target) {
         let _ = std::fs::remove_file(&temp_path);
         return Err(error);
     }
+    faults
+        .on_stage(PlanDraftStage::SecondDestinationCheck)
+        .map_err(|message| {
+            fail_stage(&temp_path, PlanDraftStage::SecondDestinationCheck, message)
+        })?;
+    if let Err(error) = verify_destination(&target) {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(error);
+    }
+    faults
+        .on_stage(PlanDraftStage::Rename)
+        .map_err(|message| fail_stage(&temp_path, PlanDraftStage::Rename, message))?;
     if let Err(error) = std::fs::rename(&temp_path, &target) {
         let _ = std::fs::remove_file(&temp_path);
         return Err(format!("plan_draft: could not publish plan: {error}"));
     }
 
-    // (8) sync the workspace-root directory before releasing the lock.
-    sync_directory(&canonical_root);
+    // (8) sync the workspace-root directory before releasing the lock. The
+    // rename has already committed the new plan; a directory-sync failure is
+    // reported to the caller and never silently swallowed.
+    faults
+        .on_stage(PlanDraftStage::DirSync)
+        .map_err(|message| stage_error(PlanDraftStage::DirSync, message))?;
+    sync_directory(&canonical_root)?;
 
     Ok(format!(
         "plan written to {} ({byte_len} bytes)",
@@ -101,14 +176,87 @@ pub async fn plan_draft(
     ))
 }
 
-fn verify_parent(canonical_root: &Path, target: &Path) -> Result<(), String> {
-    let Some(parent) = target.parent() else {
+/// Creates the sibling temporary file with create-new semantics and
+/// user-only permissions. A name collision (the path already exists) is a
+/// hard failure: the caller never truncates or reuses an existing file.
+fn create_temp_file(temp_path: &Path) -> Result<std::fs::File, String> {
+    use std::fs::OpenOptions;
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(temp_path)
+        .map_err(|error| format!("plan_draft: could not create temporary file: {error}"))?;
+    use std::io::Write as _;
+    file.write_all(b"")
+        .map_err(|error| format!("plan_draft: could not create temporary file: {error}"))?;
+    Ok(file)
+}
+
+fn stage_error(stage: PlanDraftStage, message: String) -> String {
+    format!("plan_draft: {stage:?} failed: {message}")
+}
+
+/// Failing a pre-rename stage removes only the temporary file created by
+/// this call.
+fn fail_stage(temp_path: &Path, stage: PlanDraftStage, message: String) -> String {
+    let _ = std::fs::remove_file(temp_path);
+    stage_error(stage, message)
+}
+
+struct ParentIdentity {
+    path: PathBuf,
+    #[cfg(unix)]
+    dev: u64,
+    #[cfg(unix)]
+    ino: u64,
+}
+
+fn capture_parent_identity(canonical_root: &Path) -> Result<ParentIdentity, String> {
+    let metadata = std::fs::metadata(canonical_root)
+        .map_err(|error| format!("plan_draft: parent directory unavailable: {error}"))?;
+    if !metadata.is_dir() {
+        return Err("plan_draft: workspace root is not a directory".into());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        Ok(ParentIdentity {
+            path: canonical_root.to_path_buf(),
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+        })
+    }
+    #[cfg(not(unix))]
+    Ok(ParentIdentity {
+        path: canonical_root.to_path_buf(),
+    })
+}
+
+fn verify_parent(parent: &ParentIdentity, target: &Path) -> Result<(), String> {
+    let Some(target_parent) = target.parent() else {
         return Err("plan_draft: target has no parent directory".into());
     };
-    let parent_identity = std::fs::canonicalize(parent)
+    let current = std::fs::canonicalize(target_parent)
         .map_err(|error| format!("plan_draft: parent directory unavailable: {error}"))?;
-    if parent_identity != canonical_root {
+    if current != parent.path {
         return Err("plan_draft: parent identity changed or escaped the workspace root".into());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let metadata = std::fs::metadata(target_parent)
+            .map_err(|error| format!("plan_draft: parent directory unavailable: {error}"))?;
+        if metadata.dev() != parent.dev || metadata.ino() != parent.ino {
+            return Err(
+                "plan_draft: parent directory was replaced between checks; refusing to publish"
+                    .into(),
+            );
+        }
     }
     Ok(())
 }
@@ -134,17 +282,26 @@ fn verify_destination(target: &Path) -> Result<(), String> {
 }
 
 fn sibling_temp_path(target: &Path) -> PathBuf {
+    sibling_temp_path_with_nonce(target, &unique_nonce())
+}
+
+fn sibling_temp_path_with_nonce(target: &Path, nonce: &str) -> PathBuf {
+    target.with_file_name(format!(".{PLAN_FILE_NAME}.tmp-{nonce}"))
+}
+
+/// Collision-resistant nonce: wall-clock nanos, process id, and a per-process
+/// counter (tests may pin the nonce via `sibling_temp_path_with_nonce`).
+fn unique_nonce() -> String {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    target.with_file_name(format!(
-        ".{}.tmp-{}-{}-{}",
-        PLAN_FILE_NAME,
-        std::process::id(),
+    format!(
+        "{}-{}-{}",
         nanos,
+        std::process::id(),
         temp_counter().fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    ))
+    )
 }
 
 fn temp_counter() -> &'static std::sync::atomic::AtomicU64 {
@@ -153,18 +310,24 @@ fn temp_counter() -> &'static std::sync::atomic::AtomicU64 {
     &COUNTER
 }
 
-fn sync_directory(root: &Path) {
+fn sync_directory(root: &Path) -> Result<(), String> {
     #[cfg(unix)]
     {
-        if let Ok(directory) = std::fs::File::open(root) {
-            let _ = directory.sync_all();
-        }
+        let directory = std::fs::File::open(root).map_err(|error| {
+            format!("plan_draft: could not open workspace root for sync: {error}")
+        })?;
+        directory.sync_all().map_err(|error| {
+            format!("plan_draft: could not sync workspace root directory: {error}")
+        })
     }
     #[cfg(not(unix))]
     {
         let _ = root;
+        Ok(())
     }
 }
+
+pub static NO_PLAN_DRAFT_FAULTS: NoPlanDraftFaults = NoPlanDraftFaults;
 
 #[cfg(test)]
 mod tests {
@@ -176,6 +339,38 @@ mod tests {
             .prefix(&format!("lato-plan-draft-{tag}-"))
             .tempdir()
             .unwrap()
+    }
+
+    /// Injects an error at one configured stage (and only there).
+    struct FailAt(PlanDraftStage);
+    impl PlanDraftFaults for FailAt {
+        fn on_stage(&self, stage: PlanDraftStage) -> Result<(), String> {
+            if stage == self.0 {
+                Err(format!("injected failure at {stage:?}"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    /// Runs an action at one stage, then lets the stage succeed.
+    struct ActAt<A: Fn(PlanDraftStage) + Send + Sync>(PlanDraftStage, A);
+    impl<A: Fn(PlanDraftStage) + Send + Sync> PlanDraftFaults for ActAt<A> {
+        fn on_stage(&self, stage: PlanDraftStage) -> Result<(), String> {
+            if stage == self.0 {
+                (self.1)(stage);
+            }
+            Ok(())
+        }
+    }
+
+    fn leftovers(root: &Path) -> Vec<String> {
+        std::fs::read_dir(root)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .filter(|name| name.contains(".tmp-"))
+            .collect()
     }
 
     #[tokio::test]
@@ -199,15 +394,7 @@ mod tests {
         );
 
         // No temporary files survive publication.
-        let leftovers: Vec<_> = std::fs::read_dir(&root)
-            .unwrap()
-            .filter_map(|entry| entry.ok())
-            .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp-"))
-            .collect();
-        assert!(
-            leftovers.is_empty(),
-            "temporary files leaked: {leftovers:?}"
-        );
+        assert!(leftovers(&root).is_empty());
     }
 
     #[tokio::test]
@@ -277,9 +464,121 @@ mod tests {
         assert!(root.join(PLAN_FILE_NAME).is_dir());
     }
 
+    #[tokio::test]
+    async fn pre_rename_stage_failures_preserve_previous_draft_and_clean_temp_files() {
+        let stages_before_rename = [
+            PlanDraftStage::ParentCheck,
+            PlanDraftStage::DestinationCheck,
+            PlanDraftStage::CreateTemp,
+            PlanDraftStage::Write,
+            PlanDraftStage::Flush,
+            PlanDraftStage::FileSync,
+            PlanDraftStage::SecondParentCheck,
+            PlanDraftStage::SecondDestinationCheck,
+        ];
+        for stage in stages_before_rename {
+            let directory = temp_workspace("stage-fail");
+            let root = directory.path().to_path_buf();
+            let locks = FileLocks::new();
+            plan_draft(&locks, &root, "previous").await.unwrap();
+
+            let error = plan_draft_with_faults(&locks, &root, "replacement", &FailAt(stage))
+                .await
+                .unwrap_err();
+            assert!(
+                error.contains(&format!("{stage:?}")),
+                "stage {stage:?}: {error}"
+            );
+            assert_eq!(
+                std::fs::read(root.join(PLAN_FILE_NAME)).unwrap(),
+                b"previous",
+                "stage {stage:?} must preserve the previous draft"
+            );
+            assert!(
+                leftovers(&root).is_empty(),
+                "stage {stage:?} leaked temporary files"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn dir_sync_failure_is_propagated_and_never_reports_silent_success() {
+        let directory = temp_workspace("dir-sync");
+        let root = directory.path().to_path_buf();
+        let locks = FileLocks::new();
+        plan_draft(&locks, &root, "previous").await.unwrap();
+
+        // After the rename has committed, a directory-sync failure cannot
+        // restore the previous content: the freshly published plan remains,
+        // and the caller receives the error instead of a success message.
+        let error = plan_draft_with_faults(
+            &locks,
+            &root,
+            "replacement",
+            &FailAt(PlanDraftStage::DirSync),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("DirSync"), "{error}");
+        assert_eq!(
+            std::fs::read(root.join(PLAN_FILE_NAME)).unwrap(),
+            b"replacement"
+        );
+        assert!(leftovers(&root).is_empty());
+    }
+
     #[cfg(unix)]
     #[tokio::test]
-    async fn failure_preserves_previous_draft_and_cleans_temp_files() {
+    async fn parent_directory_replaced_between_checks_is_rejected() {
+        let directory = temp_workspace("parent-swap");
+        let root = directory.path().to_path_buf();
+        let locks = FileLocks::new();
+        plan_draft(&locks, &root, "previous").await.unwrap();
+
+        // Replace the workspace root directory (new device/inode identity)
+        // between the first and second parent checks. The stale temporary
+        // file disappears with the old directory; the new directory keeps the
+        // previous draft and the publication is refused.
+        let faults = ActAt(PlanDraftStage::SecondParentCheck, |_| {
+            std::fs::remove_dir_all(&root).unwrap();
+            std::fs::create_dir(&root).unwrap();
+            std::fs::write(root.join(PLAN_FILE_NAME), "previous").unwrap();
+        });
+        let error = plan_draft_with_faults(&locks, &root, "replacement", &faults)
+            .await
+            .unwrap_err();
+        assert!(
+            error.contains("replaced between checks"),
+            "parent swap must be rejected: {error}"
+        );
+        assert_eq!(
+            std::fs::read(root.join(PLAN_FILE_NAME)).unwrap(),
+            b"previous"
+        );
+    }
+
+    #[test]
+    fn temporary_file_name_collision_fails_without_truncating_the_existing_file() {
+        let directory = temp_workspace("collision");
+        let collision =
+            sibling_temp_path_with_nonce(&directory.path().join(PLAN_FILE_NAME), "pinned");
+        std::fs::write(&collision, b"innocent-bystander").unwrap();
+
+        // Create-new semantics: an existing file at the temporary path is a
+        // hard failure — the collided file is never truncated or reused.
+        let error = create_temp_file(&collision).unwrap_err();
+        assert!(error.contains("could not create temporary file"), "{error}");
+        assert_eq!(std::fs::read(&collision).unwrap(), b"innocent-bystander");
+        assert!(
+            sibling_temp_path_with_nonce(&directory.path().join(PLAN_FILE_NAME), "other")
+                != collision,
+            "distinct nonces must produce distinct temporary paths"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failure_preserves_previous_draft_and_cleans_temp_files_without_seam() {
         use std::io::Write as _;
         use std::os::unix::fs::PermissionsExt;
         let directory = temp_workspace("preserve");
@@ -314,15 +613,7 @@ mod tests {
             std::fs::read(root.join(PLAN_FILE_NAME)).unwrap(),
             b"previous"
         );
-        let leftovers: Vec<_> = std::fs::read_dir(&root)
-            .unwrap()
-            .filter_map(|entry| entry.ok())
-            .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp-"))
-            .collect();
-        assert!(
-            leftovers.is_empty(),
-            "temporary files leaked: {leftovers:?}"
-        );
+        assert!(leftovers(&root).is_empty());
     }
 
     #[tokio::test]
