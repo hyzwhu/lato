@@ -2578,3 +2578,43 @@ async fn compaction_persistence_replay_failure_stops_without_false_completion() 
         "runtime.command_bus_closed" | "runtime.reply_bus_closed"
     ));
 }
+
+#[tokio::test]
+async fn dropping_a_session_without_shutdown_leaves_the_journal_crash_consistent() {
+    let sid = SessionId::from("drop-without-shutdown");
+    let store = Arc::new(MemoryEventStore::new());
+    let session = spawn_session_with_store(
+        sid.clone(),
+        Arc::new(EchoDriver),
+        store.clone(),
+        bootstrap(&sid),
+    );
+    session
+        .submit(Command::StartTurn(StartTurn {
+            input: UserInput::text("one"),
+            behavior: StartBehavior::Reject,
+        }))
+        .await
+        .unwrap();
+
+    // Drop the handle without `Command::Shutdown`, the in-process shape of a
+    // process exit. The loop must stop without appending terminal records, so
+    // no in-flight tail commit can ever collide with a reopening reader.
+    drop(session);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let replay = store.replay(&sid).await.unwrap();
+    assert!(
+        !replay
+            .envelopes
+            .iter()
+            .any(|envelope| matches!(envelope.record, JournalRecord::SessionStopped)),
+        "a dropped session must not append SessionStopped"
+    );
+    let last_turn_record = replay
+        .envelopes
+        .iter()
+        .filter(|envelope| envelope.turn_id.is_some())
+        .count();
+    assert!(last_turn_record > 0, "the turn records must be intact");
+}
