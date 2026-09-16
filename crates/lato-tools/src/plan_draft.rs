@@ -134,6 +134,7 @@ pub async fn plan_draft_with_faults(
 /// captured at creation time.
 struct CreatedTemp {
     name: String,
+    #[cfg(not(unix))]
     full_path: PathBuf,
     #[cfg(unix)]
     identity: (u64, u64),
@@ -158,7 +159,6 @@ fn stage_error(stage: PlanDraftStage, message: String) -> String {
 
 #[cfg(unix)]
 mod handle {
-    use super::PLAN_FILE_NAME;
     use std::ffi::CString;
     use std::fs::File;
     use std::io;
@@ -322,10 +322,6 @@ mod handle {
             Ok(())
         }
     }
-
-    /// Sanity guard used by tests and the publication path: the canonical
-    /// name of the plan file inside the pinned directory.
-    pub const PLAN_FINAL_NAME: &str = PLAN_FILE_NAME;
 }
 
 #[cfg(unix)]
@@ -373,7 +369,6 @@ fn publish_locked_handle(
     let (mut file, identity) = handle.create_temp(temp_name)?;
     let mut created = Some(CreatedTemp {
         name: temp_name.to_owned(),
-        full_path: canonical_root.join(temp_name),
         identity,
     });
 
@@ -427,8 +422,6 @@ fn publish_locked_handle(
     if let Err(error) = handle.rename_over(temp_name, PLAN_FILE_NAME) {
         fault_fail!(handle, created, PlanDraftStage::Rename, error);
     }
-    // The temporary is now the published plan; there is nothing to clean.
-    created = None;
 
     // (8) sync the pinned directory before releasing the lock. The rename
     // has already committed the new plan; a directory-sync failure is
@@ -609,10 +602,6 @@ fn verify_destination(target: &Path) -> Result<(), String> {
 
 pub fn temp_file_name(nonce: &str) -> String {
     format!(".{PLAN_FILE_NAME}.tmp-{nonce}")
-}
-
-fn sibling_temp_path_with_nonce(target: &Path, nonce: &str) -> PathBuf {
-    target.with_file_name(temp_file_name(nonce))
 }
 
 /// Collision-resistant nonce: wall-clock nanos, process id, and a per-process
