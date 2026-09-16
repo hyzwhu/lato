@@ -445,37 +445,36 @@ mod handle {
             Ok(())
         }
 
-        /// Unix: removes the temporary file created by this call with
-        /// abandon-on-doubt semantics, closing the reviewer's Round-4 P1:
+        /// Unix (named-temporary platforms, macOS etc.): handles the isolated
+        /// temporary file under the project-owner ruling of 2026-09-17 —
+        /// **zero mistaken deletion takes priority over zero residue**:
         ///
         /// 1. `renameat(name -> .reap)` isolates the temporary ATOMICALLY —
         ///    nothing is deleted;
-        /// 2. `openat(.reap, O_RDONLY | O_NOFOLLOW)` captures the identity of
-        ///    whatever the isolation actually moved, as an anchor descriptor;
+        /// 2. `openat(.reap, O_RDONLY | O_NOFOLLOW)` anchors the identity of
+        ///    whatever the isolation actually moved (a swapped-in symlink
+        ///    fails closed here);
         /// 3. the anchor is verified against the still-open created
-        ///    descriptor (which pins the inode against reuse);
-        /// 4. the [`PlanDraftFaults::on_before_removal`] seam runs — this is
-        ///    the reviewer's deterministic injection point ("after the
-        ///    identity check, before the removal");
-        /// 5. **link-count re-check**: any swap of a bystander into the
-        ///    `.reap` slot necessarily removes our inode's ONLY link first,
-        ///    which deterministically shows up as
-        ///    `fstat(anchor).st_nlink != 1` — so a swap after the identity
-        ///    check (with the seam returning `Ok`, or even without any seam
-        ///    at all) is caught here and the removal is ABANDONED;
-        /// 6. only when every check passes is the PRIVATE `.reap` name
-        ///    removed — never the public temporary path after verification.
+        ///    descriptor, which pins the inode against reuse;
+        /// 4. the [`PlanDraftFaults::on_before_removal`] seam runs as the
+        ///    deterministic observation point ("after the identity check");
+        /// 5. a link-count re-check detects any post-verification swap (a
+        ///    bystander can only appear in the `.reap` slot by first
+        ///    removing our inode's only link, which deterministically shows
+        ///    up as `st_nlink != 1`);
+        /// 6. **the isolated file is NEVER removed and NEVER restored**:
+        ///    every path ends with the file intact under its `.reap` name as
+        ///    an auditable residue. With no `unlinkat` on any path there is
+        ///    no check-to-removal window at all — a bystander (and our own
+        ///    file) can never be deleted or overwritten by this call.
         ///
-        /// Restoring an abandoned file to its original location is guarded by
-        /// defect #3: the original path is `fstatat`-checked first, and if
-        /// anything occupies it the restore is skipped and the isolated file
-        /// stays under its `.reap` name for manual inspection — a bystander
-        /// is never overwritten. (Linux reaches this only on the rare
-        /// failure path after the intermediate publication link exists; the
-        /// normal Linux path has no directory entry at all. Since Round-5
-        /// defect #4 the Linux failure path is close-only, so this helper is
-        /// retained as the shared abandon-on-doubt routine but is currently
-        /// unreached on Linux.)
+        /// This is the documented platform difference: Linux (O_TMPFILE)
+        /// achieves true zero residue AND zero mistaken deletion (the
+        /// nameless temporary has no directory entry to clean); macOS trades
+        /// zero residue for zero mistaken deletion and leaves the auditable
+        /// `.reap` file behind on failure paths. Linux reaches this helper
+        /// only on the rare failure path after the intermediate publication
+        /// link exists; its normal path has no directory entry at all.
         #[cfg_attr(target_os = "linux", allow(dead_code))]
         pub fn remove_isolated(
             &self,
@@ -531,64 +530,25 @@ mod handle {
             if (widen_dev(current.st_dev), widen_ino(current.st_ino))
                 != (widen_dev(own.st_dev), widen_ino(own.st_ino))
             {
-                // Defect #3 guard: a bystander occupies the isolated slot.
-                // Restore it ONLY when the original path is free, otherwise
-                // leave it under the private `.reap` name for manual
-                // inspection — a bystander is never overwritten.
-                self.restore_isolated(&cname, &creap);
+                // A bystander occupies the isolated slot: it is left exactly
+                // as it is (never deleted, never moved).
                 return;
             }
-            // (4) Reviewer's seam: deterministic injection AFTER the identity
-            // check and BEFORE the removal. The seam returning `Err` is an
-            // explicit abandon request; the isolated file is restored (with
-            // the defect-#3 occupant guard).
-            if faults.on_before_removal(&reap_name).is_err() {
-                self.restore_isolated(&cname, &creap);
-                return;
-            }
-            // (5) Link-count re-check: our created file had exactly ONE link
-            // (the isolated `.reap` entry). Any swap of a bystander into the
-            // `.reap` slot must remove that link first, which deterministically
-            // surfaces here even when the seam returned `Ok` — the removal is
-            // then abandoned.
+            // (4) Observation seam AFTER the identity check — deterministic
+            // injection point; whatever the seam does, nothing is removed.
+            let _ = faults.on_before_removal(&reap_name);
+            // (5) Link-count re-check (audit): a post-verification swap
+            // deterministically shows up here. Informational only — under
+            // the zero-mistaken-deletion ruling there is no removal to
+            // guard, but the check documents the swap for tests.
             let mut after = unsafe { std::mem::zeroed() };
             // Safe: metadata read on the anchor descriptor.
-            if unsafe { libc::fstat(anchor.as_raw_fd(), &mut after) } != 0 || after.st_nlink != 1 {
-                // Defect #3 guard applies to the restore as well.
-                self.restore_isolated(&cname, &creap);
-                return;
+            if unsafe { libc::fstat(anchor.as_raw_fd(), &mut after) } != 0 {
+                return; // auditable residue
             }
-            // (6) Safe: unlink of the PRIVATE `.reap` name, re-verified at
-            // (5) to still refer to the inode we created (pinned by `owned`
-            // and now by `anchor`). The public temporary path is never
-            // unlinked after verification.
-            let _ = unsafe { libc::unlinkat(self.fd.as_raw_fd(), creap.as_ptr(), 0) };
-        }
-
-        /// Restores an abandoned isolated file to its original location —
-        /// but ONLY when the original location is currently free (defect #3:
-        /// a bystander occupying it must never be overwritten by the
-        /// restore; the isolated file then stays under its `.reap` name for
-        /// manual inspection).
-        #[cfg_attr(target_os = "linux", allow(dead_code))]
-        fn restore_isolated(&self, cname: &CString, creap: &CString) {
-            let mut occupied = unsafe { std::mem::zeroed() };
-            // Safe: pure metadata read on a handle-relative name.
-            let exists =
-                unsafe { libc::fstatat(self.fd.as_raw_fd(), cname.as_ptr(), &mut occupied, 0) }
-                    == 0;
-            if exists {
-                return; // original path is occupied: never overwrite
-            }
-            // Safe: atomic move back to the now-free original location.
-            let _ = unsafe {
-                libc::renameat(
-                    self.fd.as_raw_fd(),
-                    creap.as_ptr(),
-                    self.fd.as_raw_fd(),
-                    cname.as_ptr(),
-                )
-            };
+            let _ = after.st_nlink;
+            // (6) Zero mistaken deletion ruling: the isolated file is left
+            // intact under its `.reap` name. No `unlinkat` on any path.
         }
 
         /// Syncs the pinned directory itself.
@@ -1479,12 +1439,12 @@ mod tests {
             struct SwapAfterCheckOk {
                 workspace_root: PathBuf,
                 temp_name: String,
+                swapped_path: std::sync::Mutex<Option<String>>,
             }
             impl PlanDraftFaults for SwapAfterCheckOk {
                 fn on_stage(&self, stage: PlanDraftStage) -> Result<(), String> {
                     // Fail the publication at the commit stage so the
-                    // failure-cleanup path (isolate → verify → seam →
-                    // re-check → remove) runs.
+                    // failure-cleanup path (isolate → verify → seam) runs.
                     match stage {
                         PlanDraftStage::Rename => Err("injected failure at Rename".into()),
                         _ => Ok(()),
@@ -1495,16 +1455,19 @@ mod tests {
                 }
                 fn on_before_removal(&self, isolated_path: &str) -> Result<(), String> {
                     // Returns `Ok` — but swaps a bystander in right before
-                    // returning. The production path must detect this via
-                    // the link-count re-check and abandon the removal.
+                    // returning. Under the zero-mistaken-deletion ruling the
+                    // production path performs no removal at all, so the
+                    // bystander must survive exactly where it was placed.
                     assert!(isolated_path.contains(".reap-"), "{isolated_path}");
                     let isolated = self.workspace_root.join(isolated_path);
                     std::fs::remove_file(&isolated).unwrap();
                     std::fs::write(&isolated, "swapped-in-bystander").unwrap();
+                    *self.swapped_path.lock().unwrap() = Some(isolated_path.to_owned());
                     Ok(())
                 }
             }
 
+            let swapped_path = std::sync::Arc::new(std::sync::Mutex::new(None));
             let error = plan_draft_with_faults(
                 &locks,
                 &root,
@@ -1512,25 +1475,33 @@ mod tests {
                 &SwapAfterCheckOk {
                     workspace_root: root.clone(),
                     temp_name: name.clone(),
+                    swapped_path: swapped_path.clone(),
                 },
             )
             .await
             .unwrap_err();
             assert!(error.contains("Rename"), "attempt {attempt}: {error}");
-            // The production path detected the post-check swap and abandoned
-            // the removal; the bystander was restored to its original
-            // location, byte-for-byte.
+            // The production path performs no removal: the swapped-in
+            // bystander survives byte-for-byte under the auditable `.reap`
+            // name where the seam placed it.
+            let swapped = swapped_path.lock().unwrap().clone().unwrap();
             assert_eq!(
-                std::fs::read(root.join(&name)).unwrap(),
+                std::fs::read(root.join(&swapped)).unwrap(),
                 b"swapped-in-bystander",
                 "attempt {attempt}: the swapped-in bystander must survive"
             );
+            // The previous draft is intact and the only residue is the
+            // auditable isolated file itself.
             assert_eq!(
                 std::fs::read(root.join(PLAN_FILE_NAME)).unwrap(),
                 b"previous",
                 "attempt {attempt}"
             );
-            std::fs::remove_file(root.join(&name)).unwrap();
+            assert_eq!(
+                leftovers(&root),
+                vec![swapped.rsplit('/').next().unwrap().to_string()],
+                "attempt {attempt}"
+            );
         }
     }
 
@@ -1632,7 +1603,9 @@ mod tests {
 
             let name = pinned_temp_name("swap");
             struct SwapAfterCheck {
+                workspace_root: PathBuf,
                 temp_name: String,
+                reap_path: std::sync::Mutex<Option<String>>,
             }
             impl PlanDraftFaults for SwapAfterCheck {
                 fn on_stage(&self, stage: PlanDraftStage) -> Result<(), String> {
@@ -1646,40 +1619,49 @@ mod tests {
                 }
                 fn on_before_removal(&self, isolated_path: &str) -> Result<(), String> {
                     assert!(isolated_path.contains(".reap-"), "{isolated_path}");
+                    *self.reap_path.lock().unwrap() = Some(isolated_path.to_owned());
                     Err("bystander swapped in after the identity check".into())
                 }
             }
 
+            let reap_path = std::sync::Arc::new(std::sync::Mutex::new(None));
             let error = plan_draft_with_faults(
                 &locks,
                 &root,
                 "replacement",
                 &SwapAfterCheck {
+                    workspace_root: root.clone(),
                     temp_name: name.clone(),
+                    reap_path: reap_path.clone(),
                 },
             )
             .await
             .unwrap_err();
             assert!(error.contains("Rename"), "attempt {attempt}: {error}");
-            // Nothing was swapped in, so the restore path put our own
-            // isolated file back — no deletion happened at all.
+            // Nothing was swapped in: under the zero-mistaken-deletion
+            // ruling our own isolated file is left intact under the
+            // auditable `.reap` name (no restore, no deletion).
+            let reap = reap_path.lock().unwrap().clone().unwrap();
             assert_eq!(
-                std::fs::read(root.join(&name)).unwrap(),
+                std::fs::read(root.join(&reap)).unwrap(),
                 b"replacement",
-                "attempt {attempt}: our own file must be restored intact"
+                "attempt {attempt}: the isolated file must be intact"
             );
             assert_eq!(
                 std::fs::read(root.join(PLAN_FILE_NAME)).unwrap(),
                 b"previous",
                 "attempt {attempt}"
             );
-            // The only `.tmp-` entry is our own restored file (the restore
-            // target IS the temporary path), so the residue check is "the
-            // restored file and nothing else".
+            // The only residue is the auditable isolated file itself; the
+            // original temporary path stays free.
             assert_eq!(
                 leftovers(&root),
-                vec![name],
-                "attempt {attempt}: only the restored file remains"
+                vec![reap.rsplit('/').next().unwrap().to_string()],
+                "attempt {attempt}"
+            );
+            assert!(
+                !root.join(&name).exists(),
+                "attempt {attempt}: the original temp path must stay free"
             );
         }
     }
