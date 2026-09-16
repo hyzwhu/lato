@@ -12,7 +12,7 @@
       "control-plane/internal/handlers/execute.go",
       "control-plane/internal/handlers/execute_helpers.go",
       "control-plane/internal/handlers/execute_cancel.go",
-      "control-plane/internal/routes/routes_core.go"
+      "control-plane/internal/server/routes_core.go"
     ]
   },
   "target_contract": {
@@ -35,7 +35,7 @@
     "success_envelope": {
       "execution_id": "exec_redacted",
       "run_id": "run_redacted",
-      "workflow_id": "",
+      "workflow_id": "run_redacted",
       "status": "queued",
       "target": "legal-agent.review_contract",
       "type": "reasoner",
@@ -53,6 +53,16 @@
         "webhook_registered"
       ],
       "optional_ignored_but_type_checked": ["webhook_error"]
+    },
+    "invariants": {
+      "workflow_id_equals_run_id": {
+        "validated": true,
+        "consumed": false
+      },
+      "enqueued_at_equals_created_at_for_normal_queue": {
+        "validated": true,
+        "consumed": false
+      }
     },
     "idempotency_key_supported": false,
     "retry_can_create_duplicate_execution": true
@@ -86,7 +96,7 @@
         "webhook_events",
         "approval_request_id",
         "approval_status",
-        "approval_url"
+        "approval_request_url"
       ]
     }
   },
@@ -114,8 +124,14 @@
     },
     "terminal_conflict_status": 409,
     "terminal_conflict_envelope": {
-      "error": "Execution cannot be cancelled",
-      "message": "Execution is already in terminal state: completed"
+      "error": "invalid_state",
+      "message": "execution is in terminal state 'completed'"
+    },
+    "terminal_conflict_contract": {
+      "stable_consumed": {
+        "error": "invalid_state"
+      },
+      "dynamic_ignored_but_type_checked": ["message"]
     }
   },
   "discovery": {

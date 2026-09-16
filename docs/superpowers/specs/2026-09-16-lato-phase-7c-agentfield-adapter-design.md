@@ -2,12 +2,12 @@
 
 | 字段 | 值 |
 | --- | --- |
-| 状态 | **v1.1 修订稿，待设计评审；禁止施工** |
+| 状态 | **v1.2 修订稿，待设计评审；禁止施工** |
 | 日期 | 2026-09-16 |
 | 基线 | `origin/master@0611e26`（Phase 7B7 已合入） |
 | 目标版本 | Phase 7C；具体发行版本待确认 |
 | 依赖 | Phase 5 task/runtime、Phase 6 信任与配置、Phase 7B workflow/journal/model tool、现有 `ToolRuntime`/policy/approval membrane；7C3 另硬依赖 WIN-26 合入后的 master SHA |
-| 外部基线 | AgentField `v0.1.138` / `0aba9d6de1ef2c473070fc329ac7ac63e5d096b9`；脱敏 fixture SHA-256 `1bac46c4ce5c20d165bb88128a68ae056a70c4aabea3310b3e229210e094736a` |
+| 外部基线 | AgentField `v0.1.138` / `0aba9d6de1ef2c473070fc329ac7ac63e5d096b9`；脱敏 fixture SHA-256 `fd524cab584994bdfa9beede4a5691390548fa3cb2a75efc4c23186af3ab3ae8` |
 | 后续 | AgentField shared memory、DID/VC、实时 session、harness、远程 workflow DAG UI 均另立规格 |
 
 ## 1. 决策摘要
@@ -190,12 +190,13 @@ SHA-256({"adapter":"agentfield-v0.1.138","origin":"<scheme://lowercase-host:effe
 
 远端最小兼容检查还要求：版本 endpoint 可识别；discovery entry 与 reasoner envelope 的锁定版必现字段类型正确。远端 description/schema/examples 均不进入 revision、不覆盖本地字段、不扩大输入面。字段缺失、类型错误、重复 target、版本不兼容或 target 不一致均 fail closed 为 `agentfield.remote_protocol`。
 
-远端健康探测不得成为每 turn 的硬依赖：最近 30 秒成功快照可用于 list；过期且不可达时 list 标记 `available:false`，start fail closed。兼容 fixture 位于 `docs/superpowers/fixtures/agentfield-v0.1.138-contract.json`。它是从 pinned source handler/type 提炼并脱敏的 contract fixture，**不是实际隔离服务 LIVE round-trip 证据**；其 envelope 逐字段标注 required/optional/ignored-but-type-checked。SHA-256 为 `1bac46c4ce5c20d165bb88128a68ae056a70c4aabea3310b3e229210e094736a`。复现：
+远端健康探测不得成为每 turn 的硬依赖：最近 30 秒成功快照可用于 list；过期且不可达时 list 标记 `available:false`，start fail closed。兼容 fixture 位于 `docs/superpowers/fixtures/agentfield-v0.1.138-contract.json`。它是从 pinned source handler/type 提炼并脱敏的 contract fixture，**不是实际隔离服务 LIVE round-trip 证据**；其 envelope 逐字段标注 required/optional/ignored-but-type-checked。async 正常入队还必须校验 `workflow_id == run_id` 与 `enqueued_at == created_at`，但二者均不被产品逻辑消费；cancel 409 仅把 `error == "invalid_state"` 视为稳定合同，动态 `message` 只做字符串类型检查。SHA-256 为 `fd524cab584994bdfa9beede4a5691390548fa3cb2a75efc4c23186af3ab3ae8`。复现：
 
 ```bash
 sha256sum docs/superpowers/fixtures/agentfield-v0.1.138-contract.json
 gh release view v0.1.138 --repo Agent-Field/agentfield
 gh api repos/Agent-Field/agentfield/commits/v0.1.138 --jq .sha
+./scripts/verify-agentfield-contract.sh /path/to/agentfield-checkout-at-pinned-commit
 ```
 
 ## 7. 模型工具协议
@@ -381,6 +382,7 @@ AgentField 远端 PASS 不能升级 Lato 权限；远端返回的 URL、命令�
 17. enabled=false 与回滚：所有既有 task/workflow/ACP/TUI golden 不变。
 18. target 正反例：colon discovery target 只用于一致性校验；由合法原子派生 dot execute target；`.`/`:`/`/`/`%`/非 ASCII、编码分隔符、字段不一致全部在发 HTTP 前拒绝。
 19. pinned async/status/cancel/discovery 完整成功 envelope：缺少必现字段、required/optional 字段类型错误均 fail closed；未知字段仅忽略。
+20. 运行 `scripts/verify-agentfield-contract.sh`，机械验证 fixture 字段对应 pinned Go JSON tag、cancel 409 稳定枚举、async 字段关系及全部 provenance path。
 
 ### 12.2 锁定版本集成测试
 
@@ -422,7 +424,7 @@ LIVE 测试只使用无敏感数据的 fixture capability，不进入普通 CI�
 | AC-11 | Linux/macOS/Windows focused tests、全仓 tests、fmt、clippy、install、doctor 与 no-live-network 全通过 |
 | AC-12 | README 明确双 policy、远端继续运行风险、手工对账与回滚；锁定 AgentField 版本/fixture hash 可复现 |
 | AC-13 | discovery 原子严格 ASCII 校验；colon invocation target 校验后派生 dot execute target，所有分隔符逃逸反例远端请求为 0 |
-| AC-14 | async/status/cancel/discovery 的 pinned 完整 envelope 与 required/optional/type 分类可复现；fixture 不冒充 LIVE 证据 |
+| AC-14 | async/status/cancel/discovery 的 pinned 完整 envelope 与 required/optional/type 分类可复现；机械校验脚本通过；fixture 不冒充 LIVE 证据 |
 
 ## 14. 风险与处置
 
@@ -473,9 +475,9 @@ Phase 7C v1 只有在以下全部满足后才完成：
 5. 不降低本地 task/workflow、policy、journal、CI 和 no-live-network 基线。
 6. migration、doctor、运行风险、人工对账与 rollback 文档齐全。
 
-## 17. v1.1 审查修订记录与冻结项
+## 17. v1.2 审查修订记录与冻结项
 
-| 审查项 | v1.1 处理 | 修改位置 |
+| 审查项 | v1.2 处理 | 修改位置 |
 | --- | --- | --- |
 | P0 ambiguous start | 锁定 `v0.1.138` 无 idempotency key；无 execution ID 永久 outcome_unknown，仅人工核对 | §1、§2.1、§7.2、§9.2、§11～§15 |
 | P0 action policy | 不做 action-aware runtime；四 action 统一 static external-mutation | §1、§2.3、§8.1、测试与 AC-04 |
@@ -483,6 +485,10 @@ Phase 7C v1 只有在以下全部满足后才完成：
 | P1 journal/rollback | 7C3 硬依赖 WIN-26 合入 SHA；旧 reader 对未知 enum fail closed，禁止不安全二进制降级 | §9、§10、§15 |
 | 二审 P0 target 分隔符 | 冻结 discovery colon 校验、严格原子验证与 execute dot 派生；原始 invocation target 禁止进 URL | §6.2、§12、AC-13 |
 | 二审 P1 envelope fixture | async/status/cancel/discovery 记录完整实际 envelope 与字段分类；明确 source-derived、非 LIVE | fixture、§6.2、§12、AC-14 |
+| 三审 P1 approval 字段 | `approval_url` 更正为 pinned Go tag `approval_request_url` | fixture status、校验脚本 |
+| 三审 P1 cancel 409 | 冻结稳定 `error=invalid_state`；动态 message 仅 type-check，不冻结全文 | fixture cancel、§6.2、校验脚本 |
+| 三审 P1 async 不变量 | 示例令 `workflow_id == run_id`、`enqueued_at == created_at`；校验但不消费 | fixture async、§6.2、校验脚本 |
+| 三审 P1 provenance | 路径更正为 `control-plane/internal/server/routes_core.go`，脚本验证全部路径存在且 checkout 为 pinned commit | fixture source、校验脚本 |
 
 仍有一个实施前机械门禁：PR #12 当前 head 为 `736452f866ec66bbf9f208edb0c2df93a3ba67af`，但尚未合入；当前 `origin/master` 仍为 `0611e26`。其 merge SHA 出现后必须以规格勘误替换“待写回”文字；在此之前 7C3 不得开工。这不改变产品选择，只冻结实际代码基线。
 
