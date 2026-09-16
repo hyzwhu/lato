@@ -864,7 +864,6 @@ fn publish_locked_paths(
         .map_err(|message| stage_error(PlanDraftStage::CreateTemp, message))?;
     let mut file = create_temp_file(&temp_path)?;
     let mut created = Some(CreatedTemp {
-        name: temp_name.to_owned(),
         full_path: temp_path.clone(),
     });
 
@@ -1415,12 +1414,16 @@ mod tests {
 
             let name = pinned_temp_name("swap");
             struct SwapAfterCheck {
-                swapped_path: PathBuf,
                 temp_name: String,
             }
             impl PlanDraftFaults for SwapAfterCheck {
-                fn on_stage(&self, _stage: PlanDraftStage) -> Result<(), String> {
-                    Ok(())
+                fn on_stage(&self, stage: PlanDraftStage) -> Result<(), String> {
+                    // Fail the publication at the commit stage so the
+                    // failure-cleanup path (isolate → verify → remove) runs.
+                    match stage {
+                        PlanDraftStage::Rename => Err("injected failure at Rename".into()),
+                        _ => Ok(()),
+                    }
                 }
                 fn pinned_temp_name(&self) -> Option<String> {
                     Some(self.temp_name.clone())
@@ -1441,7 +1444,6 @@ mod tests {
                 &root,
                 "replacement",
                 &SwapAfterCheck {
-                    swapped_path: root.join(&name),
                     temp_name: name.clone(),
                 },
             )
