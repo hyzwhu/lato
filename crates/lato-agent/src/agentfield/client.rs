@@ -213,11 +213,11 @@ impl<T: HttpTransport + 'static> AgentFieldClient for HttpAgentFieldClient<T> {
         execute_target: &str,
         input: &Value,
     ) -> Result<AsyncStartEnvelope, AgentFieldError> {
-        if execute_target.contains(':') || execute_target.contains('/') {
-            return Err(AgentFieldError::RemoteProtocol(
-                "execute target must use the derived dot form".to_string(),
-            ));
-        }
+        // Full atom validation before the URL exists: `%`, extra dots,
+        // non-ASCII, and inconsistent separators are rejected with zero
+        // transport requests (spec §6.2, AC-13).
+        crate::agentfield::config::validate_execute_target(execute_target)
+            .map_err(AgentFieldError::RemoteProtocol)?;
         let response = self
             .send_json(
                 "POST",

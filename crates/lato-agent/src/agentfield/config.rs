@@ -156,6 +156,25 @@ pub fn derive_execute_target(
     Ok(format!("{agent_id}.{reasoner_id}"))
 }
 
+/// Validate an already-derived dot execute target (`agent_id.reasoner_id`)
+/// before it may touch a URL: exactly one separator, both atoms strict.
+/// Rejects `%`, extra dots, non-ASCII, and any percent-encoded separator.
+pub fn validate_execute_target(target: &str) -> Result<(), String> {
+    let Some((agent_id, reasoner_id)) = target.split_once('.') else {
+        return Err(format!(
+            "execute target `{target}` must be `agent_id.reasoner_id`"
+        ));
+    };
+    validate_atom(agent_id, "execute target agent_id")?;
+    validate_atom(reasoner_id, "execute target reasoner_id")?;
+    if target.matches('.').count() != 1 {
+        return Err(format!(
+            "execute target `{target}` must contain exactly one separator"
+        ));
+    }
+    Ok(())
+}
+
 impl AgentFieldConfig {
     /// Parse and validate the raw settings value (`agentfield` key).
     pub fn parse(value: &Value) -> Result<Option<Self>, ConfigError> {

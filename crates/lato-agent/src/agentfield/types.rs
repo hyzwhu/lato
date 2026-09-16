@@ -389,6 +389,7 @@ impl DiscoveryEnvelope {
         {
             capabilities.push(Self::decode_agent(agent)?);
         }
+        Self::enforce_target_contract(&capabilities)?;
         Ok(Self {
             discovered_at: as_string(envelope, "discovered_at")?,
             total_agents: envelope["total_agents"].as_u64().unwrap_or_default(),
@@ -396,6 +397,30 @@ impl DiscoveryEnvelope {
             total_skills: envelope["total_skills"].as_u64().unwrap_or_default(),
             capabilities,
         })
+    }
+
+    /// Target contract (spec §6.2, AC-13): every `(agent_id, reasoner.id,
+    /// invocation_target)` triple must survive the colon→dot derivation, and
+    /// no derived execute target may repeat. Runs inside `decode`, so an
+    /// illegal atom or an inconsistent colon target never yields a decoded
+    /// envelope.
+    fn enforce_target_contract(capabilities: &[DiscoveryAgent]) -> Result<(), String> {
+        let mut seen = std::collections::BTreeSet::new();
+        for agent in capabilities {
+            for reasoner in &agent.reasoners {
+                let execute_target = crate::agentfield::config::derive_execute_target(
+                    &agent.agent_id,
+                    &reasoner.id,
+                    &reasoner.invocation_target,
+                )?;
+                if !seen.insert(execute_target.clone()) {
+                    return Err(format!(
+                        "duplicate discovery execute target `{execute_target}`"
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     fn decode_agent(agent: &Value) -> Result<DiscoveryAgent, String> {

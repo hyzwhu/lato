@@ -94,6 +94,75 @@ fn target_rejections_fail_before_any_http() {
     );
 }
 
+/// The real client path (not just pure validators) must reject every escaped
+/// execute target before a single transport request is made (AC-13 probe).
+#[tokio::test]
+async fn start_async_rejects_escaped_targets_with_zero_transport_requests() {
+    for execute_target in [
+        // Percent-encoded separator.
+        "legal%2Eagent.review",
+        // Extra dot inside an atom.
+        "legal..agent.review_contract",
+        // Non-ASCII atom.
+        "legal-agént.review_contract",
+        // Colon form passed through.
+        "legal-agent:review_contract",
+        // Slash.
+        "legal/agent.review_contract",
+        // No separator at all.
+        "legal-agent-review_contract",
+    ] {
+        let transport =
+            FakeTransport::with_status(202, fixture_str("/async_start/success_envelope"));
+        let client = client_with(transport.clone());
+        let error = client
+            .start_async(execute_target, &json!({"contract": "acme.pdf"}))
+            .await
+            .expect_err("escaped target must fail closed");
+        assert!(
+            matches!(error, AgentFieldError::RemoteProtocol(_)),
+            "{execute_target}: {error:?}"
+        );
+        assert_eq!(
+            transport.seen.lock().unwrap().len(),
+            0,
+            "{execute_target}: rejection must happen before any HTTP request"
+        );
+    }
+}
+
+/// `DiscoveryEnvelope::decode` itself must enforce the target contract:
+/// illegal atoms, inconsistent colon targets, and duplicate execute targets
+/// fail closed (AC-13 probe).
+#[test]
+fn discovery_decode_enforces_target_contract() {
+    let mut envelope = discovery_body();
+    envelope["capabilities"][0]["agent_id"] = json!("bad.agent");
+    assert!(
+        DiscoveryEnvelope::decode(&envelope).is_err(),
+        "illegal atom"
+    );
+
+    let mut envelope = discovery_body();
+    envelope["capabilities"][0]["reasoners"][0]["invocation_target"] =
+        json!("other-agent:review_contract");
+    assert!(
+        DiscoveryEnvelope::decode(&envelope).is_err(),
+        "inconsistent colon target"
+    );
+
+    let mut envelope = discovery_body();
+    let duplicate = envelope["capabilities"][0].clone();
+    envelope["capabilities"]
+        .as_array_mut()
+        .unwrap()
+        .push(duplicate);
+    assert!(
+        DiscoveryEnvelope::decode(&envelope).is_err(),
+        "duplicate execute target"
+    );
+}
+
 // ---- config parsing (spec §6.1) ----
 
 fn valid_config_json() -> Value {
