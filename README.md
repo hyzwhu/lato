@@ -154,8 +154,10 @@ user-owned — you can edit or delete it at any time, and Lato never touches
 `.gitignore` for it.
 
 ```bash
-# Headless: run a single planning turn; exits with code 3 when a plan was
-# produced but not approved. Headless never auto-approves.
+# Headless: run a single planning turn. Exits with code 3 only when a real,
+# readable plan.md was produced but not approved; if the turn ended without a
+# produced plan file, it fails explicitly instead. Headless never
+# auto-approves.
 lato -p --plan "draft a plan for adding retry logic"
 # Re-enter Plan mode on a resumed session; the previous plan.md is loaded as
 # the starting draft if it is present and readable.
