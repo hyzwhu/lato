@@ -161,7 +161,6 @@ mod handle {
     use std::fs::File;
     use std::io;
     use std::os::unix::ffi::OsStrExt as _;
-    use std::os::unix::fs::MetadataExt as _;
     use std::os::unix::io::{AsRawFd as _, FromRawFd as _, OwnedFd};
     use std::path::Path;
 
@@ -304,8 +303,7 @@ mod handle {
             }
             let mut current = unsafe { std::mem::zeroed() };
             // Safe: pure metadata read on a handle-relative name.
-            if unsafe { libc::fstatat(self.fd.as_raw_fd(), cname.as_ptr(), &mut current, 0) } != 0
-            {
+            if unsafe { libc::fstatat(self.fd.as_raw_fd(), cname.as_ptr(), &mut current, 0) } != 0 {
                 return Err(()); // already gone
             }
             if (current.st_dev, current.st_ino) != (own.st_dev, own.st_ino) {
@@ -385,19 +383,37 @@ fn publish_locked_handle(
         fault_fail!(handle, created, file, PlanDraftStage::Write, message);
     }
     if let Err(error) = file.as_mut().unwrap().write_all(contents.as_bytes()) {
-        fault_fail!(handle, created, file, PlanDraftStage::Write, error.to_string());
+        fault_fail!(
+            handle,
+            created,
+            file,
+            PlanDraftStage::Write,
+            error.to_string()
+        );
     }
     if let Err(message) = faults.on_stage(PlanDraftStage::Flush) {
         fault_fail!(handle, created, file, PlanDraftStage::Flush, message);
     }
     if let Err(error) = file.as_mut().unwrap().flush() {
-        fault_fail!(handle, created, file, PlanDraftStage::Flush, error.to_string());
+        fault_fail!(
+            handle,
+            created,
+            file,
+            PlanDraftStage::Flush,
+            error.to_string()
+        );
     }
     if let Err(message) = faults.on_stage(PlanDraftStage::FileSync) {
         fault_fail!(handle, created, file, PlanDraftStage::FileSync, message);
     }
     if let Err(error) = file.as_mut().unwrap().sync_all() {
-        fault_fail!(handle, created, file, PlanDraftStage::FileSync, error.to_string());
+        fault_fail!(
+            handle,
+            created,
+            file,
+            PlanDraftStage::FileSync,
+            error.to_string()
+        );
     }
     // The descriptor stays OPEN through the second checks and any failure
     // cleanup: a still-open descriptor pins the inode, so the cleanup
@@ -406,10 +422,22 @@ fn publish_locked_handle(
     // (7) repeat both checks against the pinned handle, then commit with a
     // same-directory renameat — the atomic publication point.
     if let Err(message) = faults.on_stage(PlanDraftStage::SecondParentCheck) {
-        fault_fail!(handle, created, file, PlanDraftStage::SecondParentCheck, message);
+        fault_fail!(
+            handle,
+            created,
+            file,
+            PlanDraftStage::SecondParentCheck,
+            message
+        );
     }
     if let Err(error) = handle.verify_matches_path(target) {
-        fault_fail!(handle, created, file, PlanDraftStage::SecondParentCheck, error);
+        fault_fail!(
+            handle,
+            created,
+            file,
+            PlanDraftStage::SecondParentCheck,
+            error
+        );
     }
     if let Err(message) = faults.on_stage(PlanDraftStage::SecondDestinationCheck) {
         fault_fail!(
@@ -438,7 +466,6 @@ fn publish_locked_handle(
     // The temporary is now the published plan: close the descriptor and
     // leave nothing to clean.
     drop(file.take());
-    created = None;
 
     // (8) sync the pinned directory before releasing the lock. The rename
     // has already committed the new plan; a directory-sync failure is
