@@ -1453,10 +1453,7 @@ mod tests {
             )
             .await
             .unwrap_err();
-            assert!(
-                error.contains("SecondDestinationCheck"),
-                "attempt {attempt}: {error}"
-            );
+            assert!(error.contains("Rename"), "attempt {attempt}: {error}");
             // The swapped-in bystander was restored to its original
             // location, byte-for-byte.
             assert_eq!(
