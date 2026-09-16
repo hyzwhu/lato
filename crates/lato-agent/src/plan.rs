@@ -57,21 +57,33 @@ pub enum PlanModeError {
     DraftUnreadable,
 }
 
+/// Identifies the approval generation revoked by a failed TOCTOU check, for
+/// the durable `PlanApprovalRevoked` journal trace.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlanApprovalRevocation {
+    pub activation: u64,
+    pub generation: u64,
+}
+
 /// Outcome of the first (pre-prepare) TOCTOU check for a mutation call.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MutationPreflight {
     /// No active approval: the call proceeds through ordinary policy only.
     NotGuarded,
-    /// Approval verified at this instant; the captured generation must be
+    /// Approval verified at this instant; the captured triple must be
     /// presented again to [`PlanModeRuntime::complete_mutation_preflight`]
     /// immediately before the grant is consumed.
     Guarded {
+        activation: u64,
         generation: u64,
         content_hash: String,
     },
     /// The approval is stale or the draft is unreadable: the call is denied,
     /// the generation is revoked, and the session transitions to `Revising`.
-    Denied { code: &'static str },
+    Denied {
+        code: &'static str,
+        revocation: PlanApprovalRevocation,
+    },
 }
 
 struct PlanInner {
@@ -148,7 +160,7 @@ impl PlanModeRuntime {
             }),
             plan_path: workspace_root.join(PLAN_FILE_NAME),
             plan_flag: Arc::new(AtomicBool::new(false)),
-            next_generation: AtomicU64::new(1),
+            next_generation: AtomicU64::new(0),
             next_activation: AtomicU64::new(0),
         }
     }
@@ -286,10 +298,12 @@ impl PlanModeRuntime {
         let Some(approval) = inner.approval.as_ref() else {
             return MutationPreflight::NotGuarded;
         };
+        let activation = approval.activation;
         let generation = approval.generation;
         let approved_hash = approval.content_hash.clone();
         match bounded_read(&self.plan_path) {
             Ok(Some(hash)) if hash == approved_hash => MutationPreflight::Guarded {
+                activation,
                 generation,
                 content_hash: approved_hash,
             },
@@ -301,25 +315,31 @@ impl PlanModeRuntime {
                 self.set_flag(true); // Revising re-engages the read-only overlay.
                 MutationPreflight::Denied {
                     code: PLAN_APPROVAL_STALE_CODE,
+                    revocation: PlanApprovalRevocation {
+                        activation,
+                        generation,
+                    },
                 }
             }
         }
     }
 
     /// Second TOCTOU check, run immediately before the call's execution grant
-    /// is consumed. Verifies the session is still `Approved`, the generation
-    /// is unchanged (even if the bytes were restored), and the hash matches.
+    /// is consumed. Verifies the session is still `Approved`, the activation
+    /// and generation are unchanged (even if the bytes were restored), and the
+    /// hash matches. On failure the approval is revoked and the revocation is
+    /// returned for the durable journal trace.
     pub async fn complete_mutation_preflight(
         &self,
+        activation: u64,
         generation: u64,
         content_hash: &str,
-    ) -> Result<(), PlanModeError> {
+    ) -> Result<(), PlanApprovalRevocation> {
         let mut inner = self.inner.lock().await;
         let still_valid = inner.phase == PlanPhase::Approved
-            && inner
-                .approval
-                .as_ref()
-                .is_some_and(|approval| approval.generation == generation)
+            && inner.approval.as_ref().is_some_and(|approval| {
+                approval.activation == activation && approval.generation == generation
+            })
             && match bounded_read(&self.plan_path) {
                 Ok(Some(hash)) => hash == content_hash,
                 _ => false,
@@ -332,8 +352,15 @@ impl PlanModeRuntime {
             inner.approval = None;
             drop(inner);
             self.set_flag(true);
+            return Err(PlanApprovalRevocation {
+                activation,
+                generation,
+            });
         }
-        Err(PlanModeError::IllegalEdge(PlanPhase::Approved))
+        Err(PlanApprovalRevocation {
+            activation,
+            generation,
+        })
     }
 
     /// Stable denial code for a failed second check.
@@ -423,7 +450,11 @@ mod tests {
         // Old generation can never be completed again.
         assert!(
             runtime
-                .complete_mutation_preflight(first.generation, &first.content_hash)
+                .complete_mutation_preflight(
+                    first.activation,
+                    first.generation,
+                    &first.content_hash
+                )
                 .await
                 .is_err()
         );
@@ -442,13 +473,14 @@ mod tests {
         // Unchanged file: guarded.
         match runtime.begin_mutation_preflight().await {
             MutationPreflight::Guarded {
+                activation,
                 generation,
                 content_hash,
             } => {
                 assert_eq!(generation, approval.generation);
                 // Second check passes while unchanged.
                 runtime
-                    .complete_mutation_preflight(generation, &content_hash)
+                    .complete_mutation_preflight(activation, generation, &content_hash)
                     .await
                     .unwrap();
             }
@@ -458,15 +490,16 @@ mod tests {
         // Mutate between checks: the second check must deny and revoke.
         let guarded = match runtime.begin_mutation_preflight().await {
             MutationPreflight::Guarded {
+                activation,
                 generation,
                 content_hash,
-            } => (generation, content_hash),
+            } => (activation, generation, content_hash),
             other => panic!("expected guarded, got {other:?}"),
         };
         write_plan(&dir, "mutated contents").await;
         assert!(
             runtime
-                .complete_mutation_preflight(guarded.0, &guarded.1)
+                .complete_mutation_preflight(guarded.0, guarded.1, &guarded.2)
                 .await
                 .is_err()
         );
@@ -480,7 +513,11 @@ mod tests {
         }
         assert!(
             runtime
-                .complete_mutation_preflight(approval.generation, &approval.content_hash)
+                .complete_mutation_preflight(
+                    approval.activation,
+                    approval.generation,
+                    &approval.content_hash
+                )
                 .await
                 .is_err()
         );
@@ -548,7 +585,9 @@ mod tests {
         fs::write(dir.join(PLAN_FILE_NAME), "other").unwrap();
 
         match runtime.begin_mutation_preflight().await {
-            MutationPreflight::Denied { code } => assert_eq!(code, PlanModeRuntime::STALE_CODE),
+            MutationPreflight::Denied { code, .. } => {
+                assert_eq!(code, PlanModeRuntime::STALE_CODE)
+            }
             other => panic!("expected denied, got {other:?}"),
         }
         assert_eq!(runtime.status().await.phase, PlanPhase::Revising);

@@ -41,7 +41,7 @@ pub async fn plan_draft(
     let target: PathBuf = canonical_root.join(PLAN_FILE_NAME);
 
     // (2) byte bound before any filesystem mutation, UTF-8 bytes, no truncate.
-    let byte_len = contents.as_bytes().len();
+    let byte_len = contents.len();
     if byte_len > PLAN_DRAFT_MAX_BYTES {
         return Err(format!(
             "plan_draft: draft is {byte_len} bytes, exceeding the hard limit of {PLAN_DRAFT_MAX_BYTES}; it was not written"

@@ -123,6 +123,11 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         description_en: "Find project files · @",
     },
     SlashCommand {
+        name: "/plan",
+        description_zh: "Plan 会话：enter/status/submit/approve/exit",
+        description_en: "Plan session: enter/status/submit/approve/exit",
+    },
+    SlashCommand {
         name: "/workflows",
         description_zh: "列出可用工作流",
         description_en: "List available workflows",

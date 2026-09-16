@@ -190,15 +190,25 @@ pub async fn run(args: Vec<String>) -> i32 {
             language,
             sandbox,
             plugin_dirs,
-        } => interactive(InteractiveStartup::New, language, sandbox, plugin_dirs).await,
+        } => {
+            interactive(
+                InteractiveStartup::New,
+                language,
+                sandbox,
+                false,
+                plugin_dirs,
+            )
+            .await
+        }
         Invocation::Prompt(args) => prompt(args).await,
         Invocation::Sessions(command) => crate::sessions::run(command).await,
         Invocation::Resume {
             session_id,
             language,
             sandbox,
+            plan,
             plugin_dirs,
-        } => resume_interactive(session_id, language, sandbox, plugin_dirs).await,
+        } => resume_interactive(session_id, language, sandbox, plan, plugin_dirs).await,
         Invocation::Login { provider, method } => login(provider, method).await,
         Invocation::Doctor(args) => doctor_cmd(args).await,
         Invocation::Acp { plugin_dirs } => crate::stdio::run(plugin_dirs).await,
@@ -225,11 +235,13 @@ fn canonicalize_invocation_plugin_dirs(invocation: Invocation) -> Result<Invocat
             session_id,
             language,
             sandbox,
+            plan,
             plugin_dirs,
         } => Invocation::Resume {
             session_id,
             language,
             sandbox,
+            plan,
             plugin_dirs: canonicalize_plugin_dirs(plugin_dirs)?,
         },
         Invocation::Acp { plugin_dirs } => Invocation::Acp {
@@ -385,18 +397,31 @@ async fn prompt(args: PromptArgs) -> i32 {
     } else {
         default_fake_stream()
     };
-    match crate::client::run_prompt_over_acp_with_stream(
+    match crate::client::run_prompt_over_acp_with_plan(
         cwd,
         home,
         trust,
         text,
         stream,
         args.plugin_dirs,
+        args.plan,
     )
     .await
     {
-        Ok(s) => {
-            println!("{s}");
+        Ok(outcome) => {
+            println!("{}", outcome.text);
+            // Headless never auto-approves (spec §2): a produced but
+            // unapproved plan exits with the distinct code 3.
+            if let Some(status) = outcome.plan_status {
+                let phase = status["phase"].as_str().unwrap_or("inactive");
+                println!(
+                    "plan file: {}",
+                    status["planPath"].as_str().unwrap_or("plan.md")
+                );
+                if matches!(phase, "drafting" | "awaiting_approval" | "revising") {
+                    return 3;
+                }
+            }
             0
         }
         Err(e) => {
@@ -416,9 +441,37 @@ async fn resume_interactive(
     reference: String,
     language: Option<Language>,
     sandbox: Option<SandboxArg>,
+    plan: bool,
     plugin_dirs: Vec<PathBuf>,
 ) -> i32 {
     let home = lato_home();
+    // Fail-closed draft validation for `resume --plan` (spec §2/T7): an
+    // unreadable or oversized plan.md must never silently resume Approved.
+    if plan {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let plan_path = cwd.join(lato_core::PLAN_FILE_NAME);
+        match std::fs::metadata(&plan_path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                eprintln!(
+                    "error: --plan draft {} is unreadable: {error}; refusing to resume in Plan mode",
+                    plan_path.display()
+                );
+                return 1;
+            }
+            Ok(metadata) => {
+                if !metadata.is_file() || metadata.len() as usize > lato_core::PLAN_DRAFT_MAX_BYTES
+                {
+                    eprintln!(
+                        "error: --plan draft {} is not a readable regular file within the {}-byte limit; refusing to resume in Plan mode",
+                        plan_path.display(),
+                        lato_core::PLAN_DRAFT_MAX_BYTES
+                    );
+                    return 1;
+                }
+            }
+        }
+    }
     if let Err(error) = std::fs::create_dir_all(&home) {
         eprintln!("error: cannot create {}: {error}", home.display());
         return 1;
@@ -437,6 +490,7 @@ async fn resume_interactive(
                 InteractiveStartup::Resume(session_id),
                 language,
                 sandbox,
+                plan,
                 plugin_dirs,
             )
             .await
@@ -446,6 +500,7 @@ async fn resume_interactive(
                 InteractiveStartup::ChooseResume(candidates),
                 language,
                 sandbox,
+                plan,
                 plugin_dirs,
             )
             .await
@@ -461,6 +516,7 @@ async fn interactive(
     startup: InteractiveStartup,
     language_override: Option<Language>,
     sandbox_override: Option<SandboxArg>,
+    plan: bool,
     plugin_dirs: Vec<PathBuf>,
 ) -> i32 {
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
@@ -653,6 +709,7 @@ async fn interactive(
                     home: home.clone(),
                     sessions,
                     resumed: resume_id.is_some(),
+                    plan,
                 })
             })
             .await;

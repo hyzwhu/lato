@@ -312,14 +312,23 @@ impl ClientUpdate {
     }
 }
 
-pub async fn run_prompt_over_acp_with_stream(
+pub struct PromptRunOutcome {
+    pub text: String,
+    /// Present when the headless run started with `--plan`.
+    pub plan_status: Option<serde_json::Value>,
+}
+
+/// Headless prompt; with `plan` the single turn runs in Plan mode and the
+/// session is never auto-approved (spec §2).
+pub async fn run_prompt_over_acp_with_plan(
     cwd: std::path::PathBuf,
     lato_home: std::path::PathBuf,
     trust: SessionTrust,
     text: String,
     stream: Arc<dyn ModelStream>,
     plugin_dirs: Vec<std::path::PathBuf>,
-) -> Result<String, String> {
+    plan: bool,
+) -> Result<PromptRunOutcome, String> {
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
     let mut host =
         AcpHost::new_with_home_and_plugin_dirs(cwd, trust, tx, stream, lato_home, plugin_dirs);
@@ -334,9 +343,28 @@ pub async fn run_prompt_over_acp_with_stream(
         .as_str()
         .ok_or("no session")?
         .to_string();
+    let mut plan_status = None;
+    let mut next_id = 3;
+    if plan {
+        let enter = host
+            .handle(req(
+                next_id,
+                "lato/plan/enter",
+                serde_json::json!({"sessionId": sid}),
+            ))
+            .await
+            .ok_or("no response")?;
+        if enter.get("error").is_some() {
+            return Err(enter["error"]["message"]
+                .as_str()
+                .unwrap_or("plan enter failed")
+                .to_string());
+        }
+        next_id += 1;
+    }
     let res = host
         .handle(req(
-            3,
+            next_id,
             "session/prompt",
             serde_json::json!({"sessionId": sid, "text": text}),
         ))
@@ -348,11 +376,27 @@ pub async fn run_prompt_over_acp_with_stream(
             .unwrap_or("error")
             .to_string());
     }
+    if plan
+        && let Some(status) = host
+            .handle(req(
+                next_id + 1,
+                "lato/plan/status",
+                serde_json::json!({"sessionId": sid}),
+            ))
+            .await
+            .as_ref()
+            .and_then(|response| response.get("result"))
+    {
+        plan_status = Some(status.clone());
+    }
     debug_assert!(host.prompts_via_acp > 0);
-    Ok(res["result"]["text"]
-        .as_str()
-        .unwrap_or_default()
-        .to_string())
+    Ok(PromptRunOutcome {
+        text: res["result"]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string(),
+        plan_status,
+    })
 }
 
 pub struct InteractiveAcpClient {
@@ -571,6 +615,30 @@ impl InteractiveAcpClient {
                 "lato/session/skills",
                 serde_json::json!({"sessionId": self.session_id}),
             ))
+            .await
+            .ok_or("no response")?;
+        serde_json::from_value(response_result(&response)?.clone())
+            .map_err(|error| error.to_string())
+    }
+
+    /// Plan-mode ACP requests (`enter`/`status`/`submit`/`approve`/`exit`).
+    pub async fn plan_request(
+        &mut self,
+        action: &str,
+        extra: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let id = self.take_id();
+        let mut params = serde_json::json!({"sessionId": self.session_id});
+        if let (serde_json::Value::Object(map), serde_json::Value::Object(target)) =
+            (&extra, &mut params)
+        {
+            for (key, value) in map {
+                target.insert(key.clone(), value.clone());
+            }
+        }
+        let response = self
+            .host
+            .handle(req(id, &format!("lato/plan/{action}"), params))
             .await
             .ok_or("no response")?;
         serde_json::from_value(response_result(&response)?.clone())

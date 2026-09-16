@@ -272,6 +272,7 @@ pub enum AppEvent {
 #[derive(Debug)]
 pub enum Effect {
     Backend(BackendCommand),
+    PlanAction(crate::tui::backend::PlanAction),
     PersistLanguage(Language),
     PersistModel(String),
     ConfigureModel,
@@ -670,6 +671,17 @@ impl AppState {
                 self.skills_loading = false;
                 self.skills_error = Some(error);
             }
+            BackendEvent::PlanResult(result) => match result {
+                Ok(text) => {
+                    self.screen = Screen::Main;
+                    self.messages.push(Message {
+                        role: MessageRole::System,
+                        content: text,
+                        expanded: true,
+                    });
+                }
+                Err(error) => self.error = Some(error),
+            },
             BackendEvent::Workflows(response) => {
                 self.workflows = response.workflows;
                 self.screen = Screen::Main;

@@ -14,6 +14,7 @@ pub struct PromptArgs {
     pub text: String,
     pub ask: bool,
     pub sandbox: SandboxArg,
+    pub plan: bool,
     pub model: Option<String>,
     pub plugin_dirs: Vec<PathBuf>,
 }
@@ -44,6 +45,7 @@ pub enum Invocation {
         session_id: String,
         language: Option<Language>,
         sandbox: Option<SandboxArg>,
+        plan: bool,
         plugin_dirs: Vec<PathBuf>,
     },
     Login {
@@ -86,7 +88,8 @@ pub enum WorkflowCommand {
     name = "lato",
     version,
     about = "Public Beta coding agent",
-    after_help = "Run without arguments for the interactive coding CLI.\n\nInteractive: lato [--sandbox off|workspace|read-only]\nResume: lato resume ID|TITLE [--sandbox off|workspace|read-only]\nHeadless: lato -p [--ask] [--sandbox off|workspace|read-only] [--model provider/model] TEXT\nWorkflows: lato workflow list|run ID [--input JSON] [--model provider/model] [--sandbox off|workspace|read-only] [--validate-only] [--agent-budget N] [--plugin-dir PATH]\nDoctor: lato doctor [--json] [--strict] [--live]"
+    after_help = "Run without arguments for the interactive coding CLI.\n\nInteractive: lato [--sandbox off|workspace|read-only]\nResume: lato resume ID|TITLE [--sandbox off|workspace|read-only]\nHeadless: lato -p [--ask] [--plan] [--sandbox off|workspace|read-only] [--model provider/model] TEXT
+Plan mode: lato -p --plan TEXT (exit code 3 when a plan was drafted but not approved); lato resume ID|TITLE --plan\nWorkflows: lato workflow list|run ID [--input JSON] [--model provider/model] [--sandbox off|workspace|read-only] [--validate-only] [--agent-budget N] [--plugin-dir PATH]\nDoctor: lato doctor [--json] [--strict] [--live]"
 )]
 struct Cli {
     /// Interface language for interactive mode
@@ -104,6 +107,10 @@ struct Cli {
     /// Sandbox for interactive/resumed sessions or -p; off permits writes outside the workspace
     #[arg(long, global = true, value_enum)]
     sandbox: Option<SandboxArg>,
+
+    /// Run the session in Plan mode (read-only planning; -p and resume only)
+    #[arg(long, global = true, action = ArgAction::SetTrue)]
+    plan: bool,
 
     /// Model selection in provider/model form
     #[arg(long)]
@@ -246,6 +253,12 @@ impl Cli {
                     "--sandbox is only available in interactive mode, resume, -p, or workflow run",
                 ));
             }
+            if self.plan && !matches!(&command, Command::Resume { .. }) {
+                return Err(semantic_error(
+                    ErrorKind::ArgumentConflict,
+                    "--plan is only available with -p or resume",
+                ));
+            }
             if !self.plugin_dirs.is_empty()
                 && !matches!(
                     &command,
@@ -282,6 +295,7 @@ impl Cli {
                     session_id,
                     language: self.language,
                     sandbox: self.sandbox,
+                    plan: self.plan,
                     plugin_dirs: self.plugin_dirs,
                 },
                 Command::Login {
@@ -344,9 +358,17 @@ impl Cli {
                 text: self.text.join(" "),
                 ask: self.ask,
                 sandbox: self.sandbox.unwrap_or(SandboxArg::Off),
+                plan: self.plan,
                 model: self.model,
                 plugin_dirs: self.plugin_dirs,
             }));
+        }
+
+        if self.plan {
+            return Err(semantic_error(
+                ErrorKind::ArgumentConflict,
+                "--plan is only available with -p or resume",
+            ));
         }
 
         if self.ask || self.model.is_some() || !self.text.is_empty() {
@@ -519,6 +541,7 @@ mod tests {
                         session_id: "session-1".into(),
                         language: None,
                         sandbox: Some(profile),
+                        plan: false,
                         plugin_dirs: vec![],
                     }
                 );

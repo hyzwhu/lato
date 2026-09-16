@@ -14,7 +14,7 @@ mod task;
 mod tool;
 
 pub use budget::*;
-pub use command::{Command, StartBehavior, StartTurn, UserInput};
+pub use command::{Command, PlanModeJournalEvent, StartBehavior, StartTurn, UserInput};
 pub use compaction::*;
 pub use error::{AgentError, ErrorCategory, Retryability};
 pub use event::{

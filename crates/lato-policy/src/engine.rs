@@ -7,7 +7,7 @@ use lato_core::{
     SideEffect, ToolCapability, plan_mode_denial,
 };
 use std::sync::{
-    Arc,
+    Arc, RwLock,
     atomic::{AtomicBool, Ordering},
 };
 
@@ -48,8 +48,10 @@ pub struct PolicyEngine {
     ledger: Arc<ApprovalLedger>,
     sink: Arc<dyn PolicyEventSink>,
     /// Shared Plan-mode overlay flag; flipping it re-trims every subsequent
-    /// evaluation and approval path of this engine (spec §4/§6).
-    plan_mode: Arc<AtomicBool>,
+    /// evaluation and approval path of this engine (spec §4/§6). The Arc can
+    /// be adopted from a session PlanModeRuntime so a single flag drives the
+    /// policy overlay and the model catalog.
+    plan_mode: RwLock<Arc<AtomicBool>>,
 }
 
 impl std::fmt::Debug for PolicyEngine {
@@ -70,18 +72,33 @@ impl PolicyEngine {
         Self {
             ledger,
             sink,
-            plan_mode: Arc::new(AtomicBool::new(false)),
+            plan_mode: RwLock::new(Arc::new(AtomicBool::new(false))),
         }
+    }
+
+    /// Replaces the engine's Plan-mode flag with a shared one, so the session
+    /// plan state machine toggles policy and catalog in one store.
+    pub fn adopt_plan_mode_flag(&self, flag: Arc<AtomicBool>) {
+        *self
+            .plan_mode
+            .write()
+            .expect("plan mode flag lock poisoned") = flag;
     }
 
     /// Engages or disengages the Plan-mode capability overlay.
     pub fn set_plan_mode(&self, active: bool) {
-        self.plan_mode.store(active, Ordering::Release);
+        self.plan_mode
+            .read()
+            .expect("plan mode flag lock poisoned")
+            .store(active, Ordering::Release);
     }
 
     /// True while the Plan-mode overlay applies to evaluations.
     pub fn plan_mode_active(&self) -> bool {
-        self.plan_mode.load(Ordering::Acquire)
+        self.plan_mode
+            .read()
+            .expect("plan mode flag lock poisoned")
+            .load(Ordering::Acquire)
     }
 
     pub fn evaluate(&self, request: &PolicyRequest) -> PolicyDecision {

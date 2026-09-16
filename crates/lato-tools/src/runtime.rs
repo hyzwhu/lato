@@ -455,6 +455,12 @@ impl ToolRuntime {
         self.policy.plan_mode_active()
     }
 
+    /// Shares the session plan flag with this runtime's policy engine so one
+    /// AtomicBool drives both the overlay and the catalog filter.
+    pub fn adopt_plan_mode_flag(&self, flag: Arc<std::sync::atomic::AtomicBool>) {
+        self.policy.adopt_plan_mode_flag(flag);
+    }
+
     pub fn approve(&self, approval: &ApprovalRequest) -> Result<ExecutionGrant, ToolError> {
         self.policy.approve(approval).map_err(policy_engine_error)
     }

@@ -37,6 +37,8 @@ pub struct InteractiveBootstrap {
     pub home: PathBuf,
     pub sessions: Vec<SessionSummary>,
     pub resumed: bool,
+    /// Re-enter Plan mode for a resumed session (`lato resume --plan`).
+    pub plan: bool,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -75,6 +77,16 @@ pub async fn run(
     start_file_index(&mut app, &index_tx);
     let mut tick = tokio::time::interval(std::time::Duration::from_millis(250));
     let mut approvals_open = true;
+    if bootstrap.plan {
+        // `lato resume --plan`: re-enter Plan mode; the previous plan.md is
+        // loaded as the starting draft if present (validated fail-closed by
+        // the CLI before startup).
+        if let Err(error) =
+            backend.send(BackendCommand::Plan(crate::tui::backend::PlanAction::Enter))
+        {
+            app.error = Some(error);
+        }
+    }
 
     terminal
         .draw(|frame| render::render(frame, &mut app))
@@ -348,6 +360,52 @@ async fn execute_effects(
                     }
                     Err(error) if error == dialog::CANCELLED => {}
                     Err(error) => app.error = Some(error),
+                }
+            }
+            Effect::PlanAction(action) => {
+                if app.is_busy() {
+                    app.error = Some(
+                        "Wait for the current response or cancel it first / 请先等待或取消当前回复"
+                            .into(),
+                    );
+                    continue;
+                }
+                app.composer.clear();
+                // `/plan approve` shows the plan file for review first and
+                // requires explicit confirmation (spec §2).
+                if action == crate::tui::backend::PlanAction::Approve {
+                    let plan_path = app.workspace.join("plan.md");
+                    let preview = std::fs::read_to_string(&plan_path)
+                        .map(|content| content.chars().take(4000).collect::<String>())
+                        .unwrap_or_else(|_| {
+                            "(plan.md is empty or missing; approve anyway?)".into()
+                        });
+                    app.overlay = Some(Overlay::Configuration);
+                    let choices = match app.language {
+                        Language::ZhCn => vec!["确认批准".to_string(), "取消".to_string()],
+                        Language::En => vec!["Approve".to_string(), "Cancel".to_string()],
+                    };
+                    let prompt = format!(
+                        "Review {}:\n\n{preview}\n\n{}",
+                        plan_path.display(),
+                        match app.language {
+                            Language::ZhCn => "确认批准该计划？批准不会自动执行任何文件修改。",
+                            Language::En =>
+                                "Approve this plan? Approval does not auto-execute any file modifications.",
+                        }
+                    );
+                    let result = dialog::run(terminal, events, Some(app), |ui| async move {
+                        ui.choose(prompt, &choices).await
+                    })
+                    .await;
+                    app.overlay = None;
+                    let confirmed = matches!(result.as_deref(), Ok("确认批准") | Ok("Approve"));
+                    if !confirmed {
+                        continue;
+                    }
+                }
+                if let Err(error) = backend.send(BackendCommand::Plan(action)) {
+                    app.error = Some(error);
                 }
             }
             Effect::ConfirmDeleteSession(session_id) => {
@@ -843,6 +901,32 @@ fn submit_or_command(app: &mut AppState, trust: &SessionTrust) -> Vec<Effect> {
                 Language::En => Language::ZhCn,
             };
             app.reduce(AppEvent::SwitchLanguage(language))
+        }
+        "/plan" => {
+            app.composer.clear();
+            let sub = raw_command
+                .find(char::is_whitespace)
+                .map(|index| raw_command[index..].trim())
+                .unwrap_or("");
+            let action = match sub {
+                "" | "enter" => crate::tui::backend::PlanAction::Enter,
+                "status" => crate::tui::backend::PlanAction::Status,
+                "submit" => crate::tui::backend::PlanAction::Submit,
+                "approve" => crate::tui::backend::PlanAction::Approve,
+                "exit" => crate::tui::backend::PlanAction::Exit,
+                other => {
+                    app.error = Some(match app.language {
+                        Language::ZhCn => format!(
+                            "未知的 /plan 子命令：{other}（可用：status/enter/submit/approve/exit）"
+                        ),
+                        Language::En => format!(
+                            "Unknown /plan subcommand: {other} (available: status/enter/submit/approve/exit)"
+                        ),
+                    });
+                    return Vec::new();
+                }
+            };
+            vec![Effect::PlanAction(action)]
         }
         "/approve" => {
             app.composer.clear();

@@ -18,9 +18,10 @@ pub use lato_core::ApprovalRequest;
 use lato_core::{
     AgentError, CompactionPolicy, CompactionTrigger, ContextUsage, ExtensionAuditRecord,
     HookAuditOutcome, HookAuditPhase, JournalDurability, JournalRecord, McpAuditOutcome,
-    ModelContent, ModelErrorKind, ModelMessage, ModelRole, PolicyAuditDecision, PolicyAuditStage,
-    PolicyDecision, Retryability, SessionId, SkillInvocationOrigin, ToolCallId, ToolContext,
-    ToolError, ToolName, TurnId, journal_request_hash,
+    ModelContent, ModelErrorKind, ModelMessage, ModelRole, PLAN_APPROVAL_STALE_CODE,
+    PolicyAuditDecision, PolicyAuditStage, PolicyDecision, Retryability, SessionId,
+    SkillInvocationOrigin, ToolCallId, ToolContext, ToolError, ToolName, TurnId,
+    journal_request_hash,
 };
 use lato_extensions::{hooks::HookRegistry, skills::SkillCatalog};
 use lato_runtime::{
@@ -113,6 +114,7 @@ pub struct SessionActor {
     journal_events: Option<TurnEventEmitter>,
     context_tracker: ContextTracker,
     prefire: PrefireSlot,
+    plan_slot: Arc<std::sync::OnceLock<Arc<crate::plan::PlanModeRuntime>>>,
     #[cfg(test)]
     pub(crate) on_after_persist: Option<Box<dyn Fn() + Send + Sync>>,
     #[cfg(test)]
@@ -195,6 +197,7 @@ impl SessionActor {
             journal_events: None,
             context_tracker: ContextTracker::default(),
             prefire: PrefireSlot::Empty,
+            plan_slot: Arc::new(std::sync::OnceLock::new()),
             #[cfg(test)]
             on_after_persist: None,
             #[cfg(test)]
@@ -212,6 +215,18 @@ impl SessionActor {
         self.events = Some((events, session_id));
         self.tool_approval = approval;
         self
+    }
+
+    /// Attaches the session Plan-mode runtime: one shared flag now drives the
+    /// policy overlay, the model catalog, and the TOCTOU mutation guard.
+    /// Idempotent; later attaches are ignored (one slot per session).
+    pub fn attach_plan(&mut self, plan: Arc<crate::plan::PlanModeRuntime>) {
+        self.tool_runtime.adopt_plan_mode_flag(plan.plan_flag());
+        let _ = self.plan_slot.set(plan);
+    }
+
+    fn plan(&self) -> Option<&Arc<crate::plan::PlanModeRuntime>> {
+        self.plan_slot.get()
     }
 
     pub async fn prompt(&mut self, kind: PromptKind, text: String) -> Result<TurnOutcome, String> {
@@ -370,6 +385,30 @@ impl SessionActor {
         self.context_tracker.on_new_turn();
         self.emit_suppression_if_changed(previous_suppression);
         let task_requires_workspace_change = task_requires_workspace_change(&text);
+        // Plan mode states its restriction once per turn in the system prompt
+        // (spec §4); the block replaces any earlier one from the same session.
+        if let Some(plan) = self.plan() {
+            let status = plan.status().await;
+            if status.phase.plan_mode_active() {
+                let block = format!(
+                    "[Plan mode]\nPlan mode is active: you may only inspect the workspace and draft the plan. The only permitted mutation is the plan_draft tool, which writes {} exclusively. Every other file write, search_replace, terminal command, subagent/task/workflow spawn, and MCP/plugin tool is denied. Model output never advances the plan state machine; the user drives submit and approval with /plan commands.",
+                    plan.plan_path().display()
+                );
+                let mut replaced = false;
+                for item in self.history.iter_mut() {
+                    if let HistoryItem::System(existing) = item
+                        && existing.starts_with("[Plan mode]")
+                    {
+                        *existing = block.clone();
+                        replaced = true;
+                        break;
+                    }
+                }
+                if !replaced {
+                    self.history.push(HistoryItem::System(block));
+                }
+            }
+        }
         self.history.push(HistoryItem::User(text));
         if let Some(audit) = self.skill_catalog_audit.clone() {
             self.commit(
@@ -1147,9 +1186,63 @@ impl SessionActor {
             && tool_runtime
                 .descriptor_for_wire_name(&name)
                 .is_some_and(|descriptor| descriptor.name.local_name() == "skill");
+        // Plan approval TOCTOU check #1 — before ordinary policy preparation
+        // (spec §3). One plan-mutex acquisition; the lock never crosses an
+        // await. Only mutation-capable calls are guarded.
+        let mut plan_guard: Option<(u64, u64, String)> = None;
+        let mut plan_preflight_error: Option<ToolError> = None;
+        if let Some(plan) = self.plan() {
+            let mutation_capable =
+                tool_runtime
+                    .descriptor_for_wire_name(&name)
+                    .is_some_and(|descriptor| {
+                        matches!(
+                            descriptor.side_effect,
+                            lato_core::SideEffect::WorkspaceMutation
+                                | lato_core::SideEffect::ExternalMutation
+                        ) || descriptor.capabilities.iter().any(|capability| {
+                            matches!(
+                                capability,
+                                lato_core::ToolCapability::FileWrite
+                                    | lato_core::ToolCapability::ProcessSpawn
+                                    | lato_core::ToolCapability::NetworkWrite
+                                    | lato_core::ToolCapability::TaskControl
+                                    | lato_core::ToolCapability::ExtensionInvoke
+                            )
+                        })
+                    });
+            if mutation_capable {
+                match plan.begin_mutation_preflight().await {
+                    crate::plan::MutationPreflight::Guarded {
+                        activation,
+                        generation,
+                        content_hash,
+                    } => plan_guard = Some((activation, generation, content_hash)),
+                    crate::plan::MutationPreflight::NotGuarded => {}
+                    crate::plan::MutationPreflight::Denied { code, revocation } => {
+                        self.commit(
+                            JournalRecord::PlanApprovalRevoked {
+                                activation: revocation.activation,
+                                generation: revocation.generation,
+                                reason: code.to_owned(),
+                            },
+                            JournalDurability::Flush,
+                        )
+                        .await?;
+                        plan_preflight_error = Some(ToolError::new(
+                            code,
+                            "the approved plan changed; approval was revoked and the session returned to Revising",
+                            Retryability::Never,
+                        ));
+                    }
+                }
+            }
+        }
         let prepared = if let Err(error) = initial_validation {
             Err(error)
         } else if let Some(error) = pre_hook_error {
+            Err(error)
+        } else if let Some(error) = plan_preflight_error {
             Err(error)
         } else if skill_is_unbound {
             Err(ToolError::new(
@@ -1300,7 +1393,38 @@ impl SessionActor {
                     JournalDurability::SyncData,
                 )
                 .await?;
-                let mut result = tool_runtime.execute_authorized(prepared, grant).await;
+                // Plan approval TOCTOU check #2 — immediately before this
+                // call's grant is consumed (spec §3/§6): the session must
+                // still be Approved with the same activation, generation, and
+                // plan hash captured at check #1.
+                let mut result = if let (Some(plan), Some((activation, generation, hash))) =
+                    (self.plan(), &plan_guard)
+                {
+                    match plan
+                        .complete_mutation_preflight(*activation, *generation, hash)
+                        .await
+                    {
+                        Ok(()) => tool_runtime.execute_authorized(prepared, grant).await,
+                        Err(revocation) => {
+                            self.commit(
+                                JournalRecord::PlanApprovalRevoked {
+                                    activation: revocation.activation,
+                                    generation: revocation.generation,
+                                    reason: PLAN_APPROVAL_STALE_CODE.to_owned(),
+                                },
+                                JournalDurability::Flush,
+                            )
+                            .await?;
+                            Err(ToolError::new(
+                                PLAN_APPROVAL_STALE_CODE,
+                                "the approved plan changed after preparation; approval was revoked and the session returned to Revising",
+                                Retryability::Never,
+                            ))
+                        }
+                    }
+                } else {
+                    tool_runtime.execute_authorized(prepared, grant).await
+                };
                 if canonical_builtin_skill && let Ok(output) = &result {
                     result =
                         compile_skill_scope(canonical_builtin_skill, output, tool_runtime.as_ref())
