@@ -1439,7 +1439,7 @@ mod tests {
             struct SwapAfterCheckOk {
                 workspace_root: PathBuf,
                 temp_name: String,
-                swapped_path: std::sync::Mutex<Option<String>>,
+                swapped_path: std::sync::Arc<std::sync::Mutex<Option<String>>>,
             }
             impl PlanDraftFaults for SwapAfterCheckOk {
                 fn on_stage(&self, stage: PlanDraftStage) -> Result<(), String> {
@@ -1603,9 +1603,8 @@ mod tests {
 
             let name = pinned_temp_name("swap");
             struct SwapAfterCheck {
-                workspace_root: PathBuf,
                 temp_name: String,
-                reap_path: std::sync::Mutex<Option<String>>,
+                reap_path: std::sync::Arc<std::sync::Mutex<Option<String>>>,
             }
             impl PlanDraftFaults for SwapAfterCheck {
                 fn on_stage(&self, stage: PlanDraftStage) -> Result<(), String> {
@@ -1630,7 +1629,6 @@ mod tests {
                 &root,
                 "replacement",
                 &SwapAfterCheck {
-                    workspace_root: root.clone(),
                     temp_name: name.clone(),
                     reap_path: reap_path.clone(),
                 },
