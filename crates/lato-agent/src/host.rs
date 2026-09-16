@@ -550,33 +550,11 @@ impl AcpHost {
     }
 
     async fn make_new_runtime_session(&mut self, sid: &str) -> Result<Arc<RuntimeSession>, String> {
-        let Some(events) = &self.events else {
-            return self.make_runtime_session(sid, None).await;
-        };
-        let session_id = SessionId::from(sid);
-        events
-            .append(
-                lato_core::JournalEnvelope {
-                    schema_version: lato_core::JOURNAL_SCHEMA_VERSION,
-                    record_id: lato_core::JournalRecordId::from(format!("{sid}-journal-0")),
-                    session_id: session_id.clone(),
-                    turn_id: None,
-                    journal_sequence: 0,
-                    timestamp_ms: std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis() as u64,
-                    record: lato_core::JournalRecord::SessionStarted,
-                },
-                lato_core::JournalDurability::SyncData,
-            )
-            .await
-            .map_err(|error| error.to_string())?;
-        let replay = events
-            .replay(&session_id)
-            .await
-            .map_err(|error| error.to_string())?;
-        self.make_runtime_session(sid, Some(replay)).await
+        // Single journal-ownership contract: the host never appends journal
+        // records itself. The runtime session loop owns the first record
+        // (`SessionStarted` at sequence 0) and every later sequence; this
+        // method only constructs the loop with an empty replay.
+        self.make_runtime_session(sid, None).await
     }
 
     async fn prepare_model_endpoint(

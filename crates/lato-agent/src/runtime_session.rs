@@ -575,6 +575,10 @@ impl RuntimeSession {
             store,
             SessionBootstrap { replay },
         );
+        // The session loop owns the journal's first record; wait for its
+        // startup bootstrap so the journal contract is settled (or the
+        // structured error surfaces) before the session becomes callable.
+        handle.await_started().await?;
         Ok(Self {
             session_id,
             handle,
