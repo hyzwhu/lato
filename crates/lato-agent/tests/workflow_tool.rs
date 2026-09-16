@@ -619,3 +619,357 @@ async fn persistence_failure_rolls_back_with_stable_code() {
         "failed launches must not leave ghost runs"
     );
 }
+
+// ---- TG-7B7-02: acceptance coverage gaps (round-1 rework) ----
+
+use lato_core::Retryability;
+use tokio_util::sync::CancellationToken;
+
+/// AC-02 dedicated: a guessed (never-listed) name cannot be started and
+/// reports the stable `workflow.not_found` code with zero side effects.
+#[tokio::test]
+async fn guessed_names_fail_with_workflow_not_found() {
+    let fixture = ToolFixture::new();
+    fixture.write_user("review", &hang_script("review"));
+    let (tool, manager) = tool_manager(&fixture, None);
+
+    // The guessed name is absent from the listing.
+    let listed = tool
+        .invoke(tool_context(), serde_json::json!({"action":"list"}))
+        .await
+        .unwrap();
+    let listed = serde_json::from_str::<serde_json::Value>(&listed.content).unwrap();
+    assert!(
+        listed["workflows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|entry| entry["id"] != "phantom")
+    );
+
+    let error = tool
+        .invoke(
+            tool_context(),
+            serde_json::json!({"action":"start","name":"phantom","revision":"0".repeat(64),"agentBudget":8}),
+        )
+        .await
+        .expect_err("guessed names must not launch");
+    assert_eq!(error.code, "workflow.not_found");
+    assert_eq!(error.retryability, Retryability::Never);
+    assert!(manager.list().is_empty());
+}
+
+/// D-7B7-01: pre-policy schema rejections for the workflow tool report the
+/// domain-stable `workflow.invalid_arguments` code, never the generic
+/// `tool.invalid_arguments`, and never reach approval or invoke.
+#[tokio::test]
+async fn pre_policy_schema_rejections_report_workflow_invalid_arguments() {
+    let fixture = ToolFixture::new();
+    fixture.write_user("review", &hang_script("review"));
+    let (tool, manager) = tool_manager(&fixture, None);
+
+    let policy = Arc::new(PolicyEngine::new(Arc::new(ApprovalLedger::new(
+        Duration::from_secs(60),
+    ))));
+    let mut builder = ToolRuntimeBuilder::new(
+        policy,
+        PolicyScope {
+            workspace_root: fixture.cwd.clone(),
+            mode: PolicyMode::Ask,
+            project_trusted: false,
+            sandbox_profile: SandboxProfile::Off,
+        },
+    );
+    builder.set_argument_error_code(
+        lato_core::ToolName::parse("builtin:workflow").unwrap(),
+        "workflow.invalid_arguments",
+    );
+    builder.register(Arc::new(tool)).unwrap();
+    let runtime = builder.build().unwrap();
+
+    for arguments in [
+        serde_json::json!({"action":"list","unexpected":true}),
+        serde_json::json!({"action":"start"}),
+        serde_json::json!({"action":"status","args":{}}),
+    ] {
+        let error = runtime
+            .invoke(tool_context(), "workflow", arguments)
+            .await
+            .expect_err("schema violations must be rejected pre-policy");
+        assert_eq!(error.code, "workflow.invalid_arguments");
+    }
+    assert!(manager.list().is_empty());
+}
+
+/// AC-07 (v1.2): two genuinely concurrent `start` calls race the atomic
+/// 4-active limit — the loser gets the stable error and `active_count` never
+/// exceeds 4.
+#[tokio::test]
+async fn concurrent_starts_respect_the_atomic_four_active_limit() {
+    let fixture = ToolFixture::new();
+    fixture.write_user("hang", &hang_script("hang"));
+    let (_tool, manager) = tool_manager(&fixture, None);
+    let resolved = lato_agent::workflow::resolve_workflow(
+        &fixture.cwd,
+        &fixture.home,
+        &manager.snapshot().unwrap(),
+        false,
+        "hang",
+    )
+    .unwrap();
+
+    // Three active runs already.
+    for _ in 0..3 {
+        manager
+            .launch(
+                resolved.clone(),
+                lato_agent::workflow::LaunchSpec {
+                    args: serde_json::json!({}),
+                    agent_budget: Some(8),
+                    resume_display_name: None,
+                },
+            )
+            .unwrap();
+    }
+    assert_eq!(
+        manager
+            .list()
+            .iter()
+            .filter(|r| r.status == lato_agent::workflow::WorkflowRunStatus::Active)
+            .count(),
+        3
+    );
+
+    // Two genuinely concurrent starts (OS threads, like two tool calls racing
+    // the same manager) fight for the last slot; the manager's launch lock
+    // makes the 4-active check atomic.
+    let racer = |resolved: lato_agent::workflow::ResolvedWorkflow| {
+        let manager = manager.clone();
+        tokio::task::spawn_blocking(move || {
+            manager.launch(
+                resolved,
+                lato_agent::workflow::LaunchSpec {
+                    args: serde_json::json!({}),
+                    agent_budget: Some(8),
+                    resume_display_name: None,
+                },
+            )
+        })
+    };
+    let (first, second) = tokio::join!(racer(resolved.clone()), racer(resolved.clone()));
+    let outcomes = [first.unwrap(), second.unwrap()];
+    let succeeded = outcomes.iter().filter(|result| result.is_ok()).count();
+    let rejected = outcomes
+        .iter()
+        .filter_map(|result| result.as_ref().err())
+        .filter(|error| matches!(error, lato_agent::workflow::LaunchError::TooManyActiveRuns))
+        .count();
+    assert_eq!(succeeded, 1, "exactly one racer wins the last slot");
+    assert_eq!(rejected, 1, "the loser gets the stable too-many error");
+    let active = manager
+        .list()
+        .iter()
+        .filter(|run| run.status == lato_agent::workflow::WorkflowRunStatus::Active)
+        .count();
+    assert_eq!(active, 4, "the atomic limit is never exceeded");
+}
+
+/// §9.1 #5: catalog changes from every source (project script, plugin
+/// snapshot) invalidate the listed revision — `workflow.catalog_changed`,
+/// zero runs. (User-source coverage lives in the tool unit tests.)
+#[tokio::test]
+async fn catalog_changed_covers_project_and_plugin_sources() {
+    // Project source.
+    let fixture = ToolFixture::new();
+    let project_dir = fixture.cwd.join(".lato").join("workflows");
+    std::fs::create_dir_all(&project_dir).unwrap();
+    std::fs::write(project_dir.join("projw.rhai"), hang_script("projw")).unwrap();
+    let (_tool, manager) = tool_manager(&fixture, None);
+    // tool_manager built the snapshot untrusted; rebuild trusted so the
+    // project workflow is visible.
+    let snapshot = lato_extensions::build_snapshot(
+        2,
+        lato_extensions::discover_plugins(&lato_extensions::DiscoveryConfig {
+            cwd: fixture.cwd.clone(),
+            lato_home: fixture.home.clone(),
+            cli_plugin_dirs: Vec::new(),
+            project_trusted: true,
+        }),
+        &lato_extensions::PluginConfig::default(),
+    )
+    .unwrap();
+    manager.set_snapshot(snapshot);
+    let trust = Trust::for_interactive(&fixture.cwd, true);
+    let trusted_handle =
+        SessionWorkflowHandle::new(fixture.cwd.clone(), fixture.home.clone(), trust.clone());
+    trusted_handle.install(manager.clone());
+    let tool = WorkflowTool::new(trusted_handle);
+
+    let listed = tool
+        .invoke(tool_context(), serde_json::json!({"action":"list"}))
+        .await
+        .unwrap();
+    let listed = serde_json::from_str::<serde_json::Value>(&listed.content).unwrap();
+    let entry = listed["workflows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["id"] == "projw")
+        .expect("trusted project workflow is listed")
+        .clone();
+    let stale_revision = entry["revision"].as_str().unwrap().to_owned();
+
+    // Change the project script after listing.
+    std::fs::write(
+        project_dir.join("projw.rhai"),
+        format!("{}\n// tampered", hang_script("projw")),
+    )
+    .unwrap();
+    let error = tool
+        .invoke(
+            tool_context(),
+            serde_json::json!({"action":"start","name":"projw","revision":stale_revision,"agentBudget":8}),
+        )
+        .await
+        .expect_err("project-source change must invalidate the revision");
+    assert_eq!(error.code, "workflow.catalog_changed");
+    assert!(manager.list().is_empty());
+
+    // Plugin source: the descriptor's declared budget changes → new revision.
+    let plugin_fixture = ToolFixture::new();
+    let plugin_root = plugin_fixture.home.join("plugins").join("demo");
+    std::fs::create_dir_all(&plugin_root).unwrap();
+    std::fs::write(
+        plugin_root.join("plugin.json"),
+        r#"{"name":"demo","workflows":{"plugw":{"description":"Demo","agentBudget":16}}}"#,
+    )
+    .unwrap();
+    let (tool, manager) = tool_manager(&fixture, None);
+    let plugin_snapshot = lato_extensions::build_snapshot(
+        3,
+        lato_extensions::discover_plugins(&lato_extensions::DiscoveryConfig {
+            cwd: fixture.cwd.clone(),
+            lato_home: fixture.home.clone(),
+            cli_plugin_dirs: vec![plugin_root.clone()],
+            project_trusted: true,
+        }),
+        &lato_extensions::PluginConfig::default(),
+    )
+    .unwrap();
+    manager.set_snapshot(plugin_snapshot);
+    let listed = tool
+        .invoke(tool_context(), serde_json::json!({"action":"list"}))
+        .await
+        .unwrap();
+    let listed = serde_json::from_str::<serde_json::Value>(&listed.content).unwrap();
+    let entry = listed["workflows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["id"] == "demo/plugw")
+        .expect("plugin workflow is listed")
+        .clone();
+    let stale_revision = entry["revision"].as_str().unwrap().to_owned();
+
+    // The plugin changes its declared budget after listing; the session
+    // adopts the new snapshot.
+    std::fs::write(
+        plugin_root.join("plugin.json"),
+        r#"{"name":"demo","workflows":{"plugw":{"description":"Demo","agentBudget":24}}}"#,
+    )
+    .unwrap();
+    let plugin_snapshot = lato_extensions::build_snapshot(
+        4,
+        lato_extensions::discover_plugins(&lato_extensions::DiscoveryConfig {
+            cwd: fixture.cwd.clone(),
+            lato_home: fixture.home.clone(),
+            cli_plugin_dirs: vec![plugin_root],
+            project_trusted: true,
+        }),
+        &lato_extensions::PluginConfig::default(),
+    )
+    .unwrap();
+    manager.set_snapshot(plugin_snapshot);
+
+    let error = tool
+        .invoke(
+            tool_context(),
+            serde_json::json!({"action":"start","name":"demo/plugw","revision":stale_revision,"agentBudget":16}),
+        )
+        .await
+        .expect_err("plugin-source change must invalidate the revision");
+    assert_eq!(error.code, "workflow.catalog_changed");
+    assert!(manager.list().is_empty());
+}
+
+/// §9.1 #9: cancelling the tool call AFTER a successful launch does not stop
+/// the run — it keeps streaming updates in the background.
+#[tokio::test]
+async fn post_launch_cancellation_does_not_stop_the_run() {
+    let fixture = ToolFixture::new();
+    fixture.write_user("hang", &hang_script("hang"));
+    let (tool, manager) = tool_manager(&fixture, None);
+    let resolved = lato_agent::workflow::resolve_workflow(
+        &fixture.cwd,
+        &fixture.home,
+        &manager.snapshot().unwrap(),
+        false,
+        "hang",
+    )
+    .unwrap();
+    let revision = workflow_revision(&resolved);
+
+    let mut context = tool_context();
+    let token = CancellationToken::new();
+    context.cancellation = token.clone();
+    let output = tool
+        .invoke(context, start_arguments("hang", &revision))
+        .await
+        .unwrap();
+    let run_id =
+        serde_json::from_str::<serde_json::Value>(&output.content).unwrap()["run"]["runId"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+    // Cancel the tool call after launch succeeded.
+    token.cancel();
+
+    // The run is NOT stopped: it stays active well past the cancellation.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let run = manager
+        .list()
+        .into_iter()
+        .find(|run| run.run_id == run_id)
+        .expect("run still exists");
+    assert_eq!(
+        run.status,
+        lato_agent::workflow::WorkflowRunStatus::Active,
+        "tool-call cancellation must not stop a launched run"
+    );
+}
+
+/// §9.1 #9: after session close (manager shutdown) every late model-tool
+/// call fails closed with `workflow.unavailable`.
+#[tokio::test]
+async fn late_calls_after_session_close_fail_closed() {
+    let fixture = ToolFixture::new();
+    fixture.write_user("hang", &hang_script("hang"));
+    let workflows_dir = fixture.home.join("wf-close");
+    let (tool, manager) = tool_manager(&fixture, Some(workflows_dir.clone()));
+
+    manager.shutdown().await;
+    assert!(manager.is_closed());
+
+    for arguments in [
+        serde_json::json!({"action":"list"}),
+        serde_json::json!({"action":"start","name":"hang","revision":"0".repeat(64),"agentBudget":8}),
+        serde_json::json!({"action":"status"}),
+    ] {
+        let error = tool
+            .invoke(tool_context(), arguments)
+            .await
+            .expect_err("late calls after close must fail closed");
+        assert_eq!(error.code, "workflow.unavailable");
+    }
+}
