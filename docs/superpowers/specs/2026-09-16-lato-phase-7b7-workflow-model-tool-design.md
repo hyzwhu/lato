@@ -3,7 +3,7 @@
 | 字段 | 值 |
 | --- | --- |
 | 状态 | **已冻结，待实现** |
-| 规格版本 | v1.0 |
+| 规格版本 | v1.2（冻结三种 PolicyMode、真实拒绝路径与 grant 消费时序） |
 | 日期 | 2026-09-16 |
 | 适用版本 | `origin/master` ≥ `86cd365`（包含 7B5/7B6） |
 | 目标版本 | Phase 7B7；具体发行版本待确认 |
@@ -92,16 +92,27 @@ TUI/ACP 发起，避免模型自行恢复已被用户暂停的工作或停止用
     "action": { "type": "string", "enum": ["list", "start", "status"] },
     "name": { "type": "string", "minLength": 1, "maxLength": 256 },
     "run": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "revision": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
     "args": { "type": "object" },
     "agentBudget": { "type": "integer", "minimum": 1 }
   },
-  "required": ["action"]
+  "required": ["action"],
+  "oneOf": [
+    { "properties": { "action": { "const": "list" } },
+      "not": { "anyOf": [{"required":["name"]},{"required":["run"]},{"required":["revision"]},{"required":["args"]},{"required":["agentBudget"]}] } },
+    { "properties": { "action": { "const": "start" } },
+      "required": ["name", "revision", "agentBudget"],
+      "not": { "required": ["run"] } },
+    { "properties": { "action": { "const": "status" } },
+      "not": { "anyOf": [{"required":["name"]},{"required":["revision"]},{"required":["args"]},{"required":["agentBudget"]}] } }
+  ]
 }
 ```
 
-条件约束由 invoke 层二次校验：`start` 必须有 `name`，可带 `args` 和
-`agentBudget`；`status` 可带 `run`；`list` 不接受其余字段。未知字段或错误组合返回
-`workflow.invalid_arguments`，绝不猜测或忽略。
+action 条件必须编码进 JSON schema，使错误组合在 pre-policy validation 阶段即失败；invoke 再做
+defense-in-depth 校验。`start` 必须有 `name`、`revision` 和 `agentBudget`，可带 `args`；`status`
+可带 `run`；`list` 不接受其余字段。未知字段或错误组合返回 `workflow.invalid_arguments`，绝不猜测
+或忽略，也不得先申请审批再报告参数错误。
 
 ### 4.2 `list`
 
@@ -116,25 +127,36 @@ TUI/ACP 发起，避免模型自行恢复已被用户暂停的工作或停止用
     "name": "review-changes",
     "description": "Review a diff",
     "source": "plugin",
-    "agentBudget": 32
+    "agentBudget": 32,
+    "revision": "<64-char lowercase sha256>"
   }],
   "truncated": false
 }
 ```
 
-不返回 script 正文、磁盘绝对路径、插件秘密或未通过 trust 筛选的项目定义。
+不返回 script 正文、磁盘绝对路径、插件秘密或未通过 trust 筛选的项目定义。`revision` 是
+`SHA-256(canonical JSON { id, source, script, declaredAgentBudget })` 的小写十六进制值；它是
+内容身份，不是秘密。canonical JSON 必须复用现有 canonical serializer，字段顺序固定，不得
+使用调试格式或平台相关路径。
 
 ### 4.3 `start`
 
-1. 在当前 turn 固定的 plugin snapshot 上调用现有 `resolve_workflow`；名称解析、重复短名、
-   项目信任规则完全复用 registry。
-2. `args` 缺省 `{}`；必须是 JSON object，序列化后最大 64 KiB。
-3. `agentBudget` 缺省使用 workflow 声明值；显式值复用 `clamp_agent_budget`，不得超出引擎上限。
-4. policy 对 descriptor + 精确参数做决策。受现有 `ToolDescriptor` 静态 side-effect 元数据约束，
-   v1 的三个 action 都走普通 human approval 路径；`start` 的审批摘要至少
-   显示 resolved workflow id、来源、预算和 args 摘要。审批只授权这一次、这一组规范化参数，
-   不扩大 sandbox/trust。
-5. grant 消耗后，调用当前 `RuntimeSession::workflow_launch`；由它取得当前 snapshot 并调用同一
+1. 模型必须把最近一次 `list` 返回的 qualified `id`、`revision` 和显式 `agentBudget` 原样带入
+   `start`。`ToolRuntime` 在 invoke 之前对这组原始 canonical 参数生成 policy fingerprint；
+   不把 invoke 后才得到的数据假装绑定进旧 fingerprint。
+2. invoke 在当前 turn 固定的 plugin snapshot 上调用现有 `resolve_workflow`；名称解析、重复短名、
+   项目信任规则完全复用 registry。重新计算 revision 并常量时间比较；不一致返回
+   `workflow.catalog_changed`，不得启动，也不得自动换成新版本。此时 `ToolRuntime::execute` 已在
+   进入 `Tool::invoke` 前一次性消费 grant；run 保持零副作用，已消费 grant 不得恢复或再次使用。
+3. `args` 缺省 `{}`；必须是 JSON object，序列化后最大 64 KiB。
+4. `agentBudget` 必填并复用 `clamp_agent_budget`；可等于 list 的声明值，也可由模型提出其他合法值。
+   它之所以必填，是为了在 pre-policy fingerprint 中绑定最终有效预算，禁止 invoke 后补默认值。
+5. policy 对 descriptor + 原始 canonical 参数做决策。单一 descriptor 为 `external_mutation`，
+   审批行为严格沿用现有 `PolicyMode`：`Ask` 要求 human approval；`Auto` / `Always` 可自动签发
+   一次性 grant。`PolicyDecision::Deny` 是独立决策结果，不是第四种 mode；sandbox/trust 等拒绝
+   仍 fail closed。Phase 7B7 不新增绕过 policy mode 的
+   trusted external gate，也不得宣称三个 action 在所有 mode 下都必然弹出人工审批。
+6. grant 消耗后，调用当前 `RuntimeSession::workflow_launch`；由它取得当前 snapshot 并调用同一
    Manager。成功后立即返回初始 run 快照，不等待 phase 或完成。
 
 ```json
@@ -161,8 +183,9 @@ TUI/ACP 发起，避免模型自行恢复已被用户暂停的工作或停止用
 
 - `run` 可匹配精确 `runId` 或 `displayName`；同时匹配不同对象时以 `runId` 精确匹配优先。
 - 缺 `run` 时返回 Manager 最近的至多 64 条 run；顺序与 `WorkflowTracker::list` 一致。
-- 查询本身只读，但 v1 单工具共用 `external_mutation` 描述符，因此仍要求一次性 human approval；
-  后续若要免批查询，必须先另立规格支持 action-level policy metadata，不能在工具内绕过 policy。
+- 查询本身只读，但 v1 单工具共用 `external_mutation` 描述符，因此仍按当前 `PolicyMode` 处理：
+  `Ask` 下人工审批，`Auto` / `Always` 下自动 grant。后续若要按 action 区分，必须另立规格支持
+  action-level policy metadata，不能在工具内绕过 policy。
 - 未命中返回 `workflow.run_not_found`，不返回空成功。
 
 ## 5. 状态合同
@@ -212,9 +235,10 @@ RuntimeSession
 ### 7.1 权限拦截
 
 1. 单一 `workflow` descriptor 静态标记为外部副作用，因此 `list/status/start` 均经 ToolRuntime
-   显式审批。实现不得把 descriptor 标成只读后在 `start` 内产生未授权副作用。
-2. 项目 workflow 仅在 `cwd_trusted()` 时可发现/解析；插件必须受信且启用。用户 workflow 也不
-   因来源可信而跳过 `start` 审批。
+   policy。`Ask` 要求显式审批，`Auto` / `Always` 自动 grant；实现不得把 descriptor 标成只读后
+   在 `start` 内产生未授权副作用，也不得在工具内部强制覆盖用户的 policy mode。
+2. 项目 workflow 仅在 `cwd_trusted()` 时可发现/解析；插件必须受信且启用。来源可信不绕过
+   ToolRuntime policy decision；是否弹出人工审批仍由 policy mode 决定。
 3. workflow 内部每个 host/tool 动作继续走既有 sandbox、trust、approval 与预算；外层批准不
    是内部动作的万能许可。
 4. 子会话不得通过继承一个可用的 `WorkflowTool` 扩权；主会话专属注册需有回归测试。
@@ -227,7 +251,7 @@ RuntimeSession
 | `workflow.invalid_arguments` | schema 条件、args 大小/类型、预算不合法 | 修参后可重试 |
 | `workflow.not_found` | named script 不存在或对当前 trust 不可见 | 否 |
 | `workflow.duplicate_name` | 短名歧义 | 用 qualified id 可重试 |
-| `workflow.permission_denied` | policy/用户审批拒绝 | 由用户决定 |
+| `workflow.catalog_changed` | list 后脚本/来源/声明预算内容身份改变 | 重新 list 后可重试 |
 | `workflow.unavailable` | session 未绑定 Manager/正在 teardown | 否 |
 | `workflow.too_many_active_runs` | 已有 4 个 active run | 状态变化后可重试 |
 | `workflow.persistence_failed` | 7B5 launch 落盘失败并回滚 | 修复环境后可重试 |
@@ -237,12 +261,21 @@ RuntimeSession
 错误不得泄露绝对路径、脚本内容、approval token 或模型密钥。日志可记录 session id、run id、
 action、错误码和耗时，不记录完整 args。
 
+Policy 拒绝码不重写成 `workflow.*`：Ask 模式下用户/approval callback 拒绝的真实稳定码是
+`policy.approval_denied`；构造非法 sandbox obligation（例如 read-only profile 带 writable root）
+时，`PolicyDecision::Deny` 的真实稳定码是 `sandbox.unsupported`。后者只用于 policy seam 的
+focused test，不是用户可选的“Deny mode”。上述两条均必须在进入 `WorkflowTool::invoke` 前失败，
+run、目录和 journal 为零新增。Phase 7B7 不定义 `workflow.permission_denied`，不得用领域错误吞掉
+或改写现有 policy 稳定码。
+
 ### 7.3 边界与异常流程
 
 - 同名 workflow：短名失败并提示 qualified id，绝不任选一个。
 - 并发启动：Manager 原子执行 4-active 上限；两个 tool calls 不可绕过。
-- 审批期间 snapshot 改变：approval fingerprint 绑定 resolved id/source/args/budget；执行前若 generation
-  或解析结果变化，作废批准并返回 `workflow.catalog_changed`，不启动旧/新任一版本。
+- list 与 start 之间内容改变：pre-policy fingerprint 绑定模型提交的 qualified id/revision/args/budget；
+  invoke 重新 resolve 并计算内容 revision。任何差异返回 `workflow.catalog_changed`，不启动旧/新
+  任一版本。用户/项目文件没有 catalog generation 也能由内容 digest 覆盖；plugin snapshot generation
+  可作诊断字段，但不能替代 revision。
 - persistence 失败：沿用 7B5 全回滚，工具返回失败且 `status` 不得出现幽灵 run。
 - session close：沿用 shutdown → interrupted；晚到工具调用返回 unavailable。
 - 输出过长：列表优先按条目边界截断并置 `truncated=true`；单个字段仍超限则返回稳定错误。
@@ -250,8 +283,9 @@ action、错误码和耗时，不记录完整 args。
 ## 8. 主流程
 
 1. 模型调用 `workflow {"action":"list"}`，只看到当前可信 registry。
-2. 模型选择 id，调用 `start`；UI 展示精确审批摘要。
-3. 用户批准；ToolRuntime 发放并消费一次性 grant；session 调用同一 Manager。
+2. 模型选择 qualified id，并携带 list 的 revision、显式预算和 args 调用 `start`。
+3. ToolRuntime 按 policy mode 决策：Ask 下用户批准，Auto/Always 下自动签发；一次性 grant 被消费后，
+   invoke 重验 revision，session 才调用同一 Manager。
 4. 工具立即返回 `active` 快照，主 turn 可继续；后台 updates 正常到达 TUI/ACP。
 5. 后续 turn 调用 `status`，看到 `paused` / `completed` / `interrupted` 及 detail。
 
@@ -264,10 +298,14 @@ action、错误码和耗时，不记录完整 args。
 
 1. descriptor/schema：wire name 唯一；三 action 与条件参数；未知字段、非 object args、>64 KiB 拒绝。
 2. list trust matrix：user 可见；untrusted project/plugin 不可见；trusted+enabled 可见；重复短名行为一致。
-3. start happy path：一次审批只启动一次，返回 active，主 turn 不等待 workflow 完成。
+3. start happy path：一次 grant 只启动一次，Ask/Auto/Always 三种 mode 矩阵正确，返回 active，主 turn不等待完成。
 4. 同一 Manager：TUI/ACP 启动的 run 可被 tool `status` 看见，tool 启动的 run 出现在既有 board/update；
    断言没有第二个 Manager/turn loop。
-5. permission matrix：拒批零副作用；旧/篡改 grant 失败；sandbox/trust 不扩大；内部 host 工具仍独立过膜。
+5. permission matrix：Ask + approval=false → `policy.approval_denied` 且零副作用；Auto/Always 自动 grant；
+   非法 sandbox obligation → `PolicyDecision::Deny("sandbox.unsupported")` 且不进入 invoke；旧/篡改 grant
+   失败；list 后修改 user/project script 或 plugin snapshot 均触发 catalog_changed，且断言 grant 已消费、
+   第二次 execute 返回 `policy.grant_consumed`、run/目录/journal 仍零新增；sandbox/trust 不扩大；内部
+   host 工具仍独立过膜。
 6. lifecycle matrix：所有 11 个 detail status 准确归一到 active/paused/completed/interrupted；字段无损。
 7. concurrency：4 active 时第五次稳定失败；并发 start 不越界；查询不死锁。
 8. persistence：launch 落盘失败全回滚；resume 后 paused/interrupted run 可由同一 tool 查询。
@@ -293,7 +331,7 @@ action、错误码和耗时，不记录完整 args。
 | AC-01 | 主会话请求 tool catalog | 恰有一个 wire name `workflow`，schema 与 §4 一致 |
 | AC-02 | 未信任项目执行 list/start | 项目脚本不出现且不能按猜测名称启动 |
 | AC-03 | start 后立即观察主 turn | 20 秒内返回初始快照，主 turn 未被 workflow 占用 |
-| AC-04 | 拒绝审批后查询 runs/磁盘 | 无新增 run、目录或 journal |
+| AC-04 | 三 mode + 两条拒绝路径 | Ask 批准只新增 1 run；Ask 拒绝返回 `policy.approval_denied` 且零新增；Auto/Always 各只新增 1 run；非法 sandbox 返回 `sandbox.unsupported` 且零新增，不存在 Deny mode |
 | AC-05 | 同一 run 在 tool、TUI、ACP 查询 | runId/displayName/status/预算字段一致 |
 | AC-06 | 构造全部 detail status | 四类 status 映射逐项符合 §5 |
 | AC-07 | 4 active 后并发启动两次 | 均不造成 active_count > 4；失败码稳定 |
@@ -304,7 +342,7 @@ action、错误码和耗时，不记录完整 args。
 ## 10. 实施门槛、依赖、降级与回滚
 
 **实施门槛：** 本规格评审通过；7B5/7B6 保持在目标基线；开发者确认 ToolRuntime session binding
-方案不会引入引用环；测试能注入 fake approval 和 deterministic Manager。
+方案不会引入引用环；测试能注入 policy mode、fake approval 和 deterministic Manager。
 
 **阻塞项：** 若现有 ToolRuntime 无法安全绑定 RuntimeSession，应先增加窄的 session handle 接口；不得
 用全局状态或 ACP self-call 赶工。目标发行版本目前待确认，不阻塞代码设计。
