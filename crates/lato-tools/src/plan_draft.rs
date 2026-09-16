@@ -1673,9 +1673,13 @@ mod tests {
                 b"previous",
                 "attempt {attempt}"
             );
-            assert!(
-                leftovers(&root).is_empty(),
-                "attempt {attempt}: no residue after the restore"
+            // The only `.tmp-` entry is our own restored file (the restore
+            // target IS the temporary path), so the residue check is "the
+            // restored file and nothing else".
+            assert_eq!(
+                leftovers(&root),
+                vec![name],
+                "attempt {attempt}: only the restored file remains"
             );
         }
     }
