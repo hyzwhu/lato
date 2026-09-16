@@ -26,6 +26,7 @@ fn request() -> PolicyRequest {
                 allowed_keys: vec!["PATH".into()],
             },
         },
+        detail: None,
     }
 }
 

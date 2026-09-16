@@ -29,6 +29,7 @@ fn request(
             network: NetworkPolicy::Deny,
             environment: EnvironmentPolicy::default(),
         },
+        detail: None,
     }
 }
 

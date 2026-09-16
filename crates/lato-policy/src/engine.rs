@@ -241,8 +241,11 @@ fn requires_human_approval(request: &PolicyRequest) -> bool {
 }
 
 fn approval_summary(request: &PolicyRequest) -> String {
-    format!(
-        "{} requests {:?} access with {:?} side effects",
-        request.tool_name, request.capabilities, request.side_effect
-    )
+    match &request.detail {
+        Some(detail) => format!("{}: {}", request.tool_name, detail),
+        None => format!(
+            "{} requests {:?} access with {:?} side effects",
+            request.tool_name, request.capabilities, request.side_effect
+        ),
+    }
 }

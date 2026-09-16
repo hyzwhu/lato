@@ -285,6 +285,15 @@ impl From<ToolError> for AgentError {
 #[async_trait]
 pub trait Tool: Send + Sync {
     fn descriptor(&self) -> ToolDescriptor;
+
+    /// Optional tool-specific detail shown in the human approval summary and
+    /// bound into the approval fingerprint (Phase 7B7). Must be deterministic
+    /// for identical arguments and must not contain secrets or absolute paths.
+    fn approval_detail(&self, arguments: &Value) -> Option<String> {
+        let _ = arguments;
+        None
+    }
+
     async fn invoke(&self, context: ToolContext, arguments: Value)
     -> Result<ToolOutput, ToolError>;
 }
