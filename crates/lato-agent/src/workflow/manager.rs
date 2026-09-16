@@ -132,6 +132,13 @@ impl WorkflowManager {
         *self.core.snapshot.write().unwrap() = Some(snapshot);
     }
 
+    /// Last snapshot the session pushed to this manager. The session keeps it
+    /// fresh at every plugin adoption, so the model tool (spec §6) can resolve
+    /// catalogs synchronously without a session back-reference.
+    pub fn snapshot(&self) -> Option<Arc<PluginSnapshot>> {
+        self.core.snapshot.read().unwrap().clone()
+    }
+
     pub fn subscribe(&self) -> mpsc::UnboundedReceiver<WorkflowRunState> {
         let (tx, rx) = mpsc::unbounded_channel();
         self.core.subs.lock().unwrap().push(tx);

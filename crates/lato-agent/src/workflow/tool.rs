@@ -18,13 +18,14 @@ use semver::Version;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::WorkflowManager;
+use super::{WorkflowManager, list_workflows};
 use lato_workspace::SessionTrust;
 
 /// Wire name visible to the model (`builtin:workflow` canonical).
 pub const WORKFLOW_TOOL_WIRE_NAME: &str = "workflow";
 
 const MAX_NAME_BYTES: usize = 256;
+const MAX_LIST_ENTRIES: usize = 64;
 const MAX_OUTPUT_BYTES: usize = 64 * 1024;
 const MAX_ARGS_BYTES: usize = 64 * 1024;
 const TOOL_TIMEOUT_MS: u64 = 20_000;
@@ -150,8 +151,34 @@ impl Tool for WorkflowTool {
 }
 
 impl WorkflowTool {
-    fn list(&self, _manager: &Arc<WorkflowManager>) -> Result<ToolOutput, ToolError> {
-        Err(unavailable())
+    /// `list` (spec §4.2): the current trust/plugin snapshot's named scripts
+    /// in registry keep-first order, bounded to 64 entries and 64 KiB, with
+    /// no script bodies or disk paths.
+    fn list(&self, manager: &Arc<WorkflowManager>) -> Result<ToolOutput, ToolError> {
+        let Some(snapshot) = manager.snapshot() else {
+            return Err(unavailable());
+        };
+        let workflows = list_workflows(
+            &self.handle.cwd,
+            &self.handle.lato_home,
+            &snapshot,
+            self.handle.trust.cwd_trusted(),
+        );
+        let truncated_entries = workflows.len() > MAX_LIST_ENTRIES;
+        let entries = workflows
+            .iter()
+            .take(MAX_LIST_ENTRIES)
+            .map(|workflow| {
+                json!({
+                    "id": workflow.id,
+                    "name": workflow.display_name,
+                    "description": workflow.description,
+                    "source": workflow.source,
+                    "agentBudget": workflow.agent_budget,
+                })
+            })
+            .collect();
+        bounded_output("list", "workflows", truncated_entries, entries)
     }
 
     async fn start(
@@ -271,6 +298,47 @@ fn invalid_arguments(message: &str) -> ToolError {
     ToolError::new("workflow.invalid_arguments", message, Retryability::Never)
 }
 
+/// Entry-bounded output: when the payload exceeds the limit, drop trailing
+/// entries and flag truncation (spec §7.3). A single entry that alone exceeds
+/// the limit is a stable `workflow.output_too_large` error.
+fn bounded_output(
+    action: &str,
+    entries_key: &str,
+    already_truncated: bool,
+    mut entries: Vec<Value>,
+) -> Result<ToolOutput, ToolError> {
+    let mut truncated = already_truncated;
+    loop {
+        let value = json!({
+            "action": action,
+            entries_key: entries,
+            "truncated": truncated,
+        });
+        let size = serde_json::to_vec(&value)
+            .map_err(|error| output_error(&error.to_string()))?
+            .len();
+        if size <= MAX_OUTPUT_BYTES {
+            return Ok(ToolOutput {
+                content: value.to_string(),
+                metadata: json!({"workflowTool": action}),
+                truncated,
+                artifact_path: None,
+            });
+        }
+        if entries.is_empty() {
+            return Err(output_error(
+                "a single workflow entry exceeds the 64 KiB output limit",
+            ));
+        }
+        entries.pop();
+        truncated = true;
+    }
+}
+
+fn output_error(message: &str) -> ToolError {
+    ToolError::new("workflow.output_too_large", message, Retryability::Never)
+}
+
 fn cancelled() -> ToolError {
     ToolError::new(
         "tool.cancelled",
@@ -283,6 +351,7 @@ fn cancelled() -> ToolError {
 mod tests {
     use super::*;
     use lato_core::{SessionId, ToolCallId, TurnId};
+    use lato_extensions::PluginSnapshot;
     use tokio_util::sync::CancellationToken;
 
     fn context() -> ToolContext {
@@ -375,12 +444,154 @@ mod tests {
     #[tokio::test]
     async fn cancelled_call_never_reaches_the_manager() {
         let tool = tool();
-        let mut context = context();
+        let context = context();
         context.cancellation.cancel();
         let error = tool
             .invoke(context, json!({"action":"list"}))
             .await
             .expect_err("cancelled before dispatch");
         assert_eq!(error.code, "tool.cancelled");
+    }
+
+    struct ListFixture {
+        _temp: tempfile::TempDir,
+        cwd: PathBuf,
+        home: PathBuf,
+    }
+
+    impl ListFixture {
+        fn new() -> Self {
+            let temp = tempfile::tempdir().unwrap();
+            let cwd = temp.path().join("workspace");
+            let home = temp.path().join("home");
+            std::fs::create_dir_all(home.join("workflows")).unwrap();
+            std::fs::create_dir_all(&cwd).unwrap();
+            Self {
+                _temp: temp,
+                cwd,
+                home,
+            }
+        }
+
+        fn write_rhai(dir: &std::path::Path, name: &str, description: &str) {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(
+                dir.join(format!("{name}.rhai")),
+                format!(
+                    "let meta = #{{\n    name: \"{name}\",\n    description: \"{description}\",\n}};\ncomplete(\"ok\");\n"
+                ),
+            )
+            .unwrap();
+        }
+
+        fn write_user(&self, name: &str) {
+            Self::write_rhai(&self.home.join("workflows"), name, "User workflow");
+        }
+
+        fn write_project(&self, name: &str) {
+            Self::write_rhai(&self.cwd.join(".lato/workflows"), name, "Project workflow");
+        }
+
+        fn snapshot(&self, project_trusted: bool) -> Arc<PluginSnapshot> {
+            lato_extensions::build_snapshot(
+                1,
+                lato_extensions::discover_plugins(&lato_extensions::DiscoveryConfig {
+                    cwd: self.cwd.clone(),
+                    lato_home: self.home.clone(),
+                    cli_plugin_dirs: Vec::new(),
+                    project_trusted,
+                }),
+                &lato_extensions::PluginConfig::default(),
+            )
+            .unwrap()
+        }
+
+        /// Tool with the manager installed and the snapshot mounted, mirroring
+        /// the host wiring (attach_workflow_manager → install → stage plugins).
+        fn tool(&self, project_trusted: bool) -> WorkflowTool {
+            let trust = SessionTrust::for_interactive(&self.cwd, project_trusted);
+            let handle =
+                SessionWorkflowHandle::new(self.cwd.clone(), self.home.clone(), trust.clone());
+            let manager = Arc::new(WorkflowManager::new(
+                "s-tool-test",
+                self.cwd.clone(),
+                trust,
+                Arc::new(lato_workspace::FileLocks::new()),
+                crate::default_fake_stream(),
+                None,
+                None,
+            ));
+            manager.set_snapshot(self.snapshot(project_trusted));
+            handle.install(manager);
+            WorkflowTool::new(handle)
+        }
+    }
+
+    fn output_json(output: &ToolOutput) -> Value {
+        serde_json::from_str(&output.content).unwrap()
+    }
+
+    #[tokio::test]
+    async fn list_shows_user_and_hides_untrusted_project_workflows() {
+        let fixture = ListFixture::new();
+        fixture.write_user("user-greet");
+        fixture.write_project("proj-secret");
+
+        let untrusted = fixture.tool(false);
+        let listed = output_json(
+            &untrusted
+                .invoke(context(), json!({"action":"list"}))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(listed["truncated"], false);
+        let ids: Vec<&str> = listed["workflows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["user-greet"]);
+
+        let trusted = fixture.tool(true);
+        let listed = output_json(
+            &trusted
+                .invoke(context(), json!({"action":"list"}))
+                .await
+                .unwrap(),
+        );
+        let ids: Vec<&str> = listed["workflows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["id"].as_str().unwrap())
+            .collect();
+        assert!(ids.contains(&"proj-secret"));
+        assert!(ids.contains(&"user-greet"));
+    }
+
+    #[tokio::test]
+    async fn list_entries_are_bounded_and_private() {
+        let fixture = ListFixture::new();
+        for seq in 0..70 {
+            fixture.write_user(&format!("wf-{seq:03}"));
+        }
+        let tool = fixture.tool(false);
+        let output = tool
+            .invoke(context(), json!({"action":"list"}))
+            .await
+            .unwrap();
+        assert!(output.truncated);
+        let listed = output_json(&output);
+        assert_eq!(listed["workflows"].as_array().unwrap().len(), 64);
+        assert_eq!(listed["truncated"], true);
+        let serialized = output.content;
+        assert!(!serialized.contains("complete("));
+        assert!(!serialized.contains(fixture.home.to_str().unwrap()));
+        // Stable registry order: sorted file names, keep-first.
+        assert_eq!(listed["workflows"][0]["id"], "wf-000");
+        assert_eq!(listed["workflows"][0]["source"], "user");
+        assert!(listed["workflows"][0]["agentBudget"].is_u64());
+        assert!(listed["workflows"][0]["description"].is_string());
     }
 }
