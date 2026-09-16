@@ -1,0 +1,209 @@
+{
+  "fixture_version": 2,
+  "fixture_kind": "source_derived_contract_fixture",
+  "not_live_round_trip_evidence": true,
+  "source": {
+    "repository": "https://github.com/Agent-Field/agentfield",
+    "release": "v0.1.138",
+    "commit": "0aba9d6de1ef2c473070fc329ac7ac63e5d096b9",
+    "files": [
+      "docs/api/EXECUTE.md",
+      "control-plane/internal/handlers/discovery.go",
+      "control-plane/internal/handlers/execute.go",
+      "control-plane/internal/handlers/execute_helpers.go",
+      "control-plane/internal/handlers/execute_cancel.go",
+      "control-plane/internal/server/routes_core.go"
+    ]
+  },
+  "target_contract": {
+    "atom_pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$",
+    "forbidden_in_atoms": [".", ":", "/", "%", "non-ASCII"],
+    "discovery_atoms": {
+      "agent_id": "legal-agent",
+      "reasoner_id": "review_contract",
+      "invocation_target": "legal-agent:review_contract"
+    },
+    "validation": "invocation_target must equal agent_id + ':' + reasoner_id",
+    "execute_target_derivation": "agent_id + '.' + reasoner_id",
+    "execute_target": "legal-agent.review_contract",
+    "invocation_target_used_in_url": false
+  },
+  "async_start": {
+    "method": "POST",
+    "path_template": "/api/v1/execute/async/{derived_execute_target}",
+    "success_status": 202,
+    "success_envelope": {
+      "execution_id": "exec_redacted",
+      "run_id": "run_redacted",
+      "workflow_id": "run_redacted",
+      "status": "queued",
+      "target": "legal-agent.review_contract",
+      "type": "reasoner",
+      "created_at": "2026-09-16T00:00:00Z",
+      "enqueued_at": "2026-09-16T00:00:00Z",
+      "webhook_registered": false
+    },
+    "field_classification": {
+      "required_consumed": ["execution_id", "status", "target", "type"],
+      "required_ignored_but_type_checked": [
+        "run_id",
+        "workflow_id",
+        "created_at",
+        "enqueued_at",
+        "webhook_registered"
+      ],
+      "optional_ignored_but_type_checked": ["webhook_error"]
+    },
+    "invariants": {
+      "workflow_id_equals_run_id": {
+        "validated": true,
+        "consumed": false
+      },
+      "enqueued_at_equals_created_at_for_normal_queue": {
+        "validated": true,
+        "consumed": false
+      }
+    },
+    "idempotency_key_supported": false,
+    "retry_can_create_duplicate_execution": true
+  },
+  "status": {
+    "method": "GET",
+    "path_template": "/api/v1/executions/{execution_id}",
+    "success_envelope": {
+      "execution_id": "exec_redacted",
+      "run_id": "run_redacted",
+      "status": "running",
+      "started_at": "2026-09-16T00:00:00Z",
+      "webhook_registered": false
+    },
+    "field_classification": {
+      "required_consumed": ["execution_id", "status"],
+      "required_ignored_but_type_checked": [
+        "run_id",
+        "started_at",
+        "webhook_registered"
+      ],
+      "optional_ignored_but_type_checked": [
+        "agent_node_id",
+        "instance_id",
+        "status_reason",
+        "result",
+        "error",
+        "error_details",
+        "completed_at",
+        "duration_ms",
+        "webhook_events",
+        "approval_request_id",
+        "approval_status",
+        "approval_request_url"
+      ]
+    }
+  },
+  "cancel": {
+    "method": "POST",
+    "path_template": "/api/v1/executions/{execution_id}/cancel",
+    "request_envelope": {
+      "reason": "cancelled by Lato user"
+    },
+    "success_status": 200,
+    "success_envelope": {
+      "execution_id": "exec_redacted",
+      "previous_status": "running",
+      "status": "cancelled",
+      "cancelled_at": "2026-09-16T00:00:00Z",
+      "reason": "cancelled by Lato user"
+    },
+    "field_classification": {
+      "required_consumed": ["execution_id", "status"],
+      "required_ignored_but_type_checked": [
+        "previous_status",
+        "cancelled_at"
+      ],
+      "optional_ignored_but_type_checked": ["reason"]
+    },
+    "terminal_conflict_status": 409,
+    "terminal_conflict_envelope": {
+      "error": "invalid_state",
+      "message": "execution is in terminal state 'completed'"
+    },
+    "terminal_conflict_contract": {
+      "stable_consumed": {
+        "error": "invalid_state"
+      },
+      "dynamic_ignored_but_type_checked": ["message"]
+    }
+  },
+  "discovery": {
+    "method": "GET",
+    "path": "/api/v1/discovery/capabilities",
+    "success_envelope": {
+      "discovered_at": "2026-09-16T00:00:00Z",
+      "total_agents": 1,
+      "total_reasoners": 1,
+      "total_skills": 0,
+      "pagination": {
+        "limit": 100,
+        "offset": 0,
+        "has_more": false
+      },
+      "capabilities": [
+        {
+          "agent_id": "legal-agent",
+          "group_id": "",
+          "base_url": "https://agentfield.invalid",
+          "version": "v0.1.138",
+          "health_status": "healthy",
+          "deployment_type": "service",
+          "last_heartbeat": "2026-09-16T00:00:00Z",
+          "reasoners": [
+            {
+              "id": "review_contract",
+              "invocation_target": "legal-agent:review_contract"
+            }
+          ],
+          "skills": []
+        }
+      ]
+    },
+    "field_classification": {
+      "required_consumed": [
+        "capabilities[].agent_id",
+        "capabilities[].version",
+        "capabilities[].health_status",
+        "capabilities[].reasoners[].id",
+        "capabilities[].reasoners[].invocation_target"
+      ],
+      "required_ignored_but_type_checked": [
+        "discovered_at",
+        "total_agents",
+        "total_reasoners",
+        "total_skills",
+        "pagination.limit",
+        "pagination.offset",
+        "pagination.has_more",
+        "capabilities[].group_id",
+        "capabilities[].base_url",
+        "capabilities[].deployment_type",
+        "capabilities[].last_heartbeat",
+        "capabilities[].skills"
+      ],
+      "optional_ignored_but_type_checked": [
+        "capabilities[].reasoners[].description",
+        "capabilities[].reasoners[].tags",
+        "capabilities[].reasoners[].input_schema",
+        "capabilities[].reasoners[].output_schema",
+        "capabilities[].reasoners[].examples"
+      ]
+    },
+    "schema_digest_present": false,
+    "remote_schema_authoritative": false
+  },
+  "strict_decoder": {
+    "missing_required_field": "agentfield.remote_protocol",
+    "wrong_required_or_optional_field_type": "agentfield.remote_protocol",
+    "unknown_field": "ignored",
+    "unknown_status_enum": "agentfield.remote_protocol"
+  },
+  "secrets_or_real_payloads_in_fixture": false
+}
