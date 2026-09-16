@@ -320,7 +320,7 @@ async fn agentfield_check(
     settings: Option<&DoctorSettings>,
     live: bool,
 ) -> DoctorCheck {
-    use lato_agent::agentfield::{self as af, AgentFieldClient as _};
+    use lato_agent::agentfield::{self as af};
     let raw = settings.and_then(|settings| settings.agentfield.clone());
     if raw.is_none() {
         return check(
@@ -395,8 +395,41 @@ async fn agentfield_check(
     };
     let client =
         af::client::HttpAgentFieldClient::new(config.origin.clone(), credential, transport);
-    let state = match client.discovery().await {
-        Ok(envelope) => af::classify_probe(Some(&config), Ok(&envelope)),
+    // The live probe goes through the 30-second snapshot cache (spec §6.2):
+    // repeated live checks within the freshness window reuse the pinned
+    // contract result instead of re-probing.
+    let cache = af::AgentFieldProbeCache::new(af::AgentFieldProbe::new(Arc::new(client)));
+    let state = match cache.snapshot().await {
+        Ok(snapshot) => {
+            // Every configured allowlist target must exist on a healthy
+            // agent; the probe may not expand the allowlist, only confirm it.
+            let missing: Vec<&str> = config
+                .capabilities
+                .iter()
+                .filter(|(_, capability)| {
+                    !snapshot
+                        .healthy_execute_targets
+                        .iter()
+                        .any(|target| target == &capability.target)
+                })
+                .map(|(alias, _capability)| alias.as_str())
+                .collect();
+            if !missing.is_empty() {
+                af::AgentFieldDoctorState::ContractMismatch {
+                    detail: format!(
+                        "capability target(s) {missing:?} are missing or unhealthy on the pinned control plane"
+                    ),
+                }
+            } else {
+                af::AgentFieldDoctorState::Enabled {
+                    detail: format!(
+                        "pinned {} contract verified; {} capability(ies)",
+                        af::PINNED_AGENTFIELD_VERSION,
+                        config.capabilities.len()
+                    ),
+                }
+            }
+        }
         Err(error) => af::classify_probe(Some(&config), Err(&error)),
     };
     let (summary, detail) = state.summary();

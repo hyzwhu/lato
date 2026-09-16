@@ -8,6 +8,7 @@
 
 pub mod client;
 pub mod config;
+pub mod probe;
 pub mod types;
 
 pub use client::{
@@ -17,6 +18,9 @@ pub use client::{
 pub use config::{
     CapabilityConfig, ConfigError, ControlPlaneOrigin, MAX_CAPABILITIES, MAX_INPUT_BYTES,
     MAX_OUTPUT_BYTES, PINNED_AGENTFIELD_VERSION,
+};
+pub use probe::{
+    AgentFieldHealthSnapshot, AgentFieldProbe, AgentFieldProbeCache, HEALTH_SNAPSHOT_TTL,
 };
 pub use types::{
     AsyncStartEnvelope, CancelConflictEnvelope, CancelSuccessEnvelope, DiscoveryAgent,
