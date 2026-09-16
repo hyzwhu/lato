@@ -405,7 +405,44 @@ lato doctor --strict
 lato doctor --live
 ```
 
-Default `lato doctor` is offline: it does not contact providers or submit a prompt completion. It reports binary/platform, Lato home, config parsing, selected-model catalog presence, credential presence (not values), ToolCatalog construction, a fixed PolicyEngine self-test, sandbox readiness, and project/plugin trust. `--json` prints a `schema_version: 1` report on stdout. Warnings keep exit status 0; errors return 1. `--strict` upgrades warnings to failure. `--live` is the only Doctor mode allowed to use the network; it runs a bounded catalog/connectivity probe and does not submit an ordinary prompt completion.
+Default `lato doctor` is offline: it does not contact providers or submit a prompt completion. It reports binary/platform, Lato home, config parsing, selected-model catalog presence, credential presence (not values), ToolCatalog construction, a fixed PolicyEngine self-test, sandbox readiness, and project/plugin trust. `--json` prints a `schema_version: 1` report on stdout. Warnings keep exit status 0; errors return 1. `--strict` upgrades warnings to failure. `--live` is the only Doctor mode allowed to use the network; it runs a bounded catalog/connectivity probe and does not submit an ordinary prompt completion. When an AgentField control plane is configured, the offline report additionally covers its configuration state (disabled / unconfigured / invalid), and `--live` verifies TLS reachability, DNS/SSRF policy, pinned-version compatibility, and allowlist target existence through the 30-second snapshot cache.
+
+## AgentField adapter (Phase 7C1, opt-in foundation)
+
+Lato can act as a client of an organization-deployed [AgentField](https://github.com/Agent-Field/agentfield) control plane. Phase 7C1 ships the foundation only: configuration model, credential reference resolution, URL/SSRF/DNS-rebinding defenses, a version-locked HTTP client with strict protocol decoding, a health/discovery probe with a 30-second snapshot cache, and doctor integration. **No model-visible tool is registered in Phase 7C1** — `agentfield` tool registration, policy/approval wiring, and production execution arrive in Phase 7C2/7C3.
+
+Configuration lives in the top-level `agentfield` section of `~/.lato/config.json` (`enabled` defaults to `false`):
+
+```json
+{
+  "agentfield": {
+    "enabled": true,
+    "baseUrl": "https://agents.example.internal",
+    "credential": "agentfield:primary",
+    "capabilities": {
+      "contract-review": {
+        "target": "legal-agent.review_contract",
+        "description": "Review one contract and return structured findings",
+        "inputSchema": { "type": "object", "additionalProperties": false },
+        "risk": "remote_read",
+        "timeoutSeconds": 900,
+        "maxOutputBytes": 65536
+      }
+    }
+  }
+}
+```
+
+Security contract:
+
+- `baseUrl` must be an absolute HTTP(S) URL without userinfo, query, or fragment. Production allows HTTPS only; plain HTTP is accepted solely for loopback addresses under the explicit `allowLoopbackHttp` development flag. DNS is resolved once per client build, the existing `lato-mcp` SSRF/private-network policy re-checks exactly those addresses (private, link-local, CGNAT, and loopback-via-HTTPS destinations are rejected), and the resolved addresses are pinned onto the HTTP client so connection reuse cannot bypass the re-check. Redirects to a different origin are refused.
+- `credential` is a reference, never a token value: `agentfield:<key>` resolves through the Lato credential store (`auth.json` entry `agentfield`, or the `LATO_AGENTFIELD_CREDENTIAL` environment variable). The token is wrapped in a redacted holder, injected only into the final request, and never appears in logs, errors, doctor output, or `Debug` formatting.
+- The upstream is pinned to AgentField `v0.1.138` (commit `0aba9d6de1ef2c473070fc329ac7ac63e5d096b9`; fixture SHA-256 `fd524cab…3ae8`). Every envelope is strictly decoded: missing or mistyped required fields and unknown status enums fail closed with `agentfield.remote_protocol`; unknown fields are ignored. Discovery targets must satisfy the colon→dot derivation contract (strict ASCII atoms, verbatim `agent_id:reasoner_id` consistency, unique derived execute targets), and the derived dot target is the only form that may enter a URL. The pinned async-start endpoint does not support idempotency keys, and Lato adds no fake retry guarantees. Status responses must echo the requested `execution_id`; a confirmed cancellation must answer `cancelled`.
+- Response bodies are capped at 1 MiB; non-JSON content types and oversized bodies are rejected before parsing. Capability aliases match `[a-z0-9][a-z0-9_-]{0,63}`, at most 64 capabilities per config, input schemas serialized at most 64 KiB, and output hard-capped at 64 KiB.
+
+Dual-policy note (spec §8): in Phase 7C2, every AgentField action will pass Lato's policy/approval membrane *first*; an AgentField-side policy PASS never upgrades Lato permissions, and both boundaries must agree before any execution.
+
+Migration and rollback: set `enabled: false` (or delete the `agentfield` section) to deactivate the adapter; unconfigured/disabled states make no network probes, resolve no credentials, and leave all existing task/workflow behavior untouched (tool catalog and goldens unchanged). Because Phase 7C1 registers nothing and writes no journal events, rolling back the binary is always safe. Run `lato doctor` (offline) after config changes and `lato doctor --live` before first use.
 
 ## Headless CLI smoke test
 
