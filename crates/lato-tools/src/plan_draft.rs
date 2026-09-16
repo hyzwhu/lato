@@ -445,18 +445,38 @@ mod handle {
             Ok(())
         }
 
-        /// Unix: removes the temporary file created by this call WITHOUT
-        /// ever unlinking a path that could have been swapped. The temporary
-        /// name is first moved aside ATOMICALLY (`renameat` to a private
-        /// `.reap` name — this deletes nothing), the isolated name's identity
-        /// is then verified against the still-open created descriptor, and
-        /// only on a match is the PRIVATE name removed. On any mismatch — or
-        /// when the [`PlanDraftFaults::on_before_removal`] seam reports a
-        /// swap after the identity check — the removal is safely abandoned
-        /// and the isolated file is restored to its original location, so a
-        /// bystander can never be deleted by this call. (Linux reaches this
-        /// only on the rare failure path after the intermediate link was
-        /// already created; the normal path has no directory entry at all.)
+        /// Unix: removes the temporary file created by this call with
+        /// abandon-on-doubt semantics, closing the reviewer's Round-4 P1:
+        ///
+        /// 1. `renameat(name -> .reap)` isolates the temporary ATOMICALLY —
+        ///    nothing is deleted;
+        /// 2. `openat(.reap, O_RDONLY | O_NOFOLLOW)` captures the identity of
+        ///    whatever the isolation actually moved, as an anchor descriptor;
+        /// 3. the anchor is verified against the still-open created
+        ///    descriptor (which pins the inode against reuse);
+        /// 4. the [`PlanDraftFaults::on_before_removal`] seam runs — this is
+        ///    the reviewer's deterministic injection point ("after the
+        ///    identity check, before the removal");
+        /// 5. **link-count re-check**: any swap of a bystander into the
+        ///    `.reap` slot necessarily removes our inode's ONLY link first,
+        ///    which deterministically shows up as
+        ///    `fstat(anchor).st_nlink != 1` — so a swap after the identity
+        ///    check (with the seam returning `Ok`, or even without any seam
+        ///    at all) is caught here and the removal is ABANDONED;
+        /// 6. only when every check passes is the PRIVATE `.reap` name
+        ///    removed — never the public temporary path after verification.
+        ///
+        /// Restoring an abandoned file to its original location is guarded by
+        /// defect #3: the original path is `fstatat`-checked first, and if
+        /// anything occupies it the restore is skipped and the isolated file
+        /// stays under its `.reap` name for manual inspection — a bystander
+        /// is never overwritten. (Linux reaches this only on the rare
+        /// failure path after the intermediate publication link exists; the
+        /// normal Linux path has no directory entry at all. Since Round-5
+        /// defect #4 the Linux failure path is close-only, so this helper is
+        /// retained as the shared abandon-on-doubt routine but is currently
+        /// unreached on Linux.)
+        #[cfg_attr(target_os = "linux", allow(dead_code))]
         pub fn remove_isolated(
             &self,
             name: &str,
@@ -472,8 +492,8 @@ mod handle {
                 Ok(value) => value,
                 Err(_) => return,
             };
-            // Safe: atomic move of OUR temporary name to a private name;
-            // nothing is deleted and any content is preserved under `reap`.
+            // (1) Atomic isolation of OUR temporary name; nothing is deleted
+            // and any content is preserved under the private `.reap` name.
             if unsafe {
                 libc::renameat(
                     self.fd.as_raw_fd(),
@@ -485,51 +505,86 @@ mod handle {
             {
                 return; // nothing to clean at that name
             }
-            // Identity of the created file, from its still-open descriptor
-            // (pins the inode against reuse).
+            // (2) Anchor the isolated identity with its own descriptor
+            // (O_NOFOLLOW: a swapped-in symlink fails closed here).
+            let cmode = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+            let anchor_fd = unsafe { libc::openat(self.fd.as_raw_fd(), creap.as_ptr(), cmode, 0) };
+            if anchor_fd < 0 {
+                // The isolated name disappeared or is not openable as a
+                // regular file: leave whatever is there for manual
+                // inspection and never delete by name.
+                return;
+            }
+            // Safe: freshly opened descriptor owned by us.
+            let anchor = unsafe { File::from_raw_fd(anchor_fd) };
+            // (3) Identity check: the anchor must be the file we created.
             let mut own = unsafe { std::mem::zeroed() };
             // Safe: metadata read on our own still-open descriptor.
             if unsafe { libc::fstat(owned.as_raw_fd(), &mut own) } != 0 {
-                return;
+                return; // leave the isolated file in place
             }
             let mut current = unsafe { std::mem::zeroed() };
-            // Safe: pure metadata read on a handle-relative name.
-            if unsafe { libc::fstatat(self.fd.as_raw_fd(), creap.as_ptr(), &mut current, 0) } != 0 {
-                return; // already gone
+            // Safe: metadata read on the anchor descriptor.
+            if unsafe { libc::fstat(anchor.as_raw_fd(), &mut current) } != 0 {
+                return; // leave the isolated file in place
             }
-            let matches = (widen_dev(current.st_dev), widen_ino(current.st_ino))
-                == (widen_dev(own.st_dev), widen_ino(own.st_ino));
-            if !matches {
-                // A bystander occupies the isolated name: restore it to its
-                // original location, untouched, and abandon the removal.
-                let _ = unsafe {
-                    libc::renameat(
-                        self.fd.as_raw_fd(),
-                        creap.as_ptr(),
-                        self.fd.as_raw_fd(),
-                        cname.as_ptr(),
-                    )
-                };
+            if (widen_dev(current.st_dev), widen_ino(current.st_ino))
+                != (widen_dev(own.st_dev), widen_ino(own.st_ino))
+            {
+                // Defect #3 guard: a bystander occupies the isolated slot.
+                // Restore it ONLY when the original path is free, otherwise
+                // leave it under the private `.reap` name for manual
+                // inspection — a bystander is never overwritten.
+                self.restore_isolated(&cname, &creap);
                 return;
             }
-            // Identity verified — this is OUR file. Give the deterministic
-            // seam a chance to swap a bystander in after the check; in that
-            // case the removal is abandoned and whatever occupies the
-            // isolated name is restored to its original location.
-            if faults.on_before_removal(&reap_name).is_err() {
-                let _ = unsafe {
-                    libc::renameat(
-                        self.fd.as_raw_fd(),
-                        creap.as_ptr(),
-                        self.fd.as_raw_fd(),
-                        cname.as_ptr(),
-                    )
-                };
+            // (4) Reviewer's seam: deterministic injection AFTER the identity
+            // check and BEFORE the removal. A swap performed inside the seam
+            // is caught by the link-count re-check below even when the seam
+            // returns `Ok`.
+            let _ = faults.on_before_removal(&reap_name);
+            // (5) Link-count re-check: our created file had exactly ONE link
+            // (the isolated `.reap` entry). Any swap of a bystander into the
+            // `.reap` slot must remove that link first, which deterministically
+            // surfaces here — the removal is then abandoned.
+            let mut after = unsafe { std::mem::zeroed() };
+            // Safe: metadata read on the anchor descriptor.
+            if unsafe { libc::fstat(anchor.as_raw_fd(), &mut after) } != 0 || after.st_nlink != 1 {
+                // Defect #3 guard applies to the restore as well.
+                self.restore_isolated(&cname, &creap);
                 return;
             }
-            // Safe: unlink of the PRIVATE reap name, verified to refer to
-            // the inode we created (pinned by `owned`).
+            // (6) Safe: unlink of the PRIVATE `.reap` name, re-verified at
+            // (5) to still refer to the inode we created (pinned by `owned`
+            // and now by `anchor`). The public temporary path is never
+            // unlinked after verification.
             let _ = unsafe { libc::unlinkat(self.fd.as_raw_fd(), creap.as_ptr(), 0) };
+        }
+
+        /// Restores an abandoned isolated file to its original location —
+        /// but ONLY when the original location is currently free (defect #3:
+        /// a bystander occupying it must never be overwritten by the
+        /// restore; the isolated file then stays under its `.reap` name for
+        /// manual inspection).
+        #[cfg_attr(target_os = "linux", allow(dead_code))]
+        fn restore_isolated(&self, cname: &CString, creap: &CString) {
+            let mut occupied = unsafe { std::mem::zeroed() };
+            // Safe: pure metadata read on a handle-relative name.
+            let exists =
+                unsafe { libc::fstatat(self.fd.as_raw_fd(), cname.as_ptr(), &mut occupied, 0) }
+                    == 0;
+            if exists {
+                return; // original path is occupied: never overwrite
+            }
+            // Safe: atomic move back to the now-free original location.
+            let _ = unsafe {
+                libc::renameat(
+                    self.fd.as_raw_fd(),
+                    creap.as_ptr(),
+                    self.fd.as_raw_fd(),
+                    cname.as_ptr(),
+                )
+            };
         }
 
         /// Syncs the pinned directory itself.
@@ -815,10 +870,13 @@ fn publish_locked_nameless(
     if let Err(error) =
         handle.publish_by_identity(file.as_ref().unwrap(), &middle_name, PLAN_FILE_NAME)
     {
-        // If the intermediate link still exists, isolate and verify it
-        // before removal — the same abandon-on-doubt semantics as the
-        // named-temporary platforms.
-        handle.remove_isolated(&middle_name, file.as_ref().unwrap(), faults);
+        // Defect #4 (Round 5): on the O_TMPFILE failure path we NEVER unlink
+        // by name — the documented contract is close-only. If the
+        // intermediate link still exists it is deliberately left in place
+        // (clearly named, matching the `.tmp-` audit pattern) for manual
+        // inspection; the nameless inode itself disappears when the
+        // descriptor below is dropped.
+        drop(file.take());
         return Err(error);
     }
     // The nameless inode is now the published plan: close the descriptor.
@@ -1397,12 +1455,159 @@ mod tests {
         }
     }
 
-    /// The reviewer-mandated deterministic seam: a bystander swapped in
-    /// AFTER the identity check succeeded and BEFORE the removal must be
-    /// preserved. Named-temporary platforms implement this with the
-    /// `on_before_removal` seam: the removal is safely abandoned and the
-    /// isolated file (whatever occupies it at that instant) is restored to
-    /// its original location. Ten consecutive runs.
+    /// Round-5 seam (reviewer requirement): the identity check has passed
+    /// and the `on_before_removal` seam returns `Ok` — yet a bystander is
+    /// swapped in from inside the seam. The production path must catch that
+    /// deterministically (link-count re-check: any swap removes our inode's
+    /// only link first) and abandon the removal, preserving the bystander
+    /// byte-for-byte. NOT relying on the seam raising an error. Ten
+    /// consecutive runs.
+    #[cfg(all(unix, not(target_os = "linux")))]
+    #[tokio::test]
+    async fn production_ok_path_after_identity_swap_never_deletes_bystander_ten_runs() {
+        for attempt in 0..10 {
+            let directory = temp_workspace("temp-swap");
+            let root = directory.path().to_path_buf();
+            let locks = FileLocks::new();
+            plan_draft(&locks, &root, "previous").await.unwrap();
+
+            let name = pinned_temp_name("swap");
+            struct SwapAfterCheckOk {
+                workspace_root: PathBuf,
+                temp_name: String,
+            }
+            impl PlanDraftFaults for SwapAfterCheckOk {
+                fn on_stage(&self, stage: PlanDraftStage) -> Result<(), String> {
+                    // Fail the publication at the commit stage so the
+                    // failure-cleanup path (isolate → verify → seam →
+                    // re-check → remove) runs.
+                    match stage {
+                        PlanDraftStage::Rename => Err("injected failure at Rename".into()),
+                        _ => Ok(()),
+                    }
+                }
+                fn pinned_temp_name(&self) -> Option<String> {
+                    Some(self.temp_name.clone())
+                }
+                fn on_before_removal(&self, isolated_path: &str) -> Result<(), String> {
+                    // Returns `Ok` — but swaps a bystander in right before
+                    // returning. The production path must detect this via
+                    // the link-count re-check and abandon the removal.
+                    assert!(isolated_path.contains(".reap-"), "{isolated_path}");
+                    let isolated = self.workspace_root.join(isolated_path);
+                    std::fs::remove_file(&isolated).unwrap();
+                    std::fs::write(&isolated, "swapped-in-bystander").unwrap();
+                    Ok(())
+                }
+            }
+
+            let error = plan_draft_with_faults(
+                &locks,
+                &root,
+                "replacement",
+                &SwapAfterCheckOk {
+                    workspace_root: root.clone(),
+                    temp_name: name.clone(),
+                },
+            )
+            .await
+            .unwrap_err();
+            assert!(error.contains("Rename"), "attempt {attempt}: {error}");
+            // The production path detected the post-check swap and abandoned
+            // the removal; the bystander was restored to its original
+            // location, byte-for-byte.
+            assert_eq!(
+                std::fs::read(root.join(&name)).unwrap(),
+                b"swapped-in-bystander",
+                "attempt {attempt}: the swapped-in bystander must survive"
+            );
+            assert_eq!(
+                std::fs::read(root.join(PLAN_FILE_NAME)).unwrap(),
+                b"previous",
+                "attempt {attempt}"
+            );
+            std::fs::remove_file(root.join(&name)).unwrap();
+        }
+    }
+
+    /// Round-5 defect #3: while the temporary is isolated under its `.reap`
+    /// name, a bystander occupies the ORIGINAL path. The restore must never
+    /// overwrite it: the restore is abandoned and the isolated file stays
+    /// under `.reap` for manual inspection. Ten consecutive runs.
+    #[cfg(all(unix, not(target_os = "linux")))]
+    #[tokio::test]
+    async fn bystander_at_original_path_during_reap_recovery_survives_ten_runs() {
+        for attempt in 0..10 {
+            let directory = temp_workspace("reap-recovery");
+            let root = directory.path().to_path_buf();
+            let locks = FileLocks::new();
+            plan_draft(&locks, &root, "previous").await.unwrap();
+
+            let name = pinned_temp_name("recovery");
+            struct OccupyOriginal {
+                original_path: PathBuf,
+                temp_name: String,
+            }
+            impl PlanDraftFaults for OccupyOriginal {
+                fn on_stage(&self, stage: PlanDraftStage) -> Result<(), String> {
+                    match stage {
+                        PlanDraftStage::Rename => Err("injected failure at Rename".into()),
+                        _ => Ok(()),
+                    }
+                }
+                fn pinned_temp_name(&self) -> Option<String> {
+                    Some(self.temp_name.clone())
+                }
+                fn on_before_removal(&self, isolated_path: &str) -> Result<(), String> {
+                    // Occupy the ORIGINAL path (the isolated temporary's
+                    // former location) while the temporary sits in the
+                    // isolated `.reap` slot, then report the anomaly.
+                    assert!(isolated_path.contains(".reap-"), "{isolated_path}");
+                    std::fs::write(&self.original_path, "occupying-bystander").unwrap();
+                    Err("bystander occupies the original path".into())
+                }
+            }
+
+            let error = plan_draft_with_faults(
+                &locks,
+                &root,
+                "replacement",
+                &OccupyOriginal {
+                    original_path: root.join(&name),
+                    temp_name: name.clone(),
+                },
+            )
+            .await
+            .unwrap_err();
+            assert!(error.contains("Rename"), "attempt {attempt}: {error}");
+            // The bystander at the original path is untouched.
+            assert_eq!(
+                std::fs::read(root.join(&name)).unwrap(),
+                b"occupying-bystander",
+                "attempt {attempt}: the occupying bystander must survive"
+            );
+            // The isolated temporary is preserved under its `.reap` name for
+            // manual inspection (not deleted, not placed over the
+            // bystander): exactly one .tmp leftover with our content.
+            let leftovers = leftovers(&root);
+            assert_eq!(
+                leftovers.len(),
+                1,
+                "attempt {attempt}: the isolated file must remain under .reap"
+            );
+            assert_eq!(
+                std::fs::read(root.join(&leftovers[0])).unwrap(),
+                b"replacement",
+                "attempt {attempt}: the isolated temporary must be intact"
+            );
+        }
+    }
+
+    /// Round-4 reviewer seam, macOS variant retained: the seam reports an
+    /// anomaly (Err) without swapping anything — the removal is abandoned
+    /// and our own isolated file is restored to its original location (the
+    /// path is free, so the defect-#3 guard does not trigger). Ten
+    /// consecutive runs.
     #[cfg(all(unix, not(target_os = "linux")))]
     #[tokio::test]
     async fn swap_after_the_identity_check_never_deletes_the_bystander_ten_runs() {
@@ -1414,13 +1619,10 @@ mod tests {
 
             let name = pinned_temp_name("swap");
             struct SwapAfterCheck {
-                workspace_root: PathBuf,
                 temp_name: String,
             }
             impl PlanDraftFaults for SwapAfterCheck {
                 fn on_stage(&self, stage: PlanDraftStage) -> Result<(), String> {
-                    // Fail the publication at the commit stage so the
-                    // failure-cleanup path (isolate → verify → remove) runs.
                     match stage {
                         PlanDraftStage::Rename => Err("injected failure at Rename".into()),
                         _ => Ok(()),
@@ -1430,14 +1632,7 @@ mod tests {
                     Some(self.temp_name.clone())
                 }
                 fn on_before_removal(&self, isolated_path: &str) -> Result<(), String> {
-                    // Exactly the reviewer's window: the identity check has
-                    // passed, the removal has not happened yet. Swap a
-                    // bystander in and abort the removal. The isolated path
-                    // is handle-relative, so anchor it at the workspace root.
                     assert!(isolated_path.contains(".reap-"), "{isolated_path}");
-                    let isolated = self.workspace_root.join(isolated_path);
-                    std::fs::remove_file(&isolated).unwrap();
-                    std::fs::write(&isolated, "swapped-in-bystander").unwrap();
                     Err("bystander swapped in after the identity check".into())
                 }
             }
@@ -1447,28 +1642,28 @@ mod tests {
                 &root,
                 "replacement",
                 &SwapAfterCheck {
-                    workspace_root: root.clone(),
                     temp_name: name.clone(),
                 },
             )
             .await
             .unwrap_err();
             assert!(error.contains("Rename"), "attempt {attempt}: {error}");
-            // The swapped-in bystander was restored to its original
-            // location, byte-for-byte.
+            // Nothing was swapped in, so the restore path put our own
+            // isolated file back — no deletion happened at all.
             assert_eq!(
                 std::fs::read(root.join(&name)).unwrap(),
-                b"swapped-in-bystander",
-                "attempt {attempt}: the swapped-in bystander must survive"
+                b"replacement",
+                "attempt {attempt}: our own file must be restored intact"
             );
-            // The previous draft is intact and no temp residue remains
-            // besides the restored bystander itself.
             assert_eq!(
                 std::fs::read(root.join(PLAN_FILE_NAME)).unwrap(),
                 b"previous",
                 "attempt {attempt}"
             );
-            std::fs::remove_file(root.join(&name)).unwrap();
+            assert!(
+                leftovers(&root).is_empty(),
+                "attempt {attempt}: no residue after the restore"
+            );
         }
     }
 
@@ -1526,6 +1721,101 @@ mod tests {
                 "attempt {attempt}"
             );
             assert_eq!(leftovers(&root), vec![bystander_name], "attempt {attempt}");
+        }
+    }
+
+    /// Round-5 seam, Linux (O_TMPFILE) variant: the identity-bound checks
+    /// pass, the seam returns `Ok` after planting a bystander, and the
+    /// publication SUCCEEDS. Cleanup closes the nameless descriptor and
+    /// never unlinks any path — the bystander must survive untouched. Ten
+    /// consecutive runs.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn production_ok_path_after_identity_swap_never_deletes_bystander_ten_runs() {
+        for attempt in 0..10 {
+            let directory = temp_workspace("temp-swap");
+            let root = directory.path().to_path_buf();
+            let locks = FileLocks::new();
+            plan_draft(&locks, &root, "previous").await.unwrap();
+
+            let bystander_name = pinned_temp_name("swap");
+            struct PlantBystanderOk(String);
+            impl PlanDraftFaults for PlantBystanderOk {
+                fn on_stage(&self, stage: PlanDraftStage) -> Result<(), String> {
+                    match stage {
+                        // Returns `Ok` — the publication proceeds and
+                        // succeeds; cleanup is close-only.
+                        PlanDraftStage::Rename => {
+                            std::fs::write(std::path::Path::new(&self.0), "swapped-in-bystander")
+                                .unwrap();
+                            Ok(())
+                        }
+                        _ => Ok(()),
+                    }
+                }
+            }
+
+            let outcome = plan_draft_with_faults(
+                &locks,
+                &root,
+                "replacement",
+                &PlantBystanderOk(root.join(&bystander_name).to_string_lossy().to_string()),
+            )
+            .await;
+            assert!(
+                outcome.is_ok(),
+                "attempt {attempt}: publication must succeed: {outcome:?}"
+            );
+            // The bystander survives byte-for-byte even though the
+            // publication succeeded: no unlink by name exists on this path.
+            assert_eq!(
+                std::fs::read(root.join(&bystander_name)).unwrap(),
+                b"swapped-in-bystander",
+                "attempt {attempt}: the bystander must survive"
+            );
+            // The plan was really published.
+            assert_eq!(
+                std::fs::read(root.join(PLAN_FILE_NAME)).unwrap(),
+                b"replacement",
+                "attempt {attempt}"
+            );
+            assert_eq!(leftovers(&root), vec![bystander_name], "attempt {attempt}");
+        }
+    }
+
+    /// Round-5 defect #4, Linux: a publication failure on the O_TMPFILE path
+    /// must NOT unlink anything by name — the failure path is close-only, so
+    /// no temporary residue of any kind may appear. Ten consecutive runs.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn o_tmpfile_publish_failure_does_not_unlink_by_name_ten_runs() {
+        for attempt in 0..10 {
+            let directory = temp_workspace("otmpfile-fail");
+            let root = directory.path().to_path_buf();
+            let locks = FileLocks::new();
+            plan_draft(&locks, &root, "previous").await.unwrap();
+
+            let error = plan_draft_with_faults(
+                &locks,
+                &root,
+                "replacement",
+                &FailAt(PlanDraftStage::Rename),
+            )
+            .await
+            .unwrap_err();
+            assert!(error.contains("Rename"), "attempt {attempt}: {error}");
+            // Zero residue: the nameless inode vanished with the descriptor;
+            // nothing was created, linked, or unlinked on any path.
+            assert!(
+                leftovers(&root).is_empty(),
+                "attempt {attempt}: the failure path must leave no residue"
+            );
+            // The previous draft is intact.
+            assert_eq!(
+                std::fs::read(root.join(PLAN_FILE_NAME)).unwrap(),
+                b"previous",
+                "attempt {attempt}"
+            );
         }
     }
 
