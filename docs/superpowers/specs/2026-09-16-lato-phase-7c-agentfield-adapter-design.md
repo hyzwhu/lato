@@ -2,12 +2,12 @@
 
 | 字段 | 值 |
 | --- | --- |
-| 状态 | **v1 草案，待设计评审；禁止施工** |
+| 状态 | **v1.1 修订稿，待设计评审；禁止施工** |
 | 日期 | 2026-09-16 |
 | 基线 | `origin/master@0611e26`（Phase 7B7 已合入） |
 | 目标版本 | Phase 7C；具体发行版本待确认 |
-| 依赖 | Phase 5 task/runtime、Phase 6 信任与配置、Phase 7B workflow/journal/model tool、现有 `ToolRuntime`/policy/approval membrane |
-| 外部基线 | AgentField 官方文档与 REST API（2026-09-16 查阅）；本机无 `af` CLI，具体兼容版本待集成门禁锁定 |
+| 依赖 | Phase 5 task/runtime、Phase 6 信任与配置、Phase 7B workflow/journal/model tool、现有 `ToolRuntime`/policy/approval membrane；7C3 另硬依赖 WIN-26 合入后的 master SHA |
+| 外部基线 | AgentField `v0.1.138` / `0aba9d6de1ef2c473070fc329ac7ac63e5d096b9`；脱敏 fixture SHA-256 `208e1a1b85640ee60d9d5bbd6914a11d853acb471573eb7cbc5979f4a73014bb` |
 | 后续 | AgentField shared memory、DID/VC、实时 session、harness、远程 workflow DAG UI 均另立规格 |
 
 ## 1. 决策摘要
@@ -21,8 +21,9 @@ v1 不把 AgentField 变成第二个 Lato turn loop，不替换本地 `SubagentC
 1. **显式 allowlist，不做全控制面直通。** 远端 target 必须在本地配置中声明，不能由模型拼 URL 或任意 `node.function`。
 2. **异步执行，不在一次 tool call 中等待长任务。** `start` 返回本地 run ID；`status` 轮询远端。
 3. **本地 journal 只保存关联和有界快照。** AgentField 是远端执行记录的权威来源；Lato 不复制远端 DAG、memory 或完整输出。
-4. **不自动重试非幂等 start。** 传输结果不确定时记录 `outcome_unknown`，后续只做查询/对账，禁止盲重放。
+4. **不自动重试非幂等 start。** 锁定版本不接受 idempotency key。传输结果不确定且未收到 execution ID 时永久记录 `outcome_unknown`；Lato 不自动查询、对账或重放，只提供人工控制面核对指引。
 5. **断网不伪造终态。** 已知远端执行在控制面不可达时显示 `unavailable`，而非 `failed` 或 `cancelled`。
+6. **单一静态 policy。** 现有 `ToolRuntime` metadata 是工具级而非 action 级；`list/start/status/cancel` 四个 action 全部冻结为 `external_mutation`，不在 `invoke` 内旁路或降级 policy。
 
 ## 2. 已确认事实、合理推断与 Lato 建议
 
@@ -30,7 +31,9 @@ v1 不把 AgentField 变成第二个 Lato turn loop，不替换本地 `SubagentC
 
 - AgentField 官方架构由 control plane 与 agent nodes 构成；control plane 负责发现、路由、执行、policy 与 audit。
 - capability 使用 `node.function` 形态；官方 REST API 默认位于 `/api/v1`，JSON 请求/响应，受保护端点使用 Bearer token。
-- 官方支持同步与异步执行、执行查询、控制面 discovery，以及跨 agent workflow tracing。
+- 锁定版 `v0.1.138` 的 async start 为 `POST /api/v1/execute/async/{target}`，成功返回 HTTP 202 与 `execution_id/run_id/status/target/type/created_at`；status 为 `GET /api/v1/executions/{execution_id}`，cancel 为 `POST /api/v1/executions/{execution_id}/cancel`。
+- 锁定版 execute 路由**不接受 idempotency key**，官方明确警告重试可能创建另一 execution。
+- discovery 返回 capability metadata 与可选 schema，但没有稳定 schema/version digest。
 - Lato 已有主会话工具膜、三态 PolicyMode、一次性 grant、network/sandbox 边界、session journal、跨进程恢复、本地 subagent 与 workflow runtime。
 - 当前构建环境中未安装 `af`，因此旧规格所述 `2026-03-24-v1` 不能作为本轮实机兼容性证据。
 
@@ -49,7 +52,7 @@ v1 不把 AgentField 变成第二个 Lato turn loop，不替换本地 `SubagentC
 
 ### 2.3 Lato 建议
 
-- v1 只支持一个配置的 control plane、静态 allowlist 和四个动作 `list/start/status/cancel`。
+- v1 只支持一个配置的 control plane、静态 allowlist 和四个统一按 `external_mutation` 授权的动作 `list/start/status/cancel`。
 - v1 不依赖 `af` 子进程；生产路径使用 Rust HTTP client 与版本化 adapter trait，`af` 仅可用于人工诊断。
 - 第一刀先交付 client/config/fixture 合同，第二刀再注册模型工具和 journal 恢复，降低外部协议漂移风险。
 
@@ -63,7 +66,7 @@ v1 不把 AgentField 变成第二个 Lato turn loop，不替换本地 `SubagentC
 
 1. 作为管理员，我能配置 control plane 和允许的 capability 别名，模型只能看到这些别名。
 2. 作为用户，我能要求 Lato 启动一个允许的远程任务，并立刻得到可追踪的本地 run ID。
-3. 作为用户，我能在稍后或 session resume 后查询任务状态和有界结果。
+3. 作为用户，我能在收到 remote execution ID 后，于稍后或 session resume 后查询任务状态和有界结果；未收到 ID 的 `outcome_unknown` 只能人工核对。
 4. 作为用户，我能请求取消任务，并区分“取消已确认”“远端已终态”“取消结果未知”。
 5. 作为安全负责人，我能证明 URL、token、远端 ID、输入输出和授权没有越过既有 Lato policy 与隐私边界。
 
@@ -89,7 +92,7 @@ v1 不把 AgentField 变成第二个 Lato turn loop，不替换本地 `SubagentC
 - 导入 ARD 公共目录、动态远程 registry、自动信任发现结果。
 - 将远端 reasoner 映射成本地 `explorer/worker/reviewer`，或替换 `SubagentBackend`。
 - 将 AgentField DAG 合并为 Lato task tree/workflow journal。
-- 自动 retry、failover、多 control-plane 路由、远端结果自动写文件或执行工具。
+- 自动 retry、自动 ambiguous-run 对账、failover、多 control-plane 路由、远端结果自动写文件或执行工具。
 - 新 TUI 页面；v1 只复用普通 tool call/结果展示。
 
 ## 5. 架构与所有权
@@ -167,15 +170,23 @@ crates/lato-agent/tests/agentfield_resume.rs
 
 ### 6.2 冻结 catalog 与 TOCTOU
 
-每个 model turn 冻结 `AgentFieldCatalogRevision`：
+每个 model turn 冻结 `AgentFieldCatalogRevision`。canonical bytes 使用 UTF-8 JSON、对象 key 递归字典序、数组按 alias 字典序、整数十进制、无空白；`inputSchema` 先按同一 JSON canonicalization 处理：
 
 ```text
-SHA-256(canonical base origin + adapter version + sorted alias/target/schema/risk/limits)
+SHA-256({"adapter":"agentfield-v0.1.138","origin":"<scheme://lowercase-host:effective-port>","capabilities":[{"alias", "target", "description", "inputSchema", "risk", "timeoutSeconds", "maxOutputBytes"}...]})
 ```
 
 `list` 返回 alias、description、risk、inputSchema 和 revision，不返回 base URL、token、原始远端 metadata。`start` 必须携带 alias 与 revision。approval 后、发送 HTTP 前再次比较 revision；不一致返回 `agentfield.catalog_changed`，grant 已消费，远端请求为零。
 
-远端健康探测不得成为每 turn 的硬依赖：最近 30 秒成功快照可用于 list；过期且不可达时 list 标记 `available:false`，start fail closed。
+远端最小兼容检查只接受：版本 endpoint 可识别；discovery entry 含 `agent_id/version/health_status/reasoners`；匹配 reasoner 含 `id/invocation_target`；invocation target 与本地 target 逐字一致。远端 description/schema/examples 均不进入 revision、不覆盖本地字段、不扩大输入面。字段缺失、类型错误、重复 target、版本不兼容或 target 不一致均 fail closed 为 `agentfield.remote_protocol`。
+
+远端健康探测不得成为每 turn 的硬依赖：最近 30 秒成功快照可用于 list；过期且不可达时 list 标记 `available:false`，start fail closed。兼容 fixture 位于 `docs/superpowers/fixtures/agentfield-v0.1.138-contract.json`，SHA-256 为 `208e1a1b85640ee60d9d5bbd6914a11d853acb471573eb7cbc5979f4a73014bb`。复现：
+
+```bash
+sha256sum docs/superpowers/fixtures/agentfield-v0.1.138-contract.json
+gh release view v0.1.138 --repo Agent-Field/agentfield
+gh api repos/Agent-Field/agentfield/commits/v0.1.138 --jq .sha
+```
 
 ## 7. 模型工具协议
 
@@ -211,7 +222,7 @@ SHA-256(canonical base origin + adapter version + sorted alias/target/schema/ris
 {"runId":"afrun_...","name":"contract-review","status":"queued","createdAt":"..."}
 ```
 
-`start` 不等待远端完成。若响应在确认 execution ID 前中断，记录 `outcome_unknown`，返回同码；禁止自动重发。实现门禁必须证明可用 correlation/idempotency 字段能供后续查询；若锁定 AgentField 版本不支持对账，ambiguous run 只能人工在控制面核对。
+`start` 不等待远端完成。`v0.1.138` 无 idempotency key：若 Lato 未完整校验 HTTP 202 body 并持久化非空 execution ID，记录**永久** `outcome_unknown`，返回稳定错误并禁止自动重发、status 查询、resume reconcile 或按 input/time/target 猜测匹配。用户文案必须说明“远端可能已启动；请在 AgentField 控制面按时间、target 与审计记录人工核对；不要再次 start，除非接受重复执行风险”。只有收到并绑定 execution ID 的 run 才进入自动 status/resume。
 
 ### 7.3 `status`
 
@@ -227,7 +238,7 @@ SHA-256(canonical base origin + adapter version + sorted alias/target/schema/ris
 | `completed` | 远端成功终态 |
 | `failed` | 远端失败终态或协议结果不可解码 |
 | `cancelled` | 远端明确确认取消 |
-| `outcome_unknown` | start 结果不确定，尚未对账 |
+| `outcome_unknown` | start 结果不确定且无 remote execution ID；永久本地终态，仅人工核对 |
 | `unavailable` | 控制面暂时不可达；不是终态 |
 
 未知远端状态返回 `agentfield.remote_protocol`，保留最后已知状态，不猜测映射。终态结果必须是严格 JSON、64 KiB 内；超限返回 metadata + `truncated:true`，完整内容不落 journal。
@@ -240,9 +251,9 @@ SHA-256(canonical base origin + adapter version + sorted alias/target/schema/ris
 
 ### 8.1 Policy
 
-`list/status` 为只读，但仍受 session ownership 与输出边界约束。`start/cancel` 为有副作用操作：
+现有 `ToolRuntime` 的 capability、side-effect 与 sandbox metadata 是工具级静态 descriptor，不能根据 `action` 改变。v1.1 不扩展 runtime，唯一 `agentfield` 工具四个 action 全部声明：`SideEffect::ExternalMutation`、network capability、现有 network sandbox obligation、非幂等。即使 `list/status` 在远端语义上是读取，也必须经过同一 external-mutation policy/approval；这是保守授权，不得在 `invoke` 内自行降级为只读。
 
-- Ask：展示 alias、target、risk、输入字段名、序列化字节数；不显示 token/secret value。拒批返回 `policy.approval_denied`，远端请求和本地 active run 均为零。
+- Ask：展示 action、alias/owned run、target、risk、输入字段名、序列化字节数；不显示 token/secret value。拒批返回 `policy.approval_denied`，远端请求和本地 active run 均为零。
 - Auto/Always：只在现有 policy 明确允许 `network + agentfield:<alias>` 时签发一次性 grant。
 - Deny 是 policy decision，不是第四种 PolicyMode。
 - grant 绑定 session、turn、call、action、alias、catalog revision、input digest；任何字段变化都不可复用。
@@ -277,7 +288,7 @@ AgentField 远端 PASS 不能升级 Lato 权限；远端返回的 URL、命令�
 
 最小字段：schema version、local run ID、session ID、alias、catalog revision、input digest、remote execution ID（可选）、normalized status、timestamps、bounded result summary、last error code。禁止 token、base URL userinfo、原始输入、完整结果。
 
-append 必须沿用 session journal 单一 sequence owner；不得再引入 host/manager 双写。每次状态转换单调，终态不可被晚到状态覆盖。
+7C3 在 WIN-26 合入前禁止施工。当前已验收 head 为 `17b18f14dfdd32c241a4d2d73cc30f2a8c34eb07`，但 PR #12 尚未合入；7C3 的实际基线必须是“包含该 head 的 `origin/master` merge SHA”，并在开工前以 v1.2 规格勘误写入确切 SHA。append 必须复用 WIN-26 验收后的 SessionLoop 单一 sequence owner；不得让 host、manager 或 HTTP future 直接 append。每次状态转换单调，终态不可被晚到状态覆盖。
 
 ### 9.2 跨进程 resume
 
@@ -285,7 +296,7 @@ append 必须沿用 session journal 单一 sequence owner；不得再引入 host
 
 1. 已终态 run 直接恢复本地快照，不主动联网。
 2. 有 remote execution ID 的非终态 run 在首次 `status` 或后台一次性 reconcile 时查询远端；失败显示 `unavailable`，不改终态。
-3. `outcome_unknown` 按 correlation 能力对账；不能证明唯一远端 execution 时禁止重试 start。
+3. 无 remote execution ID 的 `outcome_unknown` 不自动对账、不查询、不 reconcile，resume 后仍为同一永久本地终态；只呈现人工控制面核对指引。
 4. session close/进程退出只关闭本地 client，不隐式 cancel 远端。用户显式 cancel 才发送取消请求。
 5. 配置删除或 credential 缺失时保留历史 run，但查询返回 `agentfield.unconfigured`，不丢 journal。
 
@@ -301,7 +312,7 @@ append 必须沿用 session journal 单一 sequence owner；不得再引入 host
 
 - `agentfield.enabled` 缺省 false；未配置时工具不注册，现有 CLI/TUI/headless/ACP 输出不变。
 - 本地 task/workflow 工具 schema 与行为零变化。
-- journal 新事件使用未知事件安全跳过/版本门禁；旧 session 无 AgentField 事件可正常 resume。
+- 当前 `JournalRecord` 是无 `other/unknown` variant 的 serde tagged enum；旧 reader 遇到 7C 新事件会反序列化失败并 fail closed，不能安全跳过。7C3 必须提高 journal schema version并加入显式 reader-version 门禁；旧 session 无 7C 事件仍可正常 resume。
 - Linux/macOS/Windows 均支持；系统证书或 proxy 差异必须进入矩阵。
 
 ### 10.2 迁移
@@ -313,9 +324,9 @@ append 必须沿用 session journal 单一 sequence owner；不得再引入 host
 ### 10.3 降级与回滚
 
 - 设置 `enabled:false` 或构建时关闭 adapter 即可撤销工具注册；不会影响本地 task/workflow。
-- 回滚不得删除 journal 事件或远端 execution；旧二进制应忽略未知 7C 事件并提示历史能力不可用。
+- 回滚不得删除 journal 事件或远端 execution。写入首条 7C journal 事件后，旧二进制无法读取该 session；因此代码回滚只支持“升级后尚未产生 7C 事件”的 session。已使用 7C 的 session 必须保留新 reader，或先通过另立并验收的版本化迁移导出；禁止直接降级二进制。
 - control plane 故障时只禁用新 start；历史 status 返回 unavailable，用户仍可在 AgentField 控制面处理。
-- 若锁定版本缺少可验证 async status/cancel/correlation 合同，7C2 不开工；只交付 7C1 client/doctor，不以同步调用降级冒充完整 v1。
+- v1.1 已据 `v0.1.138` 冻结无幂等键降级合同；实现不得虚构 correlation 对账或以同步调用冒充 async v1。
 
 ## 11. 稳定错误码
 
@@ -330,7 +341,7 @@ append 必须沿用 session journal 单一 sequence owner；不得再引入 host
 | `agentfield.remote_denied` | Never | AgentField policy 明确拒绝 |
 | `agentfield.remote_protocol` | After upgrade/config | 版本、状态或 JSON envelope 不兼容 |
 | `agentfield.limit_exceeded` | After terminal/retention | 本地 4 active / 32 retained / 输入输出上限 |
-| `agentfield.outcome_unknown` | Reconcile only | start 是否到达远端不可证明，禁止重试 |
+| `agentfield.outcome_unknown` | Manual only | 未收到 execution ID；永久本地终态，禁止重试/自动查询/对账 |
 | `agentfield.output_too_large` | Never | 单结果无法安全投影 |
 
 所有 pre-policy 参数拒绝必须返回 `agentfield.invalid_arguments`；不能泄漏通用内部错误或远端 body。
@@ -346,7 +357,7 @@ append 必须沿用 session journal 单一 sequence owner；不得再引入 host
 3. Bearer token 注入且 Debug/log/journal/tool output 均无 secret。
 4. allowlist 与远端 discovery 交集；远端新增 capability 不可见。
 5. `list/start/status/cancel` schema 组合与稳定错误码。
-6. Ask 拒批、Auto/Always、remote deny；Lato deny 时零 HTTP。
+6. 四个 action 共用 static external-mutation descriptor；Ask 拒批、Auto/Always、remote deny；Lato deny 时零 HTTP，且不存在 invoke 内 action-aware 绕过。
 7. revision TOCTOU：approval 后配置变化 → grant consumed、零 HTTP/零 active run。
 8. start 成功、明确失败、响应前断线三态；断线不自动重试。
 9. 4-active 真并发原子上限；第 5 个零远端请求。
@@ -354,19 +365,19 @@ append 必须沿用 session journal 单一 sequence owner；不得再引入 host
 11. cancel 四结果与重复 cancel 幂等；超时不可伪报 cancelled。
 12. 输出 64 KiB、恶意 JSON、HTML body、压缩炸弹、未知 status/version。
 13. journal crash points：intent 前/后、bind 前/后、terminal append 前/后。
-14. 跨进程 resume：completed 离线恢复、running 对账、断网 unavailable、outcome_unknown 不重放。
+14. 跨进程 resume：completed 离线恢复、有 execution ID 的 running 对账、断网 unavailable、无 ID 的 outcome_unknown 永久不查询/不重放。
 15. session close 后晚到调用 fail closed；远端 run 不被隐式 cancel。
 16. registration：主会话唯一可见；subagent/headless-filtered/workflow host 不可见。
 17. enabled=false 与回滚：所有既有 task/workflow/ACP/TUI golden 不变。
 
 ### 12.2 锁定版本集成测试
 
-实现前必须记录 AgentField server/CLI commit 或 release、OpenAPI/fixture hash，并用隔离控制面执行：
+实现锁定 AgentField `v0.1.138` / `0aba9d6de1ef2c473070fc329ac7ac63e5d096b9` 与上述 fixture/hash，并用隔离控制面执行：
 
 - health/discovery/async start/status/cancel 的真实 round trip；
 - 401/403、remote policy deny、404 execution、5xx 与 restart；
 - Lato 进程在远端 running 时硬退出，resume 后对账同一 execution；
-- 同 correlation 的 ambiguous start 不产生可观察重复执行，或明确证明只能进入人工对账；
+- response-before-ID 断线后 Lato 自动重试/查询次数均为 0，restart/resume 后仍仅呈现人工核对指引；
 - AgentField 升级一版后的兼容测试，未知合同必须 fail closed。
 
 LIVE 测试只使用无敏感数据的 fixture capability，不进入普通 CI；普通 CI 必须通过 `no-live-network`。
@@ -388,8 +399,8 @@ LIVE 测试只使用无敏感数据的 fixture capability，不进入普通 CI�
 | AC-01 | 未配置/disabled 时 `agentfield` 工具 0 注册，现有 task/workflow schema 与 golden 零变化 |
 | AC-02 | 模型仅能看到本地 allowlist；64 个上限、revision 稳定，URL/token/远端原始 metadata 零泄漏 |
 | AC-03 | `start` 在远端接受后 2 秒内返回本地 run ID（fixture p95）；不等待远端完成；输入 ≤64 KiB |
-| AC-04 | Ask/Auto/Always 与明确 deny 全覆盖；deny/拒批/revision mismatch 均远端请求 0，grant 一次性消费 |
-| AC-05 | 模糊网络失败请求自动重试次数为 0，记录 `outcome_unknown`；恢复后不会创建第二 execution |
+| AC-04 | 四个 action 共享 static external-mutation descriptor；Ask/Auto/Always 与明确 deny 全覆盖；deny/拒批/revision mismatch 均远端请求 0，grant 一次性消费 |
+| AC-05 | 模糊网络失败的自动重试、自动查询、自动对账次数均为 0；无 execution ID 时永久 `outcome_unknown`，resume 后仍只给人工核对指引 |
 | AC-06 | 每 session 非终态上限 4、retained 上限 32；两个并发 start 竞争最后槽位时 active 永不超过 4 |
 | AC-07 | status 只访问 owned run；foreign/unknown 不可区分；未知远端状态 fail closed，不覆盖最后已知/终态 |
 | AC-08 | cancel 超时不报告成功；重复 cancel 幂等；session close 不隐式取消远端 execution |
@@ -403,7 +414,7 @@ LIVE 测试只使用无敏感数据的 fixture capability，不进入普通 CI�
 | 风险 | 严重度 | 处置 |
 | --- | --- | --- |
 | 外部 API 漂移 | P1 | 版本探测、strict decoder、pinned fixture、未知 fail closed |
-| start 超时造成重复远端副作用 | P1 | 单次发送、correlation、outcome_unknown、禁止自动 retry |
+| start 超时造成重复远端副作用 | P1 | 单次发送、永久 outcome_unknown、仅人工核对、禁止自动 retry/query/reconcile |
 | 双 policy 语义被误解 | P1 | Lato 先授权，AgentField 再授权；两者都通过才执行 |
 | Lato 退出但远端继续运行 | P1 | 明示合同、journal 绑定、resume 对账、显式 cancel |
 | token/输入/结果泄漏 | P1 | credential store、最小输入、redaction、bounded journal/output |
@@ -420,7 +431,7 @@ LIVE 测试只使用无敏感数据的 fixture capability，不进入普通 CI�
 - `AgentFieldClient` trait、strict types、fake server、版本/health/discovery；
 - doctor；不注册模型工具、不发起生产执行。
 
-完成门槛：锁定一个 AgentField release/commit 与 fixture hash，证明 async start/status/cancel/correlation 合同。若失败，7C 停在此阶段。
+完成门槛：复现锁定的 `v0.1.138` commit 与 fixture hash，证明 async start/status/cancel/discovery 最小字段；明确验证 idempotency key 不受支持。
 
 ### 7C2：模型工具与运行时（依赖 7C1）
 
@@ -428,9 +439,10 @@ LIVE 测试只使用无敏感数据的 fixture capability，不进入普通 CI�
 - 主会话注册与 UI/ACP 普通 tool 投影；
 - 不含跨进程恢复。
 
-### 7C3：journal 与跨进程恢复（依赖 7C2）
+### 7C3：journal 与跨进程恢复（依赖 7C2 + WIN-26）
 
-- 版本化事件、crash consistency、resume/reconcile、outcome_unknown 人工对账说明；
+- 开工前把 PR #12/WIN-26 合入后的真实 `origin/master` SHA 写回规格；
+- 版本化事件、reader-version fail-closed、crash consistency、仅有 execution ID 的 resume/reconcile、outcome_unknown 人工核对说明；
 - 完整三平台与 LIVE gate。
 
 三刀必须各自独立 PR 和验收；不得把 AgentField shared memory、harness 或 DAG UI 混入。
@@ -446,11 +458,35 @@ Phase 7C v1 只有在以下全部满足后才完成：
 5. 不降低本地 task/workflow、policy、journal、CI 和 no-live-network 基线。
 6. migration、doctor、运行风险、人工对账与 rollback 文档齐全。
 
-## 17. 评审待确认项
+## 17. v1.1 审查修订记录与冻结项
 
-以下问题会实质改变施工合同，规格冻结前必须由评审根据锁定 AgentField 版本回答：
+| 审查项 | v1.1 处理 | 修改位置 |
+| --- | --- | --- |
+| P0 ambiguous start | 锁定 `v0.1.138` 无 idempotency key；无 execution ID 永久 outcome_unknown，仅人工核对 | §1、§2.1、§7.2、§9.2、§11～§15 |
+| P0 action policy | 不做 action-aware runtime；四 action 统一 static external-mutation | §1、§2.3、§8.1、测试与 AC-04 |
+| P1 discovery digest | 冻结 canonical local revision、远端最小字段、strict fail-closed、fixture/hash | §6.2、§12.2 |
+| P1 journal/rollback | 7C3 硬依赖 WIN-26 合入 SHA；旧 reader 对未知 enum fail closed，禁止不安全二进制降级 | §9、§10、§15 |
 
-1. async start 的正式 endpoint、execution status envelope、cancel 结果与 correlation/idempotency 支持是否满足 AC-05；若不满足，采用何种唯一对账键。
-2. discovery 是否提供稳定的 target schema/version digest；v1 默认仍以本地 schema 为权威，不允许远端动态扩大输入面。
+仍有一个实施前机械门禁：PR #12 当前验收 head 为 `17b18f14dfdd32c241a4d2d73cc30f2a8c34eb07`，但尚未合入。其 merge SHA 出现后必须以规格勘误替换“待写回”文字；在此之前 7C3 不得开工。这不改变产品选择，只冻结实际代码基线。
 
-除这两项外，产品范围与安全边界按本 v1 草案执行。
+## 18. PR #13 CI 失败处置记录
+
+首版文档 head `71e332f` 的 GitHub run `35086976901` 仅 Ubuntu 失败：`crates/lato-mcp/tests/lifecycle.rs:204` 的 `stdio_cancel_mid_call_reaps_child` 在启动 fixture child 时得到 `Err(Spawn)`；同 job 其余 lifecycle 用例通过。
+
+归因证据：
+
+- PR #13 相对 `origin/master@0611e26` 只增加设计文档和脱敏 fixture，对 `crates/lato-mcp`、workspace manifests 与 `Cargo.lock` 的 diff 为零。
+- 同一分支本地执行 `cargo test -p lato-mcp --test lifecycle stdio_cancel_mid_call_reaps_child --quiet` 连续 20 次为 20/20 PASS。
+- 因此现有证据排除“7C 文档直接改变 MCP 代码/依赖”，但尚不足以把单次 CI 失败永久标记为环境问题；新 SHA 必须触发全套 CI。只有 Ubuntu/macOS/Windows/lint/no-live-network 5/5 SUCCESS 才允许合并。
+
+复现命令：
+
+```bash
+git diff --quiet origin/master...HEAD -- crates/lato-mcp Cargo.toml Cargo.lock
+for i in $(seq 1 20); do
+  cargo test -p lato-mcp --test lifecycle stdio_cancel_mid_call_reaps_child --quiet
+done
+gh run view 35086976901 --repo hyzwhu/lato --job 104763990022 --log-failed
+```
+
+若新 SHA 的 Ubuntu 再现相同 Spawn 失败，则暂停规格合入，建立独立基线缺陷并在 `origin/master` 相同 runner 环境复现；不得用 rerun 绿掩盖可重复 flake。

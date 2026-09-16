@@ -1,0 +1,84 @@
+{
+  "fixture_version": 1,
+  "source": {
+    "repository": "https://github.com/Agent-Field/agentfield",
+    "release": "v0.1.138",
+    "commit": "0aba9d6de1ef2c473070fc329ac7ac63e5d096b9",
+    "release_published_at": "2026-09-09T18:30:47Z",
+    "files": [
+      "docs/api/EXECUTE.md",
+      "control-plane/internal/handlers/discovery.go",
+      "control-plane/internal/handlers/execute_cancel.go",
+      "control-plane/pkg/types/execution.go"
+    ]
+  },
+  "async_start": {
+    "method": "POST",
+    "path_template": "/api/v1/execute/async/{target}",
+    "success_status": 202,
+    "required_response_fields": {
+      "execution_id": "exec_redacted",
+      "run_id": "run_redacted",
+      "status": "queued",
+      "target": "node.reasoner",
+      "type": "reasoner",
+      "created_at": "2026-09-16T00:00:00Z"
+    },
+    "idempotency_key_supported": false,
+    "retry_can_create_duplicate_execution": true
+  },
+  "status": {
+    "method": "GET",
+    "path_template": "/api/v1/executions/{execution_id}",
+    "required_fields": {
+      "execution_id": "exec_redacted",
+      "run_id": "run_redacted",
+      "agent_node_id": "node",
+      "status": "running",
+      "started_at": "2026-09-16T00:00:00Z"
+    },
+    "optional_fields": [
+      "instance_id",
+      "status_reason",
+      "result",
+      "error",
+      "error_details",
+      "completed_at",
+      "duration_ms",
+      "webhook_events",
+      "approval"
+    ]
+  },
+  "cancel": {
+    "method": "POST",
+    "path_template": "/api/v1/executions/{execution_id}/cancel",
+    "request": {
+      "reason": "cancelled by Lato user"
+    },
+    "success_status": 200,
+    "required_response_fields": {
+      "execution_id": "exec_redacted",
+      "previous_status": "running",
+      "status": "cancelled",
+      "cancelled_at": "2026-09-16T00:00:00Z"
+    },
+    "terminal_conflict_status": 409
+  },
+  "discovery": {
+    "method": "GET",
+    "path": "/api/v1/discovery/capabilities",
+    "minimum_agent_fields": [
+      "agent_id",
+      "version",
+      "health_status",
+      "reasoners"
+    ],
+    "minimum_reasoner_fields": [
+      "id",
+      "invocation_target"
+    ],
+    "schema_digest_present": false,
+    "remote_schema_authoritative": false
+  },
+  "secrets_or_payloads_in_fixture": false
+}
