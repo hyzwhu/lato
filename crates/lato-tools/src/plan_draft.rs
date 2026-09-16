@@ -539,14 +539,18 @@ mod handle {
                 return;
             }
             // (4) Reviewer's seam: deterministic injection AFTER the identity
-            // check and BEFORE the removal. A swap performed inside the seam
-            // is caught by the link-count re-check below even when the seam
-            // returns `Ok`.
-            let _ = faults.on_before_removal(&reap_name);
+            // check and BEFORE the removal. The seam returning `Err` is an
+            // explicit abandon request; the isolated file is restored (with
+            // the defect-#3 occupant guard).
+            if faults.on_before_removal(&reap_name).is_err() {
+                self.restore_isolated(&cname, &creap);
+                return;
+            }
             // (5) Link-count re-check: our created file had exactly ONE link
             // (the isolated `.reap` entry). Any swap of a bystander into the
             // `.reap` slot must remove that link first, which deterministically
-            // surfaces here — the removal is then abandoned.
+            // surfaces here even when the seam returned `Ok` — the removal is
+            // then abandoned.
             let mut after = unsafe { std::mem::zeroed() };
             // Safe: metadata read on the anchor descriptor.
             if unsafe { libc::fstat(anchor.as_raw_fd(), &mut after) } != 0 || after.st_nlink != 1 {
@@ -1588,17 +1592,26 @@ mod tests {
             );
             // The isolated temporary is preserved under its `.reap` name for
             // manual inspection (not deleted, not placed over the
-            // bystander): exactly one .tmp leftover with our content.
+            // bystander): the restore was abandoned because the original
+            // path is occupied, so the leftover set holds both the occupant
+            // and the intact isolated temporary.
             let leftovers = leftovers(&root);
             assert_eq!(
                 leftovers.len(),
-                1,
-                "attempt {attempt}: the isolated file must remain under .reap"
+                2,
+                "attempt {attempt}: occupant + isolated file must remain"
             );
-            assert_eq!(
-                std::fs::read(root.join(&leftovers[0])).unwrap(),
-                b"replacement",
+            let contents = leftovers
+                .iter()
+                .map(|entry| std::fs::read(root.join(entry)).unwrap())
+                .collect::<Vec<_>>();
+            assert!(
+                contents.contains(&b"replacement".to_vec()),
                 "attempt {attempt}: the isolated temporary must be intact"
+            );
+            assert!(
+                contents.contains(&b"occupying-bystander".to_vec()),
+                "attempt {attempt}: the occupying bystander must be intact"
             );
         }
     }
