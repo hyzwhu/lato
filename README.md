@@ -348,6 +348,41 @@ agents inherit the parent session's `ToolApproval`.
   under the run directory (`…/workflows/<runId>/scratch/`) and survive
   `session/resume`; `fork_context` stays unsupported.
 
+### Model-visible workflow tool (Phase 7B7)
+
+The main-session model catalog carries exactly one builtin tool `workflow`
+(`builtin:workflow`, v1.0.0) so the model can drive named workflows without
+slash commands. It is a thin, session-bound adapter over the same
+`WorkflowManager` the board and ACP use — no second turn loop, manager, or ACP
+self-call — and subagent catalogs never include it.
+
+- `{"action":"list"}` returns the trust/plugin snapshot's named scripts
+  (keep-first order, at most 64 entries, `truncated` flag) with
+  `id` / `name` / `description` / `source` / `agentBudget`; never script
+  bodies or disk paths.
+- `{"action":"start","name":"<id>","args":{…},"agentBudget":N}` resolves on
+  the current turn snapshot, asks for one-shot approval (the approval summary
+  shows the resolved workflow id, source, effective budget, and args digest),
+  then launches the background run through the same manager and returns its
+  initial snapshot immediately. A catalog change between approval and
+  execution fails closed with `workflow.catalog_changed` — no run starts.
+- `{"action":"status","run":"<runId|displayName>"}` reports one real run, or
+  the bounded recent-run list without `run`. Model-facing `status` is
+  normalized to `active` / `paused` / `completed` / `interrupted`, while
+  `detailStatus` stays lossless (`user_paused`, `budget_limited`, `failed`,
+  …). Runs restored after a crash report `interrupted`, never `active`.
+- Stable error codes: `workflow.invalid_arguments`, `workflow.not_found`,
+  `workflow.duplicate_name` (retry with the qualified id),
+  `workflow.permission_denied`, `workflow.unavailable`,
+  `workflow.too_many_active_runs` (4 active per session),
+  `workflow.persistence_failed`, `workflow.run_not_found`,
+  `workflow.output_too_large` (64 KiB output ceiling).
+- Boundaries: the tool is external-mutation, so `list` / `status` / `start`
+  all pass the ordinary approval membrane; model-initiated `pause` / `resume`
+  / `stop` do not exist (user-only, via TUI/ACP); internal workflow actions
+  keep their own sandbox/trust/approval checks; output is entry-bounded and
+  JSON-encoded.
+
 ## Doctor
 
 ```bash

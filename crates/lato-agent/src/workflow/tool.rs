@@ -405,12 +405,12 @@ fn validate_args(args: Option<&Value>) -> Result<(), ToolError> {
 }
 
 fn validate_selector(field: &str, value: Option<&str>) -> Result<(), ToolError> {
-    if let Some(value) = value {
-        if value.is_empty() || value.len() > MAX_NAME_BYTES {
-            return Err(invalid_arguments(&format!(
-                "{field} must contain 1..={MAX_NAME_BYTES} UTF-8 bytes"
-            )));
-        }
+    if let Some(value) = value
+        && (value.is_empty() || value.len() > MAX_NAME_BYTES)
+    {
+        return Err(invalid_arguments(&format!(
+            "{field} must contain 1..={MAX_NAME_BYTES} UTF-8 bytes"
+        )));
     }
     Ok(())
 }
