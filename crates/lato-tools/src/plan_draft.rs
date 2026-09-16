@@ -1231,10 +1231,43 @@ mod tests {
                 b"previous",
                 "stage {stage:?} must preserve the previous draft"
             );
-            assert!(
-                leftovers(&root).is_empty(),
-                "stage {stage:?} leaked temporary files"
-            );
+            // Platform difference (project-owner ruling): Linux O_TMPFILE is
+            // truly zero-residue; named-temporary platforms leave the
+            // isolated file under an auditable `.reap` name — but only for
+            // stages at or after CreateTemp (earlier failures never created
+            // anything). No stage may leak the ORIGINAL temporary path.
+            let residue = leftovers(&root);
+            if cfg!(target_os = "linux") {
+                assert!(
+                    residue.is_empty(),
+                    "stage {stage:?}: Linux must leave no residue: {residue:?}"
+                );
+            } else if matches!(
+                stage,
+                PlanDraftStage::CreateTemp
+                    | PlanDraftStage::Write
+                    | PlanDraftStage::Flush
+                    | PlanDraftStage::FileSync
+                    | PlanDraftStage::SecondParentCheck
+                    | PlanDraftStage::SecondDestinationCheck
+            ) {
+                assert_eq!(
+                    residue.len(),
+                    1,
+                    "stage {stage:?}: exactly the auditable .reap file may remain: {residue:?}"
+                );
+                let isolated = root.join(&residue[0]);
+                assert_eq!(
+                    std::fs::read(&isolated).unwrap(),
+                    b"replacement",
+                    "stage {stage:?}: the isolated file must be intact"
+                );
+            } else {
+                assert!(
+                    residue.is_empty(),
+                    "stage {stage:?}: nothing was created before CreateTemp: {residue:?}"
+                );
+            }
         }
     }
 
