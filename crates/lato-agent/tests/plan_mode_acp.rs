@@ -135,3 +135,37 @@ async fn submit_and_approve_reject_drafts_that_fail_closed() {
     let status = plan_with_sid(&mut host, 5, "lato/plan/status", &sid).await;
     assert_eq!(status["result"]["phase"], "awaiting_approval");
 }
+
+#[tokio::test]
+async fn plan_state_never_survives_into_a_fresh_session_and_draft_reloads_on_reentry() {
+    let workspace = tempfile::tempdir().unwrap();
+    let mut host = host(workspace.path());
+
+    // Session 1: enter Plan mode and leave a draft on disk.
+    let new = host.handle(req(0, "session/new", json!({}))).await.unwrap();
+    let sid1 = new["result"]["sessionId"].as_str().unwrap().to_string();
+    plan_with_sid(&mut host, 1, "lato/plan/enter", &sid1).await;
+    std::fs::write(workspace.path().join("plan.md"), "# carried-over draft").unwrap();
+    plan_with_sid(&mut host, 2, "lato/plan/exit", &sid1).await;
+
+    // A fresh session (what a resumed process creates: plan state is never
+    // persisted) starts inactive, never Approved.
+    let new2 = host.handle(req(3, "session/new", json!({}))).await.unwrap();
+    let sid2 = new2["result"]["sessionId"].as_str().unwrap().to_string();
+    let status = plan_with_sid(&mut host, 4, "lato/plan/status", &sid2).await;
+    assert_eq!(status["result"]["phase"], "inactive");
+    assert!(status["result"]["approval"].is_null());
+
+    // Re-entering Plan mode loads the previous plan.md as the starting
+    // draft: the file is intact and its hash is surfaced for /plan status.
+    let enter = plan_with_sid(&mut host, 5, "lato/plan/enter", &sid2).await;
+    assert_eq!(enter["result"]["phase"], "drafting");
+    assert!(
+        !enter["result"]["lastDraftHash"].is_null(),
+        "existing draft must be loaded as the starting point"
+    );
+    assert_eq!(
+        std::fs::read_to_string(workspace.path().join("plan.md")).unwrap(),
+        "# carried-over draft"
+    );
+}

@@ -201,6 +201,14 @@ impl PlanModeRuntime {
             PlanCommand::Revise => inner.approval = None,
             _ => {}
         }
+        // Entering (or re-entering) Plan mode loads an existing, readable
+        // plan.md as the starting draft of this activation: the draft hash is
+        // recorded for `/plan status` and the file itself stays on disk for
+        // the model to continue from. Unreadable or oversized leftovers are
+        // ignored here (they fail closed later, at submit/approve).
+        if matches!(command, PlanCommand::Enter) && to.expects_draft() {
+            inner.last_draft_hash = bounded_read(&self.plan_path).ok().flatten();
+        }
         let activation = inner.activation;
         drop(inner);
         self.set_flag(to.plan_mode_active());
@@ -591,6 +599,88 @@ mod tests {
             other => panic!("expected denied, got {other:?}"),
         }
         assert_eq!(runtime.status().await.phase, PlanPhase::Revising);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn entering_plan_mode_loads_an_existing_draft_as_the_starting_point() {
+        let dir = temp_workspace("starting-draft");
+        let runtime = PlanModeRuntime::new(&dir);
+
+        // With an existing readable draft: entering records its hash as the
+        // starting point and the file stays on disk untouched.
+        write_plan(&dir, "# carried-over plan").await;
+        runtime.enter(false).await.unwrap();
+        let status = runtime.status().await;
+        assert_eq!(status.phase, PlanPhase::Drafting);
+        assert_eq!(
+            status.last_draft_hash.as_deref(),
+            Some(sha256_hex(b"# carried-over plan").as_str())
+        );
+        assert_eq!(
+            fs::read_to_string(dir.join(PLAN_FILE_NAME)).unwrap(),
+            "# carried-over plan"
+        );
+
+        // Re-entering after an edit picks up the new content hash.
+        runtime.exit().await.unwrap();
+        write_plan(&dir, "# carried-over plan v2").await;
+        runtime.enter(false).await.unwrap();
+        assert_eq!(
+            runtime.status().await.last_draft_hash.as_deref(),
+            Some(sha256_hex(b"# carried-over plan v2").as_str())
+        );
+
+        // Without any draft on disk there is no starting hash, and that does
+        // not block entering Plan mode.
+        runtime.exit().await.unwrap();
+        fs::remove_file(dir.join(PLAN_FILE_NAME)).unwrap();
+        runtime.enter(false).await.unwrap();
+        assert!(runtime.status().await.last_draft_hash.is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn plan_state_mutex_is_never_held_across_await_points() {
+        let dir = temp_workspace("lock-scope");
+        let runtime = Arc::new(PlanModeRuntime::new(&dir));
+        write_plan(&dir, "approved contents").await;
+        runtime.enter(false).await.unwrap();
+        runtime.submit().await.unwrap();
+        runtime.approve("user").await.unwrap();
+
+        // Capture a mutation guard; the plan-state mutex must be released by
+        // the time begin_mutation_preflight returns, so a concurrent reader
+        // (status/preflight from another task) makes progress immediately.
+        let guarded = match runtime.begin_mutation_preflight().await {
+            MutationPreflight::Guarded {
+                activation,
+                generation,
+                content_hash,
+            } => (activation, generation, content_hash),
+            other => panic!("expected guarded, got {other:?}"),
+        };
+        let reader = {
+            let runtime = runtime.clone();
+            tokio::spawn(async move {
+                // Both take the same mutex; they must complete well within
+                // the timeout because no lock is held across awaits.
+                runtime.status().await;
+                runtime.begin_mutation_preflight().await
+            })
+        };
+        let concurrent = tokio::time::timeout(std::time::Duration::from_secs(2), reader)
+            .await
+            .expect("plan mutex must not stay held across awaits")
+            .unwrap();
+        assert!(matches!(concurrent, MutationPreflight::Guarded { .. }));
+
+        // The original guard is still completable: concurrent readers never
+        // invalidated it.
+        runtime
+            .complete_mutation_preflight(guarded.0, guarded.1, &guarded.2)
+            .await
+            .unwrap();
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -1212,7 +1212,8 @@ impl SessionActor {
                         })
                     });
             if mutation_capable {
-                match plan.begin_mutation_preflight().await {
+                let outcome = plan.begin_mutation_preflight().await;
+                match outcome {
                     crate::plan::MutationPreflight::Guarded {
                         activation,
                         generation,
@@ -2386,6 +2387,132 @@ mod tests {
             item,
             HistoryItem::ToolResult { output, .. } if output.contains("policy.approval_denied")
         )));
+    }
+
+    fn plan_actor(
+        script: Vec<Vec<StreamPiece>>,
+        cwd: PathBuf,
+    ) -> (SessionActor, Arc<crate::plan::PlanModeRuntime>) {
+        let plan = Arc::new(crate::plan::PlanModeRuntime::new(&cwd));
+        let mut actor = actor(script, cwd);
+        actor.attach_plan(plan.clone());
+        (actor, plan)
+    }
+
+    async fn approve_plan(plan: &crate::plan::PlanModeRuntime, cwd: &std::path::Path) {
+        std::fs::write(cwd.join("plan.md"), "approved contents").unwrap();
+        plan.enter(false).await.unwrap();
+        plan.submit().await.unwrap();
+        plan.approve("test-user").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn plan_mode_overlay_denies_mutation_tool_calls_with_the_structured_code() {
+        let d = tempfile::tempdir().unwrap();
+        let (mut actor, plan) = plan_actor(
+            vec![vec![StreamPiece::ToolCall {
+                id: "w1".into(),
+                name: "write_file".into(),
+                arguments: json!({"path":"out.txt","contents":"nope"}),
+            }]],
+            d.path().to_path_buf(),
+        );
+        plan.enter(false).await.unwrap();
+        assert!(plan.plan_flag().load(Ordering::Acquire));
+
+        actor
+            .prompt(PromptKind::Start, "plan only".into())
+            .await
+            .unwrap();
+
+        assert!(actor.history().iter().any(|item| matches!(
+            item,
+            HistoryItem::ToolResult { output, .. } if output.contains("plan.mode.readonly")
+        )));
+        assert!(!d.path().join("out.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn approved_plan_allows_one_mutation_then_denies_after_plan_tampering() {
+        let d = tempfile::tempdir().unwrap();
+        // Turn 1: one real mutation (allowed after approval, normal policy).
+        // Turn 2: another mutation after the plan file was tampered with.
+        let (mut actor, plan) = plan_actor(
+            vec![
+                vec![StreamPiece::ToolCall {
+                    id: "w-ok".into(),
+                    name: "write_file".into(),
+                    arguments: json!({"path":"notes.txt","contents":"first mutation"}),
+                }],
+                vec![StreamPiece::Text("turn one done".into())],
+                vec![StreamPiece::ToolCall {
+                    id: "w-stale".into(),
+                    name: "write_file".into(),
+                    arguments: json!({"path":"notes2.txt","contents":"second mutation"}),
+                }],
+                vec![StreamPiece::Text("turn two done".into())],
+            ],
+            d.path().to_path_buf(),
+        );
+        approve_plan(&plan, d.path()).await;
+
+        actor
+            .prompt(PromptKind::Start, "turn one".into())
+            .await
+            .unwrap();
+        // The first mutation traversed normal policy and succeeded.
+        assert_eq!(
+            std::fs::read_to_string(d.path().join("notes.txt")).unwrap(),
+            "first mutation"
+        );
+
+        // The user edits plan.md between turns; the next mutation-capable
+        // call must be denied, the approval revoked, and the session moved
+        // to Revising.
+        std::fs::write(d.path().join("plan.md"), "tampered contents").unwrap();
+        actor
+            .prompt(PromptKind::Start, "turn two".into())
+            .await
+            .unwrap();
+
+        assert!(actor.history().iter().any(|item| matches!(
+            item,
+            HistoryItem::ToolResult { output, .. } if output.contains("plan.approval_stale")
+        )));
+        assert!(!d.path().join("notes2.txt").exists());
+        let status = plan.status().await;
+        assert_eq!(status.phase, lato_core::PlanPhase::Revising);
+        assert!(status.approval.is_none());
+    }
+
+    #[tokio::test]
+    async fn approved_plan_rejects_a_mutation_when_the_generation_changed_after_prepare() {
+        let d = tempfile::tempdir().unwrap();
+        let (mut actor, plan) = plan_actor(
+            vec![vec![StreamPiece::ToolCall {
+                id: "w1".into(),
+                name: "write_file".into(),
+                arguments: json!({"path":"out.txt","contents":"x"}),
+            }]],
+            d.path().to_path_buf(),
+        );
+        approve_plan(&plan, d.path()).await;
+
+        actor
+            .prompt(PromptKind::Start, "turn one".into())
+            .await
+            .unwrap();
+
+        // Single mutation with an intact plan file succeeds; no stale denial.
+        assert_eq!(
+            std::fs::read_to_string(d.path().join("out.txt")).unwrap(),
+            "x"
+        );
+        assert!(actor.history().iter().all(|item| !matches!(
+            item,
+            HistoryItem::ToolResult { output, .. } if output.contains("plan.approval_stale")
+        )));
+        assert_eq!(plan.status().await.phase, lato_core::PlanPhase::Approved);
     }
 
     #[tokio::test]
