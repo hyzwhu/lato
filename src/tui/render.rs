@@ -37,6 +37,7 @@ pub fn render(frame: &mut Frame<'_>, app: &mut AppState) {
         Some(Overlay::CommandPalette) => widgets::command_palette(frame, app),
         Some(Overlay::Search) => widgets::search_overlay(frame, app),
         Some(Overlay::WorkflowRuns) => widgets::workflow_runs_overlay(frame, app),
+        Some(Overlay::PlanReview) => widgets::plan_review_overlay(frame, app),
         Some(Overlay::Configuration) | None => {}
     }
     widgets::approval(frame, app);

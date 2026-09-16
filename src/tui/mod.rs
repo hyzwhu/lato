@@ -5,7 +5,7 @@ mod context;
 pub mod dialog;
 pub mod i18n;
 pub mod input;
-mod plan_review;
+pub mod plan_review;
 mod progress;
 pub mod render;
 pub mod state;
@@ -372,116 +372,31 @@ async fn execute_effects(
                     continue;
                 }
                 app.composer.clear();
-                // `/plan approve` shows the plan file for review first and
-                // requires explicit confirmation (spec §2). The whole plan is
-                // reviewed paginated: the approval choice only appears on the
-                // LAST page, so a 128 KiB plan can never be approved from a
-                // truncated preview. A missing or empty plan cannot be
-                // approved at all.
+                // `/plan approve` opens the DEDICATED plan review overlay
+                // (spec §2, A+ Stage 2): the plan is shown in a real widget
+                // over the actual content area, paginated by the terminal
+                // size, and the approval action stays locked until the user
+                // has scrolled the viewport to the last display row. An
+                // empty or missing plan cannot be reviewed or approved.
                 if action == crate::tui::backend::PlanAction::Approve {
                     let plan_path = app.workspace.join("plan.md");
                     let content = std::fs::read_to_string(&plan_path).unwrap_or_default();
-                    if content.trim().is_empty() {
-                        app.error = Some(match app.language {
-                            Language::ZhCn => format!(
-                                "无法批准：{} 为空或不存在。请先让模型完成计划。",
-                                plan_path.display()
-                            ),
-                            Language::En => format!(
-                                "cannot approve: {} is empty or missing; have the model finish the plan first",
-                                plan_path.display()
-                            ),
-                        });
-                        continue;
-                    }
-                    let pages = crate::tui::plan_review::plan_review_pages(
+                    let size = terminal
+                        .size()
+                        .unwrap_or(ratatui::prelude::Size::new(80, 24));
+                    match crate::tui::plan_review::PlanReviewState::open(
+                        &plan_path,
                         &content,
-                        crate::tui::plan_review::PLAN_REVIEW_LINES_PER_PAGE,
-                    );
-                    let total = pages.len();
-                    type PlanReviewChoices<'a> = (
-                        &'a str,
-                        &'a str,
-                        &'a str,
-                        &'a str,
-                        fn(usize, usize) -> String,
-                    );
-                    let (last_choice, next_choice, cancel_choice, final_note, page_note): PlanReviewChoices =
-                        match app.language {
-                        Language::ZhCn => (
-                            "确认批准",
-                            "下一页 →",
-                            "取消",
-                            "\n\n这是最后一页。确认批准该计划？批准不会自动执行任何文件修改。",
-                            |index: usize, total: usize| {
-                                format!("\n\n（第 {}/{total} 页，批准选项在最后一页）", index + 1)
-                            },
-                        ),
-                        Language::En => (
-                            "Approve",
-                            "Next page →",
-                            "Cancel",
-                            "\n\nThis is the final page. Approve this plan? Approval does not auto-execute any file modifications.",
-                            |index: usize, total: usize| {
-                                format!(
-                                    "\n\n(page {}/{total}; the approval choice is on the last page)",
-                                    index + 1
-                                )
-                            },
-                        ),
-                    };
-                    app.overlay = Some(Overlay::Configuration);
-                    let mut confirmed = false;
-                    for (index, page) in pages.iter().enumerate() {
-                        let is_last = index + 1 == total;
-                        let header = match app.language {
-                            Language::ZhCn => format!(
-                                "审阅 {} — 第 {}/{total} 页（共 {} 行，完整审阅后方可批准）",
-                                plan_path.display(),
-                                index + 1,
-                                content.lines().count()
-                            ),
-                            Language::En => format!(
-                                "Review {} — page {}/{total} ({} lines; approve only after the full review)",
-                                plan_path.display(),
-                                index + 1,
-                                content.lines().count()
-                            ),
-                        };
-                        let (choices, note): (Vec<String>, String) = if is_last {
-                            (
-                                vec![last_choice.to_string(), cancel_choice.to_string()],
-                                final_note.to_string(),
-                            )
-                        } else {
-                            (
-                                vec![next_choice.to_string(), cancel_choice.to_string()],
-                                page_note(index, total),
-                            )
-                        };
-                        let prompt = format!("{header}\n\n{page}{note}");
-                        let result = dialog::run(terminal, events, Some(app), |ui| {
-                            let prompt = prompt.clone();
-                            let choices = choices.clone();
-                            async move { ui.choose(prompt, &choices).await }
-                        })
-                        .await;
-                        match result {
-                            Ok(answer) if answer == last_choice => {
-                                confirmed = true;
-                                break;
-                            }
-                            Ok(answer) if answer == next_choice => {}
-                            _ => {
-                                confirmed = false;
-                                break;
-                            }
+                        size.width,
+                        size.height,
+                    ) {
+                        Ok(review) => {
+                            app.plan_review = Some(review);
+                            app.overlay = Some(Overlay::PlanReview);
                         }
+                        Err(error) => app.error = Some(error),
                     }
-                    app.overlay = None;
-                    if !confirmed {
-                        continue;
-                    }
+                    continue;
                 }
                 if let Err(error) = backend.send(BackendCommand::Plan(action)) {
                     app.error = Some(error);
@@ -532,7 +447,7 @@ fn handle_terminal_event(
 ) -> Vec<Effect> {
     match event {
         Event::Resize(width, height) => app.reduce(AppEvent::Resize(width, height)),
-        Event::Paste(text) if app.approval.is_none() => {
+        Event::Paste(text) if app.approval.is_none() && app.plan_review.is_none() => {
             if app.overlay == Some(Overlay::CommandPalette) {
                 app.palette_query
                     .insert_str(&text.replace(['\n', '\r'], " "));
@@ -570,6 +485,9 @@ fn handle_key(
     }
     if app.approval.is_some() {
         return handle_approval_key(app, key);
+    }
+    if app.plan_review.is_some() {
+        return handle_plan_review_key(app, key, backend);
     }
     if app.overlay == Some(Overlay::CommandPalette) {
         return handle_palette_key(app, key, trust);
@@ -1100,6 +1018,65 @@ fn handle_approval_key(app: &mut AppState, key: KeyEvent) -> Vec<Effect> {
         let _ = approval.response.send(decision);
     }
     Vec::new()
+}
+
+/// Keys for the dedicated plan review overlay (Phase 8B spec §2): scroll or
+/// page through the wrapped plan rows; the approval key is only accepted
+/// after the viewport reached the final display row. Esc/`n` closes the
+/// review without approving.
+fn handle_plan_review_key(
+    app: &mut AppState,
+    key: KeyEvent,
+    backend: &BackendHandle,
+) -> Vec<Effect> {
+    if matches!(
+        key.code,
+        KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('q')
+    ) {
+        app.plan_review = None;
+        app.overlay = None;
+        return Vec::new();
+    }
+    let Some(review) = app.plan_review.as_mut() else {
+        return Vec::new();
+    };
+    match key.code {
+        KeyCode::Down | KeyCode::Char('j') => {
+            review.scroll_down(1);
+            Vec::new()
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            review.scroll_up(1);
+            Vec::new()
+        }
+        KeyCode::PageDown | KeyCode::Char(' ') => {
+            review.page_down();
+            Vec::new()
+        }
+        KeyCode::PageUp => {
+            review.page_up();
+            Vec::new()
+        }
+        KeyCode::Home | KeyCode::Char('g') => {
+            review.scroll_to_top();
+            Vec::new()
+        }
+        KeyCode::End | KeyCode::Char('G') => {
+            review.scroll_to_bottom();
+            Vec::new()
+        }
+        KeyCode::Enter | KeyCode::Char('a') | KeyCode::Char('y') if review.can_approve() => {
+            app.plan_review = None;
+            app.overlay = None;
+            if let Err(error) = backend.send(BackendCommand::Plan(
+                crate::tui::backend::PlanAction::Approve,
+            )) {
+                app.error = Some(error);
+            }
+            Vec::new()
+        }
+        _ => Vec::new(),
+    }
 }
 
 fn handle_palette_key(app: &mut AppState, key: KeyEvent, trust: &SessionTrust) -> Vec<Effect> {
