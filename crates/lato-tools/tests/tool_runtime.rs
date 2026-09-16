@@ -46,6 +46,7 @@ fn builtin_adapters_exclude_session_bound_task_tools() {
     let mut expected = [
         "grep",
         "list_dir",
+        "plan_draft",
         "read_file",
         "run_terminal_command",
         "search_replace",
@@ -58,7 +59,7 @@ fn builtin_adapters_exclude_session_bound_task_tools() {
     actual.sort();
     expected.sort();
     assert_eq!(actual, expected);
-    assert_eq!(actual.len(), 8);
+    assert_eq!(actual.len(), 9);
     assert!(!actual.iter().any(|name| name == "spawn_subagent"));
     assert_eq!(
         actual
