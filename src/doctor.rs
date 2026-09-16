@@ -382,7 +382,7 @@ async fn agentfield_check(
             None,
         );
     }
-    let transport = match af::client::ReqwestTransport::new(&config.origin) {
+    let transport = match af::client::ReqwestTransport::connect(&config.origin).await {
         Ok(transport) => transport,
         Err(error) => {
             return check(

@@ -350,15 +350,85 @@ impl<T: HttpTransport + 'static> AgentFieldClient for HttpAgentFieldClient<T> {
 }
 
 /// Production transport over `reqwest` with the frozen network contract:
-/// same-origin redirects only, bounded timeout, bounded body.
+/// DNS resolved once and pinned for every connection (no rebinding window),
+/// the existing `lato-mcp` SSRF/private-network policy applied to exactly
+/// those resolved addresses, same-origin redirects only, bounded timeout,
+/// bounded body.
+#[derive(Debug)]
 pub struct ReqwestTransport {
     client: reqwest::Client,
 }
 
 impl ReqwestTransport {
-    pub fn new(origin: &ControlPlaneOrigin) -> Result<Self, String> {
+    /// Build the production transport for a validated origin: resolve DNS
+    /// once, re-check the resolved addresses through the existing
+    /// `lato-mcp` network policy, and pin them onto the client so connection
+    /// reuse cannot bypass the re-check (spec §6.1/§8.3).
+    pub async fn connect(origin: &ControlPlaneOrigin) -> Result<Self, String> {
+        Self::connect_with_resolver(origin, &lato_mcp::SystemMcpDnsResolver).await
+    }
+
+    /// [`connect`] with an injectable resolver (test seam).
+    pub async fn connect_with_resolver(
+        origin: &ControlPlaneOrigin,
+        resolver: &dyn lato_mcp::McpDnsResolver,
+    ) -> Result<Self, String> {
+        use lato_mcp::validate_mcp_url;
+
+        /// Feeds an already-resolved address set to the policy check so the
+        /// validated addresses are exactly the pinned ones.
+        struct ResolvedAddrsResolver(Vec<std::net::SocketAddr>);
+
+        #[async_trait::async_trait]
+        impl lato_mcp::McpDnsResolver for ResolvedAddrsResolver {
+            async fn resolve(
+                &self,
+                _host: &str,
+                _port: u16,
+            ) -> std::io::Result<Vec<std::net::SocketAddr>> {
+                Ok(self.0.clone())
+            }
+        }
+
+        let host = origin
+            .base
+            .host_str()
+            .ok_or_else(|| "origin has no host".to_string())?
+            .to_owned();
+        let port = origin
+            .base
+            .port_or_known_default()
+            .ok_or_else(|| "origin has no port".to_string())?;
+        // One DNS resolution; policy re-check and pinning share it.
+        let resolved = resolver
+            .resolve(&host, port)
+            .await
+            .map_err(|error| format!("DNS resolution failed for `{host}`: {error}"))?;
+        if resolved.is_empty() {
+            return Err(format!("DNS resolution returned no addresses for `{host}`"));
+        }
+        // Plain HTTP already only reaches here for loopback dev origins
+        // (config-level gate); the policy check re-asserts it on the actual
+        // addresses, and HTTPS destinations reject private/link-local/CGNAT.
+        validate_mcp_url(&origin.base, &ResolvedAddrsResolver(resolved.clone()))
+            .await
+            .map_err(|error| format!("origin rejected by the network policy: {error}"))?;
+        Self::with_pinned_addrs(origin, &resolved).await
+    }
+
+    /// Build the transport with an explicit pinned address set (test seam;
+    /// production must use [`connect`]).
+    pub async fn with_pinned_addrs(
+        origin: &ControlPlaneOrigin,
+        resolved: &[std::net::SocketAddr],
+    ) -> Result<Self, String> {
         let expected_origin = origin_key(&origin.base);
         let allowed_origin = expected_origin.clone();
+        let host = origin
+            .base
+            .host_str()
+            .ok_or_else(|| "origin has no host".to_string())?
+            .to_owned();
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::custom(move |attempt| {
                 if attempt.previous().len() > 3 {
@@ -372,6 +442,7 @@ impl ReqwestTransport {
                     attempt.error(TransportError::RedirectRejected(message))
                 }
             }))
+            .resolve_to_addrs(&host, resolved)
             .timeout(std::time::Duration::from_secs(30))
             .build()
             .map_err(|error| format!("HTTP client build failed: {error}"))?;
@@ -433,5 +504,114 @@ impl HttpTransport for ReqwestTransport {
             content_type,
             body,
         })
+    }
+}
+
+#[cfg(test)]
+mod transport_tests {
+    use super::*;
+    use std::net::{IpAddr, SocketAddr};
+
+    struct FakeResolver(Vec<IpAddr>);
+
+    #[async_trait::async_trait]
+    impl lato_mcp::McpDnsResolver for FakeResolver {
+        async fn resolve(&self, _host: &str, _port: u16) -> std::io::Result<Vec<SocketAddr>> {
+            Ok(self.0.iter().map(|ip| SocketAddr::new(*ip, 443)).collect())
+        }
+    }
+
+    fn origin(url: &str, dev_mode: bool) -> ControlPlaneOrigin {
+        ControlPlaneOrigin {
+            base: url.parse().unwrap(),
+            loopback_dev_mode: dev_mode,
+        }
+    }
+
+    fn public() -> IpAddr {
+        "93.184.216.34".parse().unwrap()
+    }
+
+    fn private() -> IpAddr {
+        "10.20.30.40".parse().unwrap()
+    }
+
+    fn loopback() -> IpAddr {
+        "127.0.0.1".parse().unwrap()
+    }
+
+    #[tokio::test]
+    async fn https_private_addresses_are_rejected_before_client_build() {
+        let error = ReqwestTransport::connect_with_resolver(
+            &origin("https://agents.example.internal", false),
+            &FakeResolver(vec![private()]),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("network policy"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn plain_http_without_loopback_is_rejected_at_transport_layer() {
+        // Even if a misconfigured origin slipped past config, the transport
+        // refuses plain HTTP to non-loopback addresses.
+        let error = ReqwestTransport::connect_with_resolver(
+            &origin("http://agents.example.internal", true),
+            &FakeResolver(vec![public()]),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("network policy"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn loopback_http_connects_and_pins_the_resolved_addresses() {
+        let transport = ReqwestTransport::connect_with_resolver(
+            &origin("http://127.0.0.1:8080", true),
+            &FakeResolver(vec![loopback()]),
+        )
+        .await
+        .unwrap();
+        // The transport exists and is usable; the pinned client was built.
+        let _ = transport.client;
+    }
+
+    #[tokio::test]
+    async fn dns_failure_and_empty_resolution_fail_closed() {
+        struct FailingResolver;
+        #[async_trait::async_trait]
+        impl lato_mcp::McpDnsResolver for FailingResolver {
+            async fn resolve(&self, _host: &str, _port: u16) -> std::io::Result<Vec<SocketAddr>> {
+                Err(std::io::Error::other("dns down"))
+            }
+        }
+        let error = ReqwestTransport::connect_with_resolver(
+            &origin("https://agents.example.internal", false),
+            &FailingResolver,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("DNS resolution failed"), "{error}");
+
+        let error = ReqwestTransport::connect_with_resolver(
+            &origin("https://agents.example.internal", false),
+            &FakeResolver(vec![]),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("no addresses"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn policy_review_covers_exactly_the_pinned_address_set() {
+        // A mixed public+private resolution must be rejected: the policy sees
+        // the same set the connection would use, so reuse cannot bypass it.
+        let error = ReqwestTransport::connect_with_resolver(
+            &origin("https://agents.example.internal", false),
+            &FakeResolver(vec![public(), private()]),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("network policy"), "{error}");
     }
 }
