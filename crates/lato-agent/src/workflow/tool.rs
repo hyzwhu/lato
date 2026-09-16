@@ -6,6 +6,7 @@
 // `attach_workflow_manager`, reusing the 7B4-7B6 registry, concurrency cap,
 // journal persistence, host service, and update broadcast.
 
+use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
@@ -14,11 +15,15 @@ use lato_core::{
     Retryability, SideEffect, Tool, ToolCancellation, ToolCapability, ToolConcurrency, ToolContext,
     ToolDescriptor, ToolError, ToolIdempotency, ToolLayer, ToolName, ToolOutput, ToolSource,
 };
+use lato_workflow::{WorkflowError, clamp_agent_budget};
 use semver::Version;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::{WorkflowManager, list_workflows};
+use super::{
+    LaunchError, LaunchSpec, ResolvedWorkflow, WorkflowManager, WorkflowRunState,
+    WorkflowRunStatus, list_workflows, resolve_workflow,
+};
 use lato_workspace::SessionTrust;
 
 /// Wire name visible to the model (`builtin:workflow` canonical).
@@ -28,6 +33,7 @@ const MAX_NAME_BYTES: usize = 256;
 const MAX_LIST_ENTRIES: usize = 64;
 const MAX_OUTPUT_BYTES: usize = 64 * 1024;
 const MAX_ARGS_BYTES: usize = 64 * 1024;
+const MAX_ARGS_SUMMARY_CHARS: usize = 200;
 const TOOL_TIMEOUT_MS: u64 = 20_000;
 
 /// Model-visible input schema (spec §4.1). Conditional combinations are
@@ -58,6 +64,10 @@ pub struct SessionWorkflowHandle {
     lato_home: PathBuf,
     trust: SessionTrust,
     manager: Arc<RwLock<Option<Arc<WorkflowManager>>>>,
+    /// Approval-time resolution baseline for `start` (spec §7.3): recorded by
+    /// `approval_detail` at policy-prepare time, verified at invoke time, so a
+    /// catalog change between approval and execution fails closed.
+    pending_start: Arc<RwLock<Option<String>>>,
 }
 
 impl SessionWorkflowHandle {
@@ -67,6 +77,7 @@ impl SessionWorkflowHandle {
             lato_home,
             trust,
             manager: Arc::new(RwLock::new(None)),
+            pending_start: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -87,6 +98,29 @@ impl SessionWorkflowHandle {
             .read()
             .unwrap_or_else(|error| error.into_inner())
             .clone()
+    }
+
+    fn store_pending_start(&self, fingerprint: String) {
+        *self
+            .pending_start
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = Some(fingerprint);
+    }
+
+    /// Verify the invoke-time resolution against the approval-time baseline
+    /// (spec §7.3). Consumes the baseline either way; a missing baseline
+    /// (direct invokes, or a different call won the slot) skips the check.
+    fn check_pending_start(&self, fingerprint: &str) -> Result<(), ToolError> {
+        let mut slot = self
+            .pending_start
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        let outcome = match slot.as_deref() {
+            Some(baseline) if baseline != fingerprint => Err(catalog_changed()),
+            _ => Ok(()),
+        };
+        *slot = None;
+        outcome
     }
 }
 
@@ -141,11 +175,48 @@ impl Tool for WorkflowTool {
         let manager = self.handle.manager().ok_or_else(unavailable)?;
         match input.action.as_str() {
             "list" => self.list(&manager),
-            "start" => self.start(&manager, input).await,
-            "status" => self.status(&manager, input).await,
+            "start" => self.start(context, &manager, &input).await,
+            "status" => self.status(&manager, &input).await,
             other => Err(invalid_arguments(&format!(
                 "action must be list, start, or status (got {other:?})"
             ))),
+        }
+    }
+
+    /// Approval-time detail (spec §4.3): the summary shows the resolved
+    /// workflow id, source, effective budget, and an args digest. The
+    /// resolution is also stored as the invoke-time baseline, and the whole
+    /// detail is bound into the approval fingerprint by the runtime.
+    fn approval_detail(&self, arguments: &Value) -> Option<String> {
+        let input = parse_input(arguments.clone()).ok()?;
+        match input.action.as_str() {
+            "list" => Some("list workflows visible to this session".into()),
+            "status" => Some(match input.run.as_deref() {
+                Some(run) => format!("query workflow run status for '{run}'"),
+                None => "query recent workflow run statuses".into(),
+            }),
+            "start" => {
+                let manager = self.handle.manager()?;
+                let snapshot = manager.snapshot()?;
+                let resolved = resolve_workflow(
+                    &self.handle.cwd,
+                    &self.handle.lato_home,
+                    &snapshot,
+                    self.handle.trust.cwd_trusted(),
+                    input.name.as_deref()?,
+                )
+                .ok()?;
+                let effective_budget = effective_budget(&resolved, input.agent_budget).ok()?;
+                let args = input.args.clone().unwrap_or_else(|| json!({}));
+                let fingerprint = resolution_fingerprint(&resolved, effective_budget, &args);
+                self.handle.store_pending_start(fingerprint);
+                Some(start_summary(
+                    &resolved,
+                    effective_budget,
+                    input.args.as_ref(),
+                ))
+            }
+            _ => None,
         }
     }
 }
@@ -181,18 +252,57 @@ impl WorkflowTool {
         bounded_output("list", "workflows", truncated_entries, entries)
     }
 
+    /// `start` (spec §4.3): resolve on the current snapshot, verify the
+    /// approval-time baseline, then launch through the same manager. Returns
+    /// the initial snapshot immediately; the background run keeps streaming.
     async fn start(
         &self,
-        _manager: &Arc<WorkflowManager>,
-        _input: WorkflowToolInput,
+        context: ToolContext,
+        manager: &Arc<WorkflowManager>,
+        input: &WorkflowToolInput,
     ) -> Result<ToolOutput, ToolError> {
-        Err(unavailable())
+        let name = input
+            .name
+            .as_deref()
+            .ok_or_else(|| invalid_arguments("start requires name"))?;
+        let args = input.args.clone().unwrap_or_else(|| json!({}));
+        let snapshot = manager.snapshot().ok_or_else(unavailable)?;
+        let resolved = resolve_workflow(
+            &self.handle.cwd,
+            &self.handle.lato_home,
+            &snapshot,
+            self.handle.trust.cwd_trusted(),
+            name,
+        )
+        .map_err(|error| resolve_error(&error))?;
+        let budget = effective_budget(&resolved, input.agent_budget)
+            .map_err(|error| invalid_arguments(&error.to_string()))?;
+        // Catalog changed between approval and execution → fail closed, no run.
+        let fingerprint = resolution_fingerprint(&resolved, budget, &args);
+        self.handle.check_pending_start(&fingerprint)?;
+        // Cancellation before launch means no run is ever created.
+        if context.cancellation.is_cancelled() {
+            return Err(cancelled());
+        }
+        let state = manager
+            .launch(
+                resolved,
+                LaunchSpec {
+                    args,
+                    agent_budget: Some(budget),
+                    resume_display_name: None,
+                },
+            )
+            .map_err(launch_error)?;
+        // A cancellation arriving after a successful launch is NOT a stop
+        // (spec §4.3): the run stays live and its updates keep streaming.
+        single_run_output("start", &state)
     }
 
     async fn status(
         &self,
         _manager: &Arc<WorkflowManager>,
-        _input: WorkflowToolInput,
+        _input: &WorkflowToolInput,
     ) -> Result<ToolOutput, ToolError> {
         Err(unavailable())
     }
@@ -286,12 +396,164 @@ fn validate_selector(field: &str, value: Option<&str>) -> Result<(), ToolError> 
     Ok(())
 }
 
+/// Effective agent budget for a `start`: an explicit value must sit inside the
+/// engine range (`workflow.invalid_arguments` otherwise); the declared value
+/// applies otherwise (spec §4.3, mirroring the ACP launch path).
+fn effective_budget(
+    resolved: &ResolvedWorkflow,
+    agent_budget: Option<u64>,
+) -> Result<u64, WorkflowError> {
+    match agent_budget {
+        Some(raw) => Ok(u64::from(clamp_agent_budget(Some(raw))?)),
+        None => Ok(u64::from(resolved.agent_budget)),
+    }
+}
+
+/// Stable invocation identity for the approval baseline: resolved id, source,
+/// script content, effective budget, and the exact args (spec §7.3).
+fn resolution_fingerprint(resolved: &ResolvedWorkflow, budget: u64, args: &Value) -> String {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    resolved.id.hash(&mut hasher);
+    resolved.source.hash(&mut hasher);
+    resolved.script.hash(&mut hasher);
+    budget.hash(&mut hasher);
+    args.to_string().hash(&mut hasher);
+    format!("{:016x}{:016x}", hasher.finish(), resolved.script.len())
+}
+
+/// Human-facing approval summary; args are JSON-encoded and truncated, never
+/// interpolated into shell or paths (spec §7.1).
+fn start_summary(resolved: &ResolvedWorkflow, budget: u64, args: Option<&Value>) -> String {
+    let args_text = args.map(Value::to_string).unwrap_or_else(|| "{}".into());
+    let args_summary = if args_text.chars().count() > MAX_ARGS_SUMMARY_CHARS {
+        let truncated: String = args_text.chars().take(MAX_ARGS_SUMMARY_CHARS).collect();
+        format!("{truncated}…")
+    } else {
+        args_text
+    };
+    format!(
+        "start workflow '{}' (source: {}, agent budget: {}) with args: {}",
+        resolved.id, resolved.source, budget, args_summary
+    )
+}
+
 fn unavailable() -> ToolError {
     ToolError::new(
         "workflow.unavailable",
         "workflow runs are not available in this session",
         Retryability::Never,
     )
+}
+
+/// Stable model-facing status normalization (spec §5); `detailStatus` stays
+/// lossless and matches the manager `WorkflowRunStatus` spelling.
+fn model_status(status: WorkflowRunStatus) -> &'static str {
+    match status {
+        WorkflowRunStatus::Active => "active",
+        WorkflowRunStatus::UserPaused
+        | WorkflowRunStatus::BackOffPaused
+        | WorkflowRunStatus::NoProgressPaused
+        | WorkflowRunStatus::InfraPaused
+        | WorkflowRunStatus::Blocked
+        | WorkflowRunStatus::BudgetLimited => "paused",
+        WorkflowRunStatus::Complete => "completed",
+        WorkflowRunStatus::Interrupted
+        | WorkflowRunStatus::Failed
+        | WorkflowRunStatus::Cancelled => "interrupted",
+    }
+}
+
+fn detail_status(status: WorkflowRunStatus) -> &'static str {
+    match status {
+        WorkflowRunStatus::Active => "active",
+        WorkflowRunStatus::UserPaused => "user_paused",
+        WorkflowRunStatus::BackOffPaused => "back_off_paused",
+        WorkflowRunStatus::NoProgressPaused => "no_progress_paused",
+        WorkflowRunStatus::InfraPaused => "infra_paused",
+        WorkflowRunStatus::Blocked => "blocked",
+        WorkflowRunStatus::BudgetLimited => "budget_limited",
+        WorkflowRunStatus::Interrupted => "interrupted",
+        WorkflowRunStatus::Complete => "complete",
+        WorkflowRunStatus::Failed => "failed",
+        WorkflowRunStatus::Cancelled => "cancelled",
+    }
+}
+
+/// Bounded, privacy-safe run projection (spec §4.3/§7.2): no script bodies,
+/// journal contents, or absolute paths.
+fn run_value(state: &WorkflowRunState) -> Value {
+    json!({
+        "runId": state.run_id,
+        "displayName": state.display_name,
+        "status": model_status(state.status),
+        "detailStatus": detail_status(state.status),
+        "phase": state.current_phase,
+        "agentBudget": state.agent_budget,
+        "agentsUsed": state.agents_used,
+        "pauseMessage": state.pause_message,
+        "elapsedMsFloor": state.elapsed_ms_floor,
+    })
+}
+
+/// Single-run output with the same 64 KiB ceiling as list outputs; a snapshot
+/// that cannot fit is a stable `workflow.output_too_large` error.
+fn single_run_output(action: &str, state: &WorkflowRunState) -> Result<ToolOutput, ToolError> {
+    let value = json!({"action": action, "run": run_value(state)});
+    let size = serde_json::to_vec(&value)
+        .map_err(|error| output_error(&error.to_string()))?
+        .len();
+    if size > MAX_OUTPUT_BYTES {
+        return Err(output_error(
+            "the workflow run snapshot exceeds the 64 KiB output limit",
+        ));
+    }
+    Ok(ToolOutput {
+        content: value.to_string(),
+        metadata: json!({"workflowTool": action}),
+        truncated: false,
+        artifact_path: None,
+    })
+}
+
+fn resolve_error(error: &WorkflowError) -> ToolError {
+    match &error {
+        WorkflowError::NotFound(_) => {
+            ToolError::new("workflow.not_found", error.to_string(), Retryability::Never)
+        }
+        WorkflowError::InvalidConfiguration(message) if message == "workflow.duplicate_name" => {
+            ToolError::new(
+                "workflow.duplicate_name",
+                error.to_string(),
+                Retryability::Never,
+            )
+        }
+        _ => ToolError::new(
+            "workflow.unavailable",
+            error.to_string(),
+            Retryability::Never,
+        ),
+    }
+}
+
+fn launch_error(error: LaunchError) -> ToolError {
+    match &error {
+        LaunchError::TooManyActiveRuns => ToolError::new(
+            "workflow.too_many_active_runs",
+            error.to_string(),
+            Retryability::AfterBackoff,
+        ),
+        LaunchError::Persist(_) => ToolError::new(
+            "workflow.persistence_failed",
+            error.to_string(),
+            Retryability::AfterBackoff,
+        ),
+        LaunchError::Resolve(workflow_error) => resolve_error(workflow_error),
+        _ => ToolError::new(
+            "workflow.unavailable",
+            error.to_string(),
+            Retryability::Never,
+        ),
+    }
 }
 
 fn invalid_arguments(message: &str) -> ToolError {
@@ -337,6 +599,14 @@ fn bounded_output(
 
 fn output_error(message: &str) -> ToolError {
     ToolError::new("workflow.output_too_large", message, Retryability::Never)
+}
+
+fn catalog_changed() -> ToolError {
+    ToolError::new(
+        "workflow.catalog_changed",
+        "the workflow catalog changed after approval; re-issue the start call",
+        Retryability::Never,
+    )
 }
 
 fn cancelled() -> ToolError {
@@ -453,10 +723,32 @@ mod tests {
         assert_eq!(error.code, "tool.cancelled");
     }
 
+    fn user_script(name: &str, description: &str) -> String {
+        format!(
+            "let meta = #{{\n    name: \"{name}\",\n    description: \"{description}\",\n}};\ncomplete(\"ok\");\n"
+        )
+    }
+
+    struct HangingStream;
+
+    #[async_trait::async_trait]
+    impl lato_ai::ModelStream for HangingStream {
+        async fn stream(
+            &self,
+            _prompt_bytes: usize,
+            _context: serde_json::Value,
+            _tx: tokio::sync::mpsc::Sender<lato_ai::StreamPiece>,
+        ) -> Result<(), lato_core::ModelError> {
+            std::future::pending::<()>().await;
+            unreachable!();
+        }
+    }
+
     struct ListFixture {
         _temp: tempfile::TempDir,
         cwd: PathBuf,
         home: PathBuf,
+        plugins: Vec<PathBuf>,
     }
 
     impl ListFixture {
@@ -470,26 +762,40 @@ mod tests {
                 _temp: temp,
                 cwd,
                 home,
+                plugins: Vec::new(),
             }
         }
 
-        fn write_rhai(dir: &std::path::Path, name: &str, description: &str) {
+        fn write_rhai(dir: &std::path::Path, name: &str, body: &str) {
             std::fs::create_dir_all(dir).unwrap();
-            std::fs::write(
-                dir.join(format!("{name}.rhai")),
-                format!(
-                    "let meta = #{{\n    name: \"{name}\",\n    description: \"{description}\",\n}};\ncomplete(\"ok\");\n"
-                ),
-            )
-            .unwrap();
+            std::fs::write(dir.join(format!("{name}.rhai")), body).unwrap();
         }
 
         fn write_user(&self, name: &str) {
-            Self::write_rhai(&self.home.join("workflows"), name, "User workflow");
+            Self::write_rhai(
+                &self.home.join("workflows"),
+                name,
+                &user_script(name, "User workflow"),
+            );
+        }
+
+        fn rewrite_user(&self, name: &str, body: &str) {
+            Self::write_rhai(&self.home.join("workflows"), name, body);
         }
 
         fn write_project(&self, name: &str) {
-            Self::write_rhai(&self.cwd.join(".lato/workflows"), name, "Project workflow");
+            Self::write_rhai(
+                &self.cwd.join(".lato/workflows"),
+                name,
+                &user_script(name, "Project workflow"),
+            );
+        }
+
+        fn cli_plugin(&mut self, name: &str, plugin_json: &str) {
+            let root = self.home.join("plugins").join(name);
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(root.join("plugin.json"), plugin_json).unwrap();
+            self.plugins.push(root);
         }
 
         fn snapshot(&self, project_trusted: bool) -> Arc<PluginSnapshot> {
@@ -498,7 +804,7 @@ mod tests {
                 lato_extensions::discover_plugins(&lato_extensions::DiscoveryConfig {
                     cwd: self.cwd.clone(),
                     lato_home: self.home.clone(),
-                    cli_plugin_dirs: Vec::new(),
+                    cli_plugin_dirs: self.plugins.clone(),
                     project_trusted,
                 }),
                 &lato_extensions::PluginConfig::default(),
@@ -508,7 +814,11 @@ mod tests {
 
         /// Tool with the manager installed and the snapshot mounted, mirroring
         /// the host wiring (attach_workflow_manager → install → stage plugins).
-        fn tool(&self, project_trusted: bool) -> WorkflowTool {
+        fn tool_with_stream(
+            &self,
+            project_trusted: bool,
+            stream: Arc<dyn lato_ai::ModelStream>,
+        ) -> WorkflowTool {
             let trust = SessionTrust::for_interactive(&self.cwd, project_trusted);
             let handle =
                 SessionWorkflowHandle::new(self.cwd.clone(), self.home.clone(), trust.clone());
@@ -517,7 +827,7 @@ mod tests {
                 self.cwd.clone(),
                 trust,
                 Arc::new(lato_workspace::FileLocks::new()),
-                crate::default_fake_stream(),
+                stream,
                 None,
                 None,
             ));
@@ -525,10 +835,150 @@ mod tests {
             handle.install(manager);
             WorkflowTool::new(handle)
         }
+
+        fn tool(&self, project_trusted: bool) -> WorkflowTool {
+            self.tool_with_stream(project_trusted, crate::default_fake_stream())
+        }
     }
 
     fn output_json(output: &ToolOutput) -> Value {
         serde_json::from_str(&output.content).unwrap()
+    }
+
+    #[tokio::test]
+    async fn start_launches_through_the_same_manager_and_returns_immediately() {
+        let fixture = ListFixture::new();
+        fixture.write_user("review");
+        let tool = fixture.tool(false);
+
+        let started = tokio::time::Instant::now();
+        let output = tool
+            .invoke(
+                context(),
+                json!({"action":"start","name":"review","args":{"base":"main"}}),
+            )
+            .await
+            .unwrap();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "start must return the initial snapshot quickly"
+        );
+        let value = output_json(&output);
+        assert_eq!(value["action"], "start");
+        assert_eq!(value["run"]["displayName"], "review");
+        assert_eq!(value["run"]["status"], "active");
+        assert_eq!(value["run"]["detailStatus"], "active");
+        assert_eq!(value["run"]["agentsUsed"], 0);
+        assert_eq!(value["run"]["agentBudget"], 128);
+        // Same Manager: the tool-launched run is visible through the manager
+        // the TUI/ACP already poll — there is no second manager.
+        let run_id = value["run"]["runId"].as_str().unwrap().to_owned();
+        assert!(run_id.starts_with("wf_"));
+    }
+
+    #[tokio::test]
+    async fn start_maps_stable_error_codes() {
+        let mut fixture = ListFixture::new();
+        fixture.write_user("greet");
+        fixture.cli_plugin(
+            "alpha",
+            r#"{"name":"alpha","workflows":{"shared":{"description":"Alpha"}}}"#,
+        );
+        fixture.cli_plugin(
+            "beta",
+            r#"{"name":"beta","workflows":{"shared":{"description":"Beta"}}}"#,
+        );
+        let tool = fixture.tool(true);
+
+        let missing = tool
+            .invoke(context(), json!({"action":"start","name":"missing/none"}))
+            .await
+            .unwrap_err();
+        assert_eq!(missing.code, "workflow.not_found");
+
+        let duplicate = tool
+            .invoke(context(), json!({"action":"start","name":"shared"}))
+            .await
+            .unwrap_err();
+        assert_eq!(duplicate.code, "workflow.duplicate_name");
+        // The qualified id resolves.
+        let qualified = tool
+            .invoke(context(), json!({"action":"start","name":"alpha/shared"}))
+            .await
+            .unwrap();
+        assert_eq!(output_json(&qualified)["run"]["displayName"], "shared");
+
+        let budget = tool
+            .invoke(
+                context(),
+                json!({"action":"start","name":"greet","agentBudget":999_999_999}),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(budget.code, "workflow.invalid_arguments");
+    }
+
+    #[tokio::test]
+    async fn approval_summary_shows_resolution_and_catalog_changes_fail_closed() {
+        let fixture = ListFixture::new();
+        fixture.write_user("review");
+        let tool = fixture.tool(false);
+
+        let arguments = json!({"action":"start","name":"review","agentBudget":32});
+        let detail = tool
+            .approval_detail(&arguments)
+            .expect("start produces an approval detail");
+        assert!(detail.contains("'review'"), "detail: {detail}");
+        assert!(detail.contains("source: user"), "detail: {detail}");
+        assert!(detail.contains("agent budget: 32"), "detail: {detail}");
+        assert!(detail.contains("args: {}"), "detail: {detail}");
+
+        // Unchanged catalog: the baseline matches and the launch proceeds.
+        let launched = tool.invoke(context(), arguments.clone()).await.unwrap();
+        assert_eq!(output_json(&launched)["run"]["status"], "active");
+
+        // Fresh approval on the untampered catalog…
+        let detail = tool
+            .approval_detail(&arguments)
+            .expect("resolution still succeeds");
+        assert!(detail.contains("'review'"));
+        // …then the script content changes under the same name before the
+        // user approves and the call executes: the approval-time baseline no
+        // longer matches the invoke-time resolution → catalog_changed, no run.
+        fixture.rewrite_user(
+            "review",
+            &format!("{}\n// tampered", user_script("review", "User workflow")),
+        );
+        let error = tool
+            .invoke(context(), arguments)
+            .await
+            .expect_err("catalog changed after approval");
+        assert_eq!(error.code, "workflow.catalog_changed");
+    }
+
+    #[tokio::test]
+    async fn fifth_concurrent_start_fails_with_stable_code() {
+        let fixture = ListFixture::new();
+        fixture.write_user("hang");
+        fixture.rewrite_user(
+            "hang",
+            "let meta = #{ name: \"hang\", description: \"d\" };\nlet r = agent(\"work\");\n",
+        );
+        let tool = fixture.tool_with_stream(false, Arc::new(HangingStream));
+
+        for _ in 0..4 {
+            let output = tool
+                .invoke(context(), json!({"action":"start","name":"hang"}))
+                .await
+                .unwrap();
+            assert_eq!(output_json(&output)["run"]["status"], "active");
+        }
+        let fifth = tool
+            .invoke(context(), json!({"action":"start","name":"hang"}))
+            .await
+            .unwrap_err();
+        assert_eq!(fifth.code, "workflow.too_many_active_runs");
+        assert_eq!(fifth.retryability, Retryability::AfterBackoff);
     }
 
     #[tokio::test]
