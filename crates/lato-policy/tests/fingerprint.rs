@@ -135,7 +135,7 @@ fn fingerprint_is_lowercase_sha256() {
         // Golden for fingerprint domain v2 (PolicyRequest gained detail,
         // plan_mode and tool_layer bindings); recomputed from the same
         // canonical request.
-        "GOLDEN_TO_RECOMPUTE"
+        "87c03d042d274167cbb2168444457c3495e40c8945b1d3bd5ad99bdb37c3645c"
     );
     assert_eq!(fingerprint.0.len(), 64);
     assert!(

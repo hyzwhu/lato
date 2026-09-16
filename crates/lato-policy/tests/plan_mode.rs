@@ -37,6 +37,7 @@ fn request(
         },
         plan_mode: true,
         tool_layer: ToolLayer::Builtin,
+        detail: None,
     }
 }
 
