@@ -37,15 +37,16 @@ impl std::fmt::Display for ConfigError {
     }
 }
 
-/// A validated control-plane origin: absolute HTTPS (or loopback HTTP in
-/// explicit development mode), no userinfo/query/fragment.
+/// A validated control-plane origin for offline use (v1.2.1): absolute URL
+/// with no userinfo/query/fragment, HTTPS in production, and plain HTTP only
+/// for loopback hosts in explicit development mode. This is a pure data
+/// holder for URL construction; 7C1 performs no network I/O with it — the
+/// production transport and its address policy arrive in Phase 7C1.1.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ControlPlaneOrigin {
     /// `https://host` or `https://host:port` — always ends without a path
     /// beyond the root; API paths are appended by the client.
     pub base: Url,
-    /// True when the origin is an explicitly allowed loopback HTTP origin.
-    pub loopback_dev_mode: bool,
 }
 
 /// One allowlisted capability after validation.
@@ -253,10 +254,7 @@ fn validate_base_url(raw: &str, allow_loopback_http: bool) -> Result<ControlPlan
         base.set_port(Some(port))
             .map_err(|_| "baseUrl port rejected".to_string())?;
     }
-    Ok(ControlPlaneOrigin {
-        base,
-        loopback_dev_mode: loopback && parsed.scheme() == "http",
-    })
+    Ok(ControlPlaneOrigin { base })
 }
 
 fn validate_credential(reference: &str) -> Result<(), String> {

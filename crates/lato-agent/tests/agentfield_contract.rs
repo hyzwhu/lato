@@ -193,7 +193,6 @@ fn config_parses_valid_stanza() {
         config.origin.base.as_str(),
         "https://agents.example.internal/"
     );
-    assert!(!config.origin.loopback_dev_mode);
     assert_eq!(config.capabilities.len(), 1);
     assert_eq!(config.capabilities[0].0, "contract-review");
     assert_eq!(
@@ -228,8 +227,9 @@ fn config_allows_loopback_http_only_in_explicit_dev_mode() {
 
     let mut with_dev = without_dev;
     with_dev["allowLoopbackHttp"] = json!(true);
-    let config = AgentFieldConfig::parse(&with_dev).unwrap().unwrap();
-    assert!(config.origin.loopback_dev_mode);
+    let _config = AgentFieldConfig::parse(&with_dev).unwrap().unwrap();
+    // Dev-mode loopback acceptance stays a config-parse concern in v1.2.1;
+    // the parsed origin carries only the normalized base URL.
 
     // Dev escape hatch never applies to non-loopback hosts.
     let mut remote_http = with_dev.clone();
@@ -421,7 +421,6 @@ fn client_with(transport: Arc<FakeTransport>) -> HttpAgentFieldClient<Arc<FakeTr
     HttpAgentFieldClient::new(
         lato_agent::agentfield::config::ControlPlaneOrigin {
             base: "https://agents.example.internal/".parse().unwrap(),
-            loopback_dev_mode: false,
         },
         Some(RedactedToken::new("super-secret-token-value")),
         transport,
@@ -523,7 +522,6 @@ async fn http_status_mapping_is_stable() {
     let html_client = HttpAgentFieldClient::new(
         lato_agent::agentfield::config::ControlPlaneOrigin {
             base: "https://agents.example.internal/".parse().unwrap(),
-            loopback_dev_mode: false,
         },
         None,
         Arc::new(FakeHtmlTransport),
@@ -591,7 +589,6 @@ async fn transport_failures_map_to_unavailable_and_never_retry() {
     let client = HttpAgentFieldClient::new(
         lato_agent::agentfield::config::ControlPlaneOrigin {
             base: "https://agents.example.internal/".parse().unwrap(),
-            loopback_dev_mode: false,
         },
         None,
         DyingTransport,
@@ -622,7 +619,6 @@ async fn oversized_bodies_are_rejected() {
     let client = HttpAgentFieldClient::new(
         lato_agent::agentfield::config::ControlPlaneOrigin {
             base: "https://agents.example.internal/".parse().unwrap(),
-            loopback_dev_mode: false,
         },
         None,
         HugeTransport,
@@ -639,7 +635,6 @@ async fn cancel_rejects_html_and_non_cancelled_success_status() {
     let client = HttpAgentFieldClient::new(
         lato_agent::agentfield::config::ControlPlaneOrigin {
             base: "https://agents.example.internal/".parse().unwrap(),
-            loopback_dev_mode: false,
         },
         None,
         Arc::new(FakeHtmlTransport),

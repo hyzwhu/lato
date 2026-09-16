@@ -313,8 +313,9 @@ fn home_check(home: &Path) -> DoctorCheck {
 }
 
 /// Phase 7C1: AgentField adapter diagnostics. Offline: configuration state
-/// only (disabled / unconfigured / invalid). Live (`--live`): bounded pinned
-/// contract probe — version, discovery envelope, allowlist target presence.
+/// only (disabled / unconfigured / invalid). Live (`--live`) stays offline for
+/// AgentField in v1.2.1: it reports the `deferred_to_7c1_1` status with zero
+/// AgentField network requests (production verification is Phase 7C1.1).
 async fn agentfield_check(
     home: &Path,
     settings: Option<&DoctorSettings>,
@@ -371,82 +372,24 @@ async fn agentfield_check(
             Some("agentfield.unconfigured"),
         );
     }
-    if !live {
-        return check(
-            "agentfield",
-            DoctorStatus::Ok,
-            format!(
-                "enabled with {} capability(ies); run `lato doctor --live` to verify the pinned contract",
-                config.capabilities.len()
-            ),
-            None,
-        );
-    }
-    let transport = match af::client::ReqwestTransport::connect(&config.origin).await {
-        Ok(transport) => transport,
-        Err(error) => {
-            return check(
-                "agentfield",
-                DoctorStatus::Error,
-                error,
-                Some("agentfield.invalid_arguments"),
-            );
-        }
+    let deferred_note = if live {
+        // v1.2.1 (DG-01): 7C1 is offline-only — doctor `--live` performs ZERO
+        // AgentField network requests; production verification is deferred to
+        // the separately accepted Phase 7C1.1.
+        "; AgentField network verification deferred_to_7c1_1 (zero requests made)"
+    } else {
+        "; run `lato doctor --live` for the deferred-status report"
     };
-    let client =
-        af::client::HttpAgentFieldClient::new(config.origin.clone(), credential, transport);
-    // The live probe goes through the 30-second snapshot cache (spec §6.2):
-    // repeated live checks within the freshness window reuse the pinned
-    // contract result instead of re-probing.
-    let cache = af::AgentFieldProbeCache::new(af::AgentFieldProbe::new(Arc::new(client)));
-    let state = match cache.snapshot().await {
-        Ok(snapshot) => {
-            // Every configured allowlist target must exist on a healthy
-            // agent; the probe may not expand the allowlist, only confirm it.
-            let missing: Vec<&str> = config
-                .capabilities
-                .iter()
-                .filter(|(_, capability)| {
-                    !snapshot
-                        .healthy_execute_targets
-                        .iter()
-                        .any(|target| target == &capability.target)
-                })
-                .map(|(alias, _capability)| alias.as_str())
-                .collect();
-            if !missing.is_empty() {
-                af::AgentFieldDoctorState::ContractMismatch {
-                    detail: format!(
-                        "capability target(s) {missing:?} are missing or unhealthy on the pinned control plane"
-                    ),
-                }
-            } else {
-                af::AgentFieldDoctorState::Enabled {
-                    detail: format!(
-                        "pinned {} contract verified; {} capability(ies)",
-                        af::PINNED_AGENTFIELD_VERSION,
-                        config.capabilities.len()
-                    ),
-                }
-            }
-        }
-        Err(error) => af::classify_probe(Some(&config), Err(&error)),
-    };
-    let (summary, detail) = state.summary();
-    let (status, code) = match &state {
-        af::AgentFieldDoctorState::Enabled { .. } => (DoctorStatus::Ok, None),
-        af::AgentFieldDoctorState::Disabled => (DoctorStatus::Ok, None),
-        af::AgentFieldDoctorState::Unconfigured { .. } => {
-            (DoctorStatus::Warn, Some("agentfield.unconfigured"))
-        }
-        af::AgentFieldDoctorState::Unavailable { .. } => {
-            (DoctorStatus::Warn, Some("agentfield.unavailable"))
-        }
-        af::AgentFieldDoctorState::ContractMismatch { .. } => {
-            (DoctorStatus::Error, Some("agentfield.remote_protocol"))
-        }
-    };
-    check("agentfield", status, format!("{summary}: {detail}"), code)
+    check(
+        "agentfield",
+        DoctorStatus::Ok,
+        format!(
+            "enabled with {} capability(ies){}",
+            config.capabilities.len(),
+            deferred_note
+        ),
+        None,
+    )
 }
 
 fn load_settings(home: &Path) -> Result<Option<DoctorSettings>, String> {
