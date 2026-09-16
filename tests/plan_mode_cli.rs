@@ -13,28 +13,67 @@ fn lato(home: &tempfile::TempDir, workspace: &tempfile::TempDir) -> Command {
 }
 
 #[test]
-fn headless_plan_exits_3_when_a_plan_was_produced_but_not_approved() {
+fn headless_plan_without_a_produced_plan_file_is_an_explicit_failure() {
     let home = tempfile::tempdir().unwrap();
     let workspace = tempfile::tempdir().unwrap();
+    // The fake model never calls plan_draft, so no plan.md is produced: the
+    // run must NOT report the pending-approval code 3, and the nonexistent
+    // plan path must not be presented as a deliverable.
     let output = lato(&home, &workspace)
         .args(["-p", "--plan", "draft a plan for the workspace"])
         .output()
         .unwrap();
     assert_eq!(
         output.status.code(),
+        Some(1),
+        "no plan file produced must be an explicit failure; stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("no readable plan file was produced"),
+        "{stderr}"
+    );
+    assert!(!workspace.path().join("plan.md").exists());
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("plan file:"));
+}
+
+#[test]
+fn headless_plan_exits_3_only_when_a_readable_plan_file_actually_exists() {
+    let home = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    // A real, readable, non-empty plan.md with the session still unapproved
+    // (headless never auto-approves) is exactly the "produced but not
+    // approved" state: exit code 3.
+    std::fs::write(
+        workspace.path().join("plan.md"),
+        "# implementation plan\n\nstep one: real content\n",
+    )
+    .unwrap();
+    let output = lato(&home, &workspace)
+        .args(["-p", "--plan", "continue planning"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
         Some(3),
-        "headless --plan must exit 3 when the plan was not approved; stdout={} stderr={}",
+        "stdout={} stderr={}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("plan file:"),
-        "must print the plan path: {stdout}"
-    );
-    // No auto-approval: the session ended with the plan unapproved, and no
-    // approval record could have been created headlessly.
+    assert!(stdout.contains("plan file:"), "{stdout}");
     assert!(!stdout.contains("approved"));
+
+    // An empty plan.md is not a produced plan: explicit failure.
+    let workspace2 = tempfile::tempdir().unwrap();
+    std::fs::write(workspace2.path().join("plan.md"), b"").unwrap();
+    let output = lato(&home, &workspace2)
+        .args(["-p", "--plan", "continue planning"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
 }
 
 #[test]

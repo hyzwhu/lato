@@ -410,16 +410,40 @@ async fn prompt(args: PromptArgs) -> i32 {
     {
         Ok(outcome) => {
             println!("{}", outcome.text);
-            // Headless never auto-approves (spec §2): a produced but
-            // unapproved plan exits with the distinct code 3.
+            // Headless never auto-approves (spec §2): exit code 3 only when a
+            // readable plan.md was actually produced in the workspace and the
+            // session did not approve it. A Plan-mode turn that ended without
+            // a real plan file is an explicit failure, not a pending approval.
             if let Some(status) = outcome.plan_status {
                 let phase = status["phase"].as_str().unwrap_or("inactive");
-                println!(
-                    "plan file: {}",
-                    status["planPath"].as_str().unwrap_or("plan.md")
-                );
-                if matches!(phase, "drafting" | "awaiting_approval" | "revising") {
+                let plan_path = status["planPath"]
+                    .as_str()
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from(lato_core::PLAN_FILE_NAME));
+                // Awaiting approval implies a readable draft exists (submit
+                // enforces it). Approved cannot occur headlessly (no
+                // auto-approval); treat it as a normal completion.
+                if phase == "awaiting_approval" {
+                    println!("plan file: {}", plan_path.display());
                     return 3;
+                }
+                if matches!(phase, "drafting" | "revising") {
+                    let produced = std::fs::metadata(&plan_path)
+                        .map(|metadata| {
+                            metadata.is_file()
+                                && metadata.len() > 0
+                                && metadata.len() as usize <= lato_core::PLAN_DRAFT_MAX_BYTES
+                        })
+                        .unwrap_or(false);
+                    if produced {
+                        println!("plan file: {}", plan_path.display());
+                        return 3;
+                    }
+                    eprintln!(
+                        "error: plan mode ended in phase {phase} but no readable plan file was produced at {}",
+                        plan_path.display()
+                    );
+                    return 1;
                 }
             }
             0
