@@ -2,9 +2,9 @@
 
 | 字段 | 值 |
 | --- | --- |
-| 状态 | **v1.2 修订稿，待设计评审；禁止施工** |
+| 状态 | **v1.2 已冻结；7C1 可施工，7C2/7C3 按依赖顺序施工** |
 | 日期 | 2026-09-16 |
-| 基线 | `origin/master@0611e26`（Phase 7B7 已合入） |
+| 基线 | `origin/master@89cc87d`（Phase 7B7、WIN-26、7C v1.2 规格已合入） |
 | 目标版本 | Phase 7C；具体发行版本待确认 |
 | 依赖 | Phase 5 task/runtime、Phase 6 信任与配置、Phase 7B workflow/journal/model tool、现有 `ToolRuntime`/policy/approval membrane；7C3 另硬依赖 WIN-26 合入后的 master SHA |
 | 外部基线 | AgentField `v0.1.138` / `0aba9d6de1ef2c473070fc329ac7ac63e5d096b9`；脱敏 fixture SHA-256 `fd524cab584994bdfa9beede4a5691390548fa3cb2a75efc4c23186af3ab3ae8` |
@@ -299,7 +299,7 @@ AgentField 远端 PASS 不能升级 Lato 权限；远端返回的 URL、命令�
 
 最小字段：schema version、local run ID、session ID、alias、catalog revision、input digest、remote execution ID（可选）、normalized status、timestamps、bounded result summary、last error code。禁止 token、base URL userinfo、原始输入、完整结果。
 
-7C3 在 WIN-26 合入前禁止施工。当前已验收 head 为 `17b18f14dfdd32c241a4d2d73cc30f2a8c34eb07`，但 PR #12 尚未合入；7C3 的实际基线必须是“包含该 head 的 `origin/master` merge SHA”，并在开工前以 v1.2 规格勘误写入确切 SHA。append 必须复用 WIN-26 验收后的 SessionLoop 单一 sequence owner；不得让 host、manager 或 HTTP future 直接 append。每次状态转换单调，终态不可被晚到状态覆盖。
+7C3 的 WIN-26 硬依赖已由 PR #12 merge commit `5ae662bbdd6f02e00466f2cce5a6b541b691f086` 满足。append 必须复用该基线中的 SessionLoop 单一 sequence owner；不得让 host、manager 或 HTTP future 直接 append。每次状态转换单调，终态不可被晚到状态覆盖。
 
 ### 9.2 跨进程 resume
 
@@ -458,7 +458,7 @@ LIVE 测试只使用无敏感数据的 fixture capability，不进入普通 CI�
 
 ### 7C3：journal 与跨进程恢复（依赖 7C2 + WIN-26）
 
-- 开工前把 PR #12/WIN-26 合入后的真实 `origin/master` SHA 写回规格；
+- 冻结并验证 WIN-26 merge commit `5ae662bbdd6f02e00466f2cce5a6b541b691f086`；
 - 版本化事件、reader-version fail-closed、crash consistency、仅有 execution ID 的 resume/reconcile、outcome_unknown 人工核对说明；
 - 完整三平台与 LIVE gate。
 
@@ -490,7 +490,7 @@ Phase 7C v1 只有在以下全部满足后才完成：
 | 三审 P1 async 不变量 | 示例令 `workflow_id == run_id`、`enqueued_at == created_at`；校验但不消费 | fixture async、§6.2、校验脚本 |
 | 三审 P1 provenance | 路径更正为 `control-plane/internal/server/routes_core.go`，脚本验证全部路径存在且 checkout 为 pinned commit | fixture source、校验脚本 |
 
-仍有一个实施前机械门禁：PR #12 当前 head 为 `736452f866ec66bbf9f208edb0c2df93a3ba67af`，但尚未合入；当前 `origin/master` 仍为 `0611e26`。其 merge SHA 出现后必须以规格勘误替换“待写回”文字；在此之前 7C3 不得开工。这不改变产品选择，只冻结实际代码基线。
+WIN-26 的实施前机械门禁已关闭：PR #12 head `736452f866ec66bbf9f208edb0c2df93a3ba67af` 已由 merge commit `5ae662bbdd6f02e00466f2cce5a6b541b691f086` 合入。7C3 仍必须等待 7C1、7C2 独立验收通过后按顺序开工。
 
 ## 18. PR #13 CI 失败处置记录
 
@@ -498,7 +498,7 @@ Phase 7C v1 只有在以下全部满足后才完成：
 
 归因证据：
 
-- PR #13 相对 `origin/master@0611e26` 只增加设计文档和脱敏 fixture，对 `crates/lato-mcp`、workspace manifests 与 `Cargo.lock` 的 diff 为零。
+- PR #13 的原始审查基线为 `origin/master@0611e26`，且只增加设计文档和脱敏 fixture，对 `crates/lato-mcp`、workspace manifests 与 `Cargo.lock` 的 diff 为零。
 - 同一分支本地执行 `cargo test -p lato-mcp --test lifecycle stdio_cancel_mid_call_reaps_child --quiet` 连续 20 次为 20/20 PASS。
 - 因此现有证据排除“7C 文档直接改变 MCP 代码/依赖”，但尚不足以把单次 CI 失败永久标记为环境问题；新 SHA 必须触发全套 CI。只有 Ubuntu/macOS/Windows/lint/no-live-network 5/5 SUCCESS 才允许合并。
 
