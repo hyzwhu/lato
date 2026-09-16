@@ -598,7 +598,9 @@ fn bounded_output(
                 artifact_path: None,
             });
         }
-        if entries.is_empty() {
+        // Never silently truncate to nothing: the last remaining entry that
+        // alone cannot fit is a stable error.
+        if entries.len() <= 1 {
             return Err(output_error(
                 "a single workflow entry exceeds the 64 KiB output limit",
             ));
@@ -1348,5 +1350,104 @@ mod tests {
         }
         let run = normalized.expect("run never completed");
         assert_eq!(run["detailStatus"], "complete");
+    }
+
+    // ---- round-1 rework coverage extensions (designer matrix) ----
+
+    #[tokio::test]
+    async fn pre_launch_cancellation_creates_no_run() {
+        let fixture = ListFixture::new();
+        fixture.write_user("review");
+        let (tool, manager) = fixture.tool_with_manager(false, crate::default_fake_stream());
+        let (_, revision) = listed_revision(&tool, "review").await;
+
+        let context = context();
+        context.cancellation.cancel();
+        let error = tool
+            .invoke(
+                context,
+                json!({"action":"start","name":"review","revision":revision,"agentBudget":8}),
+            )
+            .await
+            .expect_err("cancelled before launch");
+        assert_eq!(error.code, "tool.cancelled");
+        assert!(
+            manager.list().is_empty(),
+            "cancelled start must not create a run"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_output_is_json_safe_for_malicious_metadata() {
+        let fixture = ListFixture::new();
+        // Description containing quotes, a closing script tag, backslashes and
+        // a unicode line separator — must survive as escaped JSON.
+        let hostile = "say \"</script>\" \\\\ ok\u{2028}end";
+        ListFixture::write_rhai(
+            &fixture.home.join("workflows"),
+            "hostile",
+            &format!(
+                "let meta = #{{\n    name: \"hostile\",\n    description: \"{}\",\n}};\ncomplete(\"ok\");\n",
+                hostile.replace('\\', "\\\\").replace('"', "\\\"")
+            ),
+        );
+        let tool = fixture.tool(false);
+        let output = tool
+            .invoke(context(), json!({"action":"list"}))
+            .await
+            .unwrap();
+        // Round-trips as strict JSON without breaking the envelope.
+        let listed = serde_json::from_str::<serde_json::Value>(&output.content)
+            .expect("malicious metadata must not break the JSON envelope");
+        let entry = listed["workflows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["id"] == "hostile")
+            .expect("hostile workflow is listed");
+        assert_eq!(entry["description"].as_str().unwrap(), hostile);
+    }
+
+    #[tokio::test]
+    async fn large_listings_truncate_and_defensive_single_entry_guard_is_stable() {
+        let fixture = ListFixture::new();
+        // Registry caps: meta descriptions are validated to <= 1024 bytes, so
+        // the 64 KiB output ceiling is exceeded by entry COUNT (64-entry cap x
+        // ~1 KiB entries ~= 70 KiB), not by one field.
+        let description = "x".repeat(1_024);
+        for seq in 0..70 {
+            ListFixture::write_rhai(
+                &fixture.home.join("workflows"),
+                &format!("big{seq:03}"),
+                &format!(
+                    "let meta = #{{\n    name: \"big{seq:03}\",\n    description: \"{description}\",\n}};\ncomplete(\"ok\");\n"
+                ),
+            );
+        }
+        let tool = fixture.tool(false);
+        let output = tool
+            .invoke(context(), json!({"action":"list"}))
+            .await
+            .unwrap();
+        let listed = output_json(&output);
+        assert!(
+            output.content.len() <= 64 * 1024,
+            "payload must respect the 64 KiB ceiling"
+        );
+        assert!(
+            output.truncated,
+            "an >64 KiB listing must be flagged truncated"
+        );
+        for entry in listed["workflows"].as_array().unwrap() {
+            assert!(entry["description"].as_str().unwrap().len() <= 1_024);
+        }
+
+        // Defensive guard: a single entry that alone cannot fit (unreachable
+        // through the clamping registry, reachable through the bounded-output
+        // seam) is a stable error, never silent truncation to nothing.
+        let huge_entry = json!({"id": "huge", "description": "x".repeat(70_000)});
+        let error = bounded_output("list", "workflows", false, vec![huge_entry])
+            .expect_err("a single unfittable entry must fail stably");
+        assert_eq!(error.code, "workflow.output_too_large");
     }
 }
