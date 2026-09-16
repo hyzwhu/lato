@@ -198,6 +198,9 @@ impl Tool for WorkflowTool {
         let input = parse_input(arguments)?;
         validate_input(&input)?;
         let manager = self.handle.manager().ok_or_else(unavailable)?;
+        if manager.is_closed() {
+            return Err(unavailable());
+        }
         match input.action.as_str() {
             "list" => self.list(&manager),
             "start" => self.start(context, &manager, &input).await,
