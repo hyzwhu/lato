@@ -4,6 +4,7 @@
 
 use crate::{MAX_JOURNAL_BYTES, MAX_JOURNAL_RECORDS, projection, writer::WriterHandle};
 use async_trait::async_trait;
+use fs2::FileExt;
 use lato_core::{
     EventStore, HistoryProjectionMetadata, HistoryProjectionStore, HistoryReplacementReason,
     JournalDurability, JournalEnvelope, JournalError, JournalReplay, ModelMessage, ProjectionError,
@@ -256,6 +257,30 @@ pub(crate) fn append_envelope_blocking(
     durability: JournalDurability,
     faults: &dyn FileFaultInjector,
 ) -> Result<(), JournalError> {
+    // Cross-process critical section: sequence validation and the append must
+    // be indivisible, otherwise two independent store instances (or processes)
+    // can both validate against the same tail and write duplicate sequences.
+    // The lock lives on a dedicated sidecar file so the journal inode itself
+    // is never locked (mandatory byte-range locks on some platforms would
+    // otherwise block the re-read performed inside the section).
+    let parent = path.parent().ok_or_else(|| JournalError::Io {
+        message: "journal path has no parent".into(),
+    })?;
+    ensure_secure_directory(parent)?;
+    let lock = open_lock_file(path)?;
+    lock.lock_exclusive().map_err(io_error)?;
+    let result = append_envelope_locked(session_id, path, envelope, durability, faults);
+    let _ = lock.unlock();
+    result
+}
+
+fn append_envelope_locked(
+    session_id: &SessionId,
+    path: &Path,
+    envelope: &JournalEnvelope,
+    durability: JournalDurability,
+    faults: &dyn FileFaultInjector,
+) -> Result<(), JournalError> {
     let replay = replay_path_blocking(session_id, path)?;
     let mut candidate = replay.envelopes;
     candidate.push(envelope.clone());
@@ -291,6 +316,26 @@ pub(crate) fn append_envelope_blocking(
         }
     }
     Ok(())
+}
+
+/// Sidecar lock file guarding the validate-then-append critical section of
+/// `events.jsonl` across independent store instances and processes.
+fn journal_lock_path(journal_path: &Path) -> PathBuf {
+    let mut name = journal_path.file_name().unwrap_or_default().to_os_string();
+    name.push(".lock");
+    journal_path.with_file_name(name)
+}
+
+fn open_lock_file(journal_path: &Path) -> Result<File, JournalError> {
+    let path = journal_lock_path(journal_path);
+    let mut options = OpenOptions::new();
+    options.create(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    options.open(&path).map_err(io_error)
 }
 
 pub(crate) fn satisfy_existing_durability(

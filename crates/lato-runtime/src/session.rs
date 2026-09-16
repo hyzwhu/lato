@@ -38,6 +38,7 @@ static NEXT_COMPACTION_ID: AtomicU64 = AtomicU64::new(1);
 pub struct SessionHandle {
     command_tx: mpsc::Sender<SubmittedCommand>,
     event_tx: broadcast::Sender<EventEnvelope>,
+    started: tokio::sync::watch::Receiver<Option<Result<(), AgentError>>>,
 }
 
 impl SessionHandle {
@@ -52,9 +53,33 @@ impl SessionHandle {
             .map_err(|_| bus_closed("runtime.reply_bus_closed", "runtime reply bus closed"))?
     }
 
+    /// Waits until the session loop has finished its startup journal bootstrap
+    /// (writing the sole first record when the journal does not exist yet) and
+    /// reports whether the journal contract still holds.
+    pub async fn await_started(&self) -> Result<(), AgentError> {
+        let mut started = self.started.clone();
+        loop {
+            if let Some(result) = started.borrow().as_ref() {
+                return result.clone();
+            }
+            if started.changed().await.is_err() {
+                return Err(runtime_stopped_error());
+            }
+        }
+    }
+
     pub fn subscribe(&self) -> broadcast::Receiver<EventEnvelope> {
         self.event_tx.subscribe()
     }
+}
+
+fn runtime_stopped_error() -> AgentError {
+    AgentError::new(
+        "runtime.session_stopped",
+        ErrorCategory::InvalidInput,
+        "session loop stopped before journal startup completed",
+        Retryability::Never,
+    )
 }
 
 pub fn spawn_session(session_id: SessionId, driver: Arc<dyn TurnDriver>) -> SessionHandle {
@@ -83,6 +108,7 @@ pub fn spawn_session_with_store(
     debug_assert_eq!(bootstrap.replay.projection.session_id, session_id);
     let (command_tx, command_rx) = mpsc::channel(COMMAND_CAPACITY);
     let (event_tx, _) = broadcast::channel(EVENT_CAPACITY);
+    let (started_tx, started_rx) = tokio::sync::watch::channel(None);
     let session = SessionLoop::new(
         session_id,
         driver,
@@ -90,11 +116,13 @@ pub fn spawn_session_with_store(
         bootstrap,
         command_rx,
         event_tx.clone(),
+        Some(started_tx),
     );
     tokio::spawn(session.run());
     SessionHandle {
         command_tx,
         event_tx,
+        started: started_rx,
     }
 }
 
@@ -141,9 +169,11 @@ struct SessionLoop {
     journal_exists: bool,
     started_emitted: bool,
     current_checkpoint_id: Option<String>,
+    started_tx: Option<tokio::sync::watch::Sender<Option<Result<(), AgentError>>>>,
 }
 
 impl SessionLoop {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         session_id: SessionId,
         driver: Arc<dyn TurnDriver>,
@@ -151,6 +181,7 @@ impl SessionLoop {
         bootstrap: SessionBootstrap,
         command_rx: mpsc::Receiver<SubmittedCommand>,
         event_tx: broadcast::Sender<EventEnvelope>,
+        started_tx: Option<tokio::sync::watch::Sender<Option<Result<(), AgentError>>>>,
     ) -> Self {
         let (driver_tx, driver_rx) = mpsc::unbounded_channel();
         let current_checkpoint_id = bootstrap.replay.projection.active_checkpoint_id.clone();
@@ -171,21 +202,50 @@ impl SessionLoop {
             journal_exists: bootstrap.replay.exists,
             started_emitted: false,
             current_checkpoint_id,
+            started_tx,
         }
     }
 
+    /// Single ownership of the journal's first record: the session loop writes
+    /// `SessionStarted` at sequence 0 exactly once when no journal exists yet.
+    /// Callers must never append it themselves; they seed the loop via the
+    /// bootstrap replay instead.
+    async fn ensure_journal_started(&mut self) -> Result<(), AgentError> {
+        if !self.journal_exists {
+            self.commit(
+                None,
+                JournalRecord::SessionStarted,
+                JournalDurability::SyncData,
+            )
+            .await?;
+            self.journal_exists = true;
+        }
+        Ok(())
+    }
+
     async fn run(mut self) {
+        let startup = self.ensure_journal_started().await;
+        if let Some(started_tx) = self.started_tx.take() {
+            let _ = started_tx.send(Some(startup.clone()));
+        }
+        if startup.is_err() {
+            return;
+        }
         loop {
             tokio::select! {
                 command = self.command_rx.recv() => {
                     let Some(command) = command else {
-                        let _ = self.shutdown().await;
+                        // The owner dropped the handle without an explicit
+                        // shutdown command. Treat this like an abrupt process
+                        // exit: stop without appending terminal records so a
+                        // concurrently reopening reader never races an
+                        // in-flight tail commit. Explicit `Command::Shutdown`
+                        // remains the awaited path that commits `SessionStopped`.
+                        self.stop_without_commit();
                         break;
                     };
-                    let result = match self.emit_session_started_once().await {
-                        Ok(()) => self.handle_command(command.command).await,
-                        Err(error) => Err(error),
-                    };
+                    self.emit_session_started_once();
+                    let result = self.handle_command(command.command).await;
                     let _ = command.reply_tx.send(result);
                     if matches!(self.machine.phase(), SessionPhase::Stopped) {
                         break;
@@ -193,7 +253,7 @@ impl SessionLoop {
                 }
                 message = self.driver_rx.recv() => {
                     let Some(message) = message else {
-                        let _ = self.shutdown().await;
+                        self.stop_without_commit();
                         break;
                     };
                     self.handle_driver_message(message).await;
@@ -203,6 +263,23 @@ impl SessionLoop {
                 }
             }
         }
+    }
+
+    /// Stops the loop on an ungraceful owner drop: in-flight work is cancelled
+    /// but the journal is left exactly as last durably committed, so replay
+    /// stays crash-consistent and no tail commit can collide with a session
+    /// that reopened the journal.
+    fn stop_without_commit(&mut self) {
+        self.pending_start = None;
+        if let Some(active) = self.active.take() {
+            active.cancellation.cancel();
+            active.task.abort();
+        }
+        if let Some(active) = self.active_compaction.take() {
+            active.cancellation.cancel();
+            active.task.abort();
+        }
+        self.machine.stop();
     }
 
     async fn handle_command(&mut self, command: Command) -> Result<(), AgentError> {
@@ -1161,21 +1238,11 @@ impl SessionLoop {
         );
     }
 
-    async fn emit_session_started_once(&mut self) -> Result<(), AgentError> {
+    fn emit_session_started_once(&mut self) {
         if !self.started_emitted {
-            if !self.journal_exists {
-                self.commit(
-                    None,
-                    JournalRecord::SessionStarted,
-                    JournalDurability::SyncData,
-                )
-                .await?;
-                self.journal_exists = true;
-            }
             self.started_emitted = true;
             self.emit(None, EventPayload::SessionStarted);
         }
-        Ok(())
     }
 
     async fn shutdown(&mut self) -> Result<(), AgentError> {
