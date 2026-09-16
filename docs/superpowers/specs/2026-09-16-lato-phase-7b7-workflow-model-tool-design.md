@@ -3,7 +3,7 @@
 | 字段 | 值 |
 | --- | --- |
 | 状态 | **已冻结，待实现** |
-| 规格版本 | v1.1（修订 policy mode 与 pre-policy TOCTOU 合同） |
+| 规格版本 | v1.2（冻结三种 PolicyMode、真实拒绝路径与 grant 消费时序） |
 | 日期 | 2026-09-16 |
 | 适用版本 | `origin/master` ≥ `86cd365`（包含 7B5/7B6） |
 | 目标版本 | Phase 7B7；具体发行版本待确认 |
@@ -146,13 +146,15 @@ defense-in-depth 校验。`start` 必须有 `name`、`revision` 和 `agentBudget
    不把 invoke 后才得到的数据假装绑定进旧 fingerprint。
 2. invoke 在当前 turn 固定的 plugin snapshot 上调用现有 `resolve_workflow`；名称解析、重复短名、
    项目信任规则完全复用 registry。重新计算 revision 并常量时间比较；不一致返回
-   `workflow.catalog_changed`，不得启动，也不得自动换成新版本。
+   `workflow.catalog_changed`，不得启动，也不得自动换成新版本。此时 `ToolRuntime::execute` 已在
+   进入 `Tool::invoke` 前一次性消费 grant；run 保持零副作用，已消费 grant 不得恢复或再次使用。
 3. `args` 缺省 `{}`；必须是 JSON object，序列化后最大 64 KiB。
 4. `agentBudget` 必填并复用 `clamp_agent_budget`；可等于 list 的声明值，也可由模型提出其他合法值。
    它之所以必填，是为了在 pre-policy fingerprint 中绑定最终有效预算，禁止 invoke 后补默认值。
 5. policy 对 descriptor + 原始 canonical 参数做决策。单一 descriptor 为 `external_mutation`，
    审批行为严格沿用现有 `PolicyMode`：`Ask` 要求 human approval；`Auto` / `Always` 可自动签发
-   一次性 grant；`Deny`/sandbox/trust 拒绝仍 fail closed。Phase 7B7 不新增绕过 policy mode 的
+   一次性 grant。`PolicyDecision::Deny` 是独立决策结果，不是第四种 mode；sandbox/trust 等拒绝
+   仍 fail closed。Phase 7B7 不新增绕过 policy mode 的
    trusted external gate，也不得宣称三个 action 在所有 mode 下都必然弹出人工审批。
 6. grant 消耗后，调用当前 `RuntimeSession::workflow_launch`；由它取得当前 snapshot 并调用同一
    Manager。成功后立即返回初始 run 快照，不等待 phase 或完成。
@@ -250,7 +252,6 @@ RuntimeSession
 | `workflow.not_found` | named script 不存在或对当前 trust 不可见 | 否 |
 | `workflow.duplicate_name` | 短名歧义 | 用 qualified id 可重试 |
 | `workflow.catalog_changed` | list 后脚本/来源/声明预算内容身份改变 | 重新 list 后可重试 |
-| `workflow.permission_denied` | policy/用户审批拒绝 | 由用户决定 |
 | `workflow.unavailable` | session 未绑定 Manager/正在 teardown | 否 |
 | `workflow.too_many_active_runs` | 已有 4 个 active run | 状态变化后可重试 |
 | `workflow.persistence_failed` | 7B5 launch 落盘失败并回滚 | 修复环境后可重试 |
@@ -259,6 +260,13 @@ RuntimeSession
 
 错误不得泄露绝对路径、脚本内容、approval token 或模型密钥。日志可记录 session id、run id、
 action、错误码和耗时，不记录完整 args。
+
+Policy 拒绝码不重写成 `workflow.*`：Ask 模式下用户/approval callback 拒绝的真实稳定码是
+`policy.approval_denied`；构造非法 sandbox obligation（例如 read-only profile 带 writable root）
+时，`PolicyDecision::Deny` 的真实稳定码是 `sandbox.unsupported`。后者只用于 policy seam 的
+focused test，不是用户可选的“Deny mode”。上述两条均必须在进入 `WorkflowTool::invoke` 前失败，
+run、目录和 journal 为零新增。Phase 7B7 不定义 `workflow.permission_denied`，不得用领域错误吞掉
+或改写现有 policy 稳定码。
 
 ### 7.3 边界与异常流程
 
@@ -290,12 +298,14 @@ action、错误码和耗时，不记录完整 args。
 
 1. descriptor/schema：wire name 唯一；三 action 与条件参数；未知字段、非 object args、>64 KiB 拒绝。
 2. list trust matrix：user 可见；untrusted project/plugin 不可见；trusted+enabled 可见；重复短名行为一致。
-3. start happy path：一次 grant 只启动一次，Ask/Auto/Always/Deny 矩阵正确，返回 active，主 turn不等待完成。
+3. start happy path：一次 grant 只启动一次，Ask/Auto/Always 三种 mode 矩阵正确，返回 active，主 turn不等待完成。
 4. 同一 Manager：TUI/ACP 启动的 run 可被 tool `status` 看见，tool 启动的 run 出现在既有 board/update；
    断言没有第二个 Manager/turn loop。
-5. permission matrix：Ask 拒批零副作用；Auto/Always 自动 grant；Deny fail closed；旧/篡改 grant 失败；
-   list 后修改 user/project script 或 plugin snapshot 均触发 catalog_changed；sandbox/trust 不扩大；
-   内部 host 工具仍独立过膜。
+5. permission matrix：Ask + approval=false → `policy.approval_denied` 且零副作用；Auto/Always 自动 grant；
+   非法 sandbox obligation → `PolicyDecision::Deny("sandbox.unsupported")` 且不进入 invoke；旧/篡改 grant
+   失败；list 后修改 user/project script 或 plugin snapshot 均触发 catalog_changed，且断言 grant 已消费、
+   第二次 execute 返回 `policy.grant_consumed`、run/目录/journal 仍零新增；sandbox/trust 不扩大；内部
+   host 工具仍独立过膜。
 6. lifecycle matrix：所有 11 个 detail status 准确归一到 active/paused/completed/interrupted；字段无损。
 7. concurrency：4 active 时第五次稳定失败；并发 start 不越界；查询不死锁。
 8. persistence：launch 落盘失败全回滚；resume 后 paused/interrupted run 可由同一 tool 查询。
@@ -321,7 +331,7 @@ action、错误码和耗时，不记录完整 args。
 | AC-01 | 主会话请求 tool catalog | 恰有一个 wire name `workflow`，schema 与 §4 一致 |
 | AC-02 | 未信任项目执行 list/start | 项目脚本不出现且不能按猜测名称启动 |
 | AC-03 | start 后立即观察主 turn | 20 秒内返回初始快照，主 turn 未被 workflow 占用 |
-| AC-04 | Ask 拒批及 Deny 后查询 runs/磁盘 | 无新增 run、目录或 journal；Auto/Always 各只新增一个 run |
+| AC-04 | 三 mode + 两条拒绝路径 | Ask 批准只新增 1 run；Ask 拒绝返回 `policy.approval_denied` 且零新增；Auto/Always 各只新增 1 run；非法 sandbox 返回 `sandbox.unsupported` 且零新增，不存在 Deny mode |
 | AC-05 | 同一 run 在 tool、TUI、ACP 查询 | runId/displayName/status/预算字段一致 |
 | AC-06 | 构造全部 detail status | 四类 status 映射逐项符合 §5 |
 | AC-07 | 4 active 后并发启动两次 | 均不造成 active_count > 4；失败码稳定 |
