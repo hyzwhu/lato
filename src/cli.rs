@@ -394,6 +394,14 @@ async fn prompt(args: PromptArgs) -> i32 {
                 return 1;
             }
         }
+    } else if std::env::var_os("LATO_FAKE_PLAN_DRAFT").is_some() {
+        // Deterministic test stream: the turn actually calls `plan_draft`,
+        // producing a real publication event for exit-code coverage.
+        lato_agent::fake_plan_draft_stream()
+    } else if std::env::var_os("LATO_FAKE_PLAN_DRAFT_FAILURE").is_some() {
+        // Deterministic test stream: the `plan_draft` call fails closed, so
+        // no publication event is recorded for the exit-code decision.
+        lato_agent::fake_plan_draft_failure_stream()
     } else {
         default_fake_stream()
     };
@@ -410,37 +418,25 @@ async fn prompt(args: PromptArgs) -> i32 {
     {
         Ok(outcome) => {
             println!("{}", outcome.text);
-            // Headless never auto-approves (spec §2): exit code 3 only when a
-            // readable plan.md was actually produced in the workspace and the
-            // session did not approve it. A Plan-mode turn that ended without
-            // a real plan file is an explicit failure, not a pending approval.
+            // Headless never auto-approves (spec §2): exit code 3 only when
+            // THIS activation actually published a plan through a successful
+            // `plan_draft` tool event. Whether some old plan.md happens to
+            // exist on disk is irrelevant — a stale file from a previous run
+            // must never satisfy the deliverable.
             if let Some(status) = outcome.plan_status {
                 let phase = status["phase"].as_str().unwrap_or("inactive");
                 let plan_path = status["planPath"]
                     .as_str()
                     .map(PathBuf::from)
                     .unwrap_or_else(|| PathBuf::from(lato_core::PLAN_FILE_NAME));
-                // Awaiting approval implies a readable draft exists (submit
-                // enforces it). Approved cannot occur headlessly (no
-                // auto-approval); treat it as a normal completion.
-                if phase == "awaiting_approval" {
+                let published = status["draftPublished"].as_bool() == Some(true);
+                if published && matches!(phase, "awaiting_approval" | "drafting" | "revising") {
                     println!("plan file: {}", plan_path.display());
                     return 3;
                 }
-                if matches!(phase, "drafting" | "revising") {
-                    let produced = std::fs::metadata(&plan_path)
-                        .map(|metadata| {
-                            metadata.is_file()
-                                && metadata.len() > 0
-                                && metadata.len() as usize <= lato_core::PLAN_DRAFT_MAX_BYTES
-                        })
-                        .unwrap_or(false);
-                    if produced {
-                        println!("plan file: {}", plan_path.display());
-                        return 3;
-                    }
+                if matches!(phase, "awaiting_approval" | "drafting" | "revising") {
                     eprintln!(
-                        "error: plan mode ended in phase {phase} but no readable plan file was produced at {}",
+                        "error: plan mode ended in phase {phase} but no plan_draft publication succeeded in this run; the plan at {} was not produced here",
                         plan_path.display()
                     );
                     return 1;

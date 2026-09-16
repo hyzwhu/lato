@@ -41,6 +41,10 @@ pub struct PlanStatus {
     pub plan_path: PathBuf,
     pub last_draft_hash: Option<String>,
     pub approval: Option<PlanApproval>,
+    /// True when at least one `plan_draft` tool call completed successfully
+    /// during THIS activation. Headless exit semantics depend on this event,
+    /// never on whether an old `plan.md` happens to exist on disk.
+    pub draft_published: bool,
 }
 
 /// Errors surfaced to the human command path. The plan state is always left
@@ -91,6 +95,7 @@ struct PlanInner {
     activation: u64,
     approval: Option<PlanApproval>,
     last_draft_hash: Option<String>,
+    draft_published: bool,
 }
 
 /// Per-session Plan-mode state machine, plan file path, and overlay flag.
@@ -157,6 +162,7 @@ impl PlanModeRuntime {
                 activation: 0,
                 approval: None,
                 last_draft_hash: None,
+                draft_published: false,
             }),
             plan_path: workspace_root.join(PLAN_FILE_NAME),
             plan_flag: Arc::new(AtomicBool::new(false)),
@@ -196,6 +202,9 @@ impl PlanModeRuntime {
                 // A new activation never reuses an old approval.
                 inner.approval = None;
                 inner.last_draft_hash = None;
+                // A new activation starts with no successful draft
+                // publication of its own.
+                inner.draft_published = false;
             }
             // A revision request withdraws any recorded approval.
             PlanCommand::Revise => inner.approval = None,
@@ -293,7 +302,17 @@ impl PlanModeRuntime {
             plan_path: self.plan_path.clone(),
             last_draft_hash: inner.last_draft_hash.clone(),
             approval: inner.approval.clone(),
+            draft_published: inner.draft_published,
         }
+    }
+
+    /// Records that a `plan_draft` tool call completed successfully in this
+    /// session. Called by the session actor on the real tool completion
+    /// event; the headless exit code is derived from this, never from a
+    /// stale `plan.md` on disk.
+    pub async fn record_draft_published(&self) {
+        let mut inner = self.inner.lock().await;
+        inner.draft_published = true;
     }
 
     /// First TOCTOU check, run before ordinary policy preparation of a

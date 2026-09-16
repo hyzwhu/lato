@@ -26,13 +26,13 @@ fn headless_plan_without_a_produced_plan_file_is_an_explicit_failure() {
     assert_eq!(
         output.status.code(),
         Some(1),
-        "no plan file produced must be an explicit failure; stdout={} stderr={}",
+        "no plan produced must be an explicit failure; stdout={} stderr={}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("no readable plan file was produced"),
+        stderr.contains("no plan_draft publication succeeded"),
         "{stderr}"
     );
     assert!(!workspace.path().join("plan.md").exists());
@@ -40,19 +40,46 @@ fn headless_plan_without_a_produced_plan_file_is_an_explicit_failure() {
 }
 
 #[test]
-fn headless_plan_exits_3_only_when_a_readable_plan_file_actually_exists() {
+fn headless_plan_never_trusts_a_stale_preexisting_plan_file() {
     let home = tempfile::tempdir().unwrap();
     let workspace = tempfile::tempdir().unwrap();
-    // A real, readable, non-empty plan.md with the session still unapproved
-    // (headless never auto-approves) is exactly the "produced but not
-    // approved" state: exit code 3.
+    // Round-2 regression: an OLD plan.md from a previous run exists, but the
+    // fake model never calls plan_draft in THIS activation. The stale file
+    // must not satisfy the deliverable: exit 1, never 3.
     std::fs::write(
         workspace.path().join("plan.md"),
-        "# implementation plan\n\nstep one: real content\n",
+        "# stale plan from a previous run\n",
     )
     .unwrap();
     let output = lato(&home, &workspace)
         .args(["-p", "--plan", "continue planning"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "a stale plan.md must not produce exit 3; stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("no plan_draft publication succeeded"),
+        "{stderr}"
+    );
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("plan file:"));
+}
+
+#[test]
+fn headless_plan_exits_3_only_when_plan_draft_published_this_run() {
+    let home = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    // The fake turn calls plan_draft for real: the publication event is
+    // recorded for THIS activation and the headless run exits 3 — even with
+    // no plan file on disk before the run.
+    let output = lato(&home, &workspace)
+        .env("LATO_FAKE_PLAN_DRAFT", "1")
+        .args(["-p", "--plan", "draft a plan for the workspace"])
         .output()
         .unwrap();
     assert_eq!(
@@ -64,16 +91,36 @@ fn headless_plan_exits_3_only_when_a_readable_plan_file_actually_exists() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("plan file:"), "{stdout}");
-    assert!(!stdout.contains("approved"));
+    assert_eq!(
+        std::fs::read_to_string(workspace.path().join("plan.md")).unwrap(),
+        "# implementation plan\n\nstep one: real content\n"
+    );
+}
 
-    // An empty plan.md is not a produced plan: explicit failure.
-    let workspace2 = tempfile::tempdir().unwrap();
-    std::fs::write(workspace2.path().join("plan.md"), b"").unwrap();
-    let output = lato(&home, &workspace2)
-        .args(["-p", "--plan", "continue planning"])
+#[test]
+fn headless_plan_failed_plan_draft_write_is_an_explicit_failure() {
+    let home = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    // The plan_draft call fails closed (oversized payload): no publication
+    // event, so the run must exit 1 even though the tool ran.
+    let output = lato(&home, &workspace)
+        .env("LATO_FAKE_PLAN_DRAFT_FAILURE", "1")
+        .args(["-p", "--plan", "draft a plan for the workspace"])
         .output()
         .unwrap();
-    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("no plan_draft publication succeeded"),
+        "{stderr}"
+    );
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("plan file:"));
 }
 
 #[test]

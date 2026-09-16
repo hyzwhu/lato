@@ -354,6 +354,13 @@ impl TurnDriver for LegacyTurnDriver {
         events: TurnEventEmitter,
     ) -> Result<TurnOutput, AgentError> {
         let mut state = self.state.lock().await;
+        // Forward the session Plan-mode runtime to the turn actor (A+ Stage
+        // 2): the plan TOCTOU guard, the plan-mode overlay flag, and the
+        // plan_draft publication event must be live on the real turn path.
+        // Idempotent — `attach_plan` only fills an unset slot.
+        if let Some(plan) = self.plan_slot.get() {
+            state.actor.attach_plan(plan.clone());
+        }
         let turn_id = request.turn_id.clone();
         let cancellation = control.cancellation.clone();
         let mut input = request.input;

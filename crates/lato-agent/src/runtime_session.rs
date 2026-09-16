@@ -800,6 +800,7 @@ impl RuntimeSession {
             "activation": status.activation,
             "planPath": status.plan_path.to_string_lossy(),
             "lastDraftHash": status.last_draft_hash,
+            "draftPublished": status.draft_published,
             "approval": status.approval.map(|approval| serde_json::json!({
                 "activation": approval.activation,
                 "generation": approval.generation,

@@ -1517,6 +1517,33 @@ pub fn default_fake_stream() -> Arc<dyn ModelStream> {
     )]]))
 }
 
+/// Deterministic test stream: the turn issues a real, in-bounds `plan_draft`
+/// tool call, so the session records a genuine draft-publication event.
+pub fn fake_plan_draft_stream() -> Arc<dyn ModelStream> {
+    Arc::new(FakeModelStream::new(vec![vec![
+        StreamPiece::ToolCall {
+            id: "plan-draft-1".into(),
+            name: "plan_draft".into(),
+            arguments: serde_json::json!({"contents": "# implementation plan\n\nstep one: real content\n"}),
+        },
+        StreamPiece::Text("drafted".into()),
+    ]]))
+}
+
+/// Deterministic test stream: the turn calls `plan_draft` with an oversized
+/// payload, so the tool call FAILS closed and nothing is published.
+pub fn fake_plan_draft_failure_stream() -> Arc<dyn ModelStream> {
+    let oversized = "a".repeat(lato_core::PLAN_DRAFT_MAX_BYTES + 1);
+    Arc::new(FakeModelStream::new(vec![vec![
+        StreamPiece::ToolCall {
+            id: "plan-draft-fail-1".into(),
+            name: "plan_draft".into(),
+            arguments: serde_json::json!({ "contents": oversized }),
+        },
+        StreamPiece::Text("tried".into()),
+    ]]))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

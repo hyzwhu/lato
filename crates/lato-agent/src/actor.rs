@@ -117,6 +117,13 @@ pub struct SessionActor {
     plan_slot: Arc<std::sync::OnceLock<Arc<crate::plan::PlanModeRuntime>>>,
     #[cfg(test)]
     pub(crate) on_after_persist: Option<Box<dyn Fn() + Send + Sync>>,
+    /// Test injection seam on the REAL path: fires immediately after the
+    /// `ToolCallPrepared` journal record is committed and before the plan
+    /// TOCTOU check #2 / grant consumption. Deterministic tests use it to
+    /// mutate the plan generation/hash at exactly the race window the spec
+    /// requires to be proven fail-closed.
+    #[cfg(test)]
+    pub(crate) on_after_prepared: Option<Box<dyn Fn() + Send + Sync>>,
     #[cfg(test)]
     on_before_sample_spawn: Option<Box<dyn Fn() + Send + Sync>>,
 }
@@ -200,6 +207,8 @@ impl SessionActor {
             plan_slot: Arc::new(std::sync::OnceLock::new()),
             #[cfg(test)]
             on_after_persist: None,
+            #[cfg(test)]
+            on_after_prepared: None,
             #[cfg(test)]
             on_before_sample_spawn: None,
         }
@@ -1394,6 +1403,14 @@ impl SessionActor {
                     JournalDurability::SyncData,
                 )
                 .await?;
+                // Real prepare→consume injection seam (A+ Stage 2): tests
+                // mutate state here — after `ToolCallPrepared`, before the
+                // grant is consumed — to prove the TOCTOU check below fails
+                // closed on the production path itself.
+                #[cfg(test)]
+                if let Some(cb) = &self.on_after_prepared {
+                    cb();
+                }
                 // Plan approval TOCTOU check #2 — immediately before this
                 // call's grant is consumed (spec §3/§6): the session must
                 // still be Approved with the same activation, generation, and
@@ -1456,13 +1473,23 @@ impl SessionActor {
                 }
                 self.commit(
                     JournalRecord::ToolCallCompleted {
-                        call_id: audit.call_id,
-                        request_hash: audit.request_hash,
+                        call_id: audit.call_id.clone(),
+                        request_hash: audit.request_hash.clone(),
                         result: result.clone(),
                     },
                     JournalDurability::SyncData,
                 )
                 .await?;
+                // A successful `plan_draft` execution is the single source of
+                // "this activation produced a plan" (spec §2/A+ Stage 2):
+                // headless exit semantics read this event, never the mere
+                // existence of an old plan.md on disk.
+                if audit.tool_name.as_str() == lato_core::PLAN_DRAFT_TOOL_NAME
+                    && result.is_ok()
+                    && let Some(plan) = self.plan()
+                {
+                    plan.record_draft_published().await;
+                }
                 result
             }
             Err(error) => {
@@ -2486,7 +2513,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn approved_plan_rejects_a_mutation_when_the_generation_changed_after_prepare() {
+    async fn approved_plan_allows_a_mutation_when_the_generation_is_unchanged_after_prepare() {
         let d = tempfile::tempdir().unwrap();
         let (mut actor, plan) = plan_actor(
             vec![vec![StreamPiece::ToolCall {
@@ -2513,6 +2540,49 @@ mod tests {
             HistoryItem::ToolResult { output, .. } if output.contains("plan.approval_stale")
         )));
         assert_eq!(plan.status().await.phase, lato_core::PlanPhase::Approved);
+    }
+
+    #[tokio::test]
+    async fn mutation_after_a_post_prepared_plan_change_fails_closed_into_revising() {
+        let d = tempfile::tempdir().unwrap();
+        let (mut actor, plan) = plan_actor(
+            vec![vec![StreamPiece::ToolCall {
+                id: "w1".into(),
+                name: "write_file".into(),
+                arguments: json!({"path":"out.txt","contents":"x"}),
+            }]],
+            d.path().to_path_buf(),
+        );
+        approve_plan(&plan, d.path()).await;
+
+        // Real prepare→consume seam: mutate the plan exactly in the window
+        // between the `ToolCallPrepared` journal commit and the grant
+        // consumption. The production TOCTOU check #2 must reject the call,
+        // revoke the approval, and return the session to Revising — on the
+        // real path, not a re-implementation of it.
+        let plan_path = d.path().join("plan.md");
+        actor.on_after_prepared = Some(Box::new(move || {
+            std::fs::write(&plan_path, "mutated after prepare").unwrap();
+        }));
+
+        actor
+            .prompt(PromptKind::Start, "turn one".into())
+            .await
+            .unwrap();
+
+        assert!(
+            actor.history().iter().any(|item| matches!(
+                item,
+                HistoryItem::ToolResult { output, .. } if output.contains("plan.approval_stale")
+            )),
+            "the mutation must be rejected with plan.approval_stale: {:?}",
+            actor.history()
+        );
+        assert!(
+            !d.path().join("out.txt").exists(),
+            "the rejected call must not have executed"
+        );
+        assert_eq!(plan.status().await.phase, lato_core::PlanPhase::Revising);
     }
 
     #[tokio::test]
