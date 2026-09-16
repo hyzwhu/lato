@@ -136,8 +136,6 @@ struct CreatedTemp {
     name: String,
     #[cfg(not(unix))]
     full_path: PathBuf,
-    #[cfg(unix)]
-    identity: (u64, u64),
 }
 
 /// Removes the temporary file created by this call. A bystander that
@@ -242,8 +240,7 @@ mod handle {
 
         /// Creates the temporary file relative to the pinned handle with
         /// create-new semantics and user-only permissions. Returns the file
-        /// plus its (device, inode) identity for the cleanup guard.
-        pub fn create_temp(&self, name: &str) -> Result<(File, (u64, u64)), String> {
+        pub fn create_temp(&self, name: &str) -> Result<File, String> {
             let cname = cstring(name.as_bytes())?;
             let fd = unsafe {
                 libc::openat(
@@ -259,12 +256,10 @@ mod handle {
                     last_os_error()
                 ));
             }
-            // Safe: fd is a freshly opened descriptor owned by us.
-            let file = unsafe { File::from_raw_fd(fd) };
-            let metadata = file
-                .metadata()
-                .map_err(|error| format!("plan_draft: could not create temporary file: {error}"))?;
-            Ok(((file), (metadata.dev(), metadata.ino())))
+            // Safe: fd is a freshly opened descriptor owned by us. The
+            // caller keeps it open until the cleanup decision has been made,
+            // pinning the inode against reuse.
+            Ok(unsafe { File::from_raw_fd(fd) })
         }
 
         /// Atomically renames the temporary name over the final name, both
@@ -292,17 +287,28 @@ mod handle {
             Ok(())
         }
 
-        /// Unlinks the temporary name relative to the pinned handle, but only
-        /// when the entry still refers to the created identity — a swapped-in
-        /// bystander is never deleted.
-        pub fn unlink_if_unchanged(&self, name: &str, identity: (u64, u64)) -> Result<(), ()> {
+        /// Unlinks the temporary name relative to the pinned handle, but
+        /// only while the entry still refers to the file THIS call created.
+        /// The caller must pass the still-open descriptor of the created
+        /// file: while that descriptor is open, the inode it refers to is
+        /// pinned and can be neither freed nor reused, so comparing the live
+        /// path against `fstat(owned)` is race-free — an unlinked-and-swapped
+        /// path can never present the same (device, inode) while we hold the
+        /// descriptor, and a swapped-in bystander is never deleted.
+        pub fn unlink_if_unchanged(&self, name: &str, owned: &File) -> Result<(), ()> {
             let cname = cstring(name.as_bytes()).map_err(|_| ())?;
-            let mut stat = unsafe { std::mem::zeroed() };
+            let mut own = unsafe { std::mem::zeroed() };
+            // Safe: metadata read on our own still-open descriptor.
+            if unsafe { libc::fstat(owned.as_raw_fd(), &mut own) } != 0 {
+                return Err(());
+            }
+            let mut current = unsafe { std::mem::zeroed() };
             // Safe: pure metadata read on a handle-relative name.
-            if unsafe { libc::fstatat(self.fd.as_raw_fd(), cname.as_ptr(), &mut stat, 0) } != 0 {
+            if unsafe { libc::fstatat(self.fd.as_raw_fd(), cname.as_ptr(), &mut current, 0) } != 0
+            {
                 return Err(()); // already gone
             }
-            if (stat.st_dev, stat.st_ino) != identity {
+            if (current.st_dev, current.st_ino) != (own.st_dev, own.st_ino) {
                 return Err(()); // swapped: never delete someone else's file
             }
             // Safe: unlink on a handle-relative name; failure is harmless.
@@ -334,12 +340,16 @@ fn publish_locked_handle(
 ) -> Result<(), String> {
     use std::io::Write as _;
 
-    /// Fails a stage: clean up the created temporary (identity-checked) and
-    /// propagate the stage error.
+    /// Fails a stage: clean up the created temporary while its descriptor is
+    /// still open (pinned inode), then propagate the stage error.
     macro_rules! fault_fail {
-        ($handle:ident, $created:ident, $stage:expr, $message:expr) => {{
+        ($handle:ident, $created:ident, $file:ident, $stage:expr, $message:expr) => {{
             if let Some(created) = $created.take() {
-                cleanup_temp_unix(&$handle, &created);
+                if let Some(open) = $file.take() {
+                    cleanup_temp_unix(&$handle, &created, &open);
+                    // `open` is dropped here — only after the cleanup
+                    // decision has been made under the pinned inode.
+                }
             }
             return Err(stage_error($stage, $message));
         }};
@@ -366,44 +376,46 @@ fn publish_locked_handle(
     if let Err(message) = faults.on_stage(PlanDraftStage::CreateTemp) {
         return Err(stage_error(PlanDraftStage::CreateTemp, message));
     }
-    let (mut file, identity) = handle.create_temp(temp_name)?;
+    let mut file = Some(handle.create_temp(temp_name)?);
     let mut created = Some(CreatedTemp {
         name: temp_name.to_owned(),
-        identity,
     });
 
     if let Err(message) = faults.on_stage(PlanDraftStage::Write) {
-        fault_fail!(handle, created, PlanDraftStage::Write, message);
+        fault_fail!(handle, created, file, PlanDraftStage::Write, message);
     }
-    if let Err(error) = file.write_all(contents.as_bytes()) {
-        fault_fail!(handle, created, PlanDraftStage::Write, error.to_string());
+    if let Err(error) = file.as_mut().unwrap().write_all(contents.as_bytes()) {
+        fault_fail!(handle, created, file, PlanDraftStage::Write, error.to_string());
     }
     if let Err(message) = faults.on_stage(PlanDraftStage::Flush) {
-        fault_fail!(handle, created, PlanDraftStage::Flush, message);
+        fault_fail!(handle, created, file, PlanDraftStage::Flush, message);
     }
-    if let Err(error) = file.flush() {
-        fault_fail!(handle, created, PlanDraftStage::Flush, error.to_string());
+    if let Err(error) = file.as_mut().unwrap().flush() {
+        fault_fail!(handle, created, file, PlanDraftStage::Flush, error.to_string());
     }
     if let Err(message) = faults.on_stage(PlanDraftStage::FileSync) {
-        fault_fail!(handle, created, PlanDraftStage::FileSync, message);
+        fault_fail!(handle, created, file, PlanDraftStage::FileSync, message);
     }
-    if let Err(error) = file.sync_all() {
-        fault_fail!(handle, created, PlanDraftStage::FileSync, error.to_string());
+    if let Err(error) = file.as_mut().unwrap().sync_all() {
+        fault_fail!(handle, created, file, PlanDraftStage::FileSync, error.to_string());
     }
-    drop(file);
+    // The descriptor stays OPEN through the second checks and any failure
+    // cleanup: a still-open descriptor pins the inode, so the cleanup
+    // identity comparison can never be fooled by immediate inode reuse.
 
     // (7) repeat both checks against the pinned handle, then commit with a
     // same-directory renameat — the atomic publication point.
     if let Err(message) = faults.on_stage(PlanDraftStage::SecondParentCheck) {
-        fault_fail!(handle, created, PlanDraftStage::SecondParentCheck, message);
+        fault_fail!(handle, created, file, PlanDraftStage::SecondParentCheck, message);
     }
     if let Err(error) = handle.verify_matches_path(target) {
-        fault_fail!(handle, created, PlanDraftStage::SecondParentCheck, error);
+        fault_fail!(handle, created, file, PlanDraftStage::SecondParentCheck, error);
     }
     if let Err(message) = faults.on_stage(PlanDraftStage::SecondDestinationCheck) {
         fault_fail!(
             handle,
             created,
+            file,
             PlanDraftStage::SecondDestinationCheck,
             message
         );
@@ -412,16 +424,21 @@ fn publish_locked_handle(
         fault_fail!(
             handle,
             created,
+            file,
             PlanDraftStage::SecondDestinationCheck,
             error
         );
     }
     if let Err(message) = faults.on_stage(PlanDraftStage::Rename) {
-        fault_fail!(handle, created, PlanDraftStage::Rename, message);
+        fault_fail!(handle, created, file, PlanDraftStage::Rename, message);
     }
     if let Err(error) = handle.rename_over(temp_name, PLAN_FILE_NAME) {
-        fault_fail!(handle, created, PlanDraftStage::Rename, error);
+        fault_fail!(handle, created, file, PlanDraftStage::Rename, error);
     }
+    // The temporary is now the published plan: close the descriptor and
+    // leave nothing to clean.
+    drop(file.take());
+    created = None;
 
     // (8) sync the pinned directory before releasing the lock. The rename
     // has already committed the new plan; a directory-sync failure is
@@ -433,10 +450,13 @@ fn publish_locked_handle(
 }
 
 /// Unlinks the temporary file created by this call, refusing to delete
-/// anything whose identity no longer matches the created file.
+/// anything whose identity no longer matches the created file. `owned` must
+/// be the still-open descriptor of the created file: it pins the inode for
+/// the duration of the check, so the comparison is race-free even on
+/// filesystems that reuse freed inodes immediately.
 #[cfg(unix)]
-fn cleanup_temp_unix(handle: &handle::ParentHandle, created: &CreatedTemp) {
-    let _ = handle.unlink_if_unchanged(&created.name, created.identity);
+fn cleanup_temp_unix(handle: &handle::ParentHandle, created: &CreatedTemp, owned: &std::fs::File) {
+    let _ = handle.unlink_if_unchanged(&created.name, owned);
 }
 
 // ---------------------------------------------------------------------------
@@ -905,64 +925,78 @@ mod tests {
 
     /// When a failure happens after creation and someone swapped a different
     /// file in over the temporary path, cleanup must NOT delete it: only the
-    /// file this call created may be removed.
+    /// file this call created may be removed. The created file's descriptor
+    /// stays open until the cleanup decision has been made, which pins the
+    /// inode against reuse — so the swap is detected deterministically even
+    /// on filesystems that reuse freed inodes immediately. Ten consecutive
+    /// runs, as required by the acceptance gate.
     #[cfg(unix)]
     #[tokio::test]
-    async fn cleanup_refuses_to_delete_a_swapped_in_temp_file() {
-        let directory = temp_workspace("temp-swap");
-        let root = directory.path().to_path_buf();
-        let locks = FileLocks::new();
-        plan_draft(&locks, &root, "previous").await.unwrap();
+    async fn cleanup_refuses_to_delete_a_swapped_in_temp_file_ten_runs() {
+        for attempt in 0..10 {
+            let directory = temp_workspace("temp-swap");
+            let root = directory.path().to_path_buf();
+            let locks = FileLocks::new();
+            plan_draft(&locks, &root, "previous").await.unwrap();
 
-        let name = pinned_temp_name("swap");
-        struct SwapIn {
-            swapped_path: PathBuf,
-            temp_name: String,
-        }
-        impl PlanDraftFaults for SwapIn {
-            fn on_stage(&self, stage: PlanDraftStage) -> Result<(), String> {
-                match stage {
-                    // Once the temp exists (first parent check passed and the
-                    // file was created), swap in a bystander at the temp path.
-                    PlanDraftStage::SecondDestinationCheck => {
-                        // Replace with a NEW file (fresh inode), the way a
-                        // real bystander swap would appear.
-                        std::fs::remove_file(&self.swapped_path).unwrap();
-                        std::fs::write(&self.swapped_path, "swapped-in-by-stander").unwrap();
-                        Err("injected failure at SecondDestinationCheck".into())
+            let name = pinned_temp_name("swap");
+            struct SwapIn {
+                swapped_path: PathBuf,
+                temp_name: String,
+            }
+            impl PlanDraftFaults for SwapIn {
+                fn on_stage(&self, stage: PlanDraftStage) -> Result<(), String> {
+                    match stage {
+                        // Once the temp exists (first parent check passed and
+                        // the file was created), swap in a bystander at the
+                        // temp path.
+                        PlanDraftStage::SecondDestinationCheck => {
+                            // Replace with a NEW file (fresh inode), the way
+                            // a real bystander swap would appear.
+                            std::fs::remove_file(&self.swapped_path).unwrap();
+                            std::fs::write(&self.swapped_path, "swapped-in-by-stander").unwrap();
+                            Err("injected failure at SecondDestinationCheck".into())
+                        }
+                        _ => Ok(()),
                     }
-                    _ => Ok(()),
+                }
+                fn pinned_temp_name(&self) -> Option<String> {
+                    Some(self.temp_name.clone())
                 }
             }
-            fn pinned_temp_name(&self) -> Option<String> {
-                Some(self.temp_name.clone())
-            }
-        }
 
-        let error = plan_draft_with_faults(
-            &locks,
-            &root,
-            "replacement",
-            &SwapIn {
-                swapped_path: root.join(&name),
-                temp_name: name.clone(),
-            },
-        )
-        .await
-        .unwrap_err();
-        assert!(error.contains("SecondDestinationCheck"), "{error}");
-        // The swapped-in file is still there: cleanup saw a different
-        // identity than the one it created and refused to delete.
-        assert_eq!(
-            std::fs::read(root.join(&name)).unwrap(),
-            b"swapped-in-by-stander"
-        );
-        // The previous draft is intact.
-        assert_eq!(
-            std::fs::read(root.join(PLAN_FILE_NAME)).unwrap(),
-            b"previous"
-        );
-        std::fs::remove_file(root.join(&name)).unwrap();
+            let error = plan_draft_with_faults(
+                &locks,
+                &root,
+                "replacement",
+                &SwapIn {
+                    swapped_path: root.join(&name),
+                    temp_name: name.clone(),
+                },
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                error.contains("SecondDestinationCheck"),
+                "attempt {attempt}: {error}"
+            );
+            // The swapped-in file is still there: cleanup compared the live
+            // path against the still-open created descriptor and refused to
+            // delete a file it did not create.
+            assert_eq!(
+                std::fs::read(root.join(&name)).unwrap(),
+                b"swapped-in-by-stander",
+                "attempt {attempt}: the swapped-in bystander must survive"
+            );
+            // The previous draft is intact and no temp residue remains
+            // besides the swapped-in bystander itself.
+            assert_eq!(
+                std::fs::read(root.join(PLAN_FILE_NAME)).unwrap(),
+                b"previous",
+                "attempt {attempt}"
+            );
+            std::fs::remove_file(root.join(&name)).unwrap();
+        }
     }
 
     /// Parent swap between the two checks is rejected deterministically: the
