@@ -5,6 +5,7 @@ mod context;
 pub mod dialog;
 pub mod i18n;
 pub mod input;
+mod plan_review;
 mod progress;
 pub mod render;
 pub mod state;
@@ -372,34 +373,112 @@ async fn execute_effects(
                 }
                 app.composer.clear();
                 // `/plan approve` shows the plan file for review first and
-                // requires explicit confirmation (spec §2).
+                // requires explicit confirmation (spec §2). The whole plan is
+                // reviewed paginated: the approval choice only appears on the
+                // LAST page, so a 128 KiB plan can never be approved from a
+                // truncated preview. A missing or empty plan cannot be
+                // approved at all.
                 if action == crate::tui::backend::PlanAction::Approve {
                     let plan_path = app.workspace.join("plan.md");
-                    let preview = std::fs::read_to_string(&plan_path)
-                        .map(|content| content.chars().take(4000).collect::<String>())
-                        .unwrap_or_else(|_| {
-                            "(plan.md is empty or missing; approve anyway?)".into()
+                    let content = std::fs::read_to_string(&plan_path).unwrap_or_default();
+                    if content.trim().is_empty() {
+                        app.error = Some(match app.language {
+                            Language::ZhCn => format!(
+                                "无法批准：{} 为空或不存在。请先让模型完成计划。",
+                                plan_path.display()
+                            ),
+                            Language::En => format!(
+                                "cannot approve: {} is empty or missing; have the model finish the plan first",
+                                plan_path.display()
+                            ),
                         });
-                    app.overlay = Some(Overlay::Configuration);
-                    let choices = match app.language {
-                        Language::ZhCn => vec!["确认批准".to_string(), "取消".to_string()],
-                        Language::En => vec!["Approve".to_string(), "Cancel".to_string()],
-                    };
-                    let prompt = format!(
-                        "Review {}:\n\n{preview}\n\n{}",
-                        plan_path.display(),
-                        match app.language {
-                            Language::ZhCn => "确认批准该计划？批准不会自动执行任何文件修改。",
-                            Language::En =>
-                                "Approve this plan? Approval does not auto-execute any file modifications.",
-                        }
+                        continue;
+                    }
+                    let pages = crate::tui::plan_review::plan_review_pages(
+                        &content,
+                        crate::tui::plan_review::PLAN_REVIEW_LINES_PER_PAGE,
                     );
-                    let result = dialog::run(terminal, events, Some(app), |ui| async move {
-                        ui.choose(prompt, &choices).await
-                    })
-                    .await;
+                    let total = pages.len();
+                    type PlanReviewChoices<'a> = (
+                        &'a str,
+                        &'a str,
+                        &'a str,
+                        &'a str,
+                        fn(usize, usize) -> String,
+                    );
+                    let (last_choice, next_choice, cancel_choice, final_note, page_note): PlanReviewChoices =
+                        match app.language {
+                        Language::ZhCn => (
+                            "确认批准",
+                            "下一页 →",
+                            "取消",
+                            "\n\n这是最后一页。确认批准该计划？批准不会自动执行任何文件修改。",
+                            |index: usize, total: usize| {
+                                format!("\n\n（第 {}/{total} 页，批准选项在最后一页）", index + 1)
+                            },
+                        ),
+                        Language::En => (
+                            "Approve",
+                            "Next page →",
+                            "Cancel",
+                            "\n\nThis is the final page. Approve this plan? Approval does not auto-execute any file modifications.",
+                            |index: usize, total: usize| {
+                                format!(
+                                    "\n\n(page {}/{total}; the approval choice is on the last page)",
+                                    index + 1
+                                )
+                            },
+                        ),
+                    };
+                    app.overlay = Some(Overlay::Configuration);
+                    let mut confirmed = false;
+                    for (index, page) in pages.iter().enumerate() {
+                        let is_last = index + 1 == total;
+                        let header = match app.language {
+                            Language::ZhCn => format!(
+                                "审阅 {} — 第 {}/{total} 页（共 {} 行，完整审阅后方可批准）",
+                                plan_path.display(),
+                                index + 1,
+                                content.lines().count()
+                            ),
+                            Language::En => format!(
+                                "Review {} — page {}/{total} ({} lines; approve only after the full review)",
+                                plan_path.display(),
+                                index + 1,
+                                content.lines().count()
+                            ),
+                        };
+                        let (choices, note): (Vec<String>, String) = if is_last {
+                            (
+                                vec![last_choice.to_string(), cancel_choice.to_string()],
+                                final_note.to_string(),
+                            )
+                        } else {
+                            (
+                                vec![next_choice.to_string(), cancel_choice.to_string()],
+                                page_note(index, total),
+                            )
+                        };
+                        let prompt = format!("{header}\n\n{page}{note}");
+                        let result = dialog::run(terminal, events, Some(app), |ui| {
+                            let prompt = prompt.clone();
+                            let choices = choices.clone();
+                            async move { ui.choose(prompt, &choices).await }
+                        })
+                        .await;
+                        match result {
+                            Ok(answer) if answer == last_choice => {
+                                confirmed = true;
+                                break;
+                            }
+                            Ok(answer) if answer == next_choice => {}
+                            _ => {
+                                confirmed = false;
+                                break;
+                            }
+                        }
+                    }
                     app.overlay = None;
-                    let confirmed = matches!(result.as_deref(), Ok("确认批准") | Ok("Approve"));
                     if !confirmed {
                         continue;
                     }
