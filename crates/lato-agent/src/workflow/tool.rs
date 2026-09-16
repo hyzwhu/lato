@@ -299,12 +299,31 @@ impl WorkflowTool {
         single_run_output("start", &state)
     }
 
+    /// `status` (spec §4.4): query the same manager's real runs. An exact
+    /// `runId` match wins over a `displayName` match; without a selector the
+    /// tracker's bounded recent-run list is returned. Read-only, but still
+    /// behind the shared `external_mutation` approval membrane.
     async fn status(
         &self,
-        _manager: &Arc<WorkflowManager>,
-        _input: &WorkflowToolInput,
+        manager: &Arc<WorkflowManager>,
+        input: &WorkflowToolInput,
     ) -> Result<ToolOutput, ToolError> {
-        Err(unavailable())
+        let runs = manager.list();
+        match input.run.as_deref() {
+            Some(selector) => {
+                let state = runs
+                    .iter()
+                    .find(|run| run.run_id == selector)
+                    .or_else(|| runs.iter().find(|run| run.display_name == selector))
+                    .ok_or_else(run_not_found)?;
+                single_run_output("status", state)
+            }
+            None => {
+                let truncated_entries = runs.len() > MAX_LIST_ENTRIES;
+                let entries = runs.iter().take(MAX_LIST_ENTRIES).map(run_value).collect();
+                bounded_output("status", "runs", truncated_entries, entries)
+            }
+        }
     }
 }
 
@@ -609,6 +628,14 @@ fn catalog_changed() -> ToolError {
     )
 }
 
+fn run_not_found() -> ToolError {
+    ToolError::new(
+        "workflow.run_not_found",
+        "no workflow run matched the requested id or display name",
+        Retryability::Never,
+    )
+}
+
 fn cancelled() -> ToolError {
     ToolError::new(
         "tool.cancelled",
@@ -723,6 +750,125 @@ mod tests {
         assert_eq!(error.code, "tool.cancelled");
     }
 
+    #[test]
+    fn section_five_status_normalization_is_exhaustive_and_lossless() {
+        let cases = [
+            (WorkflowRunStatus::Active, "active", "active"),
+            (WorkflowRunStatus::UserPaused, "paused", "user_paused"),
+            (
+                WorkflowRunStatus::BackOffPaused,
+                "paused",
+                "back_off_paused",
+            ),
+            (
+                WorkflowRunStatus::NoProgressPaused,
+                "paused",
+                "no_progress_paused",
+            ),
+            (WorkflowRunStatus::InfraPaused, "paused", "infra_paused"),
+            (WorkflowRunStatus::Blocked, "paused", "blocked"),
+            (WorkflowRunStatus::BudgetLimited, "paused", "budget_limited"),
+            (WorkflowRunStatus::Complete, "completed", "complete"),
+            (WorkflowRunStatus::Interrupted, "interrupted", "interrupted"),
+            (WorkflowRunStatus::Failed, "interrupted", "failed"),
+            (WorkflowRunStatus::Cancelled, "interrupted", "cancelled"),
+        ];
+        for (status, normalized, detail) in cases {
+            assert_eq!(model_status(status), normalized, "{detail}");
+            assert_eq!(detail_status(status), detail);
+        }
+    }
+
+    #[tokio::test]
+    async fn status_reports_real_manager_runs_and_misses_stably() {
+        let fixture = ListFixture::new();
+        fixture.write_user("hold");
+        fixture.rewrite_user(
+            "hold",
+            "let meta = #{ name: \"hold\", description: \"d\" };\nlet r = agent(\"work\");\n",
+        );
+        let (tool, manager) = fixture.tool_with_manager(false, Arc::new(HangingStream));
+
+        // Launch through the MANAGER (as TUI/ACP do), query through the tool.
+        let launched = tool
+            .invoke(context(), json!({"action":"start","name":"hold"}))
+            .await
+            .unwrap();
+        let run_id = output_json(&launched)["run"]["runId"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        // By runId.
+        let by_id = tool
+            .invoke(context(), json!({"action":"status","run":run_id}))
+            .await
+            .unwrap();
+        let run = output_json(&by_id)["run"].clone();
+        assert_eq!(run["runId"], run_id.as_str());
+        assert_eq!(run["status"], "active");
+        assert_eq!(run["detailStatus"], "active");
+
+        // Pause through the manager (user action); the run task observes the
+        // pause intent asynchronously, so wait for the tracker to settle.
+        manager.pause("hold").unwrap();
+        for _ in 0..400 {
+            if manager.list().iter().any(|run| {
+                run.display_name == "hold" && run.status == WorkflowRunStatus::UserPaused
+            }) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let paused = tool
+            .invoke(context(), json!({"action":"status","run":"hold"}))
+            .await
+            .unwrap();
+        let run = output_json(&paused)["run"].clone();
+        assert_eq!(run["status"], "paused");
+        assert_eq!(run["detailStatus"], "user_paused");
+        assert!(run["phase"].is_null());
+        assert!(run["elapsedMsFloor"].is_u64());
+
+        // Default listing includes the run; a miss is a stable error.
+        let listed = tool
+            .invoke(context(), json!({"action":"status"}))
+            .await
+            .unwrap();
+        assert_eq!(output_json(&listed)["runs"].as_array().unwrap().len(), 1);
+        let missing = tool
+            .invoke(context(), json!({"action":"status","run":"nope"}))
+            .await
+            .unwrap_err();
+        assert_eq!(missing.code, "workflow.run_not_found");
+    }
+
+    #[tokio::test]
+    async fn completed_runs_normalize_to_completed() {
+        let fixture = ListFixture::new();
+        fixture.write_user("quick");
+        let tool = fixture.tool(false);
+
+        tool.invoke(context(), json!({"action":"start","name":"quick"}))
+            .await
+            .unwrap();
+        let mut normalized = None;
+        for _ in 0..200 {
+            let listed = tool
+                .invoke(context(), json!({"action":"status","run":"quick"}))
+                .await
+                .unwrap();
+            let run = output_json(&listed)["run"].clone();
+            if run["status"] == "completed" {
+                normalized = Some(run);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let run = normalized.expect("run never completed");
+        assert_eq!(run["detailStatus"], "complete");
+    }
+
     fn user_script(name: &str, description: &str) -> String {
         format!(
             "let meta = #{{\n    name: \"{name}\",\n    description: \"{description}\",\n}};\ncomplete(\"ok\");\n"
@@ -812,13 +958,13 @@ mod tests {
             .unwrap()
         }
 
-        /// Tool with the manager installed and the snapshot mounted, mirroring
-        /// the host wiring (attach_workflow_manager → install → stage plugins).
-        fn tool_with_stream(
+        /// Tool plus its manager, mirroring the host wiring
+        /// (attach_workflow_manager → install → stage plugins).
+        fn tool_with_manager(
             &self,
             project_trusted: bool,
             stream: Arc<dyn lato_ai::ModelStream>,
-        ) -> WorkflowTool {
+        ) -> (WorkflowTool, Arc<WorkflowManager>) {
             let trust = SessionTrust::for_interactive(&self.cwd, project_trusted);
             let handle =
                 SessionWorkflowHandle::new(self.cwd.clone(), self.home.clone(), trust.clone());
@@ -832,8 +978,16 @@ mod tests {
                 None,
             ));
             manager.set_snapshot(self.snapshot(project_trusted));
-            handle.install(manager);
-            WorkflowTool::new(handle)
+            handle.install(manager.clone());
+            (WorkflowTool::new(handle), manager)
+        }
+
+        fn tool_with_stream(
+            &self,
+            project_trusted: bool,
+            stream: Arc<dyn lato_ai::ModelStream>,
+        ) -> WorkflowTool {
+            self.tool_with_manager(project_trusted, stream).0
         }
 
         fn tool(&self, project_trusted: bool) -> WorkflowTool {
