@@ -9,7 +9,7 @@ use crate::agentfield::types::{
     StatusEnvelope,
 };
 use serde_json::Value;
-use std::sync::Arc;
+use std::{net::SocketAddr, sync::Arc};
 
 /// Maximum response body bytes Lato accepts (compression bombs and runaway
 /// bodies are rejected before parsing).
@@ -399,6 +399,13 @@ impl ReqwestTransport {
             .base
             .port_or_known_default()
             .ok_or_else(|| "origin has no port".to_string())?;
+        // AgentField loopback gate (spec §6.1): loopback destinations are
+        // only allowed in explicit development mode, regardless of scheme.
+        // The URL literal is checked before any DNS work, and the resolved
+        // addresses are re-checked afterwards so DNS rebinding to loopback
+        // fails closed too. (`validate_mcp_url` alone permits HTTPS to
+        // loopback — MCP semantics — which AgentField must not.)
+        ensure_loopback_policy(origin, &host)?;
         // One DNS resolution; policy re-check and pinning share it.
         let resolved = resolver
             .resolve(&host, port)
@@ -407,6 +414,7 @@ impl ReqwestTransport {
         if resolved.is_empty() {
             return Err(format!("DNS resolution returned no addresses for `{host}`"));
         }
+        ensure_resolved_loopback_policy(origin, &resolved)?;
         // Plain HTTP already only reaches here for loopback dev origins
         // (config-level gate); the policy check re-asserts it on the actual
         // addresses, and HTTPS destinations reject private/link-local/CGNAT.
@@ -448,6 +456,43 @@ impl ReqwestTransport {
             .map_err(|error| format!("HTTP client build failed: {error}"))?;
         Ok(Self { client })
     }
+}
+
+/// AgentField loopback gate on the URL literal (spec §6.1): `localhost`,
+/// `127.0.0.0/8`, and `::1` hosts are only allowed when the origin carries
+/// the explicit development flag. Checked before any DNS work.
+fn ensure_loopback_policy(origin: &ControlPlaneOrigin, host: &str) -> Result<(), String> {
+    let loopback_literal = host.eq_ignore_ascii_case("localhost")
+        || host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<std::net::IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false);
+    if loopback_literal && !origin.loopback_dev_mode {
+        return Err(format!(
+            "loopback destination `{host}` is only allowed in explicit development mode"
+        ));
+    }
+    Ok(())
+}
+
+/// AgentField loopback gate on the resolved addresses (spec §6.1): a
+/// production origin whose DNS resolution lands on loopback (including
+/// rebinding) fails closed. Dev-mode origins require every address to be
+/// loopback, which `validate_mcp_url` enforces for plain HTTP.
+fn ensure_resolved_loopback_policy(
+    origin: &ControlPlaneOrigin,
+    resolved: &[SocketAddr],
+) -> Result<(), String> {
+    if !origin.loopback_dev_mode && resolved.iter().any(|addr| addr.ip().is_loopback()) {
+        return Err(
+            "resolved addresses include loopback; loopback destinations are only allowed in \
+             explicit development mode"
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 fn origin_key(url: &reqwest::Url) -> String {
@@ -613,5 +658,70 @@ mod transport_tests {
         .await
         .unwrap_err();
         assert!(error.contains("network policy"), "{error}");
+    }
+}
+
+#[cfg(test)]
+mod round2_loopback_tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    struct FixedResolver(Vec<IpAddr>);
+
+    #[async_trait::async_trait]
+    impl lato_mcp::McpDnsResolver for FixedResolver {
+        async fn resolve(&self, _host: &str, port: u16) -> std::io::Result<Vec<SocketAddr>> {
+            Ok(self.0.iter().map(|ip| SocketAddr::new(*ip, port)).collect())
+        }
+    }
+
+    fn origin(url: &str) -> ControlPlaneOrigin {
+        ControlPlaneOrigin {
+            base: url.parse().unwrap(),
+            loopback_dev_mode: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn production_https_localhost_literal_is_rejected() {
+        let error = ReqwestTransport::connect_with_resolver(
+            &origin("https://localhost"),
+            &FixedResolver(vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("loopback"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn production_https_ipv6_loopback_literal_and_resolution_are_rejected() {
+        let error = ReqwestTransport::connect_with_resolver(
+            &origin("https://[::1]"),
+            &FixedResolver(vec![IpAddr::V6(Ipv6Addr::LOCALHOST)]),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("loopback"), "{error}");
+        let error = ReqwestTransport::connect_with_resolver(
+            &origin("https://agents.example.internal"),
+            &FixedResolver(vec![IpAddr::V6(Ipv6Addr::LOCALHOST)]),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("loopback"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn production_https_resolving_to_mixed_loopback_is_rejected() {
+        let error = ReqwestTransport::connect_with_resolver(
+            &origin("https://agents.example.internal"),
+            &FixedResolver(vec![
+                "93.184.216.34".parse().unwrap(),
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+            ]),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("loopback"), "{error}");
     }
 }
