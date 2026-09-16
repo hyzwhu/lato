@@ -9,6 +9,7 @@ pub mod hooks;
 pub mod host;
 pub mod journal;
 pub mod legacy_driver;
+pub mod plan;
 pub mod mcp;
 pub mod runtime_session;
 pub mod skills;
