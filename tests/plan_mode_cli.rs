@@ -193,3 +193,40 @@ fn resume_plan_fails_closed_on_unreadable_or_oversized_draft() {
         "missing draft must not block resume: {stderr}"
     );
 }
+
+/// T7 branch 2 — `resume --plan` with a readable draft: entry proceeds (the
+/// draft is loaded as the starting point) instead of failing closed.
+#[test]
+fn resume_plan_loads_a_readable_draft_and_proceeds() {
+    let home = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    std::fs::write(
+        workspace.path().join("plan.md"),
+        "# carried-over plan\n\nstep one\n",
+    )
+    .unwrap();
+    // The session does not exist, so the run stops at session resolution —
+    // but ONLY there: the readable draft must not fail the resume.
+    let output = lato(&home, &workspace)
+        .args(["resume", "definitely-missing-session", "--plan"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("no session has the supplied ID or title"),
+        "readable draft must not block resume: {stderr}"
+    );
+    assert!(!stderr.contains("--plan draft"), "{stderr}");
+
+    // T7 branch 1 — `resume` WITHOUT `--plan` is unaffected by a draft on
+    // disk: it proceeds normally (no plan-mode draft validation at all).
+    let output = lato(&home, &workspace)
+        .args(["resume", "definitely-missing-session"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("no session has the supplied ID or title"),
+        "resume without --plan must proceed to session resolution: {stderr}"
+    );
+}

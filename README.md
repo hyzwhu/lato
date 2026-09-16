@@ -154,10 +154,11 @@ user-owned — you can edit or delete it at any time, and Lato never touches
 `.gitignore` for it.
 
 ```bash
-# Headless: run a single planning turn. Exits with code 3 only when a real,
-# readable plan.md was produced but not approved; if the turn ended without a
-# produced plan file, it fails explicitly instead. Headless never
-# auto-approves.
+# Headless: run a single planning turn. Exits with code 3 only when THIS
+# activation actually published a plan through a successful `plan_draft` tool
+# event (and it was not approved); a stale plan.md left over from an earlier
+# run never satisfies the deliverable — the turn then fails explicitly
+# instead. Headless never auto-approves.
 lato -p --plan "draft a plan for adding retry logic"
 # Re-enter Plan mode on a resumed session; the previous plan.md is loaded as
 # the starting draft if it is present and readable.
@@ -176,7 +177,12 @@ In the interactive TUI:
 - `/plan submit` — you declare the draft ready; this is the ONLY way the
   session moves to the awaiting-approval state. Model text, markers, plan
   content, and tool calls never advance the state machine.
-- `/plan approve` — shows the plan file for review first. Approval records a
+- `/plan approve` — opens the dedicated plan review: a real scrollable,
+  paginated widget over the actual terminal content area (the plan body is
+  wrapped to the terminal width and paged by the terminal height). The
+  approval control stays locked until the viewport actually shows the final
+  row of the plan, and a terminal resize re-locks it until the new bottom is
+  reached. Esc closes the review without approving. Approval records a
   session-local plan authorization; it is NOT a policy grant and never
   authorizes a tool call by itself.
 - `/plan status` — phase, plan file path, last draft hash, and approval
