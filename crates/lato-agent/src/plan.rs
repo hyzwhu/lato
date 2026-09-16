@@ -196,7 +196,10 @@ impl PlanModeRuntime {
     }
 
     /// `/plan` — start a new activation. Refused while a turn is in flight.
-    pub async fn enter(&self, turn_in_flight: bool) -> Result<(u64, PlanPhase, PlanPhase), PlanModeError> {
+    pub async fn enter(
+        &self,
+        turn_in_flight: bool,
+    ) -> Result<(u64, PlanPhase, PlanPhase), PlanModeError> {
         if turn_in_flight {
             return Err(PlanModeError::TurnInFlight);
         }
@@ -343,10 +346,7 @@ mod tests {
     use std::fs;
 
     fn temp_workspace(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "lato-plan-test-{tag}-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("lato-plan-test-{tag}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
@@ -391,7 +391,10 @@ mod tests {
         assert_eq!(runtime.status().await.phase, PlanPhase::Approved);
         assert_eq!(approval.content_hash, sha256_hex(b"# plan"));
         let status = runtime.status().await;
-        assert_eq!(status.approval.as_ref().unwrap().generation, approval.generation);
+        assert_eq!(
+            status.approval.as_ref().unwrap().generation,
+            approval.generation
+        );
         runtime.exit().await.unwrap();
         assert_eq!(runtime.status().await.phase, PlanPhase::Exited);
         assert!(!runtime.plan_flag().load(Ordering::SeqCst));
@@ -412,13 +415,18 @@ mod tests {
         let status = runtime.status().await;
         assert_eq!(status.phase, PlanPhase::Drafting);
         assert_eq!(status.activation, first.activation + 1);
-        assert!(status.approval.is_none(), "old approval must not survive re-entry");
+        assert!(
+            status.approval.is_none(),
+            "old approval must not survive re-entry"
+        );
 
         // Old generation can never be completed again.
-        assert!(runtime
-            .complete_mutation_preflight(first.generation, &first.content_hash)
-            .await
-            .is_err());
+        assert!(
+            runtime
+                .complete_mutation_preflight(first.generation, &first.content_hash)
+                .await
+                .is_err()
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -433,24 +441,35 @@ mod tests {
 
         // Unchanged file: guarded.
         match runtime.begin_mutation_preflight().await {
-            MutationPreflight::Guarded { generation, content_hash } => {
+            MutationPreflight::Guarded {
+                generation,
+                content_hash,
+            } => {
                 assert_eq!(generation, approval.generation);
                 // Second check passes while unchanged.
-                runtime.complete_mutation_preflight(generation, &content_hash).await.unwrap();
+                runtime
+                    .complete_mutation_preflight(generation, &content_hash)
+                    .await
+                    .unwrap();
             }
             other => panic!("expected guarded, got {other:?}"),
         }
 
         // Mutate between checks: the second check must deny and revoke.
         let guarded = match runtime.begin_mutation_preflight().await {
-            MutationPreflight::Guarded { generation, content_hash } => (generation, content_hash),
+            MutationPreflight::Guarded {
+                generation,
+                content_hash,
+            } => (generation, content_hash),
             other => panic!("expected guarded, got {other:?}"),
         };
         write_plan(&dir, "mutated contents").await;
-        assert!(runtime
-            .complete_mutation_preflight(guarded.0, &guarded.1)
-            .await
-            .is_err());
+        assert!(
+            runtime
+                .complete_mutation_preflight(guarded.0, &guarded.1)
+                .await
+                .is_err()
+        );
         assert_eq!(runtime.status().await.phase, PlanPhase::Revising);
 
         // Restoring identical bytes never revives the old approval.
@@ -459,10 +478,12 @@ mod tests {
             MutationPreflight::NotGuarded => {}
             other => panic!("expected not guarded after revocation, got {other:?}"),
         }
-        assert!(runtime
-            .complete_mutation_preflight(approval.generation, &approval.content_hash)
-            .await
-            .is_err());
+        assert!(
+            runtime
+                .complete_mutation_preflight(approval.generation, &approval.content_hash)
+                .await
+                .is_err()
+        );
 
         // Recovery requires a fresh submit + approve.
         runtime.submit().await.unwrap();
@@ -480,11 +501,18 @@ mod tests {
         // A missing draft may be submitted (a human choice), but approval
         // still fails closed until a readable draft exists.
         runtime.submit().await.unwrap();
-        assert_eq!(runtime.approve("user").await, Err(PlanModeError::DraftUnreadable));
+        assert_eq!(
+            runtime.approve("user").await,
+            Err(PlanModeError::DraftUnreadable)
+        );
         runtime.request_revision().await.unwrap();
 
         // Oversized draft (131,073 bytes) is rejected, not truncated.
-        fs::write(dir.join(PLAN_FILE_NAME), vec![b'a'; PLAN_DRAFT_MAX_BYTES + 1]).unwrap();
+        fs::write(
+            dir.join(PLAN_FILE_NAME),
+            vec![b'a'; PLAN_DRAFT_MAX_BYTES + 1],
+        )
+        .unwrap();
         assert_eq!(runtime.submit().await, Err(PlanModeError::DraftUnreadable));
 
         // Exactly 131,072 bytes submits fine.
@@ -495,7 +523,10 @@ mod tests {
         // closed and stays in AwaitingApproval.
         fs::remove_file(dir.join(PLAN_FILE_NAME)).unwrap();
         fs::create_dir(dir.join(PLAN_FILE_NAME)).unwrap();
-        assert_eq!(runtime.approve("user").await, Err(PlanModeError::DraftUnreadable));
+        assert_eq!(
+            runtime.approve("user").await,
+            Err(PlanModeError::DraftUnreadable)
+        );
         assert_eq!(runtime.status().await.phase, PlanPhase::AwaitingApproval);
         let _ = fs::remove_dir_all(&dir);
     }
@@ -528,10 +559,7 @@ mod tests {
     async fn enter_is_refused_while_turn_in_flight() {
         let dir = temp_workspace("turn-in-flight");
         let runtime = PlanModeRuntime::new(&dir);
-        assert_eq!(
-            runtime.enter(true).await,
-            Err(PlanModeError::TurnInFlight)
-        );
+        assert_eq!(runtime.enter(true).await, Err(PlanModeError::TurnInFlight));
         assert_eq!(runtime.status().await.phase, PlanPhase::Inactive);
         let _ = fs::remove_dir_all(&dir);
     }
@@ -551,7 +579,10 @@ mod tests {
         runtime.approve("user").await.unwrap();
         runtime.request_revision().await.unwrap();
         assert_eq!(runtime.status().await.phase, PlanPhase::Revising);
-        assert!(runtime.status().await.approval.is_none(), "revision revokes the approval record");
+        assert!(
+            runtime.status().await.approval.is_none(),
+            "revision revokes the approval record"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 }

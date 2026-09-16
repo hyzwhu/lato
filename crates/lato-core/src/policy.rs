@@ -93,6 +93,13 @@ pub struct PolicyRequest {
     /// the grant. `None` keeps the generic capability/side-effect summary.
     #[serde(default)]
     pub detail: Option<String>,
+    /// Whether the Plan-mode capability trim applies to this evaluation.
+    #[serde(default)]
+    pub plan_mode: bool,
+    /// Descriptor layer of the tool; the Plan-mode overlay denies non-builtin
+    /// tools even when they report read-only effects (spec §4).
+    #[serde(default)]
+    pub tool_layer: crate::ToolLayer,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]

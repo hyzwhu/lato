@@ -1,7 +1,7 @@
 use lato_core::{
     ApprovalFingerprint, EnvironmentPolicy, NetworkPolicy, PolicyDecision, PolicyMode,
     PolicyRequest, SandboxObligation, SandboxProfile, SessionId, SideEffect, ToolCallId,
-    ToolCapability, ToolName, TurnId,
+    ToolCapability, ToolLayer, ToolName, TurnId,
 };
 use lato_policy::{ApprovalLedger, PolicyEngine, PolicyError, approval_fingerprint};
 use std::{path::PathBuf, sync::Arc, time::Duration};
@@ -30,6 +30,8 @@ fn request(
             environment: EnvironmentPolicy::default(),
         },
         detail: None,
+        plan_mode: false,
+        tool_layer: ToolLayer::Builtin,
     }
 }
 

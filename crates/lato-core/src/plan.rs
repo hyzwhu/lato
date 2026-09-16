@@ -40,7 +40,10 @@ impl PlanPhase {
     pub fn plan_mode_active(&self) -> bool {
         matches!(
             self,
-            PlanPhase::Drafting | PlanPhase::AwaitingApproval | PlanPhase::Approved | PlanPhase::Revising
+            PlanPhase::Drafting
+                | PlanPhase::AwaitingApproval
+                | PlanPhase::Approved
+                | PlanPhase::Revising
         )
     }
 
@@ -48,7 +51,10 @@ impl PlanPhase {
     pub fn expects_draft(&self) -> bool {
         matches!(
             self,
-            PlanPhase::Drafting | PlanPhase::AwaitingApproval | PlanPhase::Approved | PlanPhase::Revising
+            PlanPhase::Drafting
+                | PlanPhase::AwaitingApproval
+                | PlanPhase::Approved
+                | PlanPhase::Revising
         )
     }
 }
@@ -160,8 +166,18 @@ mod tests {
     use super::*;
     use crate::ToolName;
 
-    fn denial_for(id: &str, capabilities: &[ToolCapability], side_effect: SideEffect, layer: ToolLayer) -> Option<&'static str> {
-        plan_mode_denial(&ToolName::parse(id).unwrap(), capabilities, side_effect, layer)
+    fn denial_for(
+        id: &str,
+        capabilities: &[ToolCapability],
+        side_effect: SideEffect,
+        layer: ToolLayer,
+    ) -> Option<&'static str> {
+        plan_mode_denial(
+            &ToolName::parse(id).unwrap(),
+            capabilities,
+            side_effect,
+            layer,
+        )
     }
 
     #[test]
@@ -198,7 +214,12 @@ mod tests {
             "builtin:web_fetch",
         ] {
             assert_eq!(
-                denial_for(id, &[ToolCapability::FileRead], SideEffect::ReadOnly, ToolLayer::Builtin),
+                denial_for(
+                    id,
+                    &[ToolCapability::FileRead],
+                    SideEffect::ReadOnly,
+                    ToolLayer::Builtin
+                ),
                 None,
                 "{id} must be allowed"
             );
@@ -208,11 +229,31 @@ mod tests {
     #[test]
     fn mutation_and_spawn_tools_are_denied() {
         for (id, capabilities, side_effect) in [
-            ("builtin:write_file", vec![ToolCapability::FileWrite], SideEffect::WorkspaceMutation),
-            ("builtin:search_replace", vec![ToolCapability::FileWrite], SideEffect::WorkspaceMutation),
-            ("builtin:run_terminal_command", vec![ToolCapability::ProcessSpawn], SideEffect::WorkspaceMutation),
-            ("builtin:spawn", vec![ToolCapability::TaskControl], SideEffect::None),
-            ("builtin:use_tool", vec![ToolCapability::ExtensionInvoke], SideEffect::ReadOnly),
+            (
+                "builtin:write_file",
+                vec![ToolCapability::FileWrite],
+                SideEffect::WorkspaceMutation,
+            ),
+            (
+                "builtin:search_replace",
+                vec![ToolCapability::FileWrite],
+                SideEffect::WorkspaceMutation,
+            ),
+            (
+                "builtin:run_terminal_command",
+                vec![ToolCapability::ProcessSpawn],
+                SideEffect::WorkspaceMutation,
+            ),
+            (
+                "builtin:spawn",
+                vec![ToolCapability::TaskControl],
+                SideEffect::None,
+            ),
+            (
+                "builtin:use_tool",
+                vec![ToolCapability::ExtensionInvoke],
+                SideEffect::ReadOnly,
+            ),
         ] {
             assert_eq!(
                 denial_for(id, &capabilities, side_effect, ToolLayer::Builtin),
@@ -225,29 +266,75 @@ mod tests {
     #[test]
     fn read_only_mcp_and_extension_tools_fail_closed() {
         assert_eq!(
-            denial_for("mcp:query", &[], SideEffect::ReadOnly, ToolLayer::TrustedProject),
+            denial_for(
+                "mcp:query",
+                &[],
+                SideEffect::ReadOnly,
+                ToolLayer::TrustedProject
+            ),
             Some(PLAN_MODE_READONLY_CODE)
         );
         assert_eq!(
-            denial_for("builtin:some_unknown_tool", &[], SideEffect::None, ToolLayer::Builtin),
+            denial_for(
+                "builtin:some_unknown_tool",
+                &[],
+                SideEffect::None,
+                ToolLayer::Builtin
+            ),
             Some(PLAN_MODE_READONLY_CODE)
         );
     }
 
     #[test]
     fn transition_table_matches_frozen_spec() {
-        assert_eq!(plan_transition(PlanPhase::Inactive, PlanCommand::Enter), Some(PlanPhase::Drafting));
-        assert_eq!(plan_transition(PlanPhase::Exited, PlanCommand::Enter), Some(PlanPhase::Drafting));
-        assert_eq!(plan_transition(PlanPhase::Approved, PlanCommand::Enter), None);
-        assert_eq!(plan_transition(PlanPhase::Drafting, PlanCommand::Submit), Some(PlanPhase::AwaitingApproval));
-        assert_eq!(plan_transition(PlanPhase::Revising, PlanCommand::Submit), Some(PlanPhase::AwaitingApproval));
-        assert_eq!(plan_transition(PlanPhase::AwaitingApproval, PlanCommand::Submit), None);
-        assert_eq!(plan_transition(PlanPhase::AwaitingApproval, PlanCommand::Approve), Some(PlanPhase::Approved));
-        assert_eq!(plan_transition(PlanPhase::Drafting, PlanCommand::Approve), None);
-        assert_eq!(plan_transition(PlanPhase::AwaitingApproval, PlanCommand::Revise), Some(PlanPhase::Revising));
-        assert_eq!(plan_transition(PlanPhase::Approved, PlanCommand::Revise), Some(PlanPhase::Revising));
-        assert_eq!(plan_transition(PlanPhase::Approved, PlanCommand::Stale), Some(PlanPhase::Revising));
-        assert_eq!(plan_transition(PlanPhase::Drafting, PlanCommand::Stale), None);
+        assert_eq!(
+            plan_transition(PlanPhase::Inactive, PlanCommand::Enter),
+            Some(PlanPhase::Drafting)
+        );
+        assert_eq!(
+            plan_transition(PlanPhase::Exited, PlanCommand::Enter),
+            Some(PlanPhase::Drafting)
+        );
+        assert_eq!(
+            plan_transition(PlanPhase::Approved, PlanCommand::Enter),
+            None
+        );
+        assert_eq!(
+            plan_transition(PlanPhase::Drafting, PlanCommand::Submit),
+            Some(PlanPhase::AwaitingApproval)
+        );
+        assert_eq!(
+            plan_transition(PlanPhase::Revising, PlanCommand::Submit),
+            Some(PlanPhase::AwaitingApproval)
+        );
+        assert_eq!(
+            plan_transition(PlanPhase::AwaitingApproval, PlanCommand::Submit),
+            None
+        );
+        assert_eq!(
+            plan_transition(PlanPhase::AwaitingApproval, PlanCommand::Approve),
+            Some(PlanPhase::Approved)
+        );
+        assert_eq!(
+            plan_transition(PlanPhase::Drafting, PlanCommand::Approve),
+            None
+        );
+        assert_eq!(
+            plan_transition(PlanPhase::AwaitingApproval, PlanCommand::Revise),
+            Some(PlanPhase::Revising)
+        );
+        assert_eq!(
+            plan_transition(PlanPhase::Approved, PlanCommand::Revise),
+            Some(PlanPhase::Revising)
+        );
+        assert_eq!(
+            plan_transition(PlanPhase::Approved, PlanCommand::Stale),
+            Some(PlanPhase::Revising)
+        );
+        assert_eq!(
+            plan_transition(PlanPhase::Drafting, PlanCommand::Stale),
+            None
+        );
         for from in [
             PlanPhase::Inactive,
             PlanPhase::Drafting,
@@ -256,7 +343,10 @@ mod tests {
             PlanPhase::Revising,
             PlanPhase::Exited,
         ] {
-            assert_eq!(plan_transition(from, PlanCommand::Exit), Some(PlanPhase::Exited));
+            assert_eq!(
+                plan_transition(from, PlanCommand::Exit),
+                Some(PlanPhase::Exited)
+            );
         }
         // The model can never reach AwaitingApproval or Approved on its own:
         // the only edges into them are Submit and Approve, both human commands.

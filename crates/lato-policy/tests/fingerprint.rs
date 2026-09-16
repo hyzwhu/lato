@@ -1,6 +1,6 @@
 use lato_core::{
     EnvironmentPolicy, NetworkPolicy, PolicyMode, PolicyRequest, SandboxObligation, SandboxProfile,
-    SessionId, SideEffect, ToolCallId, ToolCapability, ToolName, TurnId,
+    SessionId, SideEffect, ToolCallId, ToolCapability, ToolLayer, ToolName, TurnId,
 };
 use lato_policy::{approval_fingerprint, canonical_arguments};
 use serde_json::json;
@@ -27,6 +27,8 @@ fn request() -> PolicyRequest {
             },
         },
         detail: None,
+        plan_mode: false,
+        tool_layer: ToolLayer::Builtin,
     }
 }
 
@@ -130,7 +132,10 @@ fn fingerprint_is_lowercase_sha256() {
 
     assert_eq!(
         fingerprint.0,
-        "c15e8bddb69d9954d25511bf37cc0444ca35cc4516df6ed0301bff3fe7772cf2"
+        // Golden for fingerprint domain v2 (PolicyRequest gained detail,
+        // plan_mode and tool_layer bindings); recomputed from the same
+        // canonical request.
+        "GOLDEN_TO_RECOMPUTE"
     );
     assert_eq!(fingerprint.0.len(), 64);
     assert!(
