@@ -235,7 +235,13 @@ impl SessionLoop {
             tokio::select! {
                 command = self.command_rx.recv() => {
                     let Some(command) = command else {
-                        let _ = self.shutdown().await;
+                        // The owner dropped the handle without an explicit
+                        // shutdown command. Treat this like an abrupt process
+                        // exit: stop without appending terminal records so a
+                        // concurrently reopening reader never races an
+                        // in-flight tail commit. Explicit `Command::Shutdown`
+                        // remains the awaited path that commits `SessionStopped`.
+                        self.stop_without_commit();
                         break;
                     };
                     self.emit_session_started_once();
@@ -247,7 +253,7 @@ impl SessionLoop {
                 }
                 message = self.driver_rx.recv() => {
                     let Some(message) = message else {
-                        let _ = self.shutdown().await;
+                        self.stop_without_commit();
                         break;
                     };
                     self.handle_driver_message(message).await;
@@ -257,6 +263,23 @@ impl SessionLoop {
                 }
             }
         }
+    }
+
+    /// Stops the loop on an ungraceful owner drop: in-flight work is cancelled
+    /// but the journal is left exactly as last durably committed, so replay
+    /// stays crash-consistent and no tail commit can collide with a session
+    /// that reopened the journal.
+    fn stop_without_commit(&mut self) {
+        self.pending_start = None;
+        if let Some(active) = self.active.take() {
+            active.cancellation.cancel();
+            active.task.abort();
+        }
+        if let Some(active) = self.active_compaction.take() {
+            active.cancellation.cancel();
+            active.task.abort();
+        }
+        self.machine.stop();
     }
 
     async fn handle_command(&mut self, command: Command) -> Result<(), AgentError> {
