@@ -348,37 +348,50 @@ agents inherit the parent session's `ToolApproval`.
   under the run directory (`…/workflows/<runId>/scratch/`) and survive
   `session/resume`; `fork_context` stays unsupported.
 
-### Model-visible workflow tool (Phase 7B7)
+### Model-visible workflow tool (Phase 7B7, spec v1.2)
 
 The main-session model catalog carries exactly one builtin tool `workflow`
-(`builtin:workflow`, v1.0.0) so the model can drive named workflows without
+(`builtin:workflow`, v1.2.0) so the model can drive named workflows without
 slash commands. It is a thin, session-bound adapter over the same
 `WorkflowManager` the board and ACP use — no second turn loop, manager, or ACP
 self-call — and subagent catalogs never include it.
 
 - `{"action":"list"}` returns the trust/plugin snapshot's named scripts
   (keep-first order, at most 64 entries, `truncated` flag) with
-  `id` / `name` / `description` / `source` / `agentBudget`; never script
-  bodies or disk paths.
-- `{"action":"start","name":"<id>","args":{…},"agentBudget":N}` resolves on
-  the current turn snapshot, asks for one-shot approval (the approval summary
-  shows the resolved workflow id, source, effective budget, and args digest),
-  then launches the background run through the same manager and returns its
-  initial snapshot immediately. A catalog change between approval and
-  execution fails closed with `workflow.catalog_changed` — no run starts.
+  `id` / `name` / `description` / `source` / `agentBudget` and a content
+  `revision` — the lowercase SHA-256 of the canonical JSON
+  `{id, source, script, declaredAgentBudget}`. Never script bodies or disk
+  paths.
+- `{"action":"start","name":"<qualified id>","revision":"<64-hex>","agentBudget":N,"args":{…}}`
+  must carry the listed qualified id, revision, and an explicit budget; the
+  wrong combination is rejected by the schema (`oneOf`) before any approval is
+  requested. The pre-policy fingerprint binds these exact canonical arguments.
+  At invoke time the workflow is re-resolved and its revision is
+  constant-time-compared: any mismatch returns `workflow.catalog_changed`
+  with zero side effects (the one-shot grant was already consumed and is
+  never restored). On match the background run launches through the same
+  manager and the tool returns its initial snapshot immediately.
 - `{"action":"status","run":"<runId|displayName>"}` reports one real run, or
   the bounded recent-run list without `run`. Model-facing `status` is
   normalized to `active` / `paused` / `completed` / `interrupted`, while
   `detailStatus` stays lossless (`user_paused`, `budget_limited`, `failed`,
   …). Runs restored after a crash report `interrupted`, never `active`.
+- Authorization strictly follows the existing `PolicyMode`: `Ask` requests
+  human approval (the summary shows the resolved workflow id, source,
+  effective budget, and args digest; a rejection yields the stable
+  `policy.approval_denied` with zero side effects); `Auto` / `Always`
+  automatically issue one-shot grants. `PolicyDecision::Deny` is a decision
+  result, not a fourth mode (e.g. an illegal sandbox obligation denies with
+  `sandbox.unsupported`); policy rejection codes are never rewritten into
+  `workflow.*` errors.
 - Stable error codes: `workflow.invalid_arguments`, `workflow.not_found`,
   `workflow.duplicate_name` (retry with the qualified id),
-  `workflow.permission_denied`, `workflow.unavailable`,
-  `workflow.too_many_active_runs` (4 active per session),
-  `workflow.persistence_failed`, `workflow.run_not_found`,
+  `workflow.catalog_changed` (re-list then retry),
+  `workflow.unavailable`, `workflow.too_many_active_runs` (4 active per
+  session), `workflow.persistence_failed`, `workflow.run_not_found`,
   `workflow.output_too_large` (64 KiB output ceiling).
 - Boundaries: the tool is external-mutation, so `list` / `status` / `start`
-  all pass the ordinary approval membrane; model-initiated `pause` / `resume`
+  all pass the ordinary policy membrane; model-initiated `pause` / `resume`
   / `stop` do not exist (user-only, via TUI/ACP); internal workflow actions
   keep their own sandbox/trust/approval checks; output is entry-bounded and
   JSON-encoded.

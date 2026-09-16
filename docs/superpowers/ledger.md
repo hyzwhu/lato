@@ -4,7 +4,18 @@ A running record of notable modules, wiring points, and cross-crate contracts
 added by each phase. Newest entries first. This complements the design specs
 in `docs/superpowers/specs/`.
 
-## Phase 7B7 — Model-visible workflow tool (2026-09-16)
+## Phase 7B7 — Model-visible workflow tool (2026-09-16, spec v1.2)
+
+- Spec v1.2 contract: pre-policy fingerprint binds the model-submitted
+  canonical arguments (qualified id, content `revision`, explicit
+  `agentBudget`, args); `revision` = SHA-256 of canonical JSON
+  `{id, source, script, declaredAgentBudget}`, recomputed at invoke time and
+  constant-time-compared (`workflow.catalog_changed`, grant stays consumed,
+  `policy.grant_consumed` on replay). Policy behavior is the existing
+  `PolicyMode` matrix (Ask approval / Auto+Always auto one-shot grant);
+  `PolicyDecision::Deny` (e.g. `sandbox.unsupported`) is a decision result,
+  never a fourth mode, and policy codes are never rewritten to `workflow.*`.
+  No `workflow.permission_denied` exists.
 
 - `crates/lato-agent/src/workflow/tool.rs` — session-bound `WorkflowTool`
   (`builtin:workflow`, wire name `workflow`) with `list` / `start` / `status`,
@@ -22,10 +33,8 @@ in `docs/superpowers/specs/`.
 - Approval contract: `lato_core::Tool::approval_detail` (optional tool-provided
   detail) is copied into `lato_core::PolicyRequest::detail` by
   `lato_tools::prepare_scoped`, rendered by the `lato-policy` approval summary,
-  and bound into the approval fingerprint. For `start` it records a resolution
-  baseline (id/source/script/budget/args) that is re-verified at invoke time —
-  a catalog change between approval and execution returns
-  `workflow.catalog_changed` and starts nothing.
+  and bound into the approval fingerprint (informational summary for Ask mode;
+  the binding contract is the revision argument).
 - Registration: `lato_tools::builtin_tool_runtime_with_subagents_and_mcp_extra`
   appends caller-provided tools after builtins/task/MCP behind the same
   capability ceiling. Only `AcpHost::make_runtime_session` (main session) uses

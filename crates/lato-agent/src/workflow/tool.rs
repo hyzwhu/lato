@@ -1,12 +1,19 @@
-// Lato Phase 7B7: model-visible `workflow` tool.
+// Lato Phase 7B7 (spec v1.2): model-visible `workflow` tool.
 //
 // A thin, session-bound adapter over the same `WorkflowManager` the TUI/ACP
 // already drive (spec §6). The tool never creates a second turn loop, manager,
 // or ACP self-call: it resolves and launches through the manager mounted by
 // `attach_workflow_manager`, reusing the 7B4-7B6 registry, concurrency cap,
 // journal persistence, host service, and update broadcast.
+//
+// Authorization contract (spec v1.2): policy behavior strictly follows the
+// existing `PolicyMode` (Ask → human approval; Auto/Always → automatic
+// one-shot grant). `PolicyDecision::Deny` is a decision result, not a fourth
+// mode. The pre-policy fingerprint binds the model-submitted canonical
+// arguments — qualified id, content `revision`, explicit `agentBudget`, args —
+// and `invoke` re-resolves and constant-time-compares the revision before any
+// launch. Policy rejection codes are never rewritten into `workflow.*` errors.
 
-use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
@@ -15,10 +22,12 @@ use lato_core::{
     Retryability, SideEffect, Tool, ToolCancellation, ToolCapability, ToolConcurrency, ToolContext,
     ToolDescriptor, ToolError, ToolIdempotency, ToolLayer, ToolName, ToolOutput, ToolSource,
 };
+use lato_policy::canonical_arguments;
 use lato_workflow::{WorkflowError, clamp_agent_budget};
 use semver::Version;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 use super::{
     LaunchError, LaunchSpec, ResolvedWorkflow, WorkflowManager, WorkflowRunState,
@@ -36,8 +45,9 @@ const MAX_ARGS_BYTES: usize = 64 * 1024;
 const MAX_ARGS_SUMMARY_CHARS: usize = 200;
 const TOOL_TIMEOUT_MS: u64 = 20_000;
 
-/// Model-visible input schema (spec §4.1). Conditional combinations are
-/// re-validated by the invoke layer with `workflow.invalid_arguments`.
+/// Model-visible input schema (spec §4.1 v1.2). The action conditions are
+/// encoded as `oneOf` so wrong combinations fail pre-policy validation; the
+/// invoke layer re-checks them as defense-in-depth.
 pub fn workflow_tool_definition() -> Value {
     json!({
         "type": "object",
@@ -46,11 +56,53 @@ pub fn workflow_tool_definition() -> Value {
             "action": {"type": "string", "enum": ["list", "start", "status"]},
             "name": {"type": "string", "minLength": 1, "maxLength": MAX_NAME_BYTES},
             "run": {"type": "string", "minLength": 1, "maxLength": MAX_NAME_BYTES},
+            "revision": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
             "args": {"type": "object"},
             "agentBudget": {"type": "integer", "minimum": 1}
         },
-        "required": ["action"]
+        "required": ["action"],
+        "oneOf": [
+            { "properties": { "action": { "const": "list" } },
+              "not": { "anyOf": [{"required":["name"]},{"required":["run"]},{"required":["revision"]},{"required":["args"]},{"required":["agentBudget"]}] } },
+            { "properties": { "action": { "const": "start" } },
+              "required": ["name", "revision", "agentBudget"],
+              "not": { "required": ["run"] } },
+            { "properties": { "action": { "const": "status" } },
+              "not": { "anyOf": [{"required":["name"]},{"required":["revision"]},{"required":["args"]},{"required":["agentBudget"]}] } }
+        ]
     })
+}
+
+/// Content identity of a resolved workflow: SHA-256 of the canonical JSON
+/// `{id, source, script, declaredAgentBudget}` (spec §4.2 v1.2). Lowercase
+/// hex; reuses the existing canonical serializer (sorted keys).
+pub fn workflow_revision(resolved: &ResolvedWorkflow) -> String {
+    let value = json!({
+        "declaredAgentBudget": resolved.agent_budget,
+        "id": resolved.id,
+        "script": resolved.script,
+        "source": resolved.source,
+    });
+    let canonical = canonical_arguments(&value).expect("canonical serialization cannot fail");
+    let digest = Sha256::digest(&canonical);
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        write!(&mut encoded, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    encoded
+}
+
+/// Constant-time comparison for revision digests.
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in left.iter().zip(right.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 /// Session-owned indirection between the main-session tool runtime and the
@@ -64,10 +116,6 @@ pub struct SessionWorkflowHandle {
     lato_home: PathBuf,
     trust: SessionTrust,
     manager: Arc<RwLock<Option<Arc<WorkflowManager>>>>,
-    /// Approval-time resolution baseline for `start` (spec §7.3): recorded by
-    /// `approval_detail` at policy-prepare time, verified at invoke time, so a
-    /// catalog change between approval and execution fails closed.
-    pending_start: Arc<RwLock<Option<String>>>,
 }
 
 impl SessionWorkflowHandle {
@@ -77,7 +125,6 @@ impl SessionWorkflowHandle {
             lato_home,
             trust,
             manager: Arc::new(RwLock::new(None)),
-            pending_start: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -99,29 +146,6 @@ impl SessionWorkflowHandle {
             .unwrap_or_else(|error| error.into_inner())
             .clone()
     }
-
-    fn store_pending_start(&self, fingerprint: String) {
-        *self
-            .pending_start
-            .write()
-            .unwrap_or_else(|error| error.into_inner()) = Some(fingerprint);
-    }
-
-    /// Verify the invoke-time resolution against the approval-time baseline
-    /// (spec §7.3). Consumes the baseline either way; a missing baseline
-    /// (direct invokes, or a different call won the slot) skips the check.
-    fn check_pending_start(&self, fingerprint: &str) -> Result<(), ToolError> {
-        let mut slot = self
-            .pending_start
-            .write()
-            .unwrap_or_else(|error| error.into_inner());
-        let outcome = match slot.as_deref() {
-            Some(baseline) if baseline != fingerprint => Err(catalog_changed()),
-            _ => Ok(()),
-        };
-        *slot = None;
-        outcome
-    }
 }
 
 pub struct WorkflowTool {
@@ -139,12 +163,13 @@ impl Tool for WorkflowTool {
     fn descriptor(&self) -> ToolDescriptor {
         ToolDescriptor {
             name: ToolName::parse("builtin:workflow").expect("static tool name"),
-            version: Version::new(1, 0, 0),
+            version: Version::new(1, 2, 0),
             description: "Discover, start, and inspect named workflows. Actions: list (visible \
-                          workflows), start (launch a background run after approval), status \
-                          (query one run or recent runs). Starting a workflow never blocks the \
-                          conversation; the run keeps streaming its own updates. Model-initiated \
-                          pause, resume, and stop are not supported."
+                          workflows with content revisions), start (launch a background run with \
+                          the listed id + revision + explicit agentBudget, after policy \
+                          approval), status (query one run or recent runs). Starting a workflow \
+                          never blocks the conversation; the run keeps streaming its own \
+                          updates. Model-initiated pause, resume, and stop are not supported."
                 .into(),
             input_schema: workflow_tool_definition(),
             capabilities: vec![ToolCapability::TaskControl],
@@ -183,10 +208,10 @@ impl Tool for WorkflowTool {
         }
     }
 
-    /// Approval-time detail (spec §4.3): the summary shows the resolved
-    /// workflow id, source, effective budget, and an args digest. The
-    /// resolution is also stored as the invoke-time baseline, and the whole
-    /// detail is bound into the approval fingerprint by the runtime.
+    /// Tool-provided approval detail (spec §4.3): the Ask-mode summary shows
+    /// the resolved workflow id, source, effective budget, and args digest.
+    /// Purely informational — the binding contract is the revision argument,
+    /// which is part of the pre-policy fingerprint.
     fn approval_detail(&self, arguments: &Value) -> Option<String> {
         let input = parse_input(arguments.clone()).ok()?;
         match input.action.as_str() {
@@ -206,15 +231,8 @@ impl Tool for WorkflowTool {
                     input.name.as_deref()?,
                 )
                 .ok()?;
-                let effective_budget = effective_budget(&resolved, input.agent_budget).ok()?;
-                let args = input.args.clone().unwrap_or_else(|| json!({}));
-                let fingerprint = resolution_fingerprint(&resolved, effective_budget, &args);
-                self.handle.store_pending_start(fingerprint);
-                Some(start_summary(
-                    &resolved,
-                    effective_budget,
-                    input.args.as_ref(),
-                ))
+                let budget = effective_budget(&resolved, input.agent_budget).ok()?;
+                Some(start_summary(&resolved, budget, input.args.as_ref()))
             }
             _ => None,
         }
@@ -224,7 +242,7 @@ impl Tool for WorkflowTool {
 impl WorkflowTool {
     /// `list` (spec §4.2): the current trust/plugin snapshot's named scripts
     /// in registry keep-first order, bounded to 64 entries and 64 KiB, with
-    /// no script bodies or disk paths.
+    /// content revisions and no script bodies or disk paths.
     fn list(&self, manager: &Arc<WorkflowManager>) -> Result<ToolOutput, ToolError> {
         let Some(snapshot) = manager.snapshot() else {
             return Err(unavailable());
@@ -246,15 +264,20 @@ impl WorkflowTool {
                     "description": workflow.description,
                     "source": workflow.source,
                     "agentBudget": workflow.agent_budget,
+                    "revision": workflow_revision(workflow),
                 })
             })
             .collect();
         bounded_output("list", "workflows", truncated_entries, entries)
     }
 
-    /// `start` (spec §4.3): resolve on the current snapshot, verify the
-    /// approval-time baseline, then launch through the same manager. Returns
-    /// the initial snapshot immediately; the background run keeps streaming.
+    /// `start` (spec §4.3 v1.2): the model carries the listed qualified id,
+    /// revision, and explicit budget; the pre-policy fingerprint already binds
+    /// them. Invoke re-resolves and constant-time-compares the revision — any
+    /// mismatch returns `workflow.catalog_changed` with zero side effects
+    /// (the grant was consumed by `ToolRuntime::execute` before entering
+    /// here and is never restored). Then launch through the same manager and
+    /// return the initial snapshot immediately.
     async fn start(
         &self,
         context: ToolContext,
@@ -265,6 +288,13 @@ impl WorkflowTool {
             .name
             .as_deref()
             .ok_or_else(|| invalid_arguments("start requires name"))?;
+        let revision = input
+            .revision
+            .as_deref()
+            .ok_or_else(|| invalid_arguments("start requires revision"))?;
+        let budget = input
+            .agent_budget
+            .ok_or_else(|| invalid_arguments("start requires agentBudget"))?;
         let args = input.args.clone().unwrap_or_else(|| json!({}));
         let snapshot = manager.snapshot().ok_or_else(unavailable)?;
         let resolved = resolve_workflow(
@@ -275,11 +305,14 @@ impl WorkflowTool {
             name,
         )
         .map_err(|error| resolve_error(&error))?;
-        let budget = effective_budget(&resolved, input.agent_budget)
-            .map_err(|error| invalid_arguments(&error.to_string()))?;
-        // Catalog changed between approval and execution → fail closed, no run.
-        let fingerprint = resolution_fingerprint(&resolved, budget, &args);
-        self.handle.check_pending_start(&fingerprint)?;
+        let budget = u64::from(
+            clamp_agent_budget(Some(budget))
+                .map_err(|error| invalid_arguments(&error.to_string()))?,
+        );
+        // TOCTOU guard: content identity must match what the model listed.
+        if !constant_time_eq(revision.as_bytes(), workflow_revision(&resolved).as_bytes()) {
+            return Err(catalog_changed());
+        }
         // Cancellation before launch means no run is ever created.
         if context.cancellation.is_cancelled() {
             return Err(cancelled());
@@ -336,6 +369,8 @@ pub struct WorkflowToolInput {
     #[serde(default)]
     run: Option<String>,
     #[serde(default)]
+    revision: Option<String>,
+    #[serde(default)]
     args: Option<Value>,
     #[serde(default)]
     agent_budget: Option<u64>,
@@ -345,14 +380,25 @@ fn parse_input(arguments: Value) -> Result<WorkflowToolInput, ToolError> {
     serde_json::from_value(arguments).map_err(|error| invalid_arguments(&error.to_string()))
 }
 
-/// Conditional constraints from spec §4.1, enforced at the invoke layer.
+/// Defense-in-depth re-check of the §4.1 v1.2 `oneOf` conditions.
 fn validate_input(input: &WorkflowToolInput) -> Result<(), ToolError> {
     validate_selector("name", input.name.as_deref())?;
     validate_selector("run", input.run.as_deref())?;
+    if let Some(revision) = input.revision.as_deref()
+        && (revision.len() != 64
+            || !revision
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()))
+    {
+        return Err(invalid_arguments(
+            "revision must be 64 lowercase hex characters",
+        ));
+    }
     match input.action.as_str() {
         "list" => {
             if input.name.is_some()
                 || input.run.is_some()
+                || input.revision.is_some()
                 || input.args.is_some()
                 || input.agent_budget.is_some()
             {
@@ -368,13 +414,20 @@ fn validate_input(input: &WorkflowToolInput) -> Result<(), ToolError> {
             if input.name.as_deref().is_none() {
                 return Err(invalid_arguments("start requires name"));
             }
-            validate_args(input.args.as_ref())?;
-            if input.agent_budget.is_some_and(|budget| budget == 0) {
-                return Err(invalid_arguments("agentBudget must be at least 1"));
+            if input.revision.is_none() {
+                return Err(invalid_arguments("start requires revision"));
             }
+            if input.agent_budget.is_none() {
+                return Err(invalid_arguments("start requires agentBudget"));
+            }
+            validate_args(input.args.as_ref())?;
         }
         "status" => {
-            if input.name.is_some() || input.args.is_some() || input.agent_budget.is_some() {
+            if input.name.is_some()
+                || input.revision.is_some()
+                || input.args.is_some()
+                || input.agent_budget.is_some()
+            {
                 return Err(invalid_arguments("status accepts only action and run"));
             }
         }
@@ -415,9 +468,10 @@ fn validate_selector(field: &str, value: Option<&str>) -> Result<(), ToolError> 
     Ok(())
 }
 
-/// Effective agent budget for a `start`: an explicit value must sit inside the
-/// engine range (`workflow.invalid_arguments` otherwise); the declared value
-/// applies otherwise (spec §4.3, mirroring the ACP launch path).
+/// Effective agent budget for a `start`: the explicit value is mandatory and
+/// must sit inside the engine range (`workflow.invalid_arguments` otherwise),
+/// so the pre-policy fingerprint binds the final effective budget (spec
+/// §4.3 v1.2 step 4).
 fn effective_budget(
     resolved: &ResolvedWorkflow,
     agent_budget: Option<u64>,
@@ -426,18 +480,6 @@ fn effective_budget(
         Some(raw) => Ok(u64::from(clamp_agent_budget(Some(raw))?)),
         None => Ok(u64::from(resolved.agent_budget)),
     }
-}
-
-/// Stable invocation identity for the approval baseline: resolved id, source,
-/// script content, effective budget, and the exact args (spec §7.3).
-fn resolution_fingerprint(resolved: &ResolvedWorkflow, budget: u64, args: &Value) -> String {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    resolved.id.hash(&mut hasher);
-    resolved.source.hash(&mut hasher);
-    resolved.script.hash(&mut hasher);
-    budget.hash(&mut hasher);
-    args.to_string().hash(&mut hasher);
-    format!("{:016x}{:016x}", hasher.finish(), resolved.script.len())
 }
 
 /// Human-facing approval summary; args are JSON-encoded and truncated, never
@@ -453,14 +495,6 @@ fn start_summary(resolved: &ResolvedWorkflow, budget: u64, args: Option<&Value>)
     format!(
         "start workflow '{}' (source: {}, agent budget: {}) with args: {}",
         resolved.id, resolved.source, budget, args_summary
-    )
-}
-
-fn unavailable() -> ToolError {
-    ToolError::new(
-        "workflow.unavailable",
-        "workflow runs are not available in this session",
-        Retryability::Never,
     )
 }
 
@@ -534,8 +568,85 @@ fn single_run_output(action: &str, state: &WorkflowRunState) -> Result<ToolOutpu
     })
 }
 
+/// Entry-bounded output: when the payload exceeds the limit, drop trailing
+/// entries and flag truncation (spec §7.3). A single entry that alone exceeds
+/// the limit is a stable `workflow.output_too_large` error.
+fn bounded_output(
+    action: &str,
+    entries_key: &str,
+    already_truncated: bool,
+    mut entries: Vec<Value>,
+) -> Result<ToolOutput, ToolError> {
+    let mut truncated = already_truncated;
+    loop {
+        let value = json!({
+            "action": action,
+            entries_key: entries,
+            "truncated": truncated,
+        });
+        let size = serde_json::to_vec(&value)
+            .map_err(|error| output_error(&error.to_string()))?
+            .len();
+        if size <= MAX_OUTPUT_BYTES {
+            return Ok(ToolOutput {
+                content: value.to_string(),
+                metadata: json!({"workflowTool": action}),
+                truncated,
+                artifact_path: None,
+            });
+        }
+        if entries.is_empty() {
+            return Err(output_error(
+                "a single workflow entry exceeds the 64 KiB output limit",
+            ));
+        }
+        entries.pop();
+        truncated = true;
+    }
+}
+
+fn unavailable() -> ToolError {
+    ToolError::new(
+        "workflow.unavailable",
+        "workflow runs are not available in this session",
+        Retryability::Never,
+    )
+}
+
+fn invalid_arguments(message: &str) -> ToolError {
+    ToolError::new("workflow.invalid_arguments", message, Retryability::Never)
+}
+
+fn output_error(message: &str) -> ToolError {
+    ToolError::new("workflow.output_too_large", message, Retryability::Never)
+}
+
+fn catalog_changed() -> ToolError {
+    ToolError::new(
+        "workflow.catalog_changed",
+        "the workflow content changed since it was listed; re-list and retry",
+        Retryability::AfterBackoff,
+    )
+}
+
+fn run_not_found() -> ToolError {
+    ToolError::new(
+        "workflow.run_not_found",
+        "no workflow run matched the requested id or display name",
+        Retryability::Never,
+    )
+}
+
+fn cancelled() -> ToolError {
+    ToolError::new(
+        "tool.cancelled",
+        "tool call was cancelled",
+        Retryability::Never,
+    )
+}
+
 fn resolve_error(error: &WorkflowError) -> ToolError {
-    match &error {
+    match error {
         WorkflowError::NotFound(_) => {
             ToolError::new("workflow.not_found", error.to_string(), Retryability::Never)
         }
@@ -575,80 +686,13 @@ fn launch_error(error: LaunchError) -> ToolError {
     }
 }
 
-fn invalid_arguments(message: &str) -> ToolError {
-    ToolError::new("workflow.invalid_arguments", message, Retryability::Never)
-}
-
-/// Entry-bounded output: when the payload exceeds the limit, drop trailing
-/// entries and flag truncation (spec §7.3). A single entry that alone exceeds
-/// the limit is a stable `workflow.output_too_large` error.
-fn bounded_output(
-    action: &str,
-    entries_key: &str,
-    already_truncated: bool,
-    mut entries: Vec<Value>,
-) -> Result<ToolOutput, ToolError> {
-    let mut truncated = already_truncated;
-    loop {
-        let value = json!({
-            "action": action,
-            entries_key: entries,
-            "truncated": truncated,
-        });
-        let size = serde_json::to_vec(&value)
-            .map_err(|error| output_error(&error.to_string()))?
-            .len();
-        if size <= MAX_OUTPUT_BYTES {
-            return Ok(ToolOutput {
-                content: value.to_string(),
-                metadata: json!({"workflowTool": action}),
-                truncated,
-                artifact_path: None,
-            });
-        }
-        if entries.is_empty() {
-            return Err(output_error(
-                "a single workflow entry exceeds the 64 KiB output limit",
-            ));
-        }
-        entries.pop();
-        truncated = true;
-    }
-}
-
-fn output_error(message: &str) -> ToolError {
-    ToolError::new("workflow.output_too_large", message, Retryability::Never)
-}
-
-fn catalog_changed() -> ToolError {
-    ToolError::new(
-        "workflow.catalog_changed",
-        "the workflow catalog changed after approval; re-issue the start call",
-        Retryability::Never,
-    )
-}
-
-fn run_not_found() -> ToolError {
-    ToolError::new(
-        "workflow.run_not_found",
-        "no workflow run matched the requested id or display name",
-        Retryability::Never,
-    )
-}
-
-fn cancelled() -> ToolError {
-    ToolError::new(
-        "tool.cancelled",
-        "tool call was cancelled",
-        Retryability::Never,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use lato_core::{SessionId, ToolCallId, TurnId};
-    use lato_extensions::PluginSnapshot;
+    use lato_extensions::{
+        DiscoveryConfig, PluginConfig, PluginSnapshot, build_snapshot, discover_plugins,
+    };
     use tokio_util::sync::CancellationToken;
 
     fn context() -> ToolContext {
@@ -668,205 +712,6 @@ mod tests {
             cwd.join("lato-home"),
             SessionTrust::for_headless_prompt(&cwd),
         ))
-    }
-
-    #[test]
-    fn descriptor_matches_spec_section_four() {
-        let descriptor = tool().descriptor();
-        assert_eq!(descriptor.name.as_str(), "builtin:workflow");
-        assert_eq!(descriptor.name.local_name(), WORKFLOW_TOOL_WIRE_NAME);
-        assert_eq!(descriptor.version, Version::new(1, 0, 0));
-        assert_eq!(descriptor.capabilities, vec![ToolCapability::TaskControl]);
-        assert_eq!(descriptor.side_effect, SideEffect::ExternalMutation);
-        assert_eq!(descriptor.concurrency, ToolConcurrency::Serial);
-        assert_eq!(descriptor.idempotency, ToolIdempotency::NonIdempotent);
-        assert_eq!(descriptor.cancellation, ToolCancellation::Cooperative);
-        assert_eq!(descriptor.timeout_ms, 20_000);
-        assert_eq!(descriptor.max_output_bytes, 64 * 1024);
-        assert_eq!(descriptor.input_schema, workflow_tool_definition());
-        descriptor.validate().expect("descriptor is valid");
-    }
-
-    #[test]
-    fn wrong_argument_combinations_are_rejected() {
-        let cases = [
-            json!({"action":"list","name":"x"}),
-            json!({"action":"list","run":"x"}),
-            json!({"action":"start"}),
-            json!({"action":"start","name":"w","run":"wf_1"}),
-            json!({"action":"status","name":"w"}),
-            json!({"action":"status","agentBudget":4}),
-            json!({"action":"restart"}),
-            json!({"action":"start","name":"","args":{}}),
-            json!({"action":"start","name":"w","args":"not-object"}),
-            json!({"action":"start","name":"w","agentBudget":0}),
-            json!({}),
-        ];
-        for arguments in cases {
-            let rejected = serde_json::from_value::<WorkflowToolInput>(arguments.clone())
-                .map_err(|_| ())
-                .and_then(|input| validate_input(&input).map_err(|_| ()))
-                .is_err();
-            assert!(rejected, "expected rejection for {arguments}");
-        }
-        let ok = [
-            json!({"action":"list"}),
-            json!({"action":"start","name":"review-changes"}),
-            json!({"action":"start","name":"review-changes","args":{"base":"main"},"agentBudget":32}),
-            json!({"action":"status"}),
-            json!({"action":"status","run":"review-changes-2"}),
-        ];
-        for arguments in ok {
-            let input: WorkflowToolInput = serde_json::from_value(arguments.clone()).unwrap();
-            validate_input(&input).unwrap_or_else(|error| panic!("{arguments} rejected: {error}"));
-        }
-    }
-
-    #[tokio::test]
-    async fn actions_fail_closed_without_manager() {
-        let tool = tool();
-        for arguments in [
-            json!({"action":"list"}),
-            json!({"action":"start","name":"w"}),
-            json!({"action":"status"}),
-        ] {
-            let error = tool
-                .invoke(context(), arguments)
-                .await
-                .expect_err("no manager installed");
-            assert_eq!(error.code, "workflow.unavailable");
-        }
-    }
-
-    #[tokio::test]
-    async fn cancelled_call_never_reaches_the_manager() {
-        let tool = tool();
-        let context = context();
-        context.cancellation.cancel();
-        let error = tool
-            .invoke(context, json!({"action":"list"}))
-            .await
-            .expect_err("cancelled before dispatch");
-        assert_eq!(error.code, "tool.cancelled");
-    }
-
-    #[test]
-    fn section_five_status_normalization_is_exhaustive_and_lossless() {
-        let cases = [
-            (WorkflowRunStatus::Active, "active", "active"),
-            (WorkflowRunStatus::UserPaused, "paused", "user_paused"),
-            (
-                WorkflowRunStatus::BackOffPaused,
-                "paused",
-                "back_off_paused",
-            ),
-            (
-                WorkflowRunStatus::NoProgressPaused,
-                "paused",
-                "no_progress_paused",
-            ),
-            (WorkflowRunStatus::InfraPaused, "paused", "infra_paused"),
-            (WorkflowRunStatus::Blocked, "paused", "blocked"),
-            (WorkflowRunStatus::BudgetLimited, "paused", "budget_limited"),
-            (WorkflowRunStatus::Complete, "completed", "complete"),
-            (WorkflowRunStatus::Interrupted, "interrupted", "interrupted"),
-            (WorkflowRunStatus::Failed, "interrupted", "failed"),
-            (WorkflowRunStatus::Cancelled, "interrupted", "cancelled"),
-        ];
-        for (status, normalized, detail) in cases {
-            assert_eq!(model_status(status), normalized, "{detail}");
-            assert_eq!(detail_status(status), detail);
-        }
-    }
-
-    #[tokio::test]
-    async fn status_reports_real_manager_runs_and_misses_stably() {
-        let fixture = ListFixture::new();
-        fixture.write_user("hold");
-        fixture.rewrite_user(
-            "hold",
-            "let meta = #{ name: \"hold\", description: \"d\" };\nlet r = agent(\"work\");\n",
-        );
-        let (tool, manager) = fixture.tool_with_manager(false, Arc::new(HangingStream));
-
-        // Launch through the MANAGER (as TUI/ACP do), query through the tool.
-        let launched = tool
-            .invoke(context(), json!({"action":"start","name":"hold"}))
-            .await
-            .unwrap();
-        let run_id = output_json(&launched)["run"]["runId"]
-            .as_str()
-            .unwrap()
-            .to_owned();
-
-        // By runId.
-        let by_id = tool
-            .invoke(context(), json!({"action":"status","run":run_id}))
-            .await
-            .unwrap();
-        let run = output_json(&by_id)["run"].clone();
-        assert_eq!(run["runId"], run_id.as_str());
-        assert_eq!(run["status"], "active");
-        assert_eq!(run["detailStatus"], "active");
-
-        // Pause through the manager (user action); the run task observes the
-        // pause intent asynchronously, so wait for the tracker to settle.
-        manager.pause("hold").unwrap();
-        for _ in 0..400 {
-            if manager.list().iter().any(|run| {
-                run.display_name == "hold" && run.status == WorkflowRunStatus::UserPaused
-            }) {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        }
-        let paused = tool
-            .invoke(context(), json!({"action":"status","run":"hold"}))
-            .await
-            .unwrap();
-        let run = output_json(&paused)["run"].clone();
-        assert_eq!(run["status"], "paused");
-        assert_eq!(run["detailStatus"], "user_paused");
-        assert!(run["phase"].is_null());
-        assert!(run["elapsedMsFloor"].is_u64());
-
-        // Default listing includes the run; a miss is a stable error.
-        let listed = tool
-            .invoke(context(), json!({"action":"status"}))
-            .await
-            .unwrap();
-        assert_eq!(output_json(&listed)["runs"].as_array().unwrap().len(), 1);
-        let missing = tool
-            .invoke(context(), json!({"action":"status","run":"nope"}))
-            .await
-            .unwrap_err();
-        assert_eq!(missing.code, "workflow.run_not_found");
-    }
-
-    #[tokio::test]
-    async fn completed_runs_normalize_to_completed() {
-        let fixture = ListFixture::new();
-        fixture.write_user("quick");
-        let tool = fixture.tool(false);
-
-        tool.invoke(context(), json!({"action":"start","name":"quick"}))
-            .await
-            .unwrap();
-        let mut normalized = None;
-        for _ in 0..200 {
-            let listed = tool
-                .invoke(context(), json!({"action":"status","run":"quick"}))
-                .await
-                .unwrap();
-            let run = output_json(&listed)["run"].clone();
-            if run["status"] == "completed" {
-                normalized = Some(run);
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        }
-        let run = normalized.expect("run never completed");
-        assert_eq!(run["detailStatus"], "complete");
     }
 
     fn user_script(name: &str, description: &str) -> String {
@@ -945,15 +790,15 @@ mod tests {
         }
 
         fn snapshot(&self, project_trusted: bool) -> Arc<PluginSnapshot> {
-            lato_extensions::build_snapshot(
+            build_snapshot(
                 1,
-                lato_extensions::discover_plugins(&lato_extensions::DiscoveryConfig {
+                discover_plugins(&DiscoveryConfig {
                     cwd: self.cwd.clone(),
                     lato_home: self.home.clone(),
                     cli_plugin_dirs: self.plugins.clone(),
                     project_trusted,
                 }),
-                &lato_extensions::PluginConfig::default(),
+                &PluginConfig::default(),
             )
             .unwrap()
         }
@@ -999,140 +844,181 @@ mod tests {
         serde_json::from_str(&output.content).unwrap()
     }
 
-    #[tokio::test]
-    async fn start_launches_through_the_same_manager_and_returns_immediately() {
-        let fixture = ListFixture::new();
-        fixture.write_user("review");
-        let tool = fixture.tool(false);
-
-        let started = tokio::time::Instant::now();
+    /// List and pull one workflow's (id, revision) pair.
+    async fn listed_revision(tool: &WorkflowTool, id: &str) -> (String, String) {
         let output = tool
-            .invoke(
-                context(),
-                json!({"action":"start","name":"review","args":{"base":"main"}}),
-            )
+            .invoke(context(), json!({"action":"list"}))
             .await
             .unwrap();
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(20),
-            "start must return the initial snapshot quickly"
-        );
-        let value = output_json(&output);
-        assert_eq!(value["action"], "start");
-        assert_eq!(value["run"]["displayName"], "review");
-        assert_eq!(value["run"]["status"], "active");
-        assert_eq!(value["run"]["detailStatus"], "active");
-        assert_eq!(value["run"]["agentsUsed"], 0);
-        assert_eq!(value["run"]["agentBudget"], 128);
-        // Same Manager: the tool-launched run is visible through the manager
-        // the TUI/ACP already poll — there is no second manager.
-        let run_id = value["run"]["runId"].as_str().unwrap().to_owned();
-        assert!(run_id.starts_with("wf_"));
+        let listed = output_json(&output);
+        let entry = listed["workflows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["id"] == id)
+            .unwrap_or_else(|| panic!("{id} not listed"))
+            .clone();
+        (
+            entry["id"].as_str().unwrap().to_owned(),
+            entry["revision"].as_str().unwrap().to_owned(),
+        )
     }
 
-    #[tokio::test]
-    async fn start_maps_stable_error_codes() {
-        let mut fixture = ListFixture::new();
-        fixture.write_user("greet");
-        fixture.cli_plugin(
-            "alpha",
-            r#"{"name":"alpha","workflows":{"shared":{"description":"Alpha"}}}"#,
-        );
-        fixture.cli_plugin(
-            "beta",
-            r#"{"name":"beta","workflows":{"shared":{"description":"Beta"}}}"#,
-        );
-        let tool = fixture.tool(true);
-
-        let missing = tool
-            .invoke(context(), json!({"action":"start","name":"missing/none"}))
-            .await
-            .unwrap_err();
-        assert_eq!(missing.code, "workflow.not_found");
-
-        let duplicate = tool
-            .invoke(context(), json!({"action":"start","name":"shared"}))
-            .await
-            .unwrap_err();
-        assert_eq!(duplicate.code, "workflow.duplicate_name");
-        // The qualified id resolves.
-        let qualified = tool
-            .invoke(context(), json!({"action":"start","name":"alpha/shared"}))
-            .await
-            .unwrap();
-        assert_eq!(output_json(&qualified)["run"]["displayName"], "shared");
-
-        let budget = tool
-            .invoke(
-                context(),
-                json!({"action":"start","name":"greet","agentBudget":999_999_999}),
-            )
-            .await
-            .unwrap_err();
-        assert_eq!(budget.code, "workflow.invalid_arguments");
+    #[test]
+    fn descriptor_matches_spec_section_four() {
+        let descriptor = tool().descriptor();
+        assert_eq!(descriptor.name.as_str(), "builtin:workflow");
+        assert_eq!(descriptor.name.local_name(), WORKFLOW_TOOL_WIRE_NAME);
+        assert_eq!(descriptor.version, Version::new(1, 2, 0));
+        assert_eq!(descriptor.capabilities, vec![ToolCapability::TaskControl]);
+        assert_eq!(descriptor.side_effect, SideEffect::ExternalMutation);
+        assert_eq!(descriptor.concurrency, ToolConcurrency::Serial);
+        assert_eq!(descriptor.idempotency, ToolIdempotency::NonIdempotent);
+        assert_eq!(descriptor.cancellation, ToolCancellation::Cooperative);
+        assert_eq!(descriptor.timeout_ms, 20_000);
+        assert_eq!(descriptor.max_output_bytes, 64 * 1024);
+        assert_eq!(descriptor.input_schema, workflow_tool_definition());
+        descriptor.validate().expect("descriptor is valid");
     }
 
-    #[tokio::test]
-    async fn approval_summary_shows_resolution_and_catalog_changes_fail_closed() {
-        let fixture = ListFixture::new();
-        fixture.write_user("review");
-        let tool = fixture.tool(false);
-
-        let arguments = json!({"action":"start","name":"review","agentBudget":32});
-        let detail = tool
-            .approval_detail(&arguments)
-            .expect("start produces an approval detail");
-        assert!(detail.contains("'review'"), "detail: {detail}");
-        assert!(detail.contains("source: user"), "detail: {detail}");
-        assert!(detail.contains("agent budget: 32"), "detail: {detail}");
-        assert!(detail.contains("args: {}"), "detail: {detail}");
-
-        // Unchanged catalog: the baseline matches and the launch proceeds.
-        let launched = tool.invoke(context(), arguments.clone()).await.unwrap();
-        assert_eq!(output_json(&launched)["run"]["status"], "active");
-
-        // Fresh approval on the untampered catalog…
-        let detail = tool
-            .approval_detail(&arguments)
-            .expect("resolution still succeeds");
-        assert!(detail.contains("'review'"));
-        // …then the script content changes under the same name before the
-        // user approves and the call executes: the approval-time baseline no
-        // longer matches the invoke-time resolution → catalog_changed, no run.
-        fixture.rewrite_user(
-            "review",
-            &format!("{}\n// tampered", user_script("review", "User workflow")),
-        );
-        let error = tool
-            .invoke(context(), arguments)
-            .await
-            .expect_err("catalog changed after approval");
-        assert_eq!(error.code, "workflow.catalog_changed");
-    }
-
-    #[tokio::test]
-    async fn fifth_concurrent_start_fails_with_stable_code() {
-        let fixture = ListFixture::new();
-        fixture.write_user("hang");
-        fixture.rewrite_user(
-            "hang",
-            "let meta = #{ name: \"hang\", description: \"d\" };\nlet r = agent(\"work\");\n",
-        );
-        let tool = fixture.tool_with_stream(false, Arc::new(HangingStream));
-
-        for _ in 0..4 {
-            let output = tool
-                .invoke(context(), json!({"action":"start","name":"hang"}))
-                .await
-                .unwrap();
-            assert_eq!(output_json(&output)["run"]["status"], "active");
+    #[test]
+    fn schema_oneof_rejects_wrong_combinations_pre_policy() {
+        // Mirror of the wire schema's oneOf: wrong combinations must fail
+        // validation before any approval is requested.
+        let schema = workflow_tool_definition();
+        let validator = jsonschema::validator_for(&schema).unwrap();
+        let rejects = [
+            json!({"action":"list","name":"x"}),
+            json!({"action":"list","run":"x"}),
+            json!({"action":"list","revision":"a"}),
+            json!({"action":"start"}),
+            json!({"action":"start","name":"w"}),
+            json!({"action":"start","name":"w","revision":"a"}),
+            json!({"action":"start","name":"w","agentBudget":8}),
+            json!({"action":"start","name":"w","revision":"a","agentBudget":8,"run":"wf_1"}),
+            json!({"action":"status","name":"w"}),
+            json!({"action":"status","revision":"a"}),
+            json!({"action":"status","agentBudget":4}),
+            json!({"action":"restart"}),
+            json!({"action":"start","name":"","revision":"a","agentBudget":8}),
+            json!({"action":"start","name":"w","revision":"a","agentBudget":0}),
+            json!({}),
+        ];
+        for arguments in rejects {
+            assert!(
+                !validator.is_valid(&arguments),
+                "schema must reject {arguments}"
+            );
         }
-        let fifth = tool
-            .invoke(context(), json!({"action":"start","name":"hang"}))
+        let accepts = [
+            json!({"action":"list"}),
+            json!({"action":"start","name":"review-changes","revision":"0".repeat(64),"agentBudget":32}),
+            json!({"action":"start","name":"review-changes","revision":"0".repeat(64),"agentBudget":32,"args":{"base":"main"}}),
+            json!({"action":"status"}),
+            json!({"action":"status","run":"review-changes-2"}),
+        ];
+        for arguments in accepts {
+            assert!(
+                validator.is_valid(&arguments),
+                "schema must accept {arguments}"
+            );
+        }
+    }
+
+    #[test]
+    fn revision_is_content_identity_and_stable() {
+        let resolved = ResolvedWorkflow {
+            id: "demo/review".into(),
+            display_name: "review".into(),
+            description: "d".into(),
+            script: "complete(1)".into(),
+            agent_budget: 32,
+            source: "plugin",
+            compiled: true,
+        };
+        let first = workflow_revision(&resolved);
+        assert_eq!(first.len(), 64);
+        assert!(
+            first
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        );
+        assert_eq!(
+            workflow_revision(&resolved),
+            first,
+            "stable for identical content"
+        );
+        let mut tampered = resolved.clone();
+        tampered.script = "complete(2)".into();
+        assert_ne!(
+            workflow_revision(&tampered),
+            first,
+            "script change ⇒ new revision"
+        );
+        let mut budgeted = resolved;
+        budgeted.agent_budget = 33;
+        assert_ne!(
+            workflow_revision(&budgeted),
+            first,
+            "declared budget change ⇒ new revision"
+        );
+    }
+
+    #[tokio::test]
+    async fn actions_fail_closed_without_manager() {
+        let tool = tool();
+        for arguments in [
+            json!({"action":"list"}),
+            json!({"action":"start","name":"w","revision":"0".repeat(64),"agentBudget":8}),
+            json!({"action":"status"}),
+        ] {
+            let error = tool
+                .invoke(context(), arguments)
+                .await
+                .expect_err("no manager installed");
+            assert_eq!(error.code, "workflow.unavailable");
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_call_never_reaches_the_manager() {
+        let tool = tool();
+        let context = context();
+        context.cancellation.cancel();
+        let error = tool
+            .invoke(context, json!({"action":"list"}))
             .await
-            .unwrap_err();
-        assert_eq!(fifth.code, "workflow.too_many_active_runs");
-        assert_eq!(fifth.retryability, Retryability::AfterBackoff);
+            .expect_err("cancelled before dispatch");
+        assert_eq!(error.code, "tool.cancelled");
+    }
+
+    #[test]
+    fn section_five_status_normalization_is_exhaustive_and_lossless() {
+        let cases = [
+            (WorkflowRunStatus::Active, "active", "active"),
+            (WorkflowRunStatus::UserPaused, "paused", "user_paused"),
+            (
+                WorkflowRunStatus::BackOffPaused,
+                "paused",
+                "back_off_paused",
+            ),
+            (
+                WorkflowRunStatus::NoProgressPaused,
+                "paused",
+                "no_progress_paused",
+            ),
+            (WorkflowRunStatus::InfraPaused, "paused", "infra_paused"),
+            (WorkflowRunStatus::Blocked, "paused", "blocked"),
+            (WorkflowRunStatus::BudgetLimited, "paused", "budget_limited"),
+            (WorkflowRunStatus::Complete, "completed", "complete"),
+            (WorkflowRunStatus::Interrupted, "interrupted", "interrupted"),
+            (WorkflowRunStatus::Failed, "interrupted", "failed"),
+            (WorkflowRunStatus::Cancelled, "interrupted", "cancelled"),
+        ];
+        for (status, normalized, detail) in cases {
+            assert_eq!(model_status(status), normalized, "{detail}");
+            assert_eq!(detail_status(status), detail);
+        }
     }
 
     #[tokio::test]
@@ -1196,6 +1082,268 @@ mod tests {
         assert_eq!(listed["workflows"][0]["id"], "wf-000");
         assert_eq!(listed["workflows"][0]["source"], "user");
         assert!(listed["workflows"][0]["agentBudget"].is_u64());
-        assert!(listed["workflows"][0]["description"].is_string());
+        assert_eq!(
+            listed["workflows"][0]["revision"].as_str().unwrap().len(),
+            64
+        );
+    }
+
+    #[tokio::test]
+    async fn start_with_listed_revision_launches_through_the_same_manager() {
+        let fixture = ListFixture::new();
+        fixture.write_user("review");
+        let (tool, _manager) = fixture.tool_with_manager(false, crate::default_fake_stream());
+
+        let (id, revision) = listed_revision(&tool, "review").await;
+        let started = tokio::time::Instant::now();
+        let output = tool
+            .invoke(
+                context(),
+                json!({"action":"start","name":id,"revision":revision,"agentBudget":32,"args":{"base":"main"}}),
+            )
+            .await
+            .unwrap();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "start must return the initial snapshot quickly"
+        );
+        let value = output_json(&output);
+        assert_eq!(value["action"], "start");
+        assert_eq!(value["run"]["displayName"], "review");
+        assert_eq!(value["run"]["status"], "active");
+        assert_eq!(value["run"]["agentBudget"], 32);
+        let run_id = value["run"]["runId"].as_str().unwrap().to_owned();
+        assert!(run_id.starts_with("wf_"));
+    }
+
+    #[tokio::test]
+    async fn start_maps_stable_error_codes() {
+        let mut fixture = ListFixture::new();
+        fixture.write_user("greet");
+        fixture.cli_plugin(
+            "alpha",
+            r#"{"name":"alpha","workflows":{"shared":{"description":"Alpha"}}}"#,
+        );
+        fixture.cli_plugin(
+            "beta",
+            r#"{"name":"beta","workflows":{"shared":{"description":"Beta"}}}"#,
+        );
+        let tool = fixture.tool(true);
+        let revision = "0".repeat(64);
+
+        let missing = tool
+            .invoke(
+                context(),
+                json!({"action":"start","name":"missing/none","revision":revision,"agentBudget":8}),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(missing.code, "workflow.not_found");
+
+        let duplicate = tool
+            .invoke(
+                context(),
+                json!({"action":"start","name":"shared","revision":revision,"agentBudget":8}),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(duplicate.code, "workflow.duplicate_name");
+
+        let budget = tool
+            .invoke(
+                context(),
+                json!({"action":"start","name":"greet","revision":revision,"agentBudget":999_999_999}),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(budget.code, "workflow.invalid_arguments");
+    }
+
+    #[tokio::test]
+    async fn stale_revision_fails_closed_with_zero_side_effects() {
+        let fixture = ListFixture::new();
+        fixture.write_user("review");
+        let (tool, manager) = fixture.tool_with_manager(false, crate::default_fake_stream());
+
+        // The model lists, then the script content changes under the same name
+        // before `start` executes.
+        let (id, stale_revision) = listed_revision(&tool, "review").await;
+        fixture.rewrite_user(
+            "review",
+            &format!("{}\n// tampered", user_script("review", "User workflow")),
+        );
+        let error = tool
+            .invoke(
+                context(),
+                json!({"action":"start","name":id,"revision":stale_revision,"agentBudget":32}),
+            )
+            .await
+            .expect_err("stale revision must not launch");
+        assert_eq!(error.code, "workflow.catalog_changed");
+        assert!(
+            manager.list().is_empty(),
+            "catalog_changed must not launch a run"
+        );
+
+        // Re-listing yields the fresh revision, which launches cleanly.
+        let (_, fresh_revision) = listed_revision(&tool, "review").await;
+        let ok = tool
+            .invoke(
+                context(),
+                json!({"action":"start","name":"review","revision":fresh_revision,"agentBudget":32}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(output_json(&ok)["run"]["status"], "active");
+    }
+
+    #[tokio::test]
+    async fn approval_summary_shows_resolution() {
+        let fixture = ListFixture::new();
+        fixture.write_user("review");
+        let tool = fixture.tool(false);
+
+        let arguments =
+            json!({"action":"start","name":"review","revision":"0".repeat(64),"agentBudget":32});
+        let detail = tool
+            .approval_detail(&arguments)
+            .expect("start produces an approval detail");
+        assert!(detail.contains("'review'"), "detail: {detail}");
+        assert!(detail.contains("source: user"), "detail: {detail}");
+        assert!(detail.contains("agent budget: 32"), "detail: {detail}");
+        assert!(detail.contains("args: {}"), "detail: {detail}");
+    }
+
+    #[tokio::test]
+    async fn fifth_concurrent_start_fails_with_stable_code() {
+        let fixture = ListFixture::new();
+        fixture.write_user("hang");
+        fixture.rewrite_user(
+            "hang",
+            "let meta = #{ name: \"hang\", description: \"d\" };\nlet r = agent(\"work\");\n",
+        );
+        let (tool, _manager) = fixture.tool_with_manager(false, Arc::new(HangingStream));
+        let (_, revision) = listed_revision(&tool, "hang").await;
+
+        for _ in 0..4 {
+            let output = tool
+                .invoke(
+                    context(),
+                    json!({"action":"start","name":"hang","revision":revision,"agentBudget":8}),
+                )
+                .await
+                .unwrap();
+            assert_eq!(output_json(&output)["run"]["status"], "active");
+        }
+        let fifth = tool
+            .invoke(
+                context(),
+                json!({"action":"start","name":"hang","revision":revision,"agentBudget":8}),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(fifth.code, "workflow.too_many_active_runs");
+        assert_eq!(fifth.retryability, Retryability::AfterBackoff);
+    }
+
+    #[tokio::test]
+    async fn status_reports_real_manager_runs_and_misses_stably() {
+        let fixture = ListFixture::new();
+        fixture.write_user("hold");
+        fixture.rewrite_user(
+            "hold",
+            "let meta = #{ name: \"hold\", description: \"d\" };\nlet r = agent(\"work\");\n",
+        );
+        let (tool, manager) = fixture.tool_with_manager(false, Arc::new(HangingStream));
+
+        // Launch through the MANAGER (as TUI/ACP do), query through the tool.
+        let snapshot = manager.snapshot().unwrap();
+        let resolved =
+            super::super::resolve_workflow(&fixture.cwd, &fixture.home, &snapshot, false, "hold")
+                .unwrap();
+        let state = manager
+            .launch(
+                resolved,
+                super::super::LaunchSpec {
+                    args: json!({}),
+                    agent_budget: Some(8),
+                    resume_display_name: None,
+                },
+            )
+            .unwrap();
+        let run_id = state.run_id;
+
+        // By runId.
+        let by_id = tool
+            .invoke(context(), json!({"action":"status","run":run_id}))
+            .await
+            .unwrap();
+        let run = output_json(&by_id)["run"].clone();
+        assert_eq!(run["runId"], run_id.as_str());
+        assert_eq!(run["status"], "active");
+        assert_eq!(run["detailStatus"], "active");
+
+        // Pause through the manager (user action); the run task observes the
+        // pause intent asynchronously, so wait for the tracker to settle.
+        manager.pause("hold").unwrap();
+        for _ in 0..400 {
+            if manager.list().iter().any(|run| {
+                run.display_name == "hold" && run.status == WorkflowRunStatus::UserPaused
+            }) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let paused = tool
+            .invoke(context(), json!({"action":"status","run":"hold"}))
+            .await
+            .unwrap();
+        let run = output_json(&paused)["run"].clone();
+        assert_eq!(run["status"], "paused");
+        assert_eq!(run["detailStatus"], "user_paused");
+        assert!(run["phase"].is_null());
+        assert!(run["elapsedMsFloor"].is_u64());
+
+        // Default listing includes the run; a miss is a stable error.
+        let listed = tool
+            .invoke(context(), json!({"action":"status"}))
+            .await
+            .unwrap();
+        assert_eq!(output_json(&listed)["runs"].as_array().unwrap().len(), 1);
+        let missing = tool
+            .invoke(context(), json!({"action":"status","run":"nope"}))
+            .await
+            .unwrap_err();
+        assert_eq!(missing.code, "workflow.run_not_found");
+    }
+
+    #[tokio::test]
+    async fn completed_runs_normalize_to_completed() {
+        let fixture = ListFixture::new();
+        fixture.write_user("quick");
+        let tool = fixture.tool(false);
+
+        let (_, revision) = listed_revision(&tool, "quick").await;
+        tool.invoke(
+            context(),
+            json!({"action":"start","name":"quick","revision":revision,"agentBudget":8}),
+        )
+        .await
+        .unwrap();
+        let mut normalized = None;
+        for _ in 0..200 {
+            let listed = tool
+                .invoke(context(), json!({"action":"status","run":"quick"}))
+                .await
+                .unwrap();
+            let run = output_json(&listed)["run"].clone();
+            if run["status"] == "completed" {
+                normalized = Some(run);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let run = normalized.expect("run never completed");
+        assert_eq!(run["detailStatus"], "complete");
     }
 }

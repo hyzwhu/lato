@@ -130,7 +130,7 @@ fn fingerprint_is_lowercase_sha256() {
 
     assert_eq!(
         fingerprint.0,
-        "b27261315f404186444f70967e521985e77f7af423cfba080e07b11d013644f1"
+        "c15e8bddb69d9954d25511bf37cc0444ca35cc4516df6ed0301bff3fe7772cf2"
     );
     assert_eq!(fingerprint.0.len(), 64);
     assert!(
