@@ -26,6 +26,12 @@ pub struct ToolRuntime {
     catalog: ToolCatalog,
     wire_names: BTreeMap<String, ToolName>,
     validators: BTreeMap<ToolName, jsonschema::Validator>,
+    /// Per-tool override for the error code reported when pre-policy input
+    /// validation rejects a call (spec v1.2 §4.1: the `workflow` tool must
+    /// surface `workflow.invalid_arguments` instead of the generic
+    /// `tool.invalid_arguments`). Validation still happens identically —
+    /// only the stable code differs.
+    argument_error_codes: BTreeMap<ToolName, String>,
     policy: Arc<PolicyEngine>,
     scope: PolicyScope,
     sink: Arc<dyn PolicyEventSink>,
@@ -33,6 +39,7 @@ pub struct ToolRuntime {
 
 pub struct ToolRuntimeBuilder {
     catalog: ToolCatalog,
+    argument_error_codes: BTreeMap<ToolName, String>,
     policy: Arc<PolicyEngine>,
     scope: PolicyScope,
     sink: Arc<dyn PolicyEventSink>,
@@ -113,10 +120,17 @@ impl ToolRuntimeBuilder {
     pub fn new(policy: Arc<PolicyEngine>, scope: PolicyScope) -> Self {
         Self {
             catalog: ToolCatalog::new(),
+            argument_error_codes: BTreeMap::new(),
             policy,
             scope,
             sink: Arc::new(NoopPolicyEventSink),
         }
+    }
+
+    /// Override the stable error code reported when pre-policy input
+    /// validation rejects a call to `tool` (default: `tool.invalid_arguments`).
+    pub fn set_argument_error_code(&mut self, tool: ToolName, code: impl Into<String>) {
+        self.argument_error_codes.insert(tool, code.into());
     }
 
     pub fn with_sink(mut self, sink: Arc<dyn PolicyEventSink>) -> Self {
@@ -176,6 +190,7 @@ impl ToolRuntimeBuilder {
             catalog: self.catalog,
             wire_names,
             validators,
+            argument_error_codes: self.argument_error_codes,
             policy: self.policy,
             scope: self.scope,
             sink: self.sink,
@@ -283,19 +298,12 @@ impl ToolRuntime {
         let Some(canonical_name) = self.resolve_wire_name(wire_name) else {
             return Err(not_found(wire_name));
         };
+        let argument_error_code = self.argument_error_code(&canonical_name);
         let canonical_arguments = canonical_arguments(&arguments).map_err(|error| {
-            ToolError::new(
-                "tool.invalid_arguments",
-                error.to_string(),
-                Retryability::Never,
-            )
+            ToolError::new(argument_error_code, error.to_string(), Retryability::Never)
         })?;
         let arguments: Value = serde_json::from_slice(&canonical_arguments).map_err(|error| {
-            ToolError::new(
-                "tool.invalid_arguments",
-                error.to_string(),
-                Retryability::Never,
-            )
+            ToolError::new(argument_error_code, error.to_string(), Retryability::Never)
         })?;
         self.validate_arguments(&canonical_name, &arguments, wire_name)?;
         Ok(ValidatedToolCall {
@@ -362,6 +370,7 @@ impl ToolRuntime {
             mode: self.scope.mode,
             project_trusted: self.scope.project_trusted,
             sandbox,
+            detail: tool.approval_detail(&arguments),
         };
         let fingerprint = approval_fingerprint(&request).map_err(|error| {
             ToolError::new(
@@ -619,11 +628,18 @@ impl ToolRuntime {
         };
         validator.validate(arguments).map_err(|error| {
             ToolError::new(
-                "tool.invalid_arguments",
+                self.argument_error_code(canonical_name),
                 error.to_string(),
                 Retryability::Never,
             )
         })
+    }
+
+    fn argument_error_code(&self, canonical_name: &ToolName) -> &str {
+        self.argument_error_codes
+            .get(canonical_name)
+            .map(String::as_str)
+            .unwrap_or("tool.invalid_arguments")
     }
 }
 
@@ -637,14 +653,14 @@ pub struct ValidatedToolCall {
 pub fn builtin_tool_runtime(
     environment: BuiltinToolEnvironment,
 ) -> Result<Arc<ToolRuntime>, RuntimeBuildError> {
-    build_builtin_tool_runtime(environment, None, None, None)
+    build_builtin_tool_runtime(environment, None, None, None, Vec::new())
 }
 
 pub fn builtin_tool_runtime_for_capabilities(
     environment: BuiltinToolEnvironment,
     capabilities: Option<&[lato_core::ToolCapability]>,
 ) -> Result<Arc<ToolRuntime>, RuntimeBuildError> {
-    build_builtin_tool_runtime(environment, capabilities, None, None)
+    build_builtin_tool_runtime(environment, capabilities, None, None, Vec::new())
 }
 
 pub fn builtin_tool_runtime_for_capabilities_with_mcp(
@@ -652,14 +668,20 @@ pub fn builtin_tool_runtime_for_capabilities_with_mcp(
     capabilities: Option<&[lato_core::ToolCapability]>,
     mcp_backend: Arc<dyn McpToolBackend>,
 ) -> Result<Arc<ToolRuntime>, RuntimeBuildError> {
-    build_builtin_tool_runtime(environment, capabilities, None, Some(mcp_backend))
+    build_builtin_tool_runtime(
+        environment,
+        capabilities,
+        None,
+        Some(mcp_backend),
+        Vec::new(),
+    )
 }
 
 pub fn builtin_tool_runtime_with_subagents(
     environment: BuiltinToolEnvironment,
     backend: lato_runtime::SubagentBackendResource,
 ) -> Result<Arc<ToolRuntime>, RuntimeBuildError> {
-    build_builtin_tool_runtime(environment, None, Some(backend), None)
+    build_builtin_tool_runtime(environment, None, Some(backend), None, Vec::new())
 }
 
 pub fn builtin_tool_runtime_with_subagents_and_mcp(
@@ -667,7 +689,34 @@ pub fn builtin_tool_runtime_with_subagents_and_mcp(
     backend: lato_runtime::SubagentBackendResource,
     mcp_backend: Arc<dyn McpToolBackend>,
 ) -> Result<Arc<ToolRuntime>, RuntimeBuildError> {
-    build_builtin_tool_runtime(environment, None, Some(backend), Some(mcp_backend))
+    build_builtin_tool_runtime(
+        environment,
+        None,
+        Some(backend),
+        Some(mcp_backend),
+        Vec::new(),
+    )
+}
+
+/// Main-session variant that appends caller-provided tools (Phase 7B7: the
+/// session-bound `workflow` tool) after the built-in, task, and MCP catalogs.
+/// Extra tools pass the same capability ceiling and policy membrane, and by
+/// convention report their domain-scoped `<local>.invalid_arguments` code
+/// (e.g. `workflow.invalid_arguments`) when pre-policy validation rejects a
+/// call — the frozen spec keeps domain tools on their stable error family.
+pub fn builtin_tool_runtime_with_subagents_and_mcp_extra(
+    environment: BuiltinToolEnvironment,
+    backend: lato_runtime::SubagentBackendResource,
+    mcp_backend: Arc<dyn McpToolBackend>,
+    extra_tools: Vec<Arc<dyn Tool>>,
+) -> Result<Arc<ToolRuntime>, RuntimeBuildError> {
+    build_builtin_tool_runtime(
+        environment,
+        None,
+        Some(backend),
+        Some(mcp_backend),
+        extra_tools,
+    )
 }
 
 pub fn builtin_tool_runtime_for_capabilities_with_subagents(
@@ -675,7 +724,7 @@ pub fn builtin_tool_runtime_for_capabilities_with_subagents(
     capabilities: Option<&[lato_core::ToolCapability]>,
     backend: lato_runtime::SubagentBackendResource,
 ) -> Result<Arc<ToolRuntime>, RuntimeBuildError> {
-    build_builtin_tool_runtime(environment, capabilities, Some(backend), None)
+    build_builtin_tool_runtime(environment, capabilities, Some(backend), None, Vec::new())
 }
 
 pub fn builtin_tool_runtime_for_capabilities_with_subagents_and_mcp(
@@ -684,7 +733,13 @@ pub fn builtin_tool_runtime_for_capabilities_with_subagents_and_mcp(
     backend: lato_runtime::SubagentBackendResource,
     mcp_backend: Arc<dyn McpToolBackend>,
 ) -> Result<Arc<ToolRuntime>, RuntimeBuildError> {
-    build_builtin_tool_runtime(environment, capabilities, Some(backend), Some(mcp_backend))
+    build_builtin_tool_runtime(
+        environment,
+        capabilities,
+        Some(backend),
+        Some(mcp_backend),
+        Vec::new(),
+    )
 }
 
 fn build_builtin_tool_runtime(
@@ -692,6 +747,7 @@ fn build_builtin_tool_runtime(
     capabilities: Option<&[lato_core::ToolCapability]>,
     backend: Option<lato_runtime::SubagentBackendResource>,
     mcp_backend: Option<Arc<dyn McpToolBackend>>,
+    extra_tools: Vec<Arc<dyn Tool>>,
 ) -> Result<Arc<ToolRuntime>, RuntimeBuildError> {
     let workspace_root = environment.cwd.clone();
     let scope = PolicyScope {
@@ -753,6 +809,21 @@ fn build_builtin_tool_runtime(
             }) {
                 builder.register(tool)?;
             }
+        }
+    }
+    for tool in extra_tools {
+        let descriptor = tool.descriptor();
+        if capabilities.is_none_or(|allowed| {
+            descriptor
+                .capabilities
+                .iter()
+                .all(|capability| allowed.contains(capability))
+        }) {
+            builder.set_argument_error_code(
+                descriptor.name.clone(),
+                format!("{}.invalid_arguments", descriptor.name.local_name()),
+            );
+            builder.register(tool)?;
         }
     }
     Ok(Arc::new(builder.build()?))

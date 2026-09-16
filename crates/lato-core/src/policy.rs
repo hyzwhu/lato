@@ -88,6 +88,11 @@ pub struct PolicyRequest {
     pub mode: PolicyMode,
     pub project_trusted: bool,
     pub sandbox: SandboxObligation,
+    /// Tool-provided approval detail (Phase 7B7). Part of the approval
+    /// fingerprint, so any change between approval and execution invalidates
+    /// the grant. `None` keeps the generic capability/side-effect summary.
+    #[serde(default)]
+    pub detail: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]

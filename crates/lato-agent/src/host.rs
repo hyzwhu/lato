@@ -7,7 +7,9 @@ use crate::{
     ChildSessionRunner, PreparedModelSwitch, ProfileResultVerifier, RuntimeCompactionOutcome,
     RuntimePromptOutcome, RuntimeSession, SessionPluginSnapshots, SkillRuntimeBinding,
     ToolApproval, TranscriptStore, import_legacy_if_needed,
-    workflow::{WorkflowManager, list_workflows, resolve_workflow},
+    workflow::{
+        SessionWorkflowHandle, WorkflowManager, WorkflowTool, list_workflows, resolve_workflow,
+    },
 };
 use lato_ai::{
     ActiveModelStream, CATALOG, CredentialStore, CustomHttpModelStream, CustomModel,
@@ -17,7 +19,7 @@ use lato_ai::{
 };
 use lato_core::{
     AgentProfile, BudgetAmount, BudgetLimits, EventStore, JournalReplay, SessionId, SessionStore,
-    TaskId, TaskOwner, ToolCapability, TurnId, VerificationPolicy, WorkspaceIntent,
+    TaskId, TaskOwner, Tool, ToolCapability, TurnId, VerificationPolicy, WorkspaceIntent,
 };
 use lato_extensions::{
     DiscoveryConfig, PluginConfig, PluginSnapshot, ReloadRequest, SharedPluginRegistryHandle,
@@ -373,8 +375,17 @@ impl AcpHost {
         replay: Option<JournalReplay>,
     ) -> Result<Arc<RuntimeSession>, String> {
         let backend = self.ensure_task_root(sid).await?;
+        // Phase 7B7: the main-session catalog carries exactly one session-bound
+        // `workflow` tool. Subagent and headless catalogs never receive it.
+        let workflow_handle = SessionWorkflowHandle::new(
+            self.cwd.clone(),
+            self.effective_lato_home(),
+            self.trust.clone(),
+        );
+        let workflow_extra: Vec<Arc<dyn Tool>> =
+            vec![Arc::new(WorkflowTool::new(workflow_handle.clone()))];
         let skill_runtime = match SkillRuntimeBinding::build(|skill_resolver, mcp_backend| {
-            lato_tools::builtin_tool_runtime_with_subagents_and_mcp(
+            lato_tools::builtin_tool_runtime_with_subagents_and_mcp_extra(
                 lato_tools::BuiltinToolEnvironment {
                     cwd: self.cwd.clone(),
                     locks: self.locks.clone(),
@@ -383,6 +394,7 @@ impl AcpHost {
                 },
                 backend.into_resource(),
                 mcp_backend,
+                workflow_extra,
             )
         }) {
             Ok(runtime) => runtime,
@@ -424,7 +436,10 @@ impl AcpHost {
             return match session {
                 Ok(session) => {
                     let session = Arc::new(session);
-                    self.attach_workflow_manager(sid, &session, endpoint_stream);
+                    let manager = self.attach_workflow_manager(sid, &session, endpoint_stream);
+                    // Phase 7B7: bind the session manager into the main-session
+                    // `workflow` tool (construction-safe handle install).
+                    workflow_handle.install(manager);
                     if let Err(error) = self.attach_session_plugins(sid, &session).await {
                         let _ = self.teardown_task_root(sid).await;
                         return Err(error);
@@ -447,7 +462,9 @@ impl AcpHost {
             self.tool_approval.clone(),
             skill_runtime,
         ));
-        self.attach_workflow_manager(sid, &session, self.default_endpoint.stream.clone());
+        let manager =
+            self.attach_workflow_manager(sid, &session, self.default_endpoint.stream.clone());
+        workflow_handle.install(manager);
         if let Err(error) = self.attach_session_plugins(sid, &session).await {
             let _ = self.teardown_task_root(sid).await;
             return Err(error);
@@ -460,7 +477,7 @@ impl AcpHost {
         sid: &str,
         session: &RuntimeSession,
         stream: std::sync::Arc<dyn ModelStream>,
-    ) {
+    ) -> Arc<WorkflowManager> {
         // Phase 7B5: journals persist under the session directory so
         // `session/resume` can restore paused runs in a later process.
         let workflows_dir = Some(
@@ -478,7 +495,8 @@ impl AcpHost {
             self.tool_approval.clone(),
             workflows_dir,
         ));
-        session.attach_workflow_manager(manager);
+        session.attach_workflow_manager(manager.clone());
+        manager
     }
 
     /// Same home fallback the CLI uses (env `LATO_HOME`, else `~/.lato`) so the
@@ -539,6 +557,11 @@ impl AcpHost {
             .stage_plugin_snapshot(Arc::clone(&snapshot))
             .await
             .map_err(|error| error.to_string())?;
+        // Phase 7B7: mount the committed snapshot on the manager so the model
+        // tool resolves the same catalog the ACP launch path sees.
+        if let Some(manager) = session.workflow_manager() {
+            manager.set_snapshot(Arc::clone(&snapshot));
+        }
         self.session_plugins
             .register(SessionId::from(sid), snapshot)
             .await;

@@ -621,6 +621,7 @@ fn self_test_request(
             network: NetworkPolicy::Deny,
             environment: EnvironmentPolicy::default(),
         },
+        detail: None,
     }
 }
 

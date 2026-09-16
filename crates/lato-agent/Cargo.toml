@@ -12,11 +12,14 @@ lato-workspace = { path = "../lato-workspace" }
 lato-ai = { path = "../lato-ai" }
 lato-tools = { path = "../lato-tools" }
 lato-mcp = { path = "../lato-mcp" }
+lato-policy = { path = "../lato-policy" }
 lato-store = { path = "../lato-store" }
 lato-workflow = { path = "../lato-workflow" }
 jsonschema = "0.30"
+semver = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt"] }
@@ -26,7 +29,3 @@ tempfile = "3"
 reqwest = "0.12"
 async-trait = "0.1"
 futures-util = "0.3"
-
-[dev-dependencies]
-lato-policy = { path = "../lato-policy" }
-semver = "1"

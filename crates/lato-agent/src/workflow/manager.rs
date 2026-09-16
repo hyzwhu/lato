@@ -89,6 +89,9 @@ struct ManagerCore {
     snapshot: std::sync::RwLock<Option<Arc<PluginSnapshot>>>,
     subs: Mutex<Vec<mpsc::UnboundedSender<WorkflowRunState>>>,
     inner: Mutex<Inner>,
+    /// Set by `shutdown()` (session close): late model-tool calls must fail
+    /// closed with `workflow.unavailable` (spec §7.3).
+    closed: std::sync::atomic::AtomicBool,
     /// `Some` enables cross-process journal resume (Phase 7B5); `None` keeps
     /// the 7B4 purely in-memory behavior.
     workflows_dir: Option<PathBuf>,
@@ -122,6 +125,7 @@ impl WorkflowManager {
             snapshot: std::sync::RwLock::new(None),
             subs: Mutex::new(Vec::new()),
             inner: Mutex::new(Inner::default()),
+            closed: std::sync::atomic::AtomicBool::new(false),
             workflows_dir,
         });
         restore_runs(&core);
@@ -130,6 +134,19 @@ impl WorkflowManager {
 
     pub fn set_snapshot(&self, snapshot: Arc<PluginSnapshot>) {
         *self.core.snapshot.write().unwrap() = Some(snapshot);
+    }
+
+    /// Last snapshot the session pushed to this manager. The session keeps it
+    /// fresh at every plugin adoption, so the model tool (spec §6) can resolve
+    /// catalogs synchronously without a session back-reference.
+    pub fn snapshot(&self) -> Option<Arc<PluginSnapshot>> {
+        self.core.snapshot.read().unwrap().clone()
+    }
+
+    /// True once `shutdown()` ran (session close): late model-tool calls fail
+    /// closed (spec §7.3).
+    pub fn is_closed(&self) -> bool {
+        self.core.closed.load(std::sync::atomic::Ordering::Acquire)
     }
 
     pub fn subscribe(&self) -> mpsc::UnboundedReceiver<WorkflowRunState> {
@@ -359,6 +376,9 @@ impl WorkflowManager {
                 emit(&self.core, &stamp(&inner, updated));
             }
         }
+        self.core
+            .closed
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 }
 
