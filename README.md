@@ -145,6 +145,57 @@ repeated automatic work according to their turn, context, credit, or authenticat
 lifetime. Manual `/compact` remains available while automatic compaction is suppressed,
 and `/status` reports the active suppression mode.
 
+## Plan mode
+
+Plan mode is a session-scoped read-only mode: the model may investigate the
+repository and draft an implementation plan, but cannot mutate anything. The
+plan lives in one well-known file, `<workspace>/plan.md`, which stays
+user-owned — you can edit or delete it at any time, and Lato never touches
+`.gitignore` for it.
+
+```bash
+# Headless: run a single planning turn; exits with code 3 when a plan was
+# produced but not approved. Headless never auto-approves.
+lato -p --plan "draft a plan for adding retry logic"
+# Re-enter Plan mode on a resumed session; the previous plan.md is loaded as
+# the starting draft if it is present and readable.
+lato resume s1788336000000-1 --plan
+```
+
+In the interactive TUI:
+
+- `/plan` — enter Plan mode (refused while a turn is in flight). Shows the
+  state, the plan file path, and the trimmed tool list.
+- The model drafts through the dedicated `plan_draft` tool only. While Plan
+  mode is active, `write_file`, `search_replace`, `run_terminal_command`,
+  subagent/task/workflow spawning, and every MCP/plugin tool are denied at the
+  policy layer — including forged direct calls — and read-only MCP tools stay
+  denied as well.
+- `/plan submit` — you declare the draft ready; this is the ONLY way the
+  session moves to the awaiting-approval state. Model text, markers, plan
+  content, and tool calls never advance the state machine.
+- `/plan approve` — shows the plan file for review first. Approval records a
+  session-local plan authorization; it is NOT a policy grant and never
+  authorizes a tool call by itself.
+- `/plan status` — phase, plan file path, last draft hash, and approval
+  record. `/plan exit` — leave Plan mode; the plan file stays on disk.
+
+After approval the session continues in its normal trust mode, and every
+ordinary tool call still traverses the normal policy path: it may be allowed,
+denied, or require its own approval exactly as before. Every mutation-capable
+call re-verifies the plan file hash twice (before policy preparation and
+immediately before the grant is consumed). If `plan.md` changed since the
+approval, the call is denied with `plan.approval_stale`, the approval is
+revoked, and the session returns to the read-only revising state — restoring
+identical bytes never revives the old approval; a fresh `/plan submit` plus
+`/plan approve` is required.
+
+ACP clients can negotiate the `lato/plan/status` and `lato/plan/approve`
+extension methods (plus `lato/plan/enter`, `lato/plan/submit`, and
+`lato/plan/exit`); approvals over ACP mirror the TUI confirmation dialog and
+run the same state-machine checks. Clients that do not support the extension
+keep working unchanged.
+
 ## Plugins
 
 Lato discovers plugin roots from repeatable `--plugin-dir` arguments,
