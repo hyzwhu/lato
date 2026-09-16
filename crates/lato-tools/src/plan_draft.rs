@@ -10,39 +10,48 @@
 //!    through publication and directory sync (all aliases share the key via
 //!    `lock_key` canonicalization);
 //! 4. capture the parent as a non-replaceable directory handle and anchor
-//!    every later operation to that handle. On Unix the temporary file is
-//!    created with `openat`, committed with `renameat`, and cleaned with
-//!    `unlinkat` — all relative to the pinned handle — so a directory swapped
-//!    in at the same path can never redirect the publication. Each check
-//!    re-resolves the path and refuses to continue when it no longer points
-//!    at the pinned handle's directory (while the handle pins the original
-//!    inode, a removed-and-recreated directory can never reuse it, so the
-//!    detection is deterministic and never depends on inode non-reuse);
+//!    every later operation to that handle. Each check re-resolves the path
+//!    and refuses to continue when it no longer points at the pinned
+//!    handle's directory (while the handle pins the original inode, a
+//!    removed-and-recreated directory can never reuse it, so the detection
+//!    is deterministic and never depends on inode non-reuse);
 //! 5. inspect the destination with non-following metadata; reject symlinks
 //!    and any existing non-regular file;
-//! 6. create a collision-resistant sibling temporary file with create-new
-//!    semantics and user-only permissions, write, flush and sync it;
+//! 6. create the temporary file with user-only permissions, write, flush
+//!    and sync it;
 //! 7. repeat the handle/path and non-following destination checks, then
-//!    atomically rename the sibling over `plan.md` — the rename is the
-//!    atomic commit point;
+//!    atomically publish — the commit point;
 //! 8. sync the pinned directory before releasing the lock; the sync error is
 //!    propagated to the caller, never swallowed.
 //!
-//! Failure semantics: every error before the rename leaves the previous
+//! The temporary file is platform-specific by necessity:
+//!
+//! * **Linux** uses `O_TMPFILE`: the temporary has NO directory entry for its
+//!   whole lifetime, so there is no path a bystander could collide with or be
+//!   swapped into, and cleanup is simply `close` — no `unlink` on any path,
+//!   ever. Publication binds the nameless inode to `plan.md` atomically with
+//!   `linkat(.., AT_EMPTY_PATH)` plus `renameat`.
+//! * **Other Unix (macOS)** keeps a named sibling temporary file. Cleanup
+//!   never `unlink`s the public temporary path directly: the file is first
+//!   atomically moved aside (`renameat` to a private name), its identity is
+//!   verified against the still-open descriptor, and only then is the
+//!   private name removed. If the identity does not match — or the
+//!   [`PlanDraftFaults::on_before_removal`] seam reports a swap after the
+//!   identity check — the removal is safely ABANDONED and the isolated file
+//!   is restored to its original path, so a bystander can never be deleted
+//!   by this call.
+//! * **Windows** keeps the path-based equivalent (create-new plus
+//!   identity-checked cleanup), unchanged.
+//!
+//! Failure semantics: every error before the commit leaves the previous
 //! `plan.md` intact and removes only the temporary file THIS call created —
-//! identified by the handle-relative name plus the created file's device and
-//! inode. A bystander that collided with the temporary path is never
-//! touched, and a file swapped in over the temporary path is never deleted.
-//! Once the rename has committed, a later directory-sync failure cannot
-//! restore the previous content; the freshly published plan remains on disk
-//! and the error is reported to the caller instead of being silently
-//! swallowed. No `create_dir_all`, no canonicalization through symlinks, no
+//! and on Linux there is never anything to remove. Once the commit has
+//! happened, a later directory-sync failure cannot restore the previous
+//! content; the freshly published plan remains on disk and the error is
+//! reported to the caller instead of being silently swallowed. No
+//! `create_dir_all`, no canonicalization through symlinks, no
 //! cross-directory temporary file, no in-place truncate, no silent content
 //! truncation.
-//!
-//! Non-Unix platforms keep the path-based equivalent (canonical-path identity
-//! capture plus re-verification); the handle anchoring below is the Unix
-//! implementation of the same contract.
 
 use lato_core::{PLAN_DRAFT_MAX_BYTES, PLAN_FILE_NAME};
 use lato_workspace::FileLocks;
@@ -70,11 +79,21 @@ pub enum PlanDraftStage {
 pub trait PlanDraftFaults: Send + Sync {
     fn on_stage(&self, stage: PlanDraftStage) -> Result<(), String>;
     /// Test-only override pinning the temporary file name (relative to the
-    /// workspace root). Production returns `None` and the nonce is generated
-    /// internally; tests pin it to build deterministic collision scenarios
-    /// through the real publication path.
+    /// workspace root; named-temporary platforms only). Production returns
+    /// `None` and the nonce is generated internally; tests pin it to build
+    /// deterministic collision scenarios through the real publication path.
     fn pinned_temp_name(&self) -> Option<String> {
         None
+    }
+    /// Test-only seam invoked AFTER the identity check of the isolated
+    /// temporary file succeeded and BEFORE its final removal (named-
+    /// temporary platforms). Returning `Err` makes the cleanup safely
+    /// ABANDON the removal: the isolated file is restored to its original
+    /// location so a bystander swapped in at that instant can never be
+    /// deleted by this call. Production returns `Ok(())`.
+    fn on_before_removal(&self, isolated_path: &str) -> Result<(), String> {
+        let _ = isolated_path;
+        Ok(())
     }
 }
 
@@ -121,8 +140,10 @@ pub async fn plan_draft_with_faults(
         .pinned_temp_name()
         .unwrap_or_else(|| temp_file_name(&unique_nonce()));
 
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "linux")))]
     let outcome = publish_locked_handle(&canonical_root, &target, contents, &temp_name, faults);
+    #[cfg(target_os = "linux")]
+    let outcome = publish_locked_nameless(&canonical_root, &target, contents, &temp_name, faults);
     #[cfg(not(unix))]
     let outcome = publish_locked_paths(&canonical_root, &target, contents, &temp_name, faults);
 
@@ -131,8 +152,11 @@ pub async fn plan_draft_with_faults(
 
 /// The temporary file THIS call successfully created; cleanup is only ever
 /// attempted for it, and only while the file still carries the identity
-/// captured at creation time.
+/// captured at creation time. (Linux does not need it: the O_TMPFILE
+/// temporary has no directory entry and cleanup is just `close`.)
+#[cfg(not(target_os = "linux"))]
 struct CreatedTemp {
+    #[cfg(all(unix, not(target_os = "linux")))]
     name: String,
     #[cfg(not(unix))]
     full_path: PathBuf,
@@ -259,7 +283,9 @@ mod handle {
         }
 
         /// Creates the temporary file relative to the pinned handle with
-        /// create-new semantics and user-only permissions. Returns the file
+        /// create-new semantics and user-only permissions (named-temporary
+        /// platforms only; Linux uses [`Self::create_nameless_temp`]).
+        #[cfg(all(unix, not(target_os = "linux")))]
         pub fn create_temp(&self, name: &str) -> Result<File, String> {
             let cname = cstring(name.as_bytes())?;
             let fd = unsafe {
@@ -282,11 +308,123 @@ mod handle {
             Ok(unsafe { File::from_raw_fd(fd) })
         }
 
+        /// Linux: creates a NAMELESS temporary file inside the pinned
+        /// directory (`O_TMPFILE`). The file has no directory entry for its
+        /// whole lifetime, so no bystander can collide with it or be swapped
+        /// into it, and cleanup is simply closing the descriptor — this call
+        /// never needs to unlink anything.
+        #[cfg(target_os = "linux")]
+        pub fn create_nameless_temp(&self) -> Result<File, String> {
+            // Safe: O_TMPFILE on the pinned directory; the path component is
+            // ignored except to resolve to the directory itself.
+            let dot = cstring(b".")?;
+            let fd = unsafe {
+                libc::openat(
+                    self.fd.as_raw_fd(),
+                    dot.as_ptr(),
+                    libc::O_TMPFILE | libc::O_WRONLY | libc::O_CLOEXEC,
+                    0o600,
+                )
+            };
+            if fd < 0 {
+                return Err(format!(
+                    "plan_draft: could not create temporary file: {}",
+                    last_os_error()
+                ));
+            }
+            // Safe: fd is a freshly opened descriptor owned by us.
+            Ok(unsafe { File::from_raw_fd(fd) })
+        }
+
+        /// Linux: binds the NAMELESS inode referenced by `file` to
+        /// `final_name` atomically. `linkat(.., AT_EMPTY_PATH)` operates on
+        /// the descriptor itself — it cannot be redirected by any path
+        /// swap — and `EEXIST` on the intermediate name is impossible (a
+        /// fresh random nonce). The final `renameat` then atomically moves
+        /// OUR inode over `plan.md` (the pre-existing regular file there is
+        /// replaced, the established publication semantics). If the
+        /// intermediate link was swapped away meanwhile, the `renameat`
+        /// fails with `ENOENT` and the caller closes the descriptor: our
+        /// file has no directory entry left, so cleanup needs no `unlink`
+        /// and a swapped-in bystander is never touched.
+        #[cfg(target_os = "linux")]
+        pub fn publish_by_identity(
+            &self,
+            file: &File,
+            middle_name: &str,
+            final_name: &str,
+        ) -> Result<(), String> {
+            let empty = cstring(b"")?;
+            let cmiddle = cstring(middle_name.as_bytes())?;
+            // Safe: binds the descriptor's own inode to a fresh name.
+            let linked = unsafe {
+                libc::linkat(
+                    file.as_raw_fd(),
+                    empty.as_ptr(),
+                    self.fd.as_raw_fd(),
+                    cmiddle.as_ptr(),
+                    libc::AT_EMPTY_PATH,
+                )
+            };
+            if linked != 0 {
+                let error = io::Error::last_os_error();
+                // Some filesystems/containers restrict AT_EMPTY_PATH for
+                // non-O_PATH descriptors; fall back to the /proc magic
+                // symlink, which links the very same inode.
+                if matches!(
+                    error.raw_os_error(),
+                    Some(libc::EPERM)
+                        | Some(libc::EOPNOTSUPP)
+                        | Some(libc::EINVAL)
+                        | Some(libc::ENOENT)
+                ) {
+                    let procpath =
+                        cstring(format!("/proc/self/fd/{}", file.as_raw_fd()).as_bytes())?;
+                    // Safe: links the descriptor's own inode via procfs.
+                    let retry = unsafe {
+                        libc::linkat(
+                            libc::AT_FDCWD,
+                            procpath.as_ptr(),
+                            self.fd.as_raw_fd(),
+                            cmiddle.as_ptr(),
+                            libc::AT_SYMLINK_FOLLOW,
+                        )
+                    };
+                    if retry != 0 {
+                        return Err(format!(
+                            "plan_draft: could not publish plan: {}",
+                            last_os_error()
+                        ));
+                    }
+                } else {
+                    return Err(format!("plan_draft: could not publish plan: {error}"));
+                }
+            }
+            let cfinal = cstring(final_name.as_bytes())?;
+            // Safe: atomic move of our freshly linked name over the target.
+            if unsafe {
+                libc::renameat(
+                    self.fd.as_raw_fd(),
+                    cmiddle.as_ptr(),
+                    self.fd.as_raw_fd(),
+                    cfinal.as_ptr(),
+                )
+            } != 0
+            {
+                return Err(format!(
+                    "plan_draft: could not publish plan: {}",
+                    last_os_error()
+                ));
+            }
+            Ok(())
+        }
+
         /// Atomically renames the temporary name over the final name, both
         /// relative to the pinned handle. If the pinned directory was removed,
         /// this fails deterministically (the handle no longer refers to a
         /// linkable directory) — the publication can never land in a
         /// replacement directory at the same path.
+        #[cfg(all(unix, not(target_os = "linux")))]
         pub fn rename_over(&self, temp_name: &str, final_name: &str) -> Result<(), String> {
             let ctemp = cstring(temp_name.as_bytes())?;
             let cfinal = cstring(final_name.as_bytes())?;
@@ -307,34 +445,91 @@ mod handle {
             Ok(())
         }
 
-        /// Unlinks the temporary name relative to the pinned handle, but
-        /// only while the entry still refers to the file THIS call created.
-        /// The caller must pass the still-open descriptor of the created
-        /// file: while that descriptor is open, the inode it refers to is
-        /// pinned and can be neither freed nor reused, so comparing the live
-        /// path against `fstat(owned)` is race-free — an unlinked-and-swapped
-        /// path can never present the same (device, inode) while we hold the
-        /// descriptor, and a swapped-in bystander is never deleted.
-        pub fn unlink_if_unchanged(&self, name: &str, owned: &File) -> Result<(), ()> {
-            let cname = cstring(name.as_bytes()).map_err(|_| ())?;
+        /// Unix: removes the temporary file created by this call WITHOUT
+        /// ever unlinking a path that could have been swapped. The temporary
+        /// name is first moved aside ATOMICALLY (`renameat` to a private
+        /// `.reap` name — this deletes nothing), the isolated name's identity
+        /// is then verified against the still-open created descriptor, and
+        /// only on a match is the PRIVATE name removed. On any mismatch — or
+        /// when the [`PlanDraftFaults::on_before_removal`] seam reports a
+        /// swap after the identity check — the removal is safely abandoned
+        /// and the isolated file is restored to its original location, so a
+        /// bystander can never be deleted by this call. (Linux reaches this
+        /// only on the rare failure path after the intermediate link was
+        /// already created; the normal path has no directory entry at all.)
+        pub fn remove_isolated(
+            &self,
+            name: &str,
+            owned: &File,
+            faults: &dyn crate::PlanDraftFaults,
+        ) {
+            let reap_name = format!("{name}.reap-{}", super::unique_nonce());
+            let cname = match cstring(name.as_bytes()) {
+                Ok(value) => value,
+                Err(_) => return,
+            };
+            let creap = match cstring(reap_name.as_bytes()) {
+                Ok(value) => value,
+                Err(_) => return,
+            };
+            // Safe: atomic move of OUR temporary name to a private name;
+            // nothing is deleted and any content is preserved under `reap`.
+            if unsafe {
+                libc::renameat(
+                    self.fd.as_raw_fd(),
+                    cname.as_ptr(),
+                    self.fd.as_raw_fd(),
+                    creap.as_ptr(),
+                )
+            } != 0
+            {
+                return; // nothing to clean at that name
+            }
+            // Identity of the created file, from its still-open descriptor
+            // (pins the inode against reuse).
             let mut own = unsafe { std::mem::zeroed() };
             // Safe: metadata read on our own still-open descriptor.
             if unsafe { libc::fstat(owned.as_raw_fd(), &mut own) } != 0 {
-                return Err(());
+                return;
             }
             let mut current = unsafe { std::mem::zeroed() };
             // Safe: pure metadata read on a handle-relative name.
-            if unsafe { libc::fstatat(self.fd.as_raw_fd(), cname.as_ptr(), &mut current, 0) } != 0 {
-                return Err(()); // already gone
+            if unsafe { libc::fstatat(self.fd.as_raw_fd(), creap.as_ptr(), &mut current, 0) } != 0 {
+                return; // already gone
             }
-            if (widen_dev(current.st_dev), widen_ino(current.st_ino))
-                != (widen_dev(own.st_dev), widen_ino(own.st_ino))
-            {
-                return Err(()); // swapped: never delete someone else's file
+            let matches = (widen_dev(current.st_dev), widen_ino(current.st_ino))
+                == (widen_dev(own.st_dev), widen_ino(own.st_ino));
+            if !matches {
+                // A bystander occupies the isolated name: restore it to its
+                // original location, untouched, and abandon the removal.
+                let _ = unsafe {
+                    libc::renameat(
+                        self.fd.as_raw_fd(),
+                        creap.as_ptr(),
+                        self.fd.as_raw_fd(),
+                        cname.as_ptr(),
+                    )
+                };
+                return;
             }
-            // Safe: unlink on a handle-relative name; failure is harmless.
-            let _ = unsafe { libc::unlinkat(self.fd.as_raw_fd(), cname.as_ptr(), 0) };
-            Ok(())
+            // Identity verified — this is OUR file. Give the deterministic
+            // seam a chance to swap a bystander in after the check; in that
+            // case the removal is abandoned and whatever occupies the
+            // isolated name is restored to its original location.
+            if faults.on_before_removal(&reap_name).is_err() {
+                let _ = unsafe {
+                    libc::renameat(
+                        self.fd.as_raw_fd(),
+                        creap.as_ptr(),
+                        self.fd.as_raw_fd(),
+                        cname.as_ptr(),
+                    )
+                };
+                return;
+            }
+            // Safe: unlink of the PRIVATE reap name, verified to refer to
+            // the inode we created (pinned by `owned`).
+            let _ = unsafe { libc::unlinkat(self.fd.as_raw_fd(), creap.as_ptr(), 0) };
         }
 
         /// Syncs the pinned directory itself.
@@ -390,7 +585,9 @@ mod handle {
     }
 }
 
-#[cfg(unix)]
+// Named-temporary Unix platforms (macOS etc.): named sibling temporary file,
+// rename-aside + identity-verified + seam-aware cleanup.
+#[cfg(all(unix, not(target_os = "linux")))]
 fn publish_locked_handle(
     canonical_root: &Path,
     target: &Path,
@@ -406,7 +603,7 @@ fn publish_locked_handle(
         ($handle:ident, $created:ident, $file:ident, $stage:expr, $message:expr) => {{
             if let Some(created) = $created.take() {
                 if let Some(open) = $file.take() {
-                    cleanup_temp_unix(&$handle, &created, &open);
+                    $handle.remove_isolated(&created.name, &open, faults);
                     // `open` is dropped here — only after the cleanup
                     // decision has been made under the pinned inode.
                 }
@@ -538,14 +735,102 @@ fn publish_locked_handle(
     handle.sync()
 }
 
-/// Unlinks the temporary file created by this call, refusing to delete
-/// anything whose identity no longer matches the created file. `owned` must
-/// be the still-open descriptor of the created file: it pins the inode for
-/// the duration of the check, so the comparison is race-free even on
-/// filesystems that reuse freed inodes immediately.
-#[cfg(unix)]
-fn cleanup_temp_unix(handle: &handle::ParentHandle, created: &CreatedTemp, owned: &std::fs::File) {
-    let _ = handle.unlink_if_unchanged(&created.name, owned);
+// Linux: NAMELESS temporary file (`O_TMPFILE`). There is no directory entry
+// for the whole lifetime of the temporary — nothing for a bystander to
+// collide with or to be swapped into, and cleanup is just closing the
+// descriptor: no `unlink` on any path, ever.
+#[cfg(target_os = "linux")]
+fn publish_locked_nameless(
+    canonical_root: &Path,
+    target: &Path,
+    contents: &str,
+    _temp_name: &str,
+    faults: &dyn PlanDraftFaults,
+) -> Result<(), String> {
+    use std::io::Write as _;
+
+    // (4) capture the parent as a non-replaceable handle; both checks compare
+    // the live path against this pinned identity.
+    let handle = handle::ParentHandle::capture(canonical_root)?;
+    if let Err(message) = faults.on_stage(PlanDraftStage::ParentCheck) {
+        return Err(stage_error(PlanDraftStage::ParentCheck, message));
+    }
+    handle.verify_matches_path(target)?;
+
+    // (5) destination must not be a symlink or any non-regular file.
+    if let Err(message) = faults.on_stage(PlanDraftStage::DestinationCheck) {
+        return Err(stage_error(PlanDraftStage::DestinationCheck, message));
+    }
+    verify_destination(target)?;
+
+    // (6) nameless temporary file, user-only permissions, anchored to the
+    // pinned handle. Cleanup for every failure below is `close`: the file has
+    // no directory entry, so there is nothing to unlink and no bystander can
+    // ever be affected.
+    if let Err(message) = faults.on_stage(PlanDraftStage::CreateTemp) {
+        return Err(stage_error(PlanDraftStage::CreateTemp, message));
+    }
+    let mut file = Some(handle.create_nameless_temp()?);
+
+    if let Err(message) = faults.on_stage(PlanDraftStage::Write) {
+        return Err(stage_error(PlanDraftStage::Write, message));
+    }
+    if let Err(error) = file.as_mut().unwrap().write_all(contents.as_bytes()) {
+        return Err(stage_error(PlanDraftStage::Write, error.to_string()));
+    }
+    if let Err(message) = faults.on_stage(PlanDraftStage::Flush) {
+        return Err(stage_error(PlanDraftStage::Flush, message));
+    }
+    if let Err(error) = file.as_mut().unwrap().flush() {
+        return Err(stage_error(PlanDraftStage::Flush, error.to_string()));
+    }
+    if let Err(message) = faults.on_stage(PlanDraftStage::FileSync) {
+        return Err(stage_error(PlanDraftStage::FileSync, message));
+    }
+    if let Err(error) = file.as_mut().unwrap().sync_all() {
+        return Err(stage_error(PlanDraftStage::FileSync, error.to_string()));
+    }
+
+    // (7) repeat both checks against the pinned handle, then commit.
+    if let Err(message) = faults.on_stage(PlanDraftStage::SecondParentCheck) {
+        return Err(stage_error(PlanDraftStage::SecondParentCheck, message));
+    }
+    if let Err(error) = handle.verify_matches_path(target) {
+        return Err(stage_error(PlanDraftStage::SecondParentCheck, error));
+    }
+    if let Err(message) = faults.on_stage(PlanDraftStage::SecondDestinationCheck) {
+        return Err(stage_error(PlanDraftStage::SecondDestinationCheck, message));
+    }
+    if let Err(error) = verify_destination(target) {
+        return Err(stage_error(PlanDraftStage::SecondDestinationCheck, error));
+    }
+    if let Err(message) = faults.on_stage(PlanDraftStage::Rename) {
+        return Err(stage_error(PlanDraftStage::Rename, message));
+    }
+    // Identity-bound atomic publication: link the nameless inode under a
+    // fresh private name (the linkat syscall itself cannot be redirected by
+    // any path swap), then atomically move it over plan.md. On any failure
+    // the descriptor is simply closed — no unlink of any path.
+    let middle_name = temp_file_name(&format!("link-{}", unique_nonce()));
+    if let Err(error) =
+        handle.publish_by_identity(file.as_ref().unwrap(), &middle_name, PLAN_FILE_NAME)
+    {
+        // If the intermediate link still exists, isolate and verify it
+        // before removal — the same abandon-on-doubt semantics as the
+        // named-temporary platforms.
+        handle.remove_isolated(&middle_name, file.as_ref().unwrap(), faults);
+        return Err(error);
+    }
+    // The nameless inode is now the published plan: close the descriptor.
+    drop(file.take());
+
+    // (8) sync the pinned directory before releasing the lock. The commit
+    // has already happened; a directory-sync failure is reported to the
+    // caller and never silently swallowed.
+    if let Err(message) = faults.on_stage(PlanDraftStage::DirSync) {
+        return Err(stage_error(PlanDraftStage::DirSync, message));
+    }
+    handle.sync()
 }
 
 // ---------------------------------------------------------------------------
@@ -779,7 +1064,9 @@ mod tests {
 
     /// Pins the temporary file name without injecting any failure: the
     /// name collision itself drives the failure through the real path.
+    #[cfg(not(target_os = "linux"))]
     struct PinTempName(String);
+    #[cfg(not(target_os = "linux"))]
     impl PlanDraftFaults for PinTempName {
         fn on_stage(&self, _stage: PlanDraftStage) -> Result<(), String> {
             Ok(())
@@ -960,6 +1247,10 @@ mod tests {
     /// the publication fails, and the bystander's content AND identity are
     /// preserved byte-for-byte. Driven through the full publication path,
     /// deterministic (no inode assumptions), run ten times consecutively.
+    /// (Named-temporary platforms only: Linux uses O_TMPFILE and never
+    /// creates a named temporary at all — its equivalent guarantee is
+    /// covered by `publish_failure_leaves_arbitrary_bystanders_untouched`.)
+    #[cfg(all(unix, not(target_os = "linux")))]
     #[tokio::test]
     async fn temp_file_collision_preserves_the_bystander_across_ten_runs() {
         for attempt in 0..10 {
@@ -1012,45 +1303,71 @@ mod tests {
         }
     }
 
-    /// When a failure happens after creation and someone swapped a different
-    /// file in over the temporary path, cleanup must NOT delete it: only the
-    /// file this call created may be removed. The created file's descriptor
-    /// stays open until the cleanup decision has been made, which pins the
-    /// inode against reuse — so the swap is detected deterministically even
-    /// on filesystems that reuse freed inodes immediately. Ten consecutive
-    /// runs, as required by the acceptance gate.
-    #[cfg(unix)]
+    /// A bystander occupying the pinned temporary path is a hard collision:
+    /// the publication fails, and the bystander's content AND identity are
+    /// preserved byte-for-byte (Windows path-based implementation).
+    #[cfg(not(unix))]
     #[tokio::test]
-    async fn cleanup_refuses_to_delete_a_swapped_in_temp_file_ten_runs() {
+    async fn temp_file_collision_preserves_the_bystander_across_ten_runs() {
         for attempt in 0..10 {
-            let directory = temp_workspace("temp-swap");
+            let directory = temp_workspace("collision");
             let root = directory.path().to_path_buf();
             let locks = FileLocks::new();
             plan_draft(&locks, &root, "previous").await.unwrap();
 
-            let name = pinned_temp_name("swap");
-            struct SwapIn {
-                swapped_path: PathBuf,
-                temp_name: String,
-            }
-            impl PlanDraftFaults for SwapIn {
+            let name = pinned_temp_name("collide");
+            let bystander = root.join(&name);
+            std::fs::write(&bystander, b"innocent-bystander").unwrap();
+
+            let error =
+                plan_draft_with_faults(&locks, &root, "replacement", &PinTempName(name.clone()))
+                    .await
+                    .unwrap_err();
+            assert!(
+                error.contains("could not create temporary file"),
+                "attempt {attempt}: {error}"
+            );
+            assert_eq!(
+                std::fs::read(&bystander).unwrap(),
+                b"innocent-bystander",
+                "attempt {attempt}: bystander content must be preserved"
+            );
+            assert_eq!(
+                std::fs::read(root.join(PLAN_FILE_NAME)).unwrap(),
+                b"previous"
+            );
+            assert_eq!(leftovers(&root), vec![name], "attempt {attempt}");
+        }
+    }
+
+    /// Linux (O_TMPFILE): a bystander written anywhere in the workspace
+    /// during the publication — including at any temporary-style path — is
+    /// never touched by cleanup, because cleanup on Linux is closing the
+    /// nameless descriptor: no `unlink` on any path, ever. Ten consecutive
+    /// runs, as required by the acceptance gate.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn publish_failure_leaves_arbitrary_bystanders_untouched_ten_runs() {
+        for attempt in 0..10 {
+            let directory = temp_workspace("bystander");
+            let root = directory.path().to_path_buf();
+            let locks = FileLocks::new();
+            plan_draft(&locks, &root, "previous").await.unwrap();
+
+            let bystander_name = pinned_temp_name("bystander");
+            struct PlantBystander(String);
+            impl PlanDraftFaults for PlantBystander {
                 fn on_stage(&self, stage: PlanDraftStage) -> Result<(), String> {
                     match stage {
-                        // Once the temp exists (first parent check passed and
-                        // the file was created), swap in a bystander at the
-                        // temp path.
-                        PlanDraftStage::SecondDestinationCheck => {
-                            // Replace with a NEW file (fresh inode), the way
-                            // a real bystander swap would appear.
-                            std::fs::remove_file(&self.swapped_path).unwrap();
-                            std::fs::write(&self.swapped_path, "swapped-in-by-stander").unwrap();
-                            Err("injected failure at SecondDestinationCheck".into())
+                        // The nameless temporary exists; plant a bystander
+                        // and fail the publication right after.
+                        PlanDraftStage::Rename => {
+                            std::fs::write(std::path::Path::new(&self.0), "innocent-bystander")
+                                .unwrap();
+                            Err("injected failure at Rename".into())
                         }
                         _ => Ok(()),
                     }
-                }
-                fn pinned_temp_name(&self) -> Option<String> {
-                    Some(self.temp_name.clone())
                 }
             }
 
@@ -1058,7 +1375,72 @@ mod tests {
                 &locks,
                 &root,
                 "replacement",
-                &SwapIn {
+                &PlantBystander(root.join(&bystander_name).to_string_lossy().to_string()),
+            )
+            .await
+            .unwrap_err();
+            assert!(error.contains("Rename"), "attempt {attempt}: {error}");
+            // The bystander survives byte-for-byte: cleanup closed the
+            // nameless descriptor and never unlinked any path.
+            assert_eq!(
+                std::fs::read(root.join(&bystander_name)).unwrap(),
+                b"innocent-bystander",
+                "attempt {attempt}: the bystander must survive"
+            );
+            // The previous draft is intact; the only leftover is the
+            // bystander itself.
+            assert_eq!(
+                std::fs::read(root.join(PLAN_FILE_NAME)).unwrap(),
+                b"previous",
+                "attempt {attempt}"
+            );
+            assert_eq!(leftovers(&root), vec![bystander_name], "attempt {attempt}");
+        }
+    }
+
+    /// The reviewer-mandated deterministic seam: a bystander swapped in
+    /// AFTER the identity check succeeded and BEFORE the removal must be
+    /// preserved. Named-temporary platforms implement this with the
+    /// `on_before_removal` seam: the removal is safely abandoned and the
+    /// isolated file (whatever occupies it at that instant) is restored to
+    /// its original location. Ten consecutive runs.
+    #[cfg(all(unix, not(target_os = "linux")))]
+    #[tokio::test]
+    async fn swap_after_the_identity_check_never_deletes_the_bystander_ten_runs() {
+        for attempt in 0..10 {
+            let directory = temp_workspace("temp-swap");
+            let root = directory.path().to_path_buf();
+            let locks = FileLocks::new();
+            plan_draft(&locks, &root, "previous").await.unwrap();
+
+            let name = pinned_temp_name("swap");
+            struct SwapAfterCheck {
+                swapped_path: PathBuf,
+                temp_name: String,
+            }
+            impl PlanDraftFaults for SwapAfterCheck {
+                fn on_stage(&self, _stage: PlanDraftStage) -> Result<(), String> {
+                    Ok(())
+                }
+                fn pinned_temp_name(&self) -> Option<String> {
+                    Some(self.temp_name.clone())
+                }
+                fn on_before_removal(&self, isolated_path: &str) -> Result<(), String> {
+                    // Exactly the reviewer's window: the identity check has
+                    // passed, the removal has not happened yet. Swap a
+                    // bystander in and abort the removal.
+                    assert!(isolated_path.contains(".reap-"), "{isolated_path}");
+                    std::fs::remove_file(isolated_path).unwrap();
+                    std::fs::write(isolated_path, "swapped-in-bystander").unwrap();
+                    Err("bystander swapped in after the identity check".into())
+                }
+            }
+
+            let error = plan_draft_with_faults(
+                &locks,
+                &root,
+                "replacement",
+                &SwapAfterCheck {
                     swapped_path: root.join(&name),
                     temp_name: name.clone(),
                 },
@@ -1069,22 +1451,78 @@ mod tests {
                 error.contains("SecondDestinationCheck"),
                 "attempt {attempt}: {error}"
             );
-            // The swapped-in file is still there: cleanup compared the live
-            // path against the still-open created descriptor and refused to
-            // delete a file it did not create.
+            // The swapped-in bystander was restored to its original
+            // location, byte-for-byte.
             assert_eq!(
                 std::fs::read(root.join(&name)).unwrap(),
-                b"swapped-in-by-stander",
+                b"swapped-in-bystander",
                 "attempt {attempt}: the swapped-in bystander must survive"
             );
             // The previous draft is intact and no temp residue remains
-            // besides the swapped-in bystander itself.
+            // besides the restored bystander itself.
             assert_eq!(
                 std::fs::read(root.join(PLAN_FILE_NAME)).unwrap(),
                 b"previous",
                 "attempt {attempt}"
             );
             std::fs::remove_file(root.join(&name)).unwrap();
+        }
+    }
+
+    /// The reviewer-mandated deterministic seam, Linux (O_TMPFILE) variant:
+    /// a bystander swapped in after the identity-bound publication check
+    /// must be preserved — cleanup closes the nameless descriptor and never
+    /// unlinks any path, so there is nothing that could delete it. Ten
+    /// consecutive runs.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn swap_after_the_identity_check_never_deletes_the_bystander_ten_runs() {
+        for attempt in 0..10 {
+            let directory = temp_workspace("temp-swap");
+            let root = directory.path().to_path_buf();
+            let locks = FileLocks::new();
+            plan_draft(&locks, &root, "previous").await.unwrap();
+
+            let bystander_name = pinned_temp_name("swap");
+            struct SwapAfterCheck(String);
+            impl PlanDraftFaults for SwapAfterCheck {
+                fn on_stage(&self, stage: PlanDraftStage) -> Result<(), String> {
+                    match stage {
+                        // The identity checks have passed; swap a bystander
+                        // in and abort the publication right before the
+                        // identity-bound commit.
+                        PlanDraftStage::Rename => {
+                            std::fs::write(std::path::Path::new(&self.0), "swapped-in-bystander")
+                                .unwrap();
+                            Err("injected failure at Rename".into())
+                        }
+                        _ => Ok(()),
+                    }
+                }
+            }
+
+            let error = plan_draft_with_faults(
+                &locks,
+                &root,
+                "replacement",
+                &SwapAfterCheck(root.join(&bystander_name).to_string_lossy().to_string()),
+            )
+            .await
+            .unwrap_err();
+            assert!(error.contains("Rename"), "attempt {attempt}: {error}");
+            // The swapped-in bystander survives byte-for-byte: cleanup
+            // closed the nameless descriptor and never unlinked any path.
+            assert_eq!(
+                std::fs::read(root.join(&bystander_name)).unwrap(),
+                b"swapped-in-bystander",
+                "attempt {attempt}: the swapped-in bystander must survive"
+            );
+            assert_eq!(
+                std::fs::read(root.join(PLAN_FILE_NAME)).unwrap(),
+                b"previous",
+                "attempt {attempt}"
+            );
+            assert_eq!(leftovers(&root), vec![bystander_name], "attempt {attempt}");
         }
     }
 
