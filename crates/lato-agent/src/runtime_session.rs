@@ -1075,8 +1075,14 @@ impl RuntimeSession {
             return Err(error);
         }
         let mut state = self.plugin_state.lock().await;
-        state.current = snapshot;
+        state.current = Arc::clone(&snapshot);
         state.current_skills = skills;
+        // Phase 7B7: keep the manager's catalog snapshot in sync so the model
+        // `workflow` tool resolves the committed snapshot without a session
+        // back-reference.
+        if let Some(manager) = self.workflow_manager() {
+            manager.set_snapshot(snapshot);
+        }
         Ok(())
     }
 
@@ -1355,8 +1361,12 @@ impl RuntimeSession {
             return Err(error);
         }
         let mut state = self.plugin_state.lock().await;
-        state.current = pending;
+        state.current = Arc::clone(&pending);
         state.current_skills = pending_skills;
+        // Phase 7B7: adopt the pending snapshot on the manager as well.
+        if let Some(manager) = self.workflow_manager() {
+            manager.set_snapshot(pending);
+        }
         Ok(())
     }
 
