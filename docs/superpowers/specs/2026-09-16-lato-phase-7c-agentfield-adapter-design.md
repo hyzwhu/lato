@@ -7,7 +7,7 @@
 | 基线 | `origin/master@0611e26`（Phase 7B7 已合入） |
 | 目标版本 | Phase 7C；具体发行版本待确认 |
 | 依赖 | Phase 5 task/runtime、Phase 6 信任与配置、Phase 7B workflow/journal/model tool、现有 `ToolRuntime`/policy/approval membrane；7C3 另硬依赖 WIN-26 合入后的 master SHA |
-| 外部基线 | AgentField `v0.1.138` / `0aba9d6de1ef2c473070fc329ac7ac63e5d096b9`；脱敏 fixture SHA-256 `208e1a1b85640ee60d9d5bbd6914a11d853acb471573eb7cbc5979f4a73014bb` |
+| 外部基线 | AgentField `v0.1.138` / `0aba9d6de1ef2c473070fc329ac7ac63e5d096b9`；脱敏 fixture SHA-256 `1bac46c4ce5c20d165bb88128a68ae056a70c4aabea3310b3e229210e094736a` |
 | 后续 | AgentField shared memory、DID/VC、实时 session、harness、远程 workflow DAG UI 均另立规格 |
 
 ## 1. 决策摘要
@@ -161,7 +161,7 @@ crates/lato-agent/tests/agentfield_resume.rs
 
 约束：
 
-- alias 匹配 `[a-z0-9][a-z0-9_-]{0,63}`，target 匹配受限 `node.function`，长度不超过 129 bytes。
+- alias 匹配 `[a-z0-9][a-z0-9_-]{0,63}`。配置 target 不是自由字符串：只能由经验证的 discovery `agent_id` 与 reasoner `id` 派生。
 - capability 最多 64 个；输入序列化后不超过 64 KiB；输出默认/硬顶 64 KiB。
 - `baseUrl` 必须是预配置的绝对 URL，无 userinfo/query/fragment；生产只允许 HTTPS。回环地址可在显式 development mode 使用 HTTP。
 - 禁止重定向到不同 origin；DNS 解析后应用现有 SSRF/private-network policy，连接复用不能绕过复核。
@@ -178,9 +178,19 @@ SHA-256({"adapter":"agentfield-v0.1.138","origin":"<scheme://lowercase-host:effe
 
 `list` 返回 alias、description、risk、inputSchema 和 revision，不返回 base URL、token、原始远端 metadata。`start` 必须携带 alias 与 revision。approval 后、发送 HTTP 前再次比较 revision；不一致返回 `agentfield.catalog_changed`，grant 已消费，远端请求为零。
 
-远端最小兼容检查只接受：版本 endpoint 可识别；discovery entry 含 `agent_id/version/health_status/reasoners`；匹配 reasoner 含 `id/invocation_target`；invocation target 与本地 target 逐字一致。远端 description/schema/examples 均不进入 revision、不覆盖本地字段、不扩大输入面。字段缺失、类型错误、重复 target、版本不兼容或 target 不一致均 fail closed 为 `agentfield.remote_protocol`。
+锁定版存在必须显式适配的上游不一致：discovery 生成 `agent_id:reasoner_id`，而 execute handler 只接受 `agent_id.reasoner_id`。唯一允许的转换合同如下：
 
-远端健康探测不得成为每 turn 的硬依赖：最近 30 秒成功快照可用于 list；过期且不可达时 list 标记 `available:false`，start fail closed。兼容 fixture 位于 `docs/superpowers/fixtures/agentfield-v0.1.138-contract.json`，SHA-256 为 `208e1a1b85640ee60d9d5bbd6914a11d853acb471573eb7cbc5979f4a73014bb`。复现：
+1. 仅把 discovery 的 `agent_id` 与 reasoner `id` 当作原子字段；二者分别严格匹配 ASCII `^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`。
+2. 原子字段中的 `.`、`:`、`/`、`%`、非 ASCII 与 Unicode 混淆字符一律拒绝；不做 percent decode、Unicode normalization 或分隔符替换。
+3. discovery 的 `invocation_target` 必须逐字等于 `agent_id + ":" + reasoner_id`，否则 fail closed。
+4. Lato 只从已验证原子构造 execute target `agent_id + "." + reasoner_id`；`invocation_target` 永不直接拼入 URL。
+5. 本地 allowlist target 必须等于上述派生 execute target；重复或不一致均返回 `agentfield.remote_protocol`。
+
+正例：`legal-agent`、`review_contract`、`legal-agent:review_contract` 派生为 `legal-agent.review_contract`。反例包括任一原子含 `.`/`:`/`/`/`%`/非 ASCII、colon target 与两原子不一致、额外分隔符或编码分隔符。
+
+远端最小兼容检查还要求：版本 endpoint 可识别；discovery entry 与 reasoner envelope 的锁定版必现字段类型正确。远端 description/schema/examples 均不进入 revision、不覆盖本地字段、不扩大输入面。字段缺失、类型错误、重复 target、版本不兼容或 target 不一致均 fail closed 为 `agentfield.remote_protocol`。
+
+远端健康探测不得成为每 turn 的硬依赖：最近 30 秒成功快照可用于 list；过期且不可达时 list 标记 `available:false`，start fail closed。兼容 fixture 位于 `docs/superpowers/fixtures/agentfield-v0.1.138-contract.json`。它是从 pinned source handler/type 提炼并脱敏的 contract fixture，**不是实际隔离服务 LIVE round-trip 证据**；其 envelope 逐字段标注 required/optional/ignored-but-type-checked。SHA-256 为 `1bac46c4ce5c20d165bb88128a68ae056a70c4aabea3310b3e229210e094736a`。复现：
 
 ```bash
 sha256sum docs/superpowers/fixtures/agentfield-v0.1.138-contract.json
@@ -369,12 +379,15 @@ AgentField 远端 PASS 不能升级 Lato 权限；远端返回的 URL、命令�
 15. session close 后晚到调用 fail closed；远端 run 不被隐式 cancel。
 16. registration：主会话唯一可见；subagent/headless-filtered/workflow host 不可见。
 17. enabled=false 与回滚：所有既有 task/workflow/ACP/TUI golden 不变。
+18. target 正反例：colon discovery target 只用于一致性校验；由合法原子派生 dot execute target；`.`/`:`/`/`/`%`/非 ASCII、编码分隔符、字段不一致全部在发 HTTP 前拒绝。
+19. pinned async/status/cancel/discovery 完整成功 envelope：缺少必现字段、required/optional 字段类型错误均 fail closed；未知字段仅忽略。
 
 ### 12.2 锁定版本集成测试
 
 实现锁定 AgentField `v0.1.138` / `0aba9d6de1ef2c473070fc329ac7ac63e5d096b9` 与上述 fixture/hash，并用隔离控制面执行：
 
 - health/discovery/async start/status/cancel 的真实 round trip；
+- 验证 fixture 只是 source-derived contract；LIVE 结果另存测试证据，不反向改写 fixture；
 - 401/403、remote policy deny、404 execution、5xx 与 restart；
 - Lato 进程在远端 running 时硬退出，resume 后对账同一 execution；
 - response-before-ID 断线后 Lato 自动重试/查询次数均为 0，restart/resume 后仍仅呈现人工核对指引；
@@ -408,6 +421,8 @@ LIVE 测试只使用无敏感数据的 fixture capability，不进入普通 CI�
 | AC-10 | secret 扫描对日志、journal、tool output、错误、Debug 快照为 0 命中；恶意/超限输出安全拒绝或截断 |
 | AC-11 | Linux/macOS/Windows focused tests、全仓 tests、fmt、clippy、install、doctor 与 no-live-network 全通过 |
 | AC-12 | README 明确双 policy、远端继续运行风险、手工对账与回滚；锁定 AgentField 版本/fixture hash 可复现 |
+| AC-13 | discovery 原子严格 ASCII 校验；colon invocation target 校验后派生 dot execute target，所有分隔符逃逸反例远端请求为 0 |
+| AC-14 | async/status/cancel/discovery 的 pinned 完整 envelope 与 required/optional/type 分类可复现；fixture 不冒充 LIVE 证据 |
 
 ## 14. 风险与处置
 
@@ -431,7 +446,7 @@ LIVE 测试只使用无敏感数据的 fixture capability，不进入普通 CI�
 - `AgentFieldClient` trait、strict types、fake server、版本/health/discovery；
 - doctor；不注册模型工具、不发起生产执行。
 
-完成门槛：复现锁定的 `v0.1.138` commit 与 fixture hash，证明 async start/status/cancel/discovery 最小字段；明确验证 idempotency key 不受支持。
+完成门槛：复现锁定的 `v0.1.138` commit 与 fixture hash，证明 async start/status/cancel/discovery 完整必现 envelope 与字段分类；通过 colon discovery → dot execute 的正反合同测试；明确验证 idempotency key 不受支持。
 
 ### 7C2：模型工具与运行时（依赖 7C1）
 
@@ -454,7 +469,7 @@ Phase 7C v1 只有在以下全部满足后才完成：
 1. 规格评审冻结，并锁定外部 AgentField 版本与实际合同。
 2. 7C1/7C2/7C3 分刀实现和独立验收全部 PASS。
 3. P0/P1 为零；P2/P3 有明确处置。
-4. AC-01～AC-12 全部有实际执行证据。
+4. AC-01～AC-14 全部有实际执行证据。
 5. 不降低本地 task/workflow、policy、journal、CI 和 no-live-network 基线。
 6. migration、doctor、运行风险、人工对账与 rollback 文档齐全。
 
@@ -466,8 +481,10 @@ Phase 7C v1 只有在以下全部满足后才完成：
 | P0 action policy | 不做 action-aware runtime；四 action 统一 static external-mutation | §1、§2.3、§8.1、测试与 AC-04 |
 | P1 discovery digest | 冻结 canonical local revision、远端最小字段、strict fail-closed、fixture/hash | §6.2、§12.2 |
 | P1 journal/rollback | 7C3 硬依赖 WIN-26 合入 SHA；旧 reader 对未知 enum fail closed，禁止不安全二进制降级 | §9、§10、§15 |
+| 二审 P0 target 分隔符 | 冻结 discovery colon 校验、严格原子验证与 execute dot 派生；原始 invocation target 禁止进 URL | §6.2、§12、AC-13 |
+| 二审 P1 envelope fixture | async/status/cancel/discovery 记录完整实际 envelope 与字段分类；明确 source-derived、非 LIVE | fixture、§6.2、§12、AC-14 |
 
-仍有一个实施前机械门禁：PR #12 当前验收 head 为 `17b18f14dfdd32c241a4d2d73cc30f2a8c34eb07`，但尚未合入。其 merge SHA 出现后必须以规格勘误替换“待写回”文字；在此之前 7C3 不得开工。这不改变产品选择，只冻结实际代码基线。
+仍有一个实施前机械门禁：PR #12 当前 head 为 `736452f866ec66bbf9f208edb0c2df93a3ba67af`，但尚未合入；当前 `origin/master` 仍为 `0611e26`。其 merge SHA 出现后必须以规格勘误替换“待写回”文字；在此之前 7C3 不得开工。这不改变产品选择，只冻结实际代码基线。
 
 ## 18. PR #13 CI 失败处置记录
 
