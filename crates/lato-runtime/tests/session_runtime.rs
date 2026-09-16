@@ -735,11 +735,14 @@ async fn shutdown_and_collect(
     session: &lato_runtime::SessionHandle,
     events: &mut tokio::sync::broadcast::Receiver<lato_core::EventEnvelope>,
 ) -> Vec<lato_core::EventEnvelope> {
-    timeout(Duration::from_secs(1), session.submit(Command::Shutdown))
+    // Windows CI runners exhibit multi-second fsync latency spikes; the
+    // shutdown commit (SessionStopped, SyncData) and its event drain must not
+    // trip the fixture deadline while genuine hangs still time out.
+    timeout(Duration::from_secs(10), session.submit(Command::Shutdown))
         .await
         .expect("shutdown command exceeded its deadline")
         .unwrap();
-    let observed = timeout(Duration::from_secs(1), async {
+    let observed = timeout(Duration::from_secs(10), async {
         let mut observed = Vec::new();
         loop {
             let event = events

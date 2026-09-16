@@ -139,7 +139,10 @@ fn endpoint(stream: Arc<dyn ModelStream>) -> Arc<dyn ModelStream> {
 }
 
 async fn handle(host: &mut AcpHost, request: JsonRpcReq) -> serde_json::Value {
-    timeout(Duration::from_secs(5), host.handle(request))
+    // Windows CI runners exhibit multi-second fsync latency spikes; a request
+    // that legitimately completes in seconds must not fail the fixture, while
+    // real deadlocks still time out well below CI job limits.
+    timeout(Duration::from_secs(30), host.handle(request))
         .await
         .expect("ACP request timed out")
         .expect("ACP request returned no response")
