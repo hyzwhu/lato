@@ -157,8 +157,11 @@ fn is_special_purpose_v6_within_global_unicast(segments: [u16; 8]) -> bool {
         //   outright rather than translated, so an embedded address can
         //   never be dialed without its own v4 classification)
         || segments[0] == 0x2002
-        // - 3fff::/20 documentation (RFC 9637)
-        || (segments[0] == 0x3fff && (segments[1] & 0xfff0) == 0)
+        // - 3fff::/20 documentation (RFC 9637): the prefix is 0x3fff plus
+        //   the TOP 4 bits of segment[1] (16 + 4 = 20 bits), so the check
+        //   masks those 4 bits only (Round 4, C1: the former 0xfff0 mask
+        //   was a 16+12=28-bit check and let 3fff:10::1/3fff:fff::1 pass).
+        || (segments[0] == 0x3fff && (segments[1] & 0xf000) == 0)
     // - 5f00::/16 (SRv6) is NOT inside 2000::/3 (first 3 bits 010), so the
     //   global-unicast gate below rejects it; likewise 4000::/3 (reserved)
     //   and fec0::/10 (deprecated site-local) are outside the block.
@@ -838,6 +841,10 @@ pub(crate) mod tests {
             "3fff::1",      // documentation (RFC 9637), inside 2000::/3
             "3fff:f::1",    // documentation upper edge, inside 2000::/3
             "3fff:1::1",    // documentation, inside 2000::/3
+            // Round 4 (C1): /20 boundary correctness — inside-low and
+            // inside-high are both documentation addresses.
+            "3fff:0::1",
+            "3fff:fff:ffff:ffff:ffff:ffff:ffff:ffff", // inside-high
         ];
         for ip in cases {
             let ip: IpAddr = ip.parse().unwrap();
@@ -850,13 +857,49 @@ pub(crate) mod tests {
 
     #[test]
     fn public_addresses_are_allowed_in_production() {
-        for ip in ["93.184.216.34", "2606:2800:220:1:248:1893:25c8:1946"] {
+        // 3fff:1000:: is the first address OUTSIDE 3fff::/20 (Round 4 C1
+        // first-outside evidence): inside 2000::/3, not special-purpose,
+        // so the allow-first policy must accept it.
+        for ip in [
+            "93.184.216.34",
+            "2606:2800:220:1:248:1893:25c8:1946",
+            "3fff:1000::",
+        ] {
             let ip: IpAddr = ip.parse().unwrap();
             assert!(
                 classify_address(ip, "https", false).is_ok(),
                 "{ip} rejected"
             );
         }
+    }
+
+    /// Round 4 (D1): unit-level verification of the `3fff::/20` prefix,
+    /// exercised through the PRODUCTION classification path (not a
+    /// re-stated expression, avoiding implementation/test same-source
+    /// drift). An exhaustive sweep over segment[1] (all 2^16 values) must
+    /// reject exactly the /20 range [0x0000, 0x0fff] and accept the rest —
+    /// proving the boundary is exactly /20: no narrower, no wider.
+    #[test]
+    fn ipv6_prefix_3fff_slash_20_production_path_covers_exactly_its_address_space() {
+        let mut rejected: Vec<u16> = Vec::new();
+        let mut accepted: Vec<u16> = Vec::new();
+        for second in 0..=u16::MAX {
+            let ip: IpAddr = format!("3fff:{second:04x}::1").parse().unwrap();
+            if classify_address(ip, "https", false).is_err() {
+                rejected.push(second);
+            } else {
+                accepted.push(second);
+            }
+        }
+        assert_eq!(
+            rejected.len(),
+            0x1000,
+            "exactly the /20 (2^4 top values) is rejected"
+        );
+        assert_eq!(rejected.first(), Some(&0x0000), "inside-low");
+        assert_eq!(rejected.last(), Some(&0x0fff), "inside-high");
+        assert_eq!(accepted.first(), Some(&0x1000), "first-outside");
+        assert_eq!(accepted.last(), Some(&0xffff));
     }
 
     #[test]
@@ -918,6 +961,9 @@ pub(crate) mod tests {
             "https://[fec0::1]",
             "https://[5f00::1]",
             "https://[3fff::1]",
+            // Round 4 (C1): /20 boundary, literal path.
+            "https://[3fff:0::1]",
+            "https://[3fff:fff:ffff:ffff:ffff:ffff:ffff:ffff]",
         ] {
             let result =
                 ReqwestTransport::connect_with_resolver(&https_origin(url), resolver.clone()).await;
@@ -939,6 +985,11 @@ pub(crate) mod tests {
             "fec0::1".parse::<IpAddr>().unwrap(),
             "5f00::1".parse::<IpAddr>().unwrap(),
             "3fff::1".parse::<IpAddr>().unwrap(),
+            // Round 4 (C1): /20 boundary, DNS answer path.
+            "3fff:0::1".parse::<IpAddr>().unwrap(),
+            "3fff:fff:ffff:ffff:ffff:ffff:ffff:ffff"
+                .parse::<IpAddr>()
+                .unwrap(),
         ] {
             let resolver = Arc::new(FixedResolver(vec![answer]));
             let result = ReqwestTransport::connect_with_resolver(
