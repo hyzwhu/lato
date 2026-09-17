@@ -1,17 +1,17 @@
-//! AgentField v1.2.1 boundary guards (spec §0.2 item 7, §0.3, §0.5).
+//! AgentField v1.2 boundary guards (spec §0.2 item 7, §0.3, §0.5, §8.1).
 //!
-//! 7C1 is an OFFLINE-ONLY foundation: no `agentfield` model tool is
-//! registered in any enabled/disabled/unconfigured state, and the module
-//! ships no production outbound network path (that is Phase 7C1.1, spec
-//! §0.3/§0.4). These source-level guards fail the build if either boundary
-//! regresses.
+//! Phase 7C2 amended: the main-session `agentfield` model tool is now
+//! registered — in `host.rs` ONLY, behind the configuration gate. No other
+//! tool wiring surface (subagent runner, skills, journal, workflow tool,
+//! actor) may reference agentfield, and the adapter module must not ship
+//! its own production outbound network path beyond `agentfield/transport.rs`.
 
-/// 7C1 must not reference AgentField from any tool registration / runtime
-/// wiring surface (AC-01).
+/// 7C1/7C2 wiring boundary: `host.rs` is the ONLY main-session registration
+/// surface; every other tool registration / runtime wiring surface stays
+/// free of agentfield references (AC-01, registration test 3).
 #[test]
-fn agentfield_is_absent_from_every_tool_wiring_surface() {
+fn agentfield_is_absent_from_every_non_host_wiring_surface() {
     let surfaces: &[(&str, &str)] = &[
-        ("src/host.rs", include_str!("../src/host.rs")),
         (
             "src/subagent/runner.rs",
             include_str!("../src/subagent/runner.rs"),
@@ -27,8 +27,44 @@ fn agentfield_is_absent_from_every_tool_wiring_surface() {
     for (path, source) in surfaces {
         assert!(
             !source.to_ascii_lowercase().contains("agentfield"),
-            "{path} must not reference agentfield in Phase 7C1; \
-             model tool registration belongs to 7C2"
+            "{path} must not reference agentfield; \
+             main-session registration belongs to host.rs only"
+        );
+    }
+}
+
+/// 7C2: the main-session registration must exist in host.rs, must be gated
+/// on the validated multi-source config assembly (Round-3: registration and
+/// the post-approval recheck share `assemble_catalog_config`), and must
+/// install the manager on the session so close marks it unavailable.
+#[test]
+fn host_registers_agentfield_only_behind_the_config_gate() {
+    let host = include_str!("../src/host.rs").to_ascii_lowercase();
+    for expected in [
+        "catalog_sources(",
+        "assemble_catalog_config",
+        "sessionagentfieldhandle",
+        "agentfieldtool::new",
+        "attach_agentfield_manager",
+    ] {
+        assert!(
+            host.contains(expected),
+            "host.rs is missing the 7C2 registration marker `{expected}`"
+        );
+    }
+    // The adapter module stays free of tool-protocol dependencies in the
+    // offline files (config/client/types/probe); catalog/manager/tool are
+    // the sanctioned 7C2 additions.
+    for (name, source) in [
+        ("config.rs", include_str!("../src/agentfield/config.rs")),
+        ("client.rs", include_str!("../src/agentfield/client.rs")),
+        ("types.rs", include_str!("../src/agentfield/types.rs")),
+        ("probe.rs", include_str!("../src/agentfield/probe.rs")),
+        ("catalog.rs", include_str!("../src/agentfield/catalog.rs")),
+    ] {
+        assert!(
+            !source.contains("lato_core") && !source.contains("lato_tools"),
+            "agentfield/{name} must not gain tool-protocol dependencies"
         );
     }
 }
@@ -143,7 +179,8 @@ fn production_transport_has_exactly_one_public_constructor_and_no_insecure_path(
 
 /// 7C1.1 AC-08: the module's public surface routes product construction
 /// through the policy factory, which resolves the credential BEFORE the
-/// transport exists (unresolvable credential ⇒ zero network).
+/// transport exists (unresolvable credential ⇒ zero network). The 7C2
+/// token-based variant keeps the same ordering at the registration gate.
 #[test]
 fn product_construction_reaches_the_transport_only_through_the_policy_factory() {
     let mod_rs = include_str!("../src/agentfield/mod.rs");
@@ -170,34 +207,31 @@ fn product_construction_reaches_the_transport_only_through_the_policy_factory() 
     }
 }
 
-/// The module entry point must stay the v1.2.1 five sub-modules, and the
-/// module must not gain tool-protocol dependencies (`lato_core::Tool` /
-/// `lato_tools`).
+/// 7C2: the module entry point wires the sanctioned sub-module set; the
+/// offline Stage-1 files stay free of tool-protocol dependencies, while
+/// `tool.rs` is the single Tool implementation of the adapter.
 #[test]
-fn agentfield_module_exposes_no_tool_implementation() {
+fn agentfield_module_keeps_the_frozen_submodule_layout() {
     let mod_rs = include_str!("../src/agentfield/mod.rs");
     for expected in [
-        "pub mod config;",
+        "pub mod catalog;",
         "pub mod client;",
-        "pub mod types;",
+        "pub mod config;",
+        "pub mod manager;",
         "pub mod probe;",
+        "pub mod tool;",
+        "pub mod transport;",
+        "pub mod types;",
     ] {
         assert!(
             mod_rs.contains(expected),
             "agentfield mod.rs is missing {expected}"
         );
     }
-    let sources: &[(&str, &str)] = &[
-        ("mod.rs", mod_rs),
-        ("config.rs", include_str!("../src/agentfield/config.rs")),
-        ("client.rs", include_str!("../src/agentfield/client.rs")),
-        ("types.rs", include_str!("../src/agentfield/types.rs")),
-        ("probe.rs", include_str!("../src/agentfield/probe.rs")),
-    ];
-    for (name, source) in sources {
+    for forbidden in ["lato_core", "lato_tools"] {
         assert!(
-            !source.contains("lato_core") && !source.contains("lato_tools"),
-            "agentfield/{name} must not gain tool-protocol dependencies in 7C1"
+            !mod_rs.contains(forbidden),
+            "agentfield mod.rs must not reference {forbidden}"
         );
     }
 }

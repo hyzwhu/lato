@@ -4,18 +4,23 @@
 // `transport`, unique policy-enforcing factory, DNS classification and
 // address pinning), snapshot state machine, and doctor diagnostics.
 //
-// Still absent (7C2/7C3): model tool registration, `AgentFieldManager`,
-// policy/approval integration, journal events, and cross-process
+// Phase 7C2 adds: the session-frozen catalog revision (`catalog`), the
+// session-scoped run manager (`manager`), and the main-session model tool
+// (`tool`). Still absent (7C3): journal events and cross-process
 // resume/reconcile.
 
+pub mod catalog;
 pub mod client;
 pub mod config;
+pub mod manager;
 pub mod probe;
 #[cfg(test)]
 mod probes_7c1_1;
+pub mod tool;
 pub mod transport;
 pub mod types;
 
+pub use catalog::AgentFieldCatalog;
 pub use client::{
     AgentFieldClient, AgentFieldError, HttpAgentFieldClient, HttpTransport,
     MAX_RESPONSE_BODY_BYTES, OutboundRequest, RawResponse, RedactedToken, TransportError,
@@ -24,9 +29,11 @@ pub use config::{
     CapabilityConfig, ConfigError, ControlPlaneOrigin, MAX_CAPABILITIES, MAX_INPUT_BYTES,
     MAX_OUTPUT_BYTES, PINNED_AGENTFIELD_VERSION,
 };
+pub use manager::{AgentFieldManager, CancelOutcome, ManagerError, RunState, RunStatus};
 pub use probe::{
     AgentFieldHealthSnapshot, AgentFieldProbe, AgentFieldProbeCache, HEALTH_SNAPSHOT_TTL,
 };
+pub use tool::{AgentFieldTool, SessionAgentFieldHandle};
 pub use transport::ReqwestTransport;
 pub use types::{
     AsyncStartEnvelope, CancelConflictEnvelope, CancelSuccessEnvelope, DiscoveryAgent,
@@ -60,6 +67,20 @@ pub fn resolve_agentfield_credential(
         .map(client::RedactedToken::new)
 }
 
+/// Load and validate the `agentfield` stanza from `$LATO_HOME/config.json`
+/// (7C2 registration gate). Returns `None` — i.e. zero tool registration
+/// and zero network — when the file is missing, the stanza is absent,
+/// `enabled` is false, or validation fails (doctor reports the details).
+pub fn load_agentfield_config(home: &std::path::Path) -> Option<config::AgentFieldConfig> {
+    let bytes = std::fs::read(home.join("config.json")).ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    let raw = value.get("agentfield")?;
+    config::AgentFieldConfig::parse(raw)
+        .ok()
+        .flatten()
+        .filter(|config| config.enabled)
+}
+
 /// The unique policy-enforcing production factory (7C1.1): every product
 /// path obtains its AgentField client here and nowhere else. The credential
 /// is resolved BEFORE any transport exists — an unresolvable reference
@@ -74,6 +95,25 @@ pub async fn production_agentfield_client(
         .ok_or_else(|| {
             client::AgentFieldError::CredentialMissing(config.credential_reference.clone())
         })?;
+    let transport = transport::ReqwestTransport::connect(&config.origin)
+        .await
+        .map_err(client::map_transport_error)?;
+    Ok(client::HttpAgentFieldClient::new(
+        config.origin.clone(),
+        Some(credential),
+        transport,
+    ))
+}
+
+/// 7C2 variant of the policy factory for already-resolved credentials: the
+/// registration gate resolves the credential BEFORE the transport exists
+/// (unresolvable ⇒ zero registration, zero network), so this path receives
+/// the redacted token and enforces the same frozen transport policy through
+/// `ReqwestTransport::connect`.
+pub async fn production_agentfield_client_from_token(
+    credential: client::RedactedToken,
+    config: &config::AgentFieldConfig,
+) -> Result<client::HttpAgentFieldClient<transport::ReqwestTransport>, client::AgentFieldError> {
     let transport = transport::ReqwestTransport::connect(&config.origin)
         .await
         .map_err(client::map_transport_error)?;

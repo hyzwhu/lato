@@ -369,6 +369,11 @@ impl ToolRuntime {
         let Some(tool) = self.catalog.resolve(&canonical) else {
             return Err(not_found(wire_name));
         };
+        // Frozen validation orders may place tool-side gates (allowlist,
+        // capability input schema, …) ahead of policy/approval. Reject here,
+        // before the policy decision and any approval request, with the
+        // tool's own stable error code.
+        tool.validate_pre_policy(&arguments)?;
         let canonical_arguments = canonical_arguments(&arguments).map_err(|error| {
             ToolError::new(
                 "policy.fingerprint_failed",
