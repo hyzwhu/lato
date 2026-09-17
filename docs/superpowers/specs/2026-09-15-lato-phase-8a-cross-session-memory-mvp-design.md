@@ -1,11 +1,16 @@
 # Lato Phase 8A: Cross-session memory MVP design
 
-**Status:** v1.0 candidate for design acceptance
+**Status:** v1.1 candidate for Round 2 design acceptance
 
 **Date:** 2026-09-17
 
-**Implementation baseline:** `e6749899e868adbb95a28338aecd5ff09d9b72e4`
-(contains Phase 8B A+ Stage 2 merge `26fb3a2776c9b0075a0b7640ea4fc459bdaf2a28`)
+**Implementation baseline:** `d2ff6297fa916c2fcf319a5df5ec4fcd082d1956`
+(Phase 8A v1.0 design merge; contains Phase 8B A+ Stage 2 merge
+`26fb3a2776c9b0075a0b7640ea4fc459bdaf2a28`)
+
+**Round 2 change set:** remove ACP path/hash disclosure, add full-identity
+collision binding for `<slug>-<hash12>`, and correct the implementation crate
+and file inventory. No production implementation is authorized by this change.
 
 **Product baseline:** Grok Build user guide `13-memory.md`, reviewed 2026-09-15
 
@@ -98,6 +103,37 @@ Origin normalization is deterministic and does not contact the network:
    `memory.workspace_identity_unavailable`; it never hashes an unverified
    relative path.
 
+The 12-hex directory suffix is an index, not proof of identity. For every
+workspace directory, the store maintains an owner-only regular binding file
+named `.identity-v1` whose complete content is exactly
+`sha256-v1:<full-lowercase-64-hex-digest>\n`. The full digest is computed from
+the same normalized identity used for `<hash12>`; the normalized origin or
+canonical path itself is never persisted. The binding file is created with the
+same parent pinning, no-follow/reparse rejection, create-new, sync, and parent
+sync contract as memory data.
+
+Before every workspace memory read, reload, or append, the store validates all
+of the following while holding the workspace lock:
+
+1. `<hash12>` equals the first 12 hex characters of the computed full digest;
+2. `.identity-v1` is a non-symlink/non-reparse regular file with owner-only
+   permissions and exactly matches the computed full digest in constant time;
+3. the retained workspace-directory identity still matches the resolved path.
+
+A malformed or mismatched binding is a collision, not a recoverable stale
+file. The store disables both read and write for that workspace source for the
+process, emits stable warning `memory.workspace_identity_collision`, and never
+loads, overwrites, renames, deletes, or adopts either the existing binding or
+`MEMORY.md`. If the directory is absent, the store may create it and its
+binding. If the directory exists with neither binding nor `MEMORY.md`, it may
+install the binding atomically. If `MEMORY.md` or any other entry exists while
+the binding is absent, it fails closed as `memory.workspace_identity_unbound`;
+automatic migration or adoption is forbidden in Phase 8A. Tests inject two
+different full digests with the same 12-hex prefix and must prove zero
+cross-workspace read/write and byte-for-byte preservation of the first
+workspace. Therefore AC-03 guarantees detected isolation, rather than claiming
+that a 48-bit prefix can never collide.
+
 Thus normal clones and worktrees of one repository share workspace memory.
 Different repositories with the same directory name do not. Redirects,
 credential helpers, network lookups, and host-specific case folding are outside
@@ -142,7 +178,9 @@ per file and exactly 48 KiB total are accepted; one byte over either boundary is
 rejected. This priority is stable and is not influenced by modification time.
 
 The immutable `MemorySnapshot` contains effective state, workspace identity,
-source paths, content hashes, and the accepted global/workspace contents.
+source paths, internal content hashes, and the accepted global/workspace
+contents. Paths and hashes are process-internal and must not cross ACP,
+diagnostic, event, error, or telemetry boundaries.
 Sampling prepends one bounded instruction block after product/system rules and
 before session conversation:
 
@@ -175,7 +213,10 @@ skill, hook, tool call, policy rule, or approval.
 - `lato-core` owns serializable `MemoryConfig`, `MemoryScope`,
   `MemorySnapshot`, and structured warning/error types.
 - `lato-store` owns identity resolution, bounded reads, locking, and atomic
-  append. It has no model or TUI dependency.
+  append. Its existing `src/memory.rs` remains the in-memory session
+  `MemoryEventStore` and is not reused or renamed. Cross-session memory lives
+  under the distinct `src/cross_session_memory/` module. It has no model or TUI
+  dependency.
 - `lato-agent` owns the session snapshot and inserts the memory block at the
   same canonical model-input boundary used by new, resumed, headless, ACP, and
   post-compaction sampling.
@@ -183,17 +224,42 @@ skill, hook, tool call, policy rule, or approval.
   store into each session host.
 - the TUI owns `/memory`, `/remember`, confirmation, and warnings. Commands call
   typed agent/store APIs; they do not manipulate paths themselves.
+- `lato-protocol` owns ACP method advertisement. It adds
+  `lato/memory/status` and `lato/memory/reload` exactly once to
+  `METHODS_IMPLEMENTED` in `src/methods.rs` and tests their presence and
+  uniqueness.
 
 No canonical session event is required merely for loading memory. Successful
 toggle, reload, and remember operations emit non-durable client notifications
 so TUI and ACP adapters can refresh. ACP gains optional namespaced methods
 `lato/memory/status` and `lato/memory/reload`; write support is deferred. Both
-methods require `sessionId`. `status` returns enabled state, generation, accepted
-byte counts by scope, warning codes, and redacted source identifiers; `reload`
-returns the same shape after atomic replacement. They are advertised exactly
-once in `agentCapabilities.methods`. Older clients remain compatible because
-the methods are additive; missing/unknown methods return standard JSON-RPC
-`-32601` and malformed/session-mismatch requests return `-32602`.
+methods require `sessionId`. Both return exactly this privacy-safe result shape
+(field names are normative; no extension fields are permitted in Phase 8A):
+
+```json
+{
+  "enabled": true,
+  "generation": 3,
+  "sources": [
+    {"scope": "global", "bytes": 120, "sourceId": "global"},
+    {"scope": "workspace", "bytes": 240, "sourceId": "workspace"}
+  ],
+  "warningCodes": ["memory.aggregate_limit"]
+}
+```
+
+`sourceId` is the literal enum `global|workspace`; it is not a filename,
+pathname, hash, digest, slug, origin, repository identifier, or reversible
+token. A rejected/empty source remains represented with `bytes: 0` when its
+scope is applicable. `reload` returns the same shape only after atomically
+installing the new snapshot; on failure it returns a stable JSON-RPC error with
+no result payload and preserves the prior generation. ACP responses and
+notifications must never contain `path`, `file`, `filename`, `hash`, `digest`,
+`slug`, origin, temporary name, memory/note text, or an absolute/relative path.
+They are advertised exactly once in `agentCapabilities.methods`. Older clients
+remain compatible because the methods are additive; missing/unknown methods
+return standard JSON-RPC `-32601` and malformed/session-mismatch requests return
+`-32602`.
 
 ## 6. Explicitly out of scope
 
@@ -222,8 +288,8 @@ Memory content, note text, content hashes, temporary filenames, and absolute
 paths must not appear in logs, journal/events, history, session metadata,
 compaction summaries, panic/error chains, `doctor` human/JSON output, telemetry,
 ACP responses/notifications, or tool results. These surfaces may report scope,
-byte count, generation, stable warning/error code, and a redacted source id
-(`<global>/MEMORY.md` or `<workspace:hash12>/MEMORY.md`). The local interactive
+byte count, generation, stable warning/error code, and the non-identifying
+source id literal `global` or `workspace`. The local interactive
 `/memory` view and `/remember` confirmation are the only surfaces allowed to
 show the resolved absolute path and user note, because the local user explicitly
 requested them. Tests seed a unique canary in content, note text, home path, and
@@ -237,6 +303,9 @@ Focused tests must prove:
 2. stable origin-based identity across clones/worktrees and the normalization
    fixture matrix (HTTPS/SSH/scp/default/non-default port, case, `.git`, invalid
    segments/credentials/query/fragment), plus path fallback for non-Git roots;
+   full-digest binding creation/verification; a deterministic same-hash12,
+   different-full-digest collision that fails closed with zero cross-read/write;
+   missing/malformed binding and existing-unbound-directory behavior;
 3. global/workspace ordering; 32 KiB per-source and 48 KiB aggregate boundaries
    at `limit-1`, `limit`, and `limit+1`; global-wins aggregate rejection;
    invalid UTF-8, symlink/reparse rejection, and fail-without-truncation;
@@ -250,8 +319,10 @@ Focused tests must prove:
 7. toggle/reload generation isolation from an in-flight request;
 8. memory cannot grant capabilities, bypass policy, or override project/current
    instructions;
-9. canary-based leakage tests cover every surface listed in section 7; README
-   documents enable, inspect, remember, edit, disable, and delete paths;
+9. canary-based leakage tests cover every surface listed in section 7; ACP
+   schema rejection tests forbid path/file/hash/digest/slug/origin and accept
+   only literal `global|workspace` source ids; README documents enable,
+   inspect, remember, edit, disable, and delete paths;
 10. ACP method advertisement, response schema, `-32601`/`-32602`, session
     isolation, and compatibility with a client that ignores optional methods.
 
@@ -266,21 +337,28 @@ baseline is:
 
 - `lato-core`: add memory config/scope/snapshot/warning types and serialization
   contracts (about 180-260 production lines; 120-180 focused-test lines).
-- `lato-store`: add `memory_file.rs` and `memory_identity.rs` for normalization,
-  secure bounded reads, locks, and atomic append (about 650-900 production
-  lines; 700-1,000 focused-test lines). Existing session `memory.rs` is not
-  repurposed.
+- `lato-store`: keep existing `src/memory.rs` unchanged as the session-only
+  `MemoryEventStore`. Add `src/cross_session_memory/mod.rs`,
+  `src/cross_session_memory/identity.rs`, and
+  `src/cross_session_memory/secure_file.rs` for normalization, full-digest
+  binding/collision detection, secure bounded reads, locks, and atomic append
+  (about 760-1,050 production lines; 850-1,150 focused-test lines). Export only
+  typed cross-session APIs from `src/lib.rs`; neither module may depend on TUI
+  or model types.
 - `lato-agent`: add a session memory controller and inject immutable snapshots
   at the canonical sampling boundary used by new/resume/compaction/ACP (about
   350-500 production lines; 400-600 focused-test lines).
-- root CLI/TUI/protocol wiring: config/env/`--no-memory`, slash commands,
-  confirmation/status views, optional ACP methods, and README (about 500-750
-  production/documentation lines; 400-650 test lines).
+- `lato-protocol`: update `src/methods.rs` so both optional memory methods are
+  present exactly once in `METHODS_IMPLEMENTED`; add presence/uniqueness tests
+  (about 6-12 production lines; 20-40 test lines).
+- root CLI/TUI wiring: config/env/`--no-memory`, slash commands,
+  confirmation/status views, ACP handlers with the closed response schema, and
+  README (about 500-750 production/documentation lines; 430-700 test lines).
 - `lato-tools` and `lato-policy`: no production change expected. Add an
   integration assertion that memory cannot alter capability/policy inputs; any
   required production edit here must return for design review.
 
-Estimated total: 1,680-2,410 production/documentation lines and 1,620-2,430
+Estimated total: 1,796-2,572 production/documentation lines and 1,820-2,670
 test lines across four existing crates plus the root binary. These are planning
 ranges, not acceptance targets; correctness and the gates above control scope.
 
