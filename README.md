@@ -6,6 +6,25 @@ Lato is a Public Beta coding agent for terminal-based development workflows. It 
 
 Prebuilt binaries are available for macOS Intel, macOS Apple Silicon, Linux x86-64, Linux ARM64, and Windows x86-64.
 
+## Plan file backup (`.reap`) files
+
+When Lato publishes an approved plan (`plan_draft`), the previous `plan.md` is
+preserved as `plan.md.reap-<nonce>` in the same directory — the nonce keeps
+concurrent backups collision-free, and the `reap-` suffix makes them easy to
+audit with a plain directory scan.
+
+- **When they are created**: after every successful publication of a new plan
+  (the old content is moved aside, never deleted), and after a failed
+  publication whose target slot was occupied by another file.
+- **Ownership**: created by Lato itself; anything else found under that name
+  was placed there outside Lato and is never touched by it.
+- **Recovery**: move the file back onto `plan.md` manually if you want to
+  roll back to the previous plan.
+- **Cleanup**: Lato does NOT reap these backups automatically in this
+  release — they accumulate and manual deletion is safe at any time.
+  Automatic reaping (count/lifetime caps) is planned for spec v1.1 and is
+  tracked as an open item.
+
 ## Install a prebuilt binary
 
 On macOS and Linux, the fastest path is the install script. It detects your platform, downloads the archive from the latest release, verifies its SHA256 checksum, and installs to `~/.local/bin` (override with `LATO_INSTALL_DIR`):
