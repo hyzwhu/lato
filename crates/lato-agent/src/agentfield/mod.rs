@@ -4,10 +4,12 @@
 // `transport`, unique policy-enforcing factory, DNS classification and
 // address pinning), snapshot state machine, and doctor diagnostics.
 //
-// Still absent (7C2/7C3): model tool registration, `AgentFieldManager`,
-// policy/approval integration, journal events, and cross-process
+// Phase 7C2 adds: the session-frozen catalog revision (`catalog`). Still
+// absent (later 7C2 commits / 7C3): the session run manager, the
+// main-session model tool, journal events, and cross-process
 // resume/reconcile.
 
+pub mod catalog;
 pub mod client;
 pub mod config;
 pub mod probe;
@@ -16,6 +18,7 @@ mod probes_7c1_1;
 pub mod transport;
 pub mod types;
 
+pub use catalog::AgentFieldCatalog;
 pub use client::{
     AgentFieldClient, AgentFieldError, HttpAgentFieldClient, HttpTransport,
     MAX_RESPONSE_BODY_BYTES, OutboundRequest, RawResponse, RedactedToken, TransportError,
