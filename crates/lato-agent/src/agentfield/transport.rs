@@ -79,6 +79,58 @@ pub(crate) enum AddressPolicy {
     DevHttpLoopback,
 }
 
+/// Table-driven denylist of IPv4 special-purpose ranges that are never
+/// globally routable (IANA IPv4 Special-Purpose Address Registry). The
+/// production HTTPS policy allows only addresses outside every entry.
+fn is_special_purpose_v4(octets: [u8; 4]) -> bool {
+    octets[0] == 0 // 0.0.0.0/8 "this network"
+        || octets[0] == 10 // 10.0.0.0/8 private
+        || octets[0] == 127 // 127.0.0.0/8 loopback
+        // 100.64.0.0/10 CGNAT
+        || (octets[0] == 100 && (64..=127).contains(&octets[1]))
+        // 169.254.0.0/16 link-local
+        || (octets[0] == 169 && octets[1] == 254)
+        // 172.16.0.0/12 private
+        || (octets[0] == 172 && (16..=31).contains(&octets[1]))
+        // 192.0.0.0/24 IETF protocol assignments
+        || (octets[0] == 192 && octets[1] == 0 && octets[2] == 0)
+        // 192.0.2.0/24 documentation
+        || (octets[0] == 192 && octets[1] == 0 && octets[2] == 2)
+        // 192.88.99.0/24 6to4 relay anycast (deprecated, special-purpose)
+        || (octets[0] == 192 && octets[1] == 88 && octets[2] == 99)
+        || (octets[0] == 192 && octets[1] == 168) // 192.168.0.0/16 private
+        // 198.18.0.0/15 benchmarking
+        || (octets[0] == 198 && matches!(octets[1], 18 | 19))
+        // 198.51.100.0/24 documentation
+        || (octets[0] == 198 && octets[1] == 51 && octets[2] == 100)
+        // 203.0.113.0/24 documentation
+        || (octets[0] == 203 && octets[1] == 0 && octets[2] == 113)
+        // 224.0.0.0/4 multicast
+        || (octets[0] >= 224 && octets[0] <= 239)
+        // 240.0.0.0/4 reserved (includes 255.255.255.255 limited broadcast)
+        || octets[0] >= 240
+}
+
+/// Table-driven denylist of IPv6 special-purpose ranges that are never
+/// plain globally-routable unicast (IANA IPv6 Special-Purpose Address
+/// Registry). NAT64 and 6to4 embed an IPv4 target and are resolved back to
+/// the IPv4 policy so an embedded private address can never smuggle through.
+fn is_special_purpose_v6(segments: [u16; 8]) -> bool {
+    // ::/128 unspecified (handled by is_unspecified too) and ::1 loopback
+    // (handled above). Remaining special-purpose prefixes:
+    segments[0] == 0x0064 && segments[1] == 0xff9b // 64:ff9b::/96 NAT64 (translated below)
+        || segments[0] == 0x0100 // 100::/64 discard-only
+        || (segments[0] == 0x2001 && segments[1] == 0x0000) // 2001::/32 Teredo
+        || (segments[0] == 0x2001 && segments[1] == 0x0002 && segments[2] == 0) // 2001:2::/48 benchmarking
+        || (segments[0] == 0x2001 && (segments[1] & 0xfff0) == 0x0010) // 2001:10::/28 ORCHID
+        || (segments[0] == 0x2001 && (segments[1] & 0xfff0) == 0x0020) // 2001:20::/28 ORCHIDv2
+        || (segments[0] == 0x2001 && segments[1] == 0x0db8) // 2001:db8::/32 documentation
+        || segments[0] == 0x2002 // 2002::/16 6to4 (embedded IPv4, denied outright)
+        || (segments[0] & 0xfe00) == 0xfc00 // fc00::/7 unique local
+        || (segments[0] & 0xffc0) == 0xfe80 // fe80::/10 link-local
+        || (segments[0] & 0xff00) == 0xff00 // ff00::/8 multicast
+}
+
 fn classify_v4(ip: std::net::Ipv4Addr, policy: AddressPolicy) -> Result<(), AddressRejection> {
     if ip.is_loopback() {
         return match policy {
@@ -86,24 +138,7 @@ fn classify_v4(ip: std::net::Ipv4Addr, policy: AddressPolicy) -> Result<(), Addr
             AddressPolicy::ProductionHttps => Err(AddressRejection("loopback address")),
         };
     }
-    let octets = ip.octets();
-    let blocked = ip.is_unspecified()
-        || ip.is_private()
-        || ip.is_link_local()
-        || ip.is_multicast()
-        || ip.is_broadcast()
-        || octets[0] == 0
-        // CGNAT 100.64.0.0/10
-        || (octets[0] == 100 && (64..=127).contains(&octets[1]))
-        // 192.0.0.0/24 (IETF protocol assignments)
-        || (octets[0] == 192 && octets[1] == 0 && octets[2] == 0)
-        // Benchmarking 198.18.0.0/15
-        || (octets[0] == 198 && matches!(octets[1], 18 | 19))
-        // Documentation ranges 192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24
-        || octets[0..3] == [192, 0, 2]
-        || octets[0..3] == [198, 51, 100]
-        || octets[0..3] == [203, 0, 113];
-    if blocked {
+    if is_special_purpose_v4(ip.octets()) {
         return Err(AddressRejection("non-public address"));
     }
     match policy {
@@ -127,13 +162,18 @@ fn classify_v6(ip: std::net::Ipv6Addr, policy: AddressPolicy) -> Result<(), Addr
         return classify_v4(mapped, policy);
     }
     let segments = ip.segments();
-    let blocked = ip.is_unspecified()
-        || ip.is_multicast()
-        || ip.is_unique_local()
-        || ip.is_unicast_link_local()
-        // Documentation 2001:db8::/32
-        || (segments[0] == 0x2001 && segments[1] == 0x0db8);
-    if blocked {
+    // 64:ff9b::/96 embeds an IPv4 target behind a NAT64 gateway: the real
+    // destination is the embedded address, so classify that.
+    if segments[0] == 0x0064 && segments[1] == 0xff9b && segments[2..6] == [0, 0, 0, 0] {
+        let embedded = std::net::Ipv4Addr::new(
+            (segments[6] >> 8) as u8,
+            segments[6] as u8,
+            (segments[7] >> 8) as u8,
+            segments[7] as u8,
+        );
+        return classify_v4(embedded, policy);
+    }
+    if ip.is_unspecified() || is_special_purpose_v6(segments) {
         return Err(AddressRejection("non-public address"));
     }
     match policy {
@@ -667,6 +707,14 @@ pub(crate) mod tests {
             "203.0.113.9",
             "224.0.0.1",
             "255.255.255.255",
+            // D-30-01 regression: 240.0.0.0/4 reserved and neighbors.
+            "240.0.0.1",
+            "240.255.255.255",
+            "250.1.2.3",
+            "254.0.0.1",
+            "255.255.255.254",
+            // 6to4 relay anycast (deprecated, special-purpose).
+            "192.88.99.1",
         ];
         for ip in cases {
             let ip: IpAddr = ip.parse().unwrap();
@@ -689,6 +737,15 @@ pub(crate) mod tests {
             "::ffff:10.0.0.1",
             "::ffff:127.0.0.1",
             "::ffff:192.168.0.1",
+            // D-30-01 regression: remaining IANA special-purpose prefixes.
+            "64:ff9b::a00:1",  // NAT64 embedding 10.0.0.1
+            "64:ff9b::7f00:1", // NAT64 embedding 127.0.0.1
+            "100::1",          // discard-only
+            "2001::1",         // Teredo
+            "2001:2::1",       // benchmarking
+            "2001:10::1",      // ORCHID
+            "2001:20::1",      // ORCHIDv2
+            "2002:c000:201::", // 6to4 embedding 192.0.2.1
         ];
         for ip in cases {
             let ip: IpAddr = ip.parse().unwrap();
@@ -742,6 +799,45 @@ pub(crate) mod tests {
             result.is_err(),
             "production HTTPS resolved to loopback was accepted"
         );
+    }
+
+    /// D-30-01, constructor path: reserved ranges must be refused when they
+    /// appear as URL literals — zero DNS, zero sockets.
+    #[tokio::test]
+    async fn constructor_rejects_reserved_range_literals_with_zero_dns() {
+        let resolver = Arc::new(CountingResolver::new(vec![vec![IpAddr::from([
+            93, 184, 216, 34,
+        ])]]));
+        for url in [
+            "https://240.0.0.1",
+            "https://[2001::1]",
+            "https://192.88.99.1",
+            "https://[64:ff9b::a00:1]",
+        ] {
+            let result =
+                ReqwestTransport::connect_with_resolver(&https_origin(url), resolver.clone()).await;
+            assert!(result.is_err(), "{url} was accepted");
+        }
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 0, "DNS was queried");
+    }
+
+    /// D-30-01, DNS answer path: a hostname whose answer lands in a reserved
+    /// range must fail closed with zero connections.
+    #[tokio::test]
+    async fn dns_answers_in_reserved_ranges_fail_closed_with_zero_connections() {
+        for answer in [
+            IpAddr::from([240, 0, 0, 1]),
+            IpAddr::from([192, 88, 99, 1]),
+            "64:ff9b::a00:1".parse::<IpAddr>().unwrap(),
+        ] {
+            let resolver = Arc::new(FixedResolver(vec![answer]));
+            let result = ReqwestTransport::connect_with_resolver(
+                &https_origin("https://agents.example.com"),
+                resolver,
+            )
+            .await;
+            assert!(result.is_err(), "{answer} answer was accepted");
+        }
     }
 
     #[tokio::test]
