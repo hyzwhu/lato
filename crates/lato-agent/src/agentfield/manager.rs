@@ -784,10 +784,14 @@ fn apply_remote_status(run: &mut RunState, status: RunStatus, envelope: &StatusE
 }
 
 /// Redact credential-shaped material from remote-controlled text before it
-/// reaches a summary, log, or model projection: `Authorization`/
-/// `Bearer` header values and `token`/`secret`/`password`/`api[-_]key`
-/// assignments. The redaction is value-agnostic (whatever follows the
-/// separator is replaced), so unknown credential shapes fail safe.
+/// reaches a summary, log, or model projection: any `*authorization` header
+/// value (any case, any scheme — `Basic`/`Digest`/`Bearer`/`Token`/
+/// `Negotiate`/`AWS4-HMAC-SHA256`/unknown/multi-parameter), `Bearer`
+/// credentials, and `token`/`secret`/`password`/`api[-_]key` assignments.
+/// The redaction is value-agnostic and fails safe: after an
+/// `authorization`-shaped header the ENTIRE remainder of the line is
+/// redacted, so no scheme spelling or parameter layout can leave credential
+/// material behind.
 pub fn redact_secrets(text: &str) -> String {
     const TRIGGERS: [&str; 8] = [
         "authorization",
@@ -805,6 +809,9 @@ pub fn redact_secrets(text: &str) -> String {
     let mut cursor = 0usize;
     while cursor < lower.len() {
         // Find the next trigger occurrence with a word boundary before it.
+        // A preceding `-` is allowed so compound header names
+        // (`proxy-authorization`, `x-api-key`, …) trigger too — the
+        // redaction is value-agnostic, so the extra breadth fails safe.
         let mut hit: Option<(usize, &str)> = None;
         for trigger in TRIGGERS {
             let mut from = cursor;
@@ -812,7 +819,7 @@ pub fn redact_secrets(text: &str) -> String {
                 let start = from + rel;
                 let end = start + trigger.len();
                 let before_ok = start == 0
-                    || !matches!(bytes[start - 1], b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'-');
+                    || !matches!(bytes[start - 1], b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_');
                 let after_ok = end == bytes.len()
                     || !matches!(bytes[end], b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_');
                 if before_ok && after_ok && hit.is_none_or(|(offset, _)| start < offset) {
@@ -830,34 +837,37 @@ pub fn redact_secrets(text: &str) -> String {
         out.push_str(&text[cursor..start]);
         let mut pos = start + trigger.len();
         out.push_str(&text[start..pos]);
-        // Consume separators (`:`, `=`, quotes, whitespace).
+        // Consume separators (`:`, `=`, quotes, whitespace) and remember
+        // whether an assignment shape (`:` or `=`) is present.
+        let mut saw_assignment = false;
         while pos < bytes.len() && matches!(bytes[pos], b' ' | b'\t' | b':' | b'=' | b'"' | b'\'') {
+            if matches!(bytes[pos], b':' | b'=') {
+                saw_assignment = true;
+            }
             out.push(bytes[pos] as char);
             pos += 1;
         }
-        // For `authorization`, a following `bearer` word is part of the
-        // scheme, not the secret — keep it, then redact the token.
-        if trigger == "authorization" {
-            let rest_lower = lower[pos..].to_string();
-            if rest_lower.starts_with("bearer") {
-                let bearer_end = pos + "bearer".len();
-                if bearer_end <= bytes.len() {
-                    out.push_str(&text[pos..bearer_end]);
-                    pos = bearer_end;
-                    while pos < bytes.len() && matches!(bytes[pos], b' ' | b'\t') {
-                        out.push(bytes[pos] as char);
-                        pos += 1;
-                    }
-                }
-            }
+        if trigger == "authorization" && !saw_assignment {
+            // Prose mentioning "authorization" without a header/assignment
+            // shape: not credential material, keep scanning after the word.
+            cursor = pos;
+            continue;
         }
-        // Redact the value: everything until whitespace or a JSON-ish closer.
+        // Redact the value. `authorization`-shaped headers redact the whole
+        // remainder of the line — any scheme or parameter layout must never
+        // leak; other triggers redact the single value token (everything
+        // until whitespace or a JSON-ish closer).
         let value_start = pos;
+        let line_rest = trigger == "authorization";
         while pos < bytes.len()
-            && !matches!(
-                bytes[pos],
-                b' ' | b'\t' | b'\n' | b'\r' | b',' | b';' | b'}' | b']' | b'"'
-            )
+            && !(if line_rest {
+                matches!(bytes[pos], b'\n' | b'\r')
+            } else {
+                matches!(
+                    bytes[pos],
+                    b' ' | b'\t' | b'\n' | b'\r' | b',' | b';' | b'}' | b']' | b'"'
+                )
+            })
         {
             pos += 1;
         }
@@ -1574,17 +1584,60 @@ mod tests {
     #[test]
     fn redaction_removes_credential_values_from_remote_text() {
         let cases = [
+            // Round-3 (AC-10): any `*authorization` header, any scheme, any
+            // parameter layout — the whole header value is redacted.
             (
                 "Authorization: Bearer QA_SUPER_SECRET",
-                "Authorization: Bearer [redacted]",
+                "Authorization: [redacted]",
             ),
             (
-                "Authorization: Bearer QA_SUPER_SECRET and findings",
-                "Authorization: Bearer [redacted] and findings",
+                "Authorization: Basic QA_SUPER_SECRET",
+                "Authorization: [redacted]",
             ),
             (
-                "authorization: bearer abc",
-                "authorization: bearer [redacted]",
+                "authorization: digest realm=x, nonce=QA_SECRET, ok",
+                "authorization: [redacted]",
+            ),
+            (
+                "AUTHORIZATION: Token QA_SUPER_SECRET",
+                "AUTHORIZATION: [redacted]",
+            ),
+            (
+                "Authorization: AWS4-HMAC-SHA256 Credential=QA_SECRET",
+                "Authorization: [redacted]",
+            ),
+            // Unrecognized scheme or bare credential: fail safe.
+            (
+                "Authorization: WeirdScheme QA_SUPER_SECRET tail",
+                "Authorization: [redacted]",
+            ),
+            (
+                "authorization: QA_SUPER_SECRET",
+                "authorization: [redacted]",
+            ),
+            // Compound header names trigger too.
+            (
+                "Proxy-Authorization: Basic QA_SUPER_SECRET",
+                "Proxy-Authorization: [redacted]",
+            ),
+            ("x-api-key: QA_SUPER_SECRET", "x-api-key: [redacted]"),
+            // Content after the line survives.
+            (
+                "Authorization: Basic QA_SUPER_SECRET\nstatus: ok",
+                "Authorization: [redacted]\nstatus: ok",
+            ),
+            // JSON-embedded shape: the opening quote is part of the
+            // separator run; the closing quote is swallowed by the
+            // line-rest redaction (fail safe).
+            (
+                "\"authorization\": \"Bearer QA_SUPER_SECRET\"",
+                "\"authorization\": \"[redacted]",
+            ),
+            // Prose mentioning authorization without an assignment shape is
+            // not credential material and survives.
+            (
+                "the authorization is handled by the gateway",
+                "the authorization is handled by the gateway",
             ),
             ("Bearer sk-123", "Bearer [redacted]"),
             ("token=abc123", "token=[redacted]"),
@@ -1597,7 +1650,6 @@ mod tests {
         for (input, expected) in cases {
             assert_eq!(redact_secrets(input), expected, "input: {input}");
         }
-        assert!(redact_secrets("Authorization: Bearer QA_SUPER_SECRET keep").contains("keep"));
         assert!(
             !redact_secrets("Authorization: Bearer QA_SUPER_SECRET").contains("QA_SUPER_SECRET")
         );
@@ -1639,7 +1691,7 @@ mod tests {
         let summary = run.summary.as_deref().unwrap();
         assert!(summary.contains("done."));
         assert!(!summary.contains("QA_SUPER_SECRET"), "{summary}");
-        assert!(summary.contains("Bearer [redacted]"), "{summary}");
+        assert!(summary.contains("Authorization: [redacted]"), "{summary}");
     }
 
     #[tokio::test]
