@@ -11,6 +11,8 @@
 pub mod client;
 pub mod config;
 pub mod probe;
+#[cfg(test)]
+mod probes_7c1_1;
 pub mod transport;
 pub mod types;
 

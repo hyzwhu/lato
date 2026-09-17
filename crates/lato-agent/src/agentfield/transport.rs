@@ -589,12 +589,12 @@ fn sanitize_stream_error(error: reqwest::Error) -> TransportError {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::agentfield::config::ControlPlaneOrigin;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    struct FixedResolver(Vec<IpAddr>);
+    pub(crate) struct FixedResolver(pub(crate) Vec<IpAddr>);
 
     #[async_trait]
     impl AgentFieldDnsResolver for FixedResolver {
@@ -603,15 +603,15 @@ mod tests {
         }
     }
 
-    struct CountingResolver {
-        calls: AtomicUsize,
-        answers: Mutex<Vec<Vec<IpAddr>>>,
+    pub(crate) struct CountingResolver {
+        pub(crate) calls: Arc<AtomicUsize>,
+        pub(crate) answers: Mutex<Vec<Vec<IpAddr>>>,
     }
 
     impl CountingResolver {
-        fn new(answers: Vec<Vec<IpAddr>>) -> Self {
+        pub(crate) fn new(answers: Vec<Vec<IpAddr>>) -> Self {
             Self {
-                calls: AtomicUsize::new(0),
+                calls: Arc::new(AtomicUsize::new(0)),
                 answers: Mutex::new(answers),
             }
         }
