@@ -706,7 +706,10 @@ fn apply_remote_status(run: &mut RunState, status: RunStatus, envelope: &StatusE
     match status {
         RunStatus::Completed => {
             if let Some(result) = envelope.optional_ignored.result.as_deref() {
-                let (summary, truncated) = truncate_utf8(result, MAX_SUMMARY_BYTES);
+                // Remote-controlled content is redacted BEFORE it can reach
+                // any summary/projection surface (Round-1 acceptance P1-2).
+                let (summary, truncated) =
+                    truncate_utf8(&redact_secrets(result), MAX_SUMMARY_BYTES);
                 run.summary = Some(summary);
                 run.summary_truncated = truncated;
             }
@@ -719,13 +722,98 @@ fn apply_remote_status(run: &mut RunState, status: RunStatus, envelope: &StatusE
                 .or(envelope.optional_ignored.error_details.as_deref())
                 .or(envelope.optional_ignored.status_reason.as_deref());
             if let Some(detail) = detail {
-                let (summary, truncated) = truncate_utf8(detail, MAX_SUMMARY_BYTES);
+                let (summary, truncated) =
+                    truncate_utf8(&redact_secrets(detail), MAX_SUMMARY_BYTES);
                 run.summary = Some(summary);
                 run.summary_truncated = truncated;
             }
         }
         _ => {}
     }
+}
+
+/// Redact credential-shaped material from remote-controlled text before it
+/// reaches a summary, log, or model projection: `Authorization`/`Bearer`
+/// header values and `token`/`secret`/`password`/`api[-_]key` assignments.
+/// The redaction is value-agnostic (whatever follows the separator is
+/// replaced), so unknown credential shapes fail safe.
+pub fn redact_secrets(text: &str) -> String {
+    const TRIGGERS: [&str; 8] = [
+        "authorization",
+        "bearer",
+        "token",
+        "secret",
+        "password",
+        "api-key",
+        "api_key",
+        "apikey",
+    ];
+    let lower = text.to_ascii_lowercase();
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0usize;
+    while cursor < lower.len() {
+        // Find the next trigger occurrence with a word boundary before it.
+        let mut hit: Option<(usize, &str)> = None;
+        for trigger in TRIGGERS {
+            let mut from = cursor;
+            while let Some(rel) = lower[from..].find(trigger) {
+                let start = from + rel;
+                let end = start + trigger.len();
+                let before_ok = start == 0
+                    || !matches!(
+                        bytes[start - 1],
+                        b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'-'
+                    );
+                let after_ok = end == bytes.len()
+                    || !matches!(bytes[end], b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_');
+                if before_ok && after_ok && hit.is_none_or(|(offset, _)| start < offset) {
+                    hit = Some((start, trigger));
+                    break;
+                }
+                from = end;
+            }
+        }
+        let Some((start, trigger)) = hit else {
+            out.push_str(&text[cursor..]);
+            break;
+        };
+        // Emit everything up to the trigger, then the trigger itself.
+        out.push_str(&text[cursor..start]);
+        let mut pos = start + trigger.len();
+        out.push_str(&text[start..pos]);
+        // Consume separators (`:`, `=`, quotes, whitespace).
+        while pos < bytes.len() && matches!(bytes[pos], b' ' | b'\t' | b':' | b'=' | b'"' | b'\'') {
+            out.push(bytes[pos] as char);
+            pos += 1;
+        }
+        // For `authorization`, a following `bearer` word is part of the
+        // scheme, not the secret — keep it, then redact the token value.
+        if trigger == "authorization" && lower[pos..].starts_with("bearer") {
+            let bearer_end = pos + "bearer".len();
+            out.push_str(&text[pos..bearer_end]);
+            pos = bearer_end;
+            while pos < bytes.len() && matches!(bytes[pos], b' ' | b'\t') {
+                out.push(bytes[pos] as char);
+                pos += 1;
+            }
+        }
+        // Redact the value: everything until whitespace or a JSON-ish closer.
+        let value_start = pos;
+        while pos < bytes.len()
+            && !matches!(
+                bytes[pos],
+                b' ' | b'\t' | b'\n' | b'\r' | b',' | b';' | b'}' | b']' | b'"'
+            )
+        {
+            pos += 1;
+        }
+        if pos > value_start {
+            out.push_str("[redacted]");
+        }
+        cursor = pos;
+    }
+    out
 }
 
 /// UTF-8-safe truncation to a byte budget: the cut only happens on char
@@ -1428,5 +1516,75 @@ mod tests {
             .filter(|run| !run.status.is_terminal())
             .count();
         assert_eq!(nonterminal, 0);
+    }
+
+    #[test]
+    fn redaction_removes_credential_values_from_remote_text() {
+        let cases = [
+            (
+                "Authorization: Bearer QA_SUPER_SECRET",
+                "Authorization: Bearer [redacted]",
+            ),
+            (
+                "Authorization: Bearer QA_SUPER_SECRET and findings",
+                "Authorization: Bearer [redacted] and findings",
+            ),
+            (
+                "authorization: bearer abc",
+                "authorization: bearer [redacted]",
+            ),
+            ("Bearer sk-123", "Bearer [redacted]"),
+            ("token=abc123", "token=[redacted]"),
+            ("secret: hunter2", "secret: [redacted]"),
+            ("password=\"p@ss\"", "password=\"[redacted]\""),
+            ("api_key=KEY-1; ok", "api_key=[redacted]; ok"),
+            ("no credentials in this text", "no credentials in this text"),
+            ("the tokens are many", "the tokens are many"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(redact_secrets(input), expected, "input: {input}");
+        }
+        assert!(
+            !redact_secrets("Authorization: Bearer QA_SUPER_SECRET").contains("QA_SUPER_SECRET")
+        );
+        // UTF-8 safety: multibyte content survives.
+        assert!(redact_secrets("结果: token=abc 密钥值保留").contains("密钥值保留"));
+    }
+
+    #[tokio::test]
+    async fn completed_result_is_redacted_before_entering_the_summary() {
+        let (manager, client) = manager_with(StartBehavior::Ok("exec-1".into()));
+        let run = manager
+            .start_run(
+                "contract-review",
+                "legal.review_contract",
+                "sha256:x",
+                &input(),
+            )
+            .await
+            .unwrap();
+        // Malicious remote result carrying a credential.
+        let malicious = StatusEnvelope::decode(&json!({
+            "execution_id": "exec-1",
+            "status": "completed",
+            "run_id": "run-1",
+            "started_at": "2026-09-17T00:00:01Z",
+            "webhook_registered": false,
+            "result": "done. Authorization: Bearer QA_SUPER_SECRET",
+        }))
+        .unwrap();
+        client.status_calls.fetch_add(1, Ordering::SeqCst);
+        let mut inner = manager.inner.lock().expect("lock");
+        let run = inner
+            .runs
+            .iter_mut()
+            .find(|r| r.run_id == run.run_id)
+            .unwrap();
+        apply_remote_status(run, RunStatus::Completed, &malicious);
+        assert_eq!(run.status, RunStatus::Completed);
+        let summary = run.summary.as_deref().unwrap();
+        assert!(summary.contains("done."));
+        assert!(!summary.contains("QA_SUPER_SECRET"), "{summary}");
+        assert!(summary.contains("Bearer [redacted]"), "{summary}");
     }
 }
