@@ -838,12 +838,15 @@ pub fn redact_secrets(text: &str) -> String {
         let mut pos = start + trigger.len();
         out.push_str(&text[start..pos]);
         // Consume separators (`:`, `=`, quotes, whitespace) and remember
-        // whether an assignment shape (`:` or `=`) is present.
+        // whether an assignment shape (`:` or `=`) is present and whether
+        // the value is quote-delimited (a quote is the LAST separator).
         let mut saw_assignment = false;
+        let mut value_quoted = false;
         while pos < bytes.len() && matches!(bytes[pos], b' ' | b'\t' | b':' | b'=' | b'"' | b'\'') {
             if matches!(bytes[pos], b':' | b'=') {
                 saw_assignment = true;
             }
+            value_quoted = matches!(bytes[pos], b'"' | b'\'');
             out.push(bytes[pos] as char);
             pos += 1;
         }
@@ -853,30 +856,90 @@ pub fn redact_secrets(text: &str) -> String {
             cursor = pos;
             continue;
         }
-        // Redact the value. `authorization`-shaped headers redact the whole
-        // remainder of the line — any scheme or parameter layout must never
-        // leak; other triggers redact the single value token (everything
-        // until whitespace or a JSON-ish closer).
-        let value_start = pos;
-        let line_rest = trigger == "authorization";
-        while pos < bytes.len()
-            && !(if line_rest {
-                matches!(bytes[pos], b'\n' | b'\r')
-            } else {
-                matches!(
-                    bytes[pos],
-                    b' ' | b'\t' | b'\n' | b'\r' | b',' | b';' | b'}' | b']' | b'"'
-                )
-            })
-        {
-            pos += 1;
-        }
-        if pos > value_start {
+        if value_quoted {
+            // Quoted value: everything up to the matching closing quote is
+            // credential material — whitespace inside must not split it
+            // (`token="a b"` redacts BOTH tokens). A missing closer fails
+            // safe by redacting to the end of the text.
+            let closing = bytes[pos..]
+                .iter()
+                .position(|byte| *byte == b'"' || *byte == b'\'')
+                .map_or(bytes.len(), |rel| pos + rel);
             out.push_str("[redacted]");
+            if closing < bytes.len() {
+                out.push_str(&text[closing..closing + 1]);
+            }
+            pos = closing + usize::from(closing < bytes.len());
+            cursor = pos;
+            continue;
+        }
+        // Unquoted values. `authorization`-shaped headers redact the whole
+        // remainder of the line PLUS any folded continuation lines (remote
+        // text may use folded header layout and must not be trusted to keep
+        // a header on one line); every other trigger redacts the single
+        // value token (everything until whitespace or a JSON-ish closer).
+        let line_rest = trigger == "authorization";
+        loop {
+            let value_start = pos;
+            while pos < bytes.len()
+                && !(if line_rest {
+                    matches!(bytes[pos], b'\n' | b'\r')
+                } else {
+                    matches!(
+                        bytes[pos],
+                        b' ' | b'\t' | b'\n' | b'\r' | b',' | b';' | b'}' | b']' | b'"'
+                    )
+                })
+            {
+                pos += 1;
+            }
+            if pos > value_start {
+                out.push_str("[redacted]");
+            }
+            if !line_rest || pos >= bytes.len() {
+                break;
+            }
+            // Consume the line terminator verbatim.
+            let term_start = pos;
+            if bytes[pos] == b'\r' {
+                pos += 1;
+            }
+            if pos < bytes.len() && bytes[pos] == b'\n' {
+                pos += 1;
+            }
+            out.push_str(&text[term_start..pos]);
+            // A folded continuation line keeps the credential going; a
+            // `key:`-shaped line is the next field and survives.
+            if line_is_header_shaped(bytes, pos) {
+                break;
+            }
         }
         cursor = pos;
     }
     out
+}
+
+/// True when the line starting at `start` begins with a `key:`-shaped
+/// field (token of `[A-Za-z0-9_-]+`, optional whitespace, then `:`).
+/// Continuation lines of a folded header do not have this shape.
+fn line_is_header_shaped(bytes: &[u8], start: usize) -> bool {
+    let mut peek = start;
+    while peek < bytes.len() && matches!(bytes[peek], b' ' | b'\t') {
+        peek += 1;
+    }
+    let token_start = peek;
+    while peek < bytes.len()
+        && matches!(bytes[peek], b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_')
+    {
+        peek += 1;
+    }
+    if peek == token_start {
+        return false;
+    }
+    while peek < bytes.len() && matches!(bytes[peek], b' ' | b'\t') {
+        peek += 1;
+    }
+    peek < bytes.len() && bytes[peek] == b':'
 }
 
 /// UTF-8-safe truncation to a byte budget: the cut only happens on char
@@ -1626,13 +1689,24 @@ mod tests {
                 "Authorization: Basic QA_SUPER_SECRET\nstatus: ok",
                 "Authorization: [redacted]\nstatus: ok",
             ),
-            // JSON-embedded shape: the opening quote is part of the
-            // separator run; the closing quote is swallowed by the
-            // line-rest redaction (fail safe).
+            // JSON-embedded shape: quoted values redact to the closing
+            // quote, which survives.
             (
                 "\"authorization\": \"Bearer QA_SUPER_SECRET\"",
-                "\"authorization\": \"[redacted]",
+                "\"authorization\": \"[redacted]\"",
             ),
+            // Round-4 (acceptance P1-2): folded header layout.
+            (
+                "Authorization:\r\n Basic QA_FOLDED_SECRET\r\nstatus: failed",
+                "Authorization:\r\n[redacted]\r\nstatus: failed",
+            ),
+            // Round-4 (acceptance P1-2): quoted value containing whitespace.
+            (
+                "token=\"QA_FIRST_SECRET QA_SECOND_SECRET\"",
+                "token=\"[redacted]\"",
+            ),
+            // Quoted value without a closer fails safe to end-of-text.
+            ("token=\"QA_OPEN_SECRET", "token=\"[redacted]"),
             // Prose mentioning authorization without an assignment shape is
             // not credential material and survives.
             (
