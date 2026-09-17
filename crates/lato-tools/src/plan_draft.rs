@@ -1234,8 +1234,10 @@ mod tests {
             // Platform difference (project-owner ruling): Linux O_TMPFILE is
             // truly zero-residue; named-temporary platforms leave the
             // isolated file under an auditable `.reap` name — but only for
-            // stages at or after CreateTemp (earlier failures never created
-            // anything). No stage may leak the ORIGINAL temporary path.
+            // stages AFTER CreateTemp (the CreateTemp injection fires before
+            // anything is created, and earlier failures never create
+            // anything either). No stage may leak the ORIGINAL temporary
+            // path.
             let residue = leftovers(&root);
             if cfg!(target_os = "linux") {
                 assert!(
@@ -1244,8 +1246,7 @@ mod tests {
                 );
             } else if matches!(
                 stage,
-                PlanDraftStage::CreateTemp
-                    | PlanDraftStage::Write
+                PlanDraftStage::Write
                     | PlanDraftStage::Flush
                     | PlanDraftStage::FileSync
                     | PlanDraftStage::SecondParentCheck
@@ -1265,7 +1266,7 @@ mod tests {
             } else {
                 assert!(
                     residue.is_empty(),
-                    "stage {stage:?}: nothing was created before CreateTemp: {residue:?}"
+                    "stage {stage:?}: nothing was created before Write: {residue:?}"
                 );
             }
         }
