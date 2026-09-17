@@ -16,8 +16,8 @@
 // unavailable; late calls fail closed with `agentfield.unavailable` and
 // the remote execution is NEVER implicitly cancelled.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Instant;
 
 use serde_json::Value;
@@ -185,6 +185,37 @@ struct Inner {
     runs: Vec<RunState>,
 }
 
+/// Drop guard for an in-flight `start_run` send. If the future is dropped
+/// before the send resolved (tool timeout, task abort, mid-call cancel),
+/// the reserved run — which may or may not have reached the control plane —
+/// is marked permanently `outcome_unknown`: it can never stay a stranded,
+/// unbound `queued` reservation (spec §7.2).
+struct SendGuard {
+    inner: Arc<StdMutex<Inner>>,
+    run_id: String,
+    resolved: bool,
+}
+
+impl Drop for SendGuard {
+    fn drop(&mut self) {
+        if self.resolved {
+            return;
+        }
+        if let Ok(mut inner) = self.inner.lock()
+            && let Some(run) = inner.runs.iter_mut().find(|run| run.run_id == self.run_id)
+            && !run.status.is_terminal()
+        {
+            run.status = RunStatus::OutcomeUnknown;
+            run.last_error = Some("agentfield.outcome_unknown");
+            run.updated_at_ms = epoch_ms();
+            run.summary = Some(
+                "the start outcome could not be determined because the call was interrupted; the execution may have started. Verify manually in the AgentField control plane (by time, target, and audit records). Do NOT start again unless accepting duplicate-execution risk."
+                    .to_owned(),
+            );
+        }
+    }
+}
+
 /// Session-scoped run manager. All mutating transitions serialize on
 /// `inner`; the remote send happens outside the lock so one slow request
 /// never blocks state reads, but capacity is consumed inside the lock.
@@ -194,7 +225,7 @@ pub struct AgentFieldManager {
     factory: Option<ClientFactory>,
     client: OnceCell<Arc<dyn AgentFieldClient>>,
     probe_cache: Mutex<Option<(Instant, AgentFieldHealthSnapshot)>>,
-    inner: Mutex<Inner>,
+    inner: Arc<StdMutex<Inner>>,
     seq: AtomicU64,
     closed: AtomicBool,
 }
@@ -231,7 +262,7 @@ impl AgentFieldManager {
             factory,
             client: OnceCell::new(),
             probe_cache: Mutex::new(None),
-            inner: Mutex::new(Inner { runs: Vec::new() }),
+            inner: Arc::new(StdMutex::new(Inner { runs: Vec::new() })),
             seq: AtomicU64::new(1),
             closed: AtomicBool::new(false),
         }
@@ -351,9 +382,12 @@ impl AgentFieldManager {
         input: &Value,
     ) -> Result<RunState, ManagerError> {
         self.ensure_open()?;
+        // Obtain the client BEFORE the reservation: a client failure means
+        // NO request was attempted and nothing needs rolling back.
+        let client = self.client().await?;
         let input_digest = digest_hex(&canonical_input(input));
         let run_id = {
-            let mut inner = self.inner.lock().await;
+            let mut inner = self.inner.lock().expect("agentfield run state lock");
             let nonterminal = inner
                 .runs
                 .iter()
@@ -400,40 +434,40 @@ impl AgentFieldManager {
             });
             run_id
         };
-
-        // Obtain the client BEFORE the send decision: a client failure means
-        // NO request was attempted, so the reservation rolls back and the
-        // stable error surfaces with zero run residue.
-        let client = match self.client().await {
-            Ok(client) => client,
-            Err(error) => {
-                self.inner
-                    .lock()
-                    .await
-                    .runs
-                    .retain(|run| run.run_id != run_id);
-                return Err(error);
-            }
+        // Disarmed on every deliberate resolution path; fires only when the
+        // future is dropped mid-send (cancel/timeout/abort).
+        let mut guard = SendGuard {
+            inner: self.inner.clone(),
+            run_id: run_id.clone(),
+            resolved: false,
         };
 
         // Exactly one send attempt. Everything below is post-decision.
-        match client.start_async(execute_target, input).await {
+        let outcome = client.start_async(execute_target, input).await;
+        match outcome {
             Ok(envelope) => {
                 if envelope.execution_id.is_empty() {
-                    return Ok(self.mark_outcome_unknown(&run_id).await);
+                    let run = self.mark_outcome_unknown(&run_id).await;
+                    guard.resolved = true;
+                    return Ok(run);
                 }
-                let mut inner = self.inner.lock().await;
+                let mut inner = self.inner.lock().expect("agentfield run state lock");
                 if let Some(run) = inner.runs.iter_mut().find(|run| run.run_id == run_id) {
                     run.execution_id = Some(envelope.execution_id);
                     run.status = RunStatus::Queued;
                     run.updated_at_ms = epoch_ms();
+                    guard.resolved = true;
                     Ok(run.clone())
                 } else {
                     // The reservation cannot vanish while nonterminal.
                     Err(ManagerError::NotFound)
                 }
             }
-            Err(error) => self.finish_failed_send(&run_id, error).await,
+            Err(error) => {
+                let result = self.finish_failed_send(&run_id, error).await;
+                guard.resolved = true;
+                result
+            }
         }
     }
 
@@ -449,7 +483,7 @@ impl AgentFieldManager {
             error,
             AgentFieldError::Unauthorized | AgentFieldError::RemoteDenied
         );
-        let mut inner = self.inner.lock().await;
+        let mut inner = self.inner.lock().expect("agentfield run state lock");
         let Some(run) = inner.runs.iter_mut().find(|run| run.run_id == run_id) else {
             return Err(ManagerError::NotFound);
         };
@@ -475,7 +509,7 @@ impl AgentFieldManager {
     }
 
     async fn mark_outcome_unknown(&self, run_id: &str) -> RunState {
-        let mut inner = self.inner.lock().await;
+        let mut inner = self.inner.lock().expect("agentfield run state lock");
         let Some(run) = inner.runs.iter_mut().find(|run| run.run_id == run_id) else {
             unreachable!("reservation for {run_id} cannot vanish before binding");
         };
@@ -497,12 +531,12 @@ impl AgentFieldManager {
     pub async fn run_status(&self, run_id: Option<&str>) -> Result<Vec<RunState>, ManagerError> {
         self.ensure_open()?;
         let Some(run_id) = run_id else {
-            let inner = self.inner.lock().await;
+            let inner = self.inner.lock().expect("agentfield run state lock");
             let runs: Vec<RunState> = inner.runs.iter().rev().take(20).cloned().collect();
             return Ok(runs);
         };
         let execution_id = {
-            let inner = self.inner.lock().await;
+            let inner = self.inner.lock().expect("agentfield run state lock");
             let run = inner
                 .runs
                 .iter()
@@ -521,7 +555,7 @@ impl AgentFieldManager {
         let Some(execution_id) = execution_id else {
             // Nonterminal without a bound execution id cannot exist (every
             // admitted run binds or turns outcome_unknown before returning).
-            let inner = self.inner.lock().await;
+            let inner = self.inner.lock().expect("agentfield run state lock");
             let run = inner
                 .runs
                 .iter()
@@ -534,7 +568,7 @@ impl AgentFieldManager {
         match envelope {
             Ok(envelope) => {
                 let status = map_remote_status(&envelope)?;
-                let mut inner = self.inner.lock().await;
+                let mut inner = self.inner.lock().expect("agentfield run state lock");
                 let Some(run) = inner.runs.iter_mut().find(|run| run.run_id == run_id) else {
                     return Err(ManagerError::NotFound);
                 };
@@ -544,7 +578,7 @@ impl AgentFieldManager {
             Err(AgentFieldError::Unavailable(_)) => {
                 // Control plane temporarily unreachable: not terminal, the
                 // last known state is preserved (spec §7.3).
-                let mut inner = self.inner.lock().await;
+                let mut inner = self.inner.lock().expect("agentfield run state lock");
                 let Some(run) = inner.runs.iter_mut().find(|run| run.run_id == run_id) else {
                     return Err(ManagerError::NotFound);
                 };
@@ -573,7 +607,7 @@ impl AgentFieldManager {
     ) -> Result<(RunState, CancelOutcome), ManagerError> {
         self.ensure_open()?;
         let execution_id = {
-            let inner = self.inner.lock().await;
+            let inner = self.inner.lock().expect("agentfield run state lock");
             let run = inner
                 .runs
                 .iter()
@@ -585,7 +619,7 @@ impl AgentFieldManager {
             run.execution_id.clone()
         };
         let Some(execution_id) = execution_id else {
-            let inner = self.inner.lock().await;
+            let inner = self.inner.lock().expect("agentfield run state lock");
             let run = inner
                 .runs
                 .iter()
@@ -597,7 +631,7 @@ impl AgentFieldManager {
         let result = client.cancel(&execution_id, reason).await;
         match result {
             Ok(Some(_envelope)) => {
-                let mut inner = self.inner.lock().await;
+                let mut inner = self.inner.lock().expect("agentfield run state lock");
                 let Some(run) = inner.runs.iter_mut().find(|run| run.run_id == run_id) else {
                     return Err(ManagerError::NotFound);
                 };
@@ -611,7 +645,7 @@ impl AgentFieldManager {
                 // 409 invalid_state: the remote says the execution is already
                 // terminal. The local state is left for the next `status` to
                 // reconcile; the outcome is still truthful.
-                let inner = self.inner.lock().await;
+                let inner = self.inner.lock().expect("agentfield run state lock");
                 let run = inner
                     .runs
                     .iter()
@@ -620,7 +654,7 @@ impl AgentFieldManager {
                 Ok((run.clone(), CancelOutcome::AlreadyTerminal))
             }
             Err(error) => {
-                let mut inner = self.inner.lock().await;
+                let mut inner = self.inner.lock().expect("agentfield run state lock");
                 let Some(run) = inner.runs.iter_mut().find(|run| run.run_id == run_id) else {
                     return Err(ManagerError::NotFound);
                 };
@@ -633,12 +667,16 @@ impl AgentFieldManager {
     /// Local run lookup (no network). Unknown and foreign ids return
     /// `None` — the caller renders the same `agentfield.not_found`.
     pub async fn run(&self, run_id: &str) -> Option<RunState> {
-        let inner = self.inner.lock().await;
+        let inner = self.inner.lock().expect("agentfield run state lock");
         inner.runs.iter().find(|run| run.run_id == run_id).cloned()
     }
 
     pub async fn run_count(&self) -> usize {
-        self.inner.lock().await.runs.len()
+        self.inner
+            .lock()
+            .expect("agentfield run state lock")
+            .runs
+            .len()
     }
 }
 
@@ -795,6 +833,9 @@ mod tests {
         Ok(String),
         EmptyId,
         Fail(AgentFieldError),
+        /// Sleep before answering, so the send future can be aborted
+        /// mid-flight (Round-1 acceptance P1-1 regression).
+        DelayThenOk(String, u64),
     }
 
     #[derive(Clone)]
@@ -867,6 +908,10 @@ mod tests {
                 StartBehavior::Ok(id) => Ok(start_envelope(&id)),
                 StartBehavior::EmptyId => Ok(start_envelope("")),
                 StartBehavior::Fail(error) => Err(error),
+                StartBehavior::DelayThenOk(id, ms) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                    Ok(start_envelope(&id))
+                }
             }
         }
 
@@ -1058,7 +1103,7 @@ mod tests {
                 .await
                 .unwrap();
             // Force each to a terminal state through a completed status.
-            *manager.inner.lock().await.runs.last_mut().unwrap() = {
+            *manager.inner.lock().expect("lock").runs.last_mut().unwrap() = {
                 let mut completed = run.clone();
                 completed.status = RunStatus::Completed;
                 completed
@@ -1095,7 +1140,7 @@ mod tests {
         // A single nonterminal run occupies the only slot we can create here;
         // simulate a full nonterminal set by patching inner directly.
         {
-            let mut inner = manager.inner.lock().await;
+            let mut inner = manager.inner.lock().expect("lock");
             for seq in 0..MAX_RETAINED_RUNS {
                 inner.runs.push(RunState {
                     run_id: format!("afrun_fill-{seq}"),
@@ -1342,5 +1387,46 @@ mod tests {
         let (summary, truncated) = truncate_utf8(&mixed, MAX_SUMMARY_BYTES);
         assert!(truncated);
         assert!(std::str::from_utf8(summary.as_bytes()).is_ok());
+    }
+
+    #[tokio::test]
+    async fn aborted_send_future_leaves_no_stranded_queued_run() {
+        let (manager, client) = manager_with(StartBehavior::DelayThenOk("exec-1".into(), 5_000));
+        let manager = Arc::new(manager);
+        let task = tokio::spawn({
+            let manager = manager.clone();
+            async move {
+                manager
+                    .start_run(
+                        "contract-review",
+                        "legal.review_contract",
+                        "sha256:x",
+                        &input(),
+                    )
+                    .await
+            }
+        });
+        // Wait until the request is in flight, then drop the future.
+        while client.start_calls.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        task.abort();
+        let _ = task.await;
+        // The synchronous drop guard must have flipped the unbound run to
+        // the permanent local terminal — never a stranded `queued`.
+        let runs = manager.run_status(None).await.unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, RunStatus::OutcomeUnknown);
+        assert!(runs[0].execution_id.is_none());
+        assert_eq!(runs[0].last_error, Some("agentfield.outcome_unknown"));
+        assert!(runs[0].summary.as_deref().unwrap().contains("interrupted"));
+        // The stranded run is terminal, so it consumes no active capacity.
+        let inner = manager.inner.lock().expect("lock");
+        let nonterminal = inner
+            .runs
+            .iter()
+            .filter(|run| !run.status.is_terminal())
+            .count();
+        assert_eq!(nonterminal, 0);
     }
 }
