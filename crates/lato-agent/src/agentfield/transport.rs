@@ -70,13 +70,35 @@ impl AgentFieldDnsResolver for SystemAgentFieldDnsResolver {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct AddressRejection(pub(crate) &'static str);
 
-/// The two frozen address policies. Production (HTTPS) dials public
+/// The frozen address policies. Production (HTTPS) dials public
 /// addresses only; explicit development mode over plain HTTP dials loopback
-/// only — a public address is as forbidden there as a private one.
+/// only — a public address is as forbidden there as a private one. The
+/// TLS-test policy exists solely for the `#[cfg(test)]` local-TLS
+/// verification tests (a full-verification rustls client against a loopback
+/// server with an injected trusted root); production constructors never
+/// produce it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AddressPolicy {
     ProductionHttps,
     DevHttpLoopback,
+    #[cfg_attr(not(test), allow(dead_code))]
+    TlsTestLoopback,
+}
+
+impl AddressPolicy {
+    fn allows_loopback(self) -> bool {
+        matches!(
+            self,
+            AddressPolicy::DevHttpLoopback | AddressPolicy::TlsTestLoopback
+        )
+    }
+
+    fn allows_public(self) -> bool {
+        matches!(
+            self,
+            AddressPolicy::ProductionHttps | AddressPolicy::TlsTestLoopback
+        )
+    }
 }
 
 /// Table-driven denylist of IPv4 special-purpose ranges that are never
@@ -133,27 +155,30 @@ fn is_special_purpose_v6(segments: [u16; 8]) -> bool {
 
 fn classify_v4(ip: std::net::Ipv4Addr, policy: AddressPolicy) -> Result<(), AddressRejection> {
     if ip.is_loopback() {
-        return match policy {
-            AddressPolicy::DevHttpLoopback => Ok(()),
-            AddressPolicy::ProductionHttps => Err(AddressRejection("loopback address")),
+        return if policy.allows_loopback() {
+            Ok(())
+        } else {
+            Err(AddressRejection("loopback address"))
         };
     }
     if is_special_purpose_v4(ip.octets()) {
         return Err(AddressRejection("non-public address"));
     }
-    match policy {
-        AddressPolicy::ProductionHttps => Ok(()),
-        AddressPolicy::DevHttpLoopback => Err(AddressRejection(
+    if policy.allows_public() {
+        Ok(())
+    } else {
+        Err(AddressRejection(
             "development HTTP allows only loopback addresses",
-        )),
+        ))
     }
 }
 
 fn classify_v6(ip: std::net::Ipv6Addr, policy: AddressPolicy) -> Result<(), AddressRejection> {
     if ip.is_loopback() {
-        return match policy {
-            AddressPolicy::DevHttpLoopback => Ok(()),
-            AddressPolicy::ProductionHttps => Err(AddressRejection("loopback address")),
+        return if policy.allows_loopback() {
+            Ok(())
+        } else {
+            Err(AddressRejection("loopback address"))
         };
     }
     // IPv4-mapped IPv6 must obey the IPv4 policy (mapped private ranges are
@@ -176,17 +201,30 @@ fn classify_v6(ip: std::net::Ipv6Addr, policy: AddressPolicy) -> Result<(), Addr
     if ip.is_unspecified() || is_special_purpose_v6(segments) {
         return Err(AddressRejection("non-public address"));
     }
-    match policy {
-        AddressPolicy::ProductionHttps => Ok(()),
-        AddressPolicy::DevHttpLoopback => Err(AddressRejection(
+    if policy.allows_public() {
+        Ok(())
+    } else {
+        Err(AddressRejection(
             "development HTTP allows only loopback addresses",
-        )),
+        ))
     }
 }
 
-/// Classify one address against the frozen policy (Round 2/3 probes: a
-/// production HTTPS loopback target is rejected even when a development
-/// flag is forged; a development HTTP target outside loopback is rejected).
+/// Classify one address against a concrete frozen policy.
+pub(crate) fn classify_address_with(
+    ip: IpAddr,
+    policy: AddressPolicy,
+) -> Result<(), AddressRejection> {
+    match ip {
+        IpAddr::V4(ip) => classify_v4(ip, policy),
+        IpAddr::V6(ip) => classify_v6(ip, policy),
+    }
+}
+
+/// Classify one address against the scheme-derived production policy
+/// (Round 2/3 probes: a production HTTPS loopback target is rejected even
+/// when a development flag is forged; a development HTTP target outside
+/// loopback is rejected).
 pub(crate) fn classify_address(
     ip: IpAddr,
     scheme: &str,
@@ -203,14 +241,24 @@ pub(crate) fn classify_address(
             ));
         }
     };
-    match ip {
-        IpAddr::V4(ip) => classify_v4(ip, policy),
-        IpAddr::V6(ip) => classify_v6(ip, policy),
+    classify_address_with(ip, policy)
+}
+
+/// The production policy selector: HTTPS is always production (public
+/// addresses only, loopback refused even with a forged dev flag); plain
+/// HTTP requires the explicit development flag and then dials loopback only.
+fn policy_for(origin: &ControlPlaneOrigin) -> Result<AddressPolicy, AddressRejection> {
+    match (origin.base.scheme(), origin.allow_loopback_http) {
+        ("http", true) => Ok(AddressPolicy::DevHttpLoopback),
+        ("https", _) => Ok(AddressPolicy::ProductionHttps),
+        _ => Err(AddressRejection(
+            "plain HTTP requires explicit development mode",
+        )),
     }
 }
 
 /// What the origin host turned out to be after syntax checks: an IP
-/// (or `localhost`) literal classified without DNS, or a hostname that
+/// (or `localhost`) literal to classify without DNS, or a hostname that
 /// must be resolved.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum HostClassification {
@@ -220,13 +268,10 @@ pub(crate) enum HostClassification {
 
 /// Syntax-level host checks that run before any DNS query: zone IDs,
 /// percent-encoding, Unicode confusion labels and trailing-dot bypasses are
-/// rejected outright; IP literals and `localhost` are classified directly
-/// with zero DNS queries (Round 3 probe).
-pub(crate) fn classify_host_literal(
-    host: &str,
-    scheme: &str,
-    allow_loopback_http: bool,
-) -> Result<HostClassification, AddressRejection> {
+/// rejected outright; IP literals and `localhost` are identified without
+/// any DNS query (Round 3 probe). Classification of literals happens
+/// against the selected policy in `build`/`revalidate`.
+pub(crate) fn host_syntax(host: &str) -> Result<HostClassification, AddressRejection> {
     if host.is_empty() {
         return Err(AddressRejection("empty host"));
     }
@@ -241,7 +286,6 @@ pub(crate) fn classify_host_literal(
     }
     // `localhost` is a loopback literal regardless of what DNS claims.
     if host == "localhost" {
-        classify_address(IpAddr::from([127, 0, 0, 1]), scheme, allow_loopback_http)?;
         return Ok(HostClassification::Literal(IpAddr::from([127, 0, 0, 1])));
     }
     let literal = if let Some(inner) = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
@@ -254,7 +298,6 @@ pub(crate) fn classify_host_literal(
         host.parse::<IpAddr>().ok()
     };
     if let Some(ip) = literal {
-        classify_address(ip, scheme, allow_loopback_http)?;
         return Ok(HostClassification::Literal(ip));
     }
     Ok(HostClassification::Name)
@@ -264,8 +307,7 @@ pub(crate) fn classify_host_literal(
 /// forbidden address rejects the whole set and no connection is attempted.
 pub(crate) fn classify_resolution(
     addresses: &[SocketAddr],
-    scheme: &str,
-    allow_loopback_http: bool,
+    policy: AddressPolicy,
 ) -> Result<(), AddressRejection> {
     if addresses.is_empty() {
         return Err(AddressRejection("empty DNS answer"));
@@ -278,7 +320,7 @@ pub(crate) fn classify_resolution(
         if !seen.insert(address.ip()) {
             return Err(AddressRejection("duplicate DNS answer"));
         }
-        classify_address(address.ip(), scheme, allow_loopback_http)?;
+        classify_address_with(address.ip(), policy)?;
     }
     Ok(())
 }
@@ -340,6 +382,8 @@ impl Default for Limits {
 /// the frozen address set the client may dial.
 pub struct ReqwestTransport {
     origin: ControlPlaneOrigin,
+    /// Frozen at construction; re-applied on every send (literal or DNS).
+    policy: AddressPolicy,
     /// `Some` when the origin host is an IP/`localhost` literal: the policy
     /// then re-classifies the literal on every send and never queries DNS.
     literal: Option<IpAddr>,
@@ -363,7 +407,7 @@ impl ReqwestTransport {
         origin: &ControlPlaneOrigin,
         limits: Limits,
     ) -> Result<Self, TransportError> {
-        Self::build(origin, Arc::new(SystemAgentFieldDnsResolver), limits).await
+        Self::build(origin, Arc::new(SystemAgentFieldDnsResolver), limits, None).await
     }
 
     /// Arbitrary-resolver construction exists only for in-crate regression
@@ -373,32 +417,46 @@ impl ReqwestTransport {
         origin: &ControlPlaneOrigin,
         resolver: Arc<dyn AgentFieldDnsResolver>,
     ) -> Result<Self, TransportError> {
-        Self::build(origin, resolver, Limits::default()).await
+        Self::build(origin, resolver, Limits::default(), None).await
+    }
+
+    /// TLS-verification test constructor (AC-05, `#[cfg(test)]` only): a
+    /// local HTTPS loopback server with a test root added to the trust
+    /// store. Verification stays FULL (chain + original-host name check) —
+    /// this is standard root pinning for tests, never an insecure path, and
+    /// the default build cannot reach it.
+    #[cfg(test)]
+    pub(crate) async fn connect_tls_test(
+        origin: &ControlPlaneOrigin,
+        resolver: Arc<dyn AgentFieldDnsResolver>,
+        test_root_pem: &str,
+    ) -> Result<Self, TransportError> {
+        Self::build(origin, resolver, Limits::default(), Some(test_root_pem)).await
     }
 
     async fn build(
         origin: &ControlPlaneOrigin,
         resolver: Arc<dyn AgentFieldDnsResolver>,
         limits: Limits,
+        test_root_pem: Option<&str>,
     ) -> Result<Self, TransportError> {
+        // The TLS-test policy applies only when the test constructor passed
+        // a trusted root; production constructors always derive the frozen
+        // scheme-based policy.
+        let policy = match test_root_pem {
+            Some(_) => AddressPolicy::TlsTestLoopback,
+            None => policy_for(origin).map_err(reject)?,
+        };
         let host = origin_host(origin)?;
-        let scheme = origin.base.scheme();
         let port = origin
             .base
             .port_or_known_default()
             .ok_or(TransportError::PolicyRejected("origin port unknown".into()))?;
         // Literal hosts are classified without any DNS query; a hostname is
         // resolved once and the full answer classified before a client exists.
-        let literal = match classify_host_literal(&host, scheme, origin.allow_loopback_http)
-            .map_err(reject)?
-        {
+        let literal = match host_syntax(&host).map_err(reject)? {
             HostClassification::Literal(ip) => {
-                classify_resolution(
-                    &[SocketAddr::new(ip, port)],
-                    scheme,
-                    origin.allow_loopback_http,
-                )
-                .map_err(reject)?;
+                classify_address_with(ip, policy).map_err(reject)?;
                 Some(ip)
             }
             HostClassification::Name => None,
@@ -410,12 +468,19 @@ impl ReqwestTransport {
                 .await
                 .map_err(|_| TransportError::Connection("DNS resolution failed".into()))?,
         };
-        classify_resolution(&addresses, scheme, origin.allow_loopback_http).map_err(reject)?;
+        classify_resolution(&addresses, policy).map_err(reject)?;
         let pinned = Arc::new(PinnedAddresses {
             host,
             set: Arc::new(Mutex::new(addresses)),
         });
-        let client = Client::builder()
+        let mut builder = Client::builder();
+        if let Some(pem) = test_root_pem {
+            let root = reqwest::tls::Certificate::from_pem(pem.as_bytes()).map_err(|_| {
+                TransportError::Connection("test root certificate is invalid".into())
+            })?;
+            builder = builder.add_root_certificate(root);
+        }
+        let client = builder
             // Frozen TLS policy: rustls with default verification. No
             // insecure-certificate path exists anywhere in this module.
             .use_rustls_tls()
@@ -428,6 +493,7 @@ impl ReqwestTransport {
             .map_err(|_| TransportError::Connection("HTTP client construction failed".into()))?;
         Ok(Self {
             origin: origin.clone(),
+            policy,
             literal,
             client,
             pinned,
@@ -440,7 +506,6 @@ impl ReqwestTransport {
     /// A single forbidden address aborts the request with zero connections.
     /// Literal origins re-classify the literal instead of querying DNS.
     async fn revalidate(&self) -> Result<(), TransportError> {
-        let scheme = self.origin.base.scheme();
         let port = self
             .origin
             .base
@@ -448,7 +513,7 @@ impl ReqwestTransport {
             .ok_or(TransportError::PolicyRejected("origin port unknown".into()))?;
         let addresses = match self.literal {
             Some(ip) => {
-                classify_address(ip, scheme, self.origin.allow_loopback_http).map_err(reject)?;
+                classify_address_with(ip, self.policy).map_err(reject)?;
                 vec![SocketAddr::new(ip, port)]
             }
             None => {
@@ -458,8 +523,7 @@ impl ReqwestTransport {
                     .resolve(&host, port)
                     .await
                     .map_err(|_| TransportError::Connection("DNS resolution failed".into()))?;
-                classify_resolution(&resolved, scheme, self.origin.allow_loopback_http)
-                    .map_err(reject)?;
+                classify_resolution(&resolved, self.policy).map_err(reject)?;
                 resolved
             }
         };
@@ -594,8 +658,7 @@ fn origin_host(origin: &ControlPlaneOrigin) -> Result<String, TransportError> {
         .base
         .host_str()
         .ok_or(TransportError::PolicyRejected("origin has no host".into()))?;
-    classify_host_literal(host, origin.base.scheme(), origin.allow_loopback_http)
-        .map_err(reject)?;
+    host_syntax(host).map_err(reject)?;
     Ok(host.to_ascii_lowercase())
 }
 
@@ -777,14 +840,22 @@ pub(crate) mod tests {
             "exämple.com",
         ];
         for host in cases {
-            assert!(
-                classify_host_literal(host, "https", false).is_err(),
-                "{host} was accepted"
-            );
+            assert!(host_syntax(host).is_err(), "{host} was accepted");
         }
-        // IP literals are classified directly (no DNS later for them).
-        assert!(classify_host_literal("127.0.0.1", "https", false).is_err());
-        assert!(classify_host_literal("agents.example.com", "https", false).is_ok());
+        // IP literals are identified without DNS and then classified.
+        let literal = host_syntax("127.0.0.1").unwrap();
+        assert!(matches!(literal, HostClassification::Literal(_)));
+        assert!(
+            classify_address_with("127.0.0.1".parse().unwrap(), AddressPolicy::ProductionHttps)
+                .is_err()
+        );
+        assert!(
+            matches!(
+                host_syntax("agents.example.com"),
+                Ok(HostClassification::Name)
+            ),
+            "hostname syntax must be accepted"
+        );
     }
 
     #[tokio::test]
@@ -940,7 +1011,7 @@ pub(crate) mod tests {
         out
     }
 
-    async fn read_request_headers(sock: &mut tokio::net::TcpStream) -> String {
+    async fn read_request_headers<S: tokio::io::AsyncRead + Unpin>(sock: &mut S) -> String {
         use tokio::io::AsyncReadExt;
         let mut buf = [0u8; 2048];
         let mut acc: Vec<u8> = Vec::new();
@@ -1468,5 +1539,160 @@ pub(crate) mod tests {
         }
         assert_eq!(resolver.calls.load(Ordering::SeqCst), 3);
         assert_eq!(server.connections.load(Ordering::SeqCst), 2);
+    }
+
+    // --- AC-05: dynamic rustls verification against a local TLS server ---
+
+    /// Generate a CA plus a leaf certificate for `san_dns`, returning the CA
+    /// PEM (the test root) and the leaf DER material for the TLS server.
+    fn generate_trusted_chain(san_dns: &str) -> (String, Vec<u8>, Vec<u8>) {
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        ca_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "Lato 7C1.1 Test CA");
+        ca_params.key_usages = vec![
+            rcgen::KeyUsagePurpose::DigitalSignature,
+            rcgen::KeyUsagePurpose::KeyCertSign,
+        ];
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+
+        let server_key = rcgen::KeyPair::generate().unwrap();
+        let mut server_params = rcgen::CertificateParams::new(vec![san_dns.to_string()]).unwrap();
+        server_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, san_dns);
+        server_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+        let server_cert = server_params
+            .signed_by(&server_key, &ca_cert, &ca_key)
+            .unwrap();
+
+        (
+            ca_cert.pem(),
+            server_cert.der().to_vec(),
+            server_key.serialize_der(),
+        )
+    }
+
+    /// Generate a self-signed leaf for `san_dns` (no trusted CA behind it).
+    fn generate_self_signed(san_dns: &str) -> (Vec<u8>, Vec<u8>) {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::new(vec![san_dns.to_string()]).unwrap();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, san_dns);
+        params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+        let cert = params.self_signed(&key).unwrap();
+        (cert.der().to_vec(), key.serialize_der())
+    }
+
+    /// HTTPS loopback server presenting the given certificate material.
+    async fn spawn_tls_server(cert_der: Vec<u8>, key_der: Vec<u8>) -> CannedServer {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let connections = Arc::new(AtomicUsize::new(0));
+        let counter = connections.clone();
+        let mut server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![rustls::pki_types::CertificateDer::from(cert_der)],
+                rustls::pki_types::PrivateKeyDer::Pkcs8(
+                    rustls::pki_types::PrivatePkcs8KeyDer::from(key_der),
+                ),
+            )
+            .unwrap();
+        server_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let response = http_response(
+            "HTTP/1.1 200 OK",
+            &[("content-type", "application/json")],
+            b"{}",
+        );
+        tokio::spawn(async move {
+            let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+            while let Ok((sock, _)) = listener.accept().await {
+                counter.fetch_add(1, Ordering::SeqCst);
+                let Ok(mut tls) = acceptor.accept(sock).await else {
+                    break;
+                };
+                let _ = read_request_headers(&mut tls).await;
+                let _ = tls.write_all(&response.clone()).await;
+                let _ = tls.shutdown().await;
+            }
+        });
+        CannedServer { addr, connections }
+    }
+
+    fn tls_origin(port: u16) -> ControlPlaneOrigin {
+        ControlPlaneOrigin {
+            base: format!("https://localhost:{port}").parse().unwrap(),
+            allow_loopback_http: false,
+        }
+    }
+
+    fn tls_request(port: u16) -> OutboundRequest {
+        OutboundRequest {
+            method: "GET",
+            url: format!("https://localhost:{port}/api/v1/x"),
+            bearer: None,
+            json_body: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn tls_chain_and_original_host_name_verification_succeed() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (ca_pem, cert_der, key_der) = generate_trusted_chain("localhost");
+        let server = spawn_tls_server(cert_der, key_der).await;
+        let transport = ReqwestTransport::connect_tls_test(
+            &tls_origin(server.addr.port()),
+            Arc::new(FixedResolver(vec![IpAddr::from([127, 0, 0, 1])])),
+            &ca_pem,
+        )
+        .await
+        .unwrap();
+        let response = transport
+            .send(tls_request(server.addr.port()))
+            .await
+            .expect("trusted chain for the original host must verify");
+        assert_eq!(response.status, 200);
+    }
+
+    #[tokio::test]
+    async fn tls_certificate_for_a_different_name_fails_closed() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        // Chain is trusted (signed by the test root) but the certificate is
+        // valid for another DNS name: the original-host name check fails.
+        let (ca_pem, cert_der, key_der) = generate_trusted_chain("other.example.org");
+        let server = spawn_tls_server(cert_der, key_der).await;
+        let transport = ReqwestTransport::connect_tls_test(
+            &tls_origin(server.addr.port()),
+            Arc::new(FixedResolver(vec![IpAddr::from([127, 0, 0, 1])])),
+            &ca_pem,
+        )
+        .await
+        .unwrap();
+        let error = transport.send(tls_request(server.addr.port())).await;
+        assert!(error.is_err(), "name-mismatched certificate was accepted");
+    }
+
+    #[tokio::test]
+    async fn tls_self_signed_certificate_fails_closed() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        // The presented certificate is self-signed and NOT the test root:
+        // rustls default verification must reject it.
+        let (cert_der, key_der) = generate_self_signed("localhost");
+        let (ca_pem, _unused, _unused2) = generate_trusted_chain("localhost");
+        let server = spawn_tls_server(cert_der, key_der).await;
+        let transport = ReqwestTransport::connect_tls_test(
+            &tls_origin(server.addr.port()),
+            Arc::new(FixedResolver(vec![IpAddr::from([127, 0, 0, 1])])),
+            &ca_pem,
+        )
+        .await
+        .unwrap();
+        let error = transport.send(tls_request(server.addr.port())).await;
+        assert!(error.is_err(), "self-signed certificate was accepted");
     }
 }
