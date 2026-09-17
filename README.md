@@ -405,7 +405,7 @@ lato doctor --strict
 lato doctor --live
 ```
 
-Default `lato doctor` is offline: it does not contact providers or submit a prompt completion. It reports binary/platform, Lato home, config parsing, selected-model catalog presence, credential presence (not values), ToolCatalog construction, a fixed PolicyEngine self-test, sandbox readiness, and project/plugin trust. `--json` prints a `schema_version: 1` report on stdout. Warnings keep exit status 0; errors return 1. `--strict` upgrades warnings to failure. `--live` is the only Doctor mode allowed to use the network; it runs a bounded catalog/connectivity probe and does not submit an ordinary prompt completion. When an AgentField control plane is configured, the offline report additionally covers its configuration state (disabled / unconfigured / invalid), and `--live` verifies TLS reachability, DNS/SSRF policy, pinned-version compatibility, and allowlist target existence through the 30-second snapshot cache.
+Default `lato doctor` is offline: it does not contact providers or submit a prompt completion. It reports binary/platform, Lato home, config parsing, selected-model catalog presence, credential presence (not values), ToolCatalog construction, a fixed PolicyEngine self-test, sandbox readiness, and project/plugin trust. `--json` prints a `schema_version: 1` report on stdout. Warnings keep exit status 0; errors return 1. `--strict` upgrades warnings to failure. `--live` is the only Doctor mode allowed to use the network; it runs a bounded catalog/connectivity probe and does not submit an ordinary prompt completion. When an AgentField control plane is configured, the offline report additionally covers its configuration state (disabled / unconfigured / invalid), and `--live` performs zero AgentField network requests and reports the production verification as `deferred_to_7c1_1` (Phase 7C1.1).
 
 ## AgentField adapter (Phase 7C1 v1.2.1, offline-only foundation)
 
@@ -419,7 +419,7 @@ Lato will eventually act as a client of an organization-deployed [AgentField](ht
 
 **No `agentfield` model tool is registered in any state** (enabled/disabled/unconfigured): model tool registration, manager, policy/approval wiring, and production execution arrive in Phase 7C2. **Production transport and network boundaries (HTTPS, address policy, DNS rebinding defense, address pinning, redirect/TLS/proxy, public-seam hardening) are Phase 7C1.1**, which must be independently built and accepted before Phase 7C2. Doctor `--live` therefore performs zero AgentField network requests and reports `deferred_to_7c1_1`.
 
-Configuration lives in the top-level `agentfield` section of `~/.lato/config.json` (`enabled` defaults to `false`):
+Configuration lives in the top-level `agentfield` section of `~/.lato/config.json`. The `enabled` key is required — omitting it or any other agentfield key is a parse error reported by `lato doctor`; set `"enabled": false` to disable the adapter:
 
 ```json
 {
