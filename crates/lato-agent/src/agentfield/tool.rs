@@ -288,7 +288,16 @@ impl AgentFieldTool {
         // expired-and-unreachable, and when the target is not healthy.
         match manager.target_health(&capability.target).await {
             Ok(Some(true)) => {}
-            Ok(Some(false)) => return Err(remote_denied("remote target is not healthy")),
+            // Health/discovery gaps are NOT a remote policy deny: the
+            // `agentfield.remote_denied` code is reserved for a structured
+            // AgentField policy rejection. An unhealthy target is a
+            // transient availability failure (Round-1 acceptance error-code
+            // correction; spec §11).
+            Ok(Some(false)) => {
+                return Err(unavailable_message(
+                    "remote target is not healthy; try again later",
+                ));
+            }
             Ok(None) => {
                 return Err(unavailable_message(
                     "remote health is stale and unreachable",
@@ -655,10 +664,6 @@ fn catalog_changed() -> ToolError {
     )
 }
 
-fn remote_denied(message: &str) -> ToolError {
-    ToolError::new("agentfield.remote_denied", message, Retryability::Never)
-}
-
 fn output_error(message: &str) -> ToolError {
     ToolError::new("agentfield.output_too_large", message, Retryability::Never)
 }
@@ -717,14 +722,8 @@ mod tests {
         AgentFieldConfig::parse(&raw).unwrap().unwrap()
     }
 
-    /// Minimal offline client: discovery is healthy, everything else fails
-    /// closed; the tool tests drive the manager through it.
-    struct OfflineClient;
-
-    #[async_trait]
-    impl AgentFieldClient for OfflineClient {
-        async fn discovery(&self) -> Result<DiscoveryEnvelope, AgentFieldError> {
-            DiscoveryEnvelope::decode(&json!({
+    fn discovery_value() -> Value {
+        json!({
                 "discovered_at": "2026-09-17T00:00:00Z",
                 "total_agents": 1,
                 "total_reasoners": 1,
@@ -744,8 +743,17 @@ mod tests {
                     }],
                     "skills": []
                 }]
-            }))
-            .map_err(AgentFieldError::RemoteProtocol)
+        })
+    }
+
+    /// Minimal offline client: discovery is healthy, everything else fails
+    /// closed; the tool tests drive the manager through it.
+    struct OfflineClient;
+
+    #[async_trait]
+    impl AgentFieldClient for OfflineClient {
+        async fn discovery(&self) -> Result<DiscoveryEnvelope, AgentFieldError> {
+            DiscoveryEnvelope::decode(&discovery_value()).map_err(AgentFieldError::RemoteProtocol)
         }
 
         async fn start_async(
@@ -1112,6 +1120,69 @@ mod tests {
             let error = tool.invoke(context(), arguments).await.unwrap_err();
             assert_eq!(error.code, "agentfield.unavailable", "{error:?}");
         }
+    }
+
+    /// A target that is allowlisted but NOT healthy is a transient
+    /// availability failure — never `agentfield.remote_denied` (Round-1
+    /// error-code correction).
+    #[tokio::test]
+    async fn unhealthy_target_maps_to_unavailable() {
+        struct DegradedClient;
+
+        #[async_trait]
+        impl AgentFieldClient for DegradedClient {
+            async fn discovery(&self) -> Result<DiscoveryEnvelope, AgentFieldError> {
+                let mut value = discovery_value();
+                value["capabilities"][0]["health_status"] = json!("degraded");
+                DiscoveryEnvelope::decode(&value).map_err(AgentFieldError::RemoteProtocol)
+            }
+
+            async fn start_async(
+                &self,
+                _execute_target: &str,
+                _input: &Value,
+            ) -> Result<AsyncStartEnvelope, AgentFieldError> {
+                unreachable!("start must fail closed before any send")
+            }
+
+            async fn status(&self, _execution_id: &str) -> Result<StatusEnvelope, AgentFieldError> {
+                unreachable!("status is never queried on the health gate")
+            }
+
+            async fn cancel(
+                &self,
+                _execution_id: &str,
+                _reason: &str,
+            ) -> Result<Option<CancelSuccessEnvelope>, AgentFieldError> {
+                unreachable!("cancel is never reached on the health gate")
+            }
+        }
+
+        let catalog = AgentFieldCatalog::from_config(&test_config());
+        let client: Arc<dyn AgentFieldClient> = Arc::new(DegradedClient);
+        let manager = AgentFieldManager::with_factory(
+            "session-degraded",
+            catalog,
+            Some(Arc::new(move || {
+                let client = client.clone();
+                Box::pin(async move { Ok(client.clone()) })
+            })),
+        );
+        let manager = Arc::new(manager);
+        let handle = SessionAgentFieldHandle::new();
+        handle.install(manager.clone());
+        let tool = AgentFieldTool::new(handle);
+        let revision = manager.catalog().revision().to_owned();
+        let error = tool
+            .invoke(
+                context(),
+                json!({"action":"start","name":"contract-review","revision":revision,"input":{"contract":"acme.pdf"}}),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "agentfield.unavailable", "{error:?}");
+        assert_eq!(error.retryability, Retryability::AfterBackoff);
+        assert_eq!(manager.run_count().await, 0);
     }
 
     #[tokio::test]
