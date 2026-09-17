@@ -720,6 +720,56 @@ async fn agentfield_non_live_stays_offline_without_network() {
     assert!(!rendered.contains("offline-secret"));
 }
 
+/// D-30-02: the non-live doctor message must be byte-identical whether or
+/// not a credential is resolvable — proving zero credential resolution
+/// (store entry AND `LATO_AGENTFIELD_CREDENTIAL` are never consulted).
+#[tokio::test]
+async fn agentfield_non_live_does_not_resolve_credential() {
+    let base = tempfile::tempdir().unwrap();
+    write_agentfield_config(base.path(), valid_agentfield_config("agentfield:primary"));
+    let without = non_live_report(base.path()).await;
+    let check_without = agentfield_check(&without);
+
+    let with = tempfile::tempdir().unwrap();
+    write_agentfield_config(with.path(), valid_agentfield_config("agentfield:primary"));
+    let mut store = CredentialStore::open(with.path()).unwrap();
+    store
+        .modify(|data| {
+            data.insert(
+                "agentfield".into(),
+                serde_json::json!({"type": "api_key", "key": "should-not-be-read"}),
+            );
+        })
+        .unwrap();
+    let report_with = non_live_report(with.path()).await;
+    let check_with = agentfield_check(&report_with);
+
+    assert_eq!(check_without.status, DoctorStatus::Ok);
+    assert_eq!(check_with.status, DoctorStatus::Ok);
+    assert_eq!(check_without.message, check_with.message);
+    assert_eq!(check_without.code, check_with.code);
+    let rendered = serde_json::to_string(&report_with).unwrap();
+    assert!(!rendered.contains("should-not-be-read"));
+}
+
+/// D-30-02 (source-level): the non-live early return sits BEFORE any
+/// credential-store access in `agentfield_check`.
+#[test]
+fn agentfield_non_live_returns_before_credential_access() {
+    let source = include_str!("../src/doctor.rs");
+    let non_live = source.find("if !live").expect("non-live gate present");
+    let store = source
+        .find("CredentialStore::open")
+        .expect("credential store access present");
+    let resolve = source
+        .find("resolve_agentfield_credential")
+        .expect("credential resolution present");
+    assert!(
+        non_live < store && non_live < resolve,
+        "non-live doctor must return before any credential access"
+    );
+}
+
 /// 7C1.1 AC-08: the doctor live path builds its client only through the
 /// unique policy-enforcing factory.
 #[test]

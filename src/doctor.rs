@@ -359,6 +359,21 @@ async fn agentfield_check(
             None,
         );
     }
+    if !live {
+        // Default (non-live) doctor is configuration-state only: it must not
+        // open the credential store, read `LATO_AGENTFIELD_CREDENTIAL`, or
+        // touch the network (AC-01 / designer revision 5). The message is
+        // therefore identical whether or not a credential is resolvable.
+        return check(
+            "agentfield",
+            DoctorStatus::Ok,
+            format!(
+                "enabled with {} capability(ies); run `lato doctor --live` for live AgentField diagnostics",
+                config.capabilities.len()
+            ),
+            None,
+        );
+    }
     let store = lato_ai::CredentialStore::open(home).ok();
     let credential =
         af::resolve_agentfield_credential(store.as_ref(), &config.credential_reference);
@@ -371,17 +386,6 @@ async fn agentfield_check(
                 config.credential_reference
             ),
             Some("agentfield.unconfigured"),
-        );
-    }
-    if !live {
-        return check(
-            "agentfield",
-            DoctorStatus::Ok,
-            format!(
-                "enabled with {} capability(ies); run `lato doctor --live` for live AgentField diagnostics",
-                config.capabilities.len()
-            ),
-            None,
         );
     }
     // Explicit opt-in live probe: one discovery request through the frozen
