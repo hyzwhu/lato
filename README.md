@@ -419,7 +419,7 @@ Lato will eventually act as a client of an organization-deployed [AgentField](ht
 
 **No `agentfield` model tool is registered in any state** (enabled/disabled/unconfigured): model tool registration, manager, policy/approval wiring, and production execution arrive in Phase 7C2. **Production transport and network boundaries (HTTPS, address policy, DNS rebinding defense, address pinning, redirect/TLS/proxy, public-seam hardening) are Phase 7C1.1**, which must be independently built and accepted before Phase 7C2. Doctor `--live` therefore performs zero AgentField network requests and reports `deferred_to_7c1_1`.
 
-Configuration lives in the top-level `agentfield` section of `~/.lato/config.json`. The `enabled` key is required — omitting it or any other agentfield key is a parse error reported by `lato doctor`; set `"enabled": false` to disable the adapter:
+Configuration lives in the top-level `agentfield` section of `~/.lato/config.json`. The `enabled`, `baseUrl`, and `credential` keys are required — omitting any of them is a parse error reported by `lato doctor`; `allowLoopbackHttp` and `capabilities` are optional and default to `false` / empty; unknown keys are rejected. Set `"enabled": false` to disable the adapter:
 
 ```json
 {
