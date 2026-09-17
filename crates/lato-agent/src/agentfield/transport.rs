@@ -19,15 +19,6 @@
 //   classified, so "validate A, connect B" is impossible.
 // - Every `send` re-resolves and re-classifies; connection reuse can never
 //   cross origins (one client, one origin, URL-checked per request).
-//
-// The module is delivered before its product wiring (the public factory is
-// enabled together with the DNS-pinning policy in the next commit); until
-// then the compiler cannot see the usage edge, hence the scoped dead_code
-// allowance below. It is removed when the factory becomes public.
-
-// Phase-7C1.1 delivery ordering: transport is built and tested before the
-// public factory wiring is switched on; nothing in the product can reach it.
-#![allow(dead_code)]
 
 use std::io;
 use std::net::{IpAddr, SocketAddr};
@@ -79,12 +70,20 @@ impl AgentFieldDnsResolver for SystemAgentFieldDnsResolver {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct AddressRejection(pub(crate) &'static str);
 
-fn classify_v4(ip: std::net::Ipv4Addr, http_dev_loopback: bool) -> Result<(), AddressRejection> {
+/// The two frozen address policies. Production (HTTPS) dials public
+/// addresses only; explicit development mode over plain HTTP dials loopback
+/// only — a public address is as forbidden there as a private one.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AddressPolicy {
+    ProductionHttps,
+    DevHttpLoopback,
+}
+
+fn classify_v4(ip: std::net::Ipv4Addr, policy: AddressPolicy) -> Result<(), AddressRejection> {
     if ip.is_loopback() {
-        return if http_dev_loopback {
-            Ok(())
-        } else {
-            Err(AddressRejection("loopback address"))
+        return match policy {
+            AddressPolicy::DevHttpLoopback => Ok(()),
+            AddressPolicy::ProductionHttps => Err(AddressRejection("loopback address")),
         };
     }
     let octets = ip.octets();
@@ -105,24 +104,27 @@ fn classify_v4(ip: std::net::Ipv4Addr, http_dev_loopback: bool) -> Result<(), Ad
         || octets[0..3] == [198, 51, 100]
         || octets[0..3] == [203, 0, 113];
     if blocked {
-        Err(AddressRejection("non-public address"))
-    } else {
-        Ok(())
+        return Err(AddressRejection("non-public address"));
+    }
+    match policy {
+        AddressPolicy::ProductionHttps => Ok(()),
+        AddressPolicy::DevHttpLoopback => Err(AddressRejection(
+            "development HTTP allows only loopback addresses",
+        )),
     }
 }
 
-fn classify_v6(ip: std::net::Ipv6Addr, http_dev_loopback: bool) -> Result<(), AddressRejection> {
+fn classify_v6(ip: std::net::Ipv6Addr, policy: AddressPolicy) -> Result<(), AddressRejection> {
     if ip.is_loopback() {
-        return if http_dev_loopback {
-            Ok(())
-        } else {
-            Err(AddressRejection("loopback address"))
+        return match policy {
+            AddressPolicy::DevHttpLoopback => Ok(()),
+            AddressPolicy::ProductionHttps => Err(AddressRejection("loopback address")),
         };
     }
     // IPv4-mapped IPv6 must obey the IPv4 policy (mapped private ranges are
     // never a way around the v4 classification).
     if let Some(mapped) = ip.to_ipv4_mapped() {
-        return classify_v4(mapped, http_dev_loopback);
+        return classify_v4(mapped, policy);
     }
     let segments = ip.segments();
     let blocked = ip.is_unspecified()
@@ -132,24 +134,38 @@ fn classify_v6(ip: std::net::Ipv6Addr, http_dev_loopback: bool) -> Result<(), Ad
         // Documentation 2001:db8::/32
         || (segments[0] == 0x2001 && segments[1] == 0x0db8);
     if blocked {
-        Err(AddressRejection("non-public address"))
-    } else {
-        Ok(())
+        return Err(AddressRejection("non-public address"));
+    }
+    match policy {
+        AddressPolicy::ProductionHttps => Ok(()),
+        AddressPolicy::DevHttpLoopback => Err(AddressRejection(
+            "development HTTP allows only loopback addresses",
+        )),
     }
 }
 
-/// Classify one address against the frozen policy. Loopback is dialable only
-/// for plain HTTP in explicit development mode; production HTTPS rejects it
-/// even when a development flag is set (Round 2/3 acceptance probes).
+/// Classify one address against the frozen policy (Round 2/3 probes: a
+/// production HTTPS loopback target is rejected even when a development
+/// flag is forged; a development HTTP target outside loopback is rejected).
 pub(crate) fn classify_address(
     ip: IpAddr,
     scheme: &str,
     allow_loopback_http: bool,
 ) -> Result<(), AddressRejection> {
-    let http_dev_loopback = scheme == "http" && allow_loopback_http;
+    let policy = match (scheme, allow_loopback_http) {
+        ("http", true) => AddressPolicy::DevHttpLoopback,
+        ("https", _) => AddressPolicy::ProductionHttps,
+        // Plain HTTP without the explicit development flag is refused
+        // outright by `build`; classification fails closed here too.
+        _ => {
+            return Err(AddressRejection(
+                "plain HTTP requires explicit development mode",
+            ));
+        }
+    };
     match ip {
-        IpAddr::V4(ip) => classify_v4(ip, http_dev_loopback),
-        IpAddr::V6(ip) => classify_v6(ip, http_dev_loopback),
+        IpAddr::V4(ip) => classify_v4(ip, policy),
+        IpAddr::V6(ip) => classify_v6(ip, policy),
     }
 }
 
@@ -296,8 +312,10 @@ pub struct ReqwestTransport {
 impl ReqwestTransport {
     /// The unique production constructor. Resolves the configured host once,
     /// classifies the full answer, and pins the client to the validated set.
-    /// Every later `send` re-runs the same policy before dialing.
-    pub(crate) async fn connect(origin: &ControlPlaneOrigin) -> Result<Self, TransportError> {
+    /// Every later `send` re-runs the same policy before dialing. There is
+    /// deliberately no public constructor accepting a raw client, an
+    /// arbitrary resolver, a pinned address set, or disabled verification.
+    pub async fn connect(origin: &ControlPlaneOrigin) -> Result<Self, TransportError> {
         Self::connect_with_limits(origin, Limits::default()).await
     }
 
@@ -617,13 +635,6 @@ mod tests {
         ControlPlaneOrigin {
             base: url.parse().unwrap(),
             allow_loopback_http: false,
-        }
-    }
-
-    fn dev_http_origin(url: &str) -> ControlPlaneOrigin {
-        ControlPlaneOrigin {
-            base: url.parse().unwrap(),
-            allow_loopback_http: true,
         }
     }
 
@@ -1163,5 +1174,135 @@ mod tests {
             matches!(error, TransportError::PolicyRejected(_)),
             "{error:?}"
         );
+    }
+
+    // --- DNS pinning breadth (validated set, re-resolution, TOCTOU) ---
+
+    #[tokio::test]
+    async fn rebinding_between_sends_fails_closed_before_any_connection() {
+        let server = spawn_canned(vec![http_response(
+            "HTTP/1.1 200 OK",
+            &[("content-type", "application/json")],
+            b"{}",
+        )])
+        .await;
+        let port = server.addr.port();
+        // connect → loopback (dev HTTP allows it); send #1 → loopback again;
+        // send #2 → the answer drifted to a private address: zero connection.
+        let resolver = Arc::new(CountingResolver::new(vec![
+            vec![IpAddr::from([192, 168, 0, 1])],
+            vec![IpAddr::from([127, 0, 0, 1])],
+            vec![IpAddr::from([127, 0, 0, 1])],
+        ]));
+        let transport = ReqwestTransport::connect_with_resolver(
+            &ControlPlaneOrigin {
+                base: format!("http://rebind.test:{port}").parse().unwrap(),
+                allow_loopback_http: true,
+            },
+            resolver.clone(),
+        )
+        .await
+        .unwrap();
+        let request = OutboundRequest {
+            method: "GET",
+            url: format!("http://rebind.test:{port}/api/v1/x"),
+            bearer: None,
+            json_body: None,
+        };
+        transport.send(request.clone()).await.unwrap();
+        let error = transport.send(request).await.unwrap_err();
+        assert!(
+            matches!(error, TransportError::PolicyRejected(_)),
+            "{error:?}"
+        );
+        assert_eq!(
+            resolver.calls.load(Ordering::SeqCst),
+            3,
+            "policy must run per send"
+        );
+        assert_eq!(
+            server.connections.load(Ordering::SeqCst),
+            1,
+            "the rebinding send must not have dialed anything"
+        );
+    }
+
+    #[tokio::test]
+    async fn development_http_still_rejects_non_loopback_answers() {
+        // A DNS name in development mode may not smuggle a public target.
+        let resolver = Arc::new(CountingResolver::new(vec![vec![IpAddr::from([
+            93, 184, 216, 34,
+        ])]]));
+        let result = ReqwestTransport::connect_with_resolver(
+            &ControlPlaneOrigin {
+                base: "http://public.test:8443".parse().unwrap(),
+                allow_loopback_http: true,
+            },
+            resolver.clone(),
+        )
+        .await;
+        assert!(result.is_err(), "dev HTTP accepted a non-loopback answer");
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn pinned_set_never_serves_a_foreign_host() {
+        let pinned = PinnedAddresses {
+            host: "agents.example.com".into(),
+            set: Arc::new(Mutex::new(vec![SocketAddr::new(
+                IpAddr::from([93, 184, 216, 34]),
+                443,
+            )])),
+        };
+        let foreign: Name = "other.example.com".parse().unwrap();
+        assert!(Resolve::resolve(&pinned, foreign).await.is_err());
+        let own: Name = "agents.example.com".parse().unwrap();
+        let addrs = Resolve::resolve(&pinned, own).await.unwrap();
+        let collected: Vec<SocketAddr> = addrs.collect();
+        assert_eq!(collected.len(), 1);
+        assert_eq!(collected[0].ip(), IpAddr::from([93, 184, 216, 34]));
+    }
+
+    #[tokio::test]
+    async fn every_send_revalidates_the_resolution() {
+        let server = spawn_canned(vec![
+            http_response(
+                "HTTP/1.1 200 OK",
+                &[("content-type", "application/json")],
+                b"{}",
+            ),
+            http_response(
+                "HTTP/1.1 200 OK",
+                &[("content-type", "application/json")],
+                b"{}",
+            ),
+        ])
+        .await;
+        // Hostname origin so every send goes through a fresh resolution.
+        let port = server.addr.port();
+        let origin = ControlPlaneOrigin {
+            base: format!("http://stable.test:{port}").parse().unwrap(),
+            allow_loopback_http: true,
+        };
+        let resolver = Arc::new(CountingResolver::new(vec![
+            vec![IpAddr::from([127, 0, 0, 1])],
+            vec![IpAddr::from([127, 0, 0, 1])],
+            vec![IpAddr::from([127, 0, 0, 1])],
+        ]));
+        let transport = ReqwestTransport::connect_with_resolver(&origin, resolver.clone())
+            .await
+            .unwrap();
+        // One resolution at connect + one per send: 1 + 2 = 3 policy runs.
+        for path in ["/api/v1/a", "/api/v1/b"] {
+            let request = OutboundRequest {
+                method: "GET",
+                url: format!("http://stable.test:{port}{path}"),
+                bearer: None,
+                json_body: None,
+            };
+            transport.send(request).await.unwrap();
+        }
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 3);
+        assert_eq!(server.connections.load(Ordering::SeqCst), 2);
     }
 }

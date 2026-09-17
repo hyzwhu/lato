@@ -1,18 +1,17 @@
-// Phase 7C1 (v1.2.1): AgentField OFFLINE-ONLY remote-execution adapter
-// foundation — configuration, strict wire contract for the pinned `v0.1.138`,
-// injectable fake-transport client trait, snapshot state machine, and static
-// doctor diagnostics. Per spec §0.3 there is deliberately NO production
-// transport, no DNS/address policy, and no public network seam in this
-// slice; those arrive in Phase 7C1.1.
+// Phase 7C1.1: AgentField remote-execution adapter — configuration, strict
+// wire contract for the pinned `v0.1.138`, injectable transport client, the
+// production HTTPS transport with its frozen network policy (7C1.1:
+// `transport`, unique policy-enforcing factory, DNS classification and
+// address pinning), snapshot state machine, and doctor diagnostics.
 //
-// Also absent (7C2/7C3): model tool registration, `AgentFieldManager`,
+// Still absent (7C2/7C3): model tool registration, `AgentFieldManager`,
 // policy/approval integration, journal events, and cross-process
 // resume/reconcile.
 
 pub mod client;
 pub mod config;
 pub mod probe;
-pub(crate) mod transport;
+pub mod transport;
 pub mod types;
 
 pub use client::{
@@ -26,6 +25,7 @@ pub use config::{
 pub use probe::{
     AgentFieldHealthSnapshot, AgentFieldProbe, AgentFieldProbeCache, HEALTH_SNAPSHOT_TTL,
 };
+pub use transport::ReqwestTransport;
 pub use types::{
     AsyncStartEnvelope, CancelConflictEnvelope, CancelSuccessEnvelope, DiscoveryAgent,
     DiscoveryEnvelope, DiscoveryReasoner, RemoteExecutionStatus, StatusEnvelope,
