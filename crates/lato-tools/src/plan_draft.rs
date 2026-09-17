@@ -2239,7 +2239,6 @@ mod tests {
             let locks = FileLocks::new();
             plan_draft(&locks, &root, "previous").await.unwrap();
 
-            let bystander_name = format!("pre-final-bystander-{attempt}");
             struct SwapInFinalSlot {
                 workspace_root: PathBuf,
             }
