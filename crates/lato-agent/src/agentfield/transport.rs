@@ -133,24 +133,35 @@ fn is_special_purpose_v4(octets: [u8; 4]) -> bool {
         || octets[0] >= 240
 }
 
-/// Table-driven denylist of IPv6 special-purpose ranges that are never
-/// plain globally-routable unicast (IANA IPv6 Special-Purpose Address
-/// Registry). NAT64 and 6to4 embed an IPv4 target and are resolved back to
-/// the IPv4 policy so an embedded private address can never smuggle through.
-fn is_special_purpose_v6(segments: [u16; 8]) -> bool {
-    // ::/128 unspecified (handled by is_unspecified too) and ::1 loopback
-    // (handled above). Remaining special-purpose prefixes:
-    segments[0] == 0x0064 && segments[1] == 0xff9b // 64:ff9b::/96 NAT64 (translated below)
-        || segments[0] == 0x0100 // 100::/64 discard-only
-        || (segments[0] == 0x2001 && segments[1] == 0x0000) // 2001::/32 Teredo
-        || (segments[0] == 0x2001 && segments[1] == 0x0002 && segments[2] == 0) // 2001:2::/48 benchmarking
-        || (segments[0] == 0x2001 && (segments[1] & 0xfff0) == 0x0010) // 2001:10::/28 ORCHID
-        || (segments[0] == 0x2001 && (segments[1] & 0xfff0) == 0x0020) // 2001:20::/28 ORCHIDv2
-        || (segments[0] == 0x2001 && segments[1] == 0x0db8) // 2001:db8::/32 documentation
-        || segments[0] == 0x2002 // 2002::/16 6to4 (embedded IPv4, denied outright)
-        || (segments[0] & 0xfe00) == 0xfc00 // fc00::/7 unique local
-        || (segments[0] & 0xffc0) == 0xfe80 // fe80::/10 link-local
-        || (segments[0] & 0xff00) == 0xff00 // ff00::/8 multicast
+/// Allow-first IPv6 special-purpose handling. An address is dialable only if
+/// it is GLOBAL UNICAST: inside `2000::/3` (the entire IANA globally
+/// routable unicast allocation) AND not inside one of the IANA IPv6
+/// Special-Purpose prefixes that fall within that block. Everything outside
+/// `2000::/3` fails closed — including unspecified `::/128`, loopback
+/// `::1`, IPv4-compatible `::/96`, discard-only `100::/64`, local-use NAT64
+/// `64:ff9b:1::/48`, reserved `2000::/3`-external ranges such as
+/// `4000::/3` (Reserved by IETF) and `5f00::/16` (SRv6), deprecated
+/// site-local `fec0::/10`, link-local `fe80::/10`, unique-local `fc00::/7`,
+/// and multicast `ff00::/8`.
+/// (Registry: https://www.iana.org/assignments/iana-ipv6-special-registry/)
+fn is_special_purpose_v6_within_global_unicast(segments: [u16; 8]) -> bool {
+    // Prefixes INSIDE 2000::/3 that IANA marks special-purpose (Globally
+    // Reachable = False):
+    // - 2001::/23 IETF protocol assignments (covers Teredo 2001::/32,
+    //   benchmarking 2001:2::/48, ORCHID 2001:10::/28 and 2001:20::/28)
+    (segments[0] == 0x2001 && (segments[1] & 0xfe00) == 0)
+        // - 2001:db8::/32 documentation (separate registry entry, outside
+        //   the 2001::/23 block)
+        || (segments[0] == 0x2001 && segments[1] == 0x0db8)
+        // - 2002::/16 6to4 (deprecated; embeds an IPv4 target — denied
+        //   outright rather than translated, so an embedded address can
+        //   never be dialed without its own v4 classification)
+        || segments[0] == 0x2002
+        // - 3fff::/20 documentation (RFC 9637)
+        || (segments[0] == 0x3fff && (segments[1] & 0xfff0) == 0)
+    // - 5f00::/16 (SRv6) is NOT inside 2000::/3 (first 3 bits 010), so the
+    //   global-unicast gate below rejects it; likewise 4000::/3 (reserved)
+    //   and fec0::/10 (deprecated site-local) are outside the block.
 }
 
 fn classify_v4(ip: std::net::Ipv4Addr, policy: AddressPolicy) -> Result<(), AddressRejection> {
@@ -198,8 +209,17 @@ fn classify_v6(ip: std::net::Ipv6Addr, policy: AddressPolicy) -> Result<(), Addr
         );
         return classify_v4(embedded, policy);
     }
-    if ip.is_unspecified() || is_special_purpose_v6(segments) {
-        return Err(AddressRejection("non-public address"));
+    // Allow-first gate: only 2000::/3 is globally routable unicast. This
+    // covers unspecified (::/128 — caught by the gate since its first three
+    // bits are 000), and every non-unicast or reserved block outside the
+    // allocation (see `is_special_purpose_v6_within_global_unicast`).
+    if ip.is_unspecified() || (segments[0] & 0xe000) != 0x2000 {
+        return Err(AddressRejection(
+            "outside the globally routable unicast space 2000::/3",
+        ));
+    }
+    if is_special_purpose_v6_within_global_unicast(segments) {
+        return Err(AddressRejection("IANA special-purpose prefix"));
     }
     if policy.allows_public() {
         Ok(())
@@ -810,6 +830,14 @@ pub(crate) mod tests {
             "2001:10::1",      // ORCHID
             "2001:20::1",      // ORCHIDv2
             "2002:c000:201::", // 6to4 embedding 192.0.2.1
+            // Round 3 (D-30-01 reopen): allow-global-unicast gate.
+            "4000::1",      // outside 2000::/3 (Reserved by IETF)
+            "4000:ffff::1", // outside 2000::/3
+            "5f00::1",      // SRv6, outside 2000::/3
+            "fec0::1",      // deprecated site-local, outside 2000::/3
+            "3fff::1",      // documentation (RFC 9637), inside 2000::/3
+            "3fff:f::1",    // documentation upper edge, inside 2000::/3
+            "3fff:1::1",    // documentation, inside 2000::/3
         ];
         for ip in cases {
             let ip: IpAddr = ip.parse().unwrap();
@@ -885,6 +913,11 @@ pub(crate) mod tests {
             "https://[2001::1]",
             "https://192.88.99.1",
             "https://[64:ff9b::a00:1]",
+            // Round 3 (D-30-01 reopen): IPv6 allow-global-unicast gate.
+            "https://[4000::1]",
+            "https://[fec0::1]",
+            "https://[5f00::1]",
+            "https://[3fff::1]",
         ] {
             let result =
                 ReqwestTransport::connect_with_resolver(&https_origin(url), resolver.clone()).await;
@@ -901,6 +934,11 @@ pub(crate) mod tests {
             IpAddr::from([240, 0, 0, 1]),
             IpAddr::from([192, 88, 99, 1]),
             "64:ff9b::a00:1".parse::<IpAddr>().unwrap(),
+            // Round 3 (D-30-01 reopen): IPv6 allow-global-unicast gate.
+            "4000::1".parse::<IpAddr>().unwrap(),
+            "fec0::1".parse::<IpAddr>().unwrap(),
+            "5f00::1".parse::<IpAddr>().unwrap(),
+            "3fff::1".parse::<IpAddr>().unwrap(),
         ] {
             let resolver = Arc::new(FixedResolver(vec![answer]));
             let result = ReqwestTransport::connect_with_resolver(
