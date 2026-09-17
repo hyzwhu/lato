@@ -224,23 +224,35 @@ impl AgentFieldTool {
     /// remote metadata.
     async fn list(&self, manager: &Arc<AgentFieldManager>) -> Result<ToolOutput, ToolError> {
         let catalog = manager.catalog();
-        let health = manager.healthy_targets().await;
-        let capabilities: Vec<Value> = catalog
-            .capabilities()
-            .iter()
-            .map(|(alias, capability)| {
-                let available = health
-                    .as_ref()
-                    .map(|targets| targets.contains(&capability.target))
-                    .unwrap_or(false);
-                json!({
-                    "name": alias,
-                    "description": capability.description,
-                    "risk": capability.risk,
-                    "available": available,
+        // Intersection source: a fresh (<=30 s) snapshot, else the last
+        // VERIFIED (possibly stale) discovery snapshot; `None` = no
+        // verified discovery exists at all.
+        let snapshot = match manager.health_snapshot().await {
+            Ok(snapshot) => Some(snapshot),
+            Err(_) => manager.verified_discovery_snapshot().await,
+        };
+        let capabilities: Vec<Value> = match snapshot {
+            None => Vec::new(),
+            Some(snapshot) => catalog
+                .capabilities()
+                .iter()
+                // Verified-discovery intersection: targets the control plane
+                // never published are invisible to the model, even when
+                // allowlisted locally.
+                .filter(|(_, capability)| snapshot.execute_targets.contains(&capability.target))
+                .map(|(alias, capability)| {
+                    json!({
+                        "name": alias,
+                        "description": capability.description,
+                        "risk": capability.risk,
+                        "inputSchema": capability.input_schema,
+                        "available": snapshot
+                            .healthy_execute_targets
+                            .contains(&capability.target),
+                    })
                 })
-            })
-            .collect();
+                .collect(),
+        };
         let truncated_entries = capabilities.len() > MAX_LIST_ENTRIES;
         let entries = capabilities.into_iter().take(MAX_LIST_ENTRIES).collect();
         bounded_output(
@@ -548,7 +560,9 @@ fn run_value(run: &RunState) -> Value {
         value["executionId"] = json!(execution_id);
     }
     if let Some(summary) = run.summary.as_deref() {
-        value["summary"] = json!(summary);
+        // Defense in depth: the summary was already redacted at storage
+        // time; re-check at the projection boundary too.
+        value["summary"] = json!(crate::agentfield::manager::redact_secrets(summary));
         value["summaryTruncated"] = json!(run.summary_truncated);
     }
     if let Some(last_error) = run.last_error {

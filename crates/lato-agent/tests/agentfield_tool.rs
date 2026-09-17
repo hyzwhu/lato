@@ -895,3 +895,131 @@ async fn runtime_abort_mid_send_marks_the_run_outcome_unknown() {
     assert!(runs[0].execution_id.is_none());
     assert_eq!(runs[0].last_error, Some("agentfield.outcome_unknown"));
 }
+
+/// Round-1 P2 regression: `list` returns ONLY the allowlist ∩ verified
+/// discovery (a locally allowlisted target the control plane never
+/// published is invisible) and each entry carries the locally frozen
+/// `inputSchema`.
+#[tokio::test]
+async fn list_intersects_allowlist_with_verified_discovery_and_includes_input_schema() {
+    let temp_home = TempDir::new().unwrap();
+    let temp_cwd = TempDir::new().unwrap();
+    // Two allowlisted capabilities; the fake discovery below only publishes
+    // `legal.review_contract`.
+    std::fs::write(
+        temp_home.path().join("config.json"),
+        json!({"agentfield": {
+            "enabled": true,
+            "baseUrl": "https://agents.example.internal",
+            "credential": "agentfield:primary",
+            "capabilities": {
+                "contract-review": {
+                    "target": "legal.review_contract",
+                    "description": "Review one contract",
+                    "inputSchema": {"type":"object","properties":{"contract":{"type":"string"}},"required":["contract"]},
+                    "risk": "remote_read",
+                },
+                "other-missing": {
+                    "target": "other.missing",
+                    "description": "Not published by discovery",
+                    "inputSchema": {"type":"object"},
+                    "risk": "remote_read",
+                }
+            }
+        }}).to_string(),
+    )
+    .unwrap();
+    let (manager, _fake) = manager_with_sources(
+        temp_home.path(),
+        temp_cwd.path(),
+        StartBehavior::Ok("exec-1".into()),
+    );
+    let handle = SessionAgentFieldHandle::new();
+    handle.install(manager.clone());
+    let tool = AgentFieldTool::new(handle);
+    let context = lato_core::ToolContext {
+        session_id: lato_core::SessionId::from("session"),
+        turn_id: lato_core::TurnId::from("turn"),
+        call_id: lato_core::ToolCallId::from("call-list"),
+        cancellation: tokio_util::sync::CancellationToken::new(),
+        execution_grant: None,
+    };
+    let output = tool
+        .invoke(context, json!({"action":"list"}))
+        .await
+        .unwrap();
+    let listed = output_json(&output);
+    let capabilities = listed["capabilities"].as_array().unwrap();
+    assert_eq!(
+        capabilities.len(),
+        1,
+        "only the allowlist ∩ verified discovery: {listed}"
+    );
+    assert_eq!(capabilities[0]["name"], "contract-review");
+    assert_eq!(
+        capabilities[0]["inputSchema"],
+        json!({"type":"object","properties":{"contract":{"type":"string"}},"required":["contract"]}),
+        "the locally frozen inputSchema is projected"
+    );
+    assert_eq!(capabilities[0]["available"], true);
+}
+
+/// With no verified discovery at all, the intersection is empty.
+#[tokio::test]
+async fn list_without_verified_discovery_is_empty() {
+    struct DeadDiscovery;
+    #[async_trait]
+    impl AgentFieldClient for DeadDiscovery {
+        async fn discovery(&self) -> Result<DiscoveryEnvelope, AgentFieldError> {
+            Err(AgentFieldError::Unavailable("control plane down".into()))
+        }
+        async fn start_async(
+            &self,
+            _execute_target: &str,
+            _input: &Value,
+        ) -> Result<AsyncStartEnvelope, AgentFieldError> {
+            unreachable!("list never starts")
+        }
+        async fn status(&self, _execution_id: &str) -> Result<StatusEnvelope, AgentFieldError> {
+            unreachable!("list never queries status")
+        }
+        async fn cancel(
+            &self,
+            _execution_id: &str,
+            _reason: &str,
+        ) -> Result<Option<CancelSuccessEnvelope>, AgentFieldError> {
+            unreachable!("list never cancels")
+        }
+    }
+    let config = lato_agent::agentfield::config::AgentFieldConfig::parse(&test_config_value())
+        .unwrap()
+        .unwrap();
+    let catalog = AgentFieldCatalog::from_config(&config);
+    let client: Arc<dyn AgentFieldClient> = Arc::new(DeadDiscovery);
+    let manager = AgentFieldManager::with_factory(
+        "session-dead",
+        catalog,
+        Some(Arc::new(move || {
+            let client = client.clone();
+            Box::pin(async move { Ok(client.clone()) })
+        })),
+    );
+    let manager = Arc::new(manager);
+    let handle = SessionAgentFieldHandle::new();
+    handle.install(manager);
+    let tool = AgentFieldTool::new(handle);
+    let context = lato_core::ToolContext {
+        session_id: lato_core::SessionId::from("session"),
+        turn_id: lato_core::TurnId::from("turn"),
+        call_id: lato_core::ToolCallId::from("call-list-dead"),
+        cancellation: tokio_util::sync::CancellationToken::new(),
+        execution_grant: None,
+    };
+    let output = tool
+        .invoke(context, json!({"action":"list"}))
+        .await
+        .unwrap();
+    let listed = output_json(&output);
+    assert_eq!(listed["capabilities"].as_array().unwrap().len(), 0);
+    assert!(listed["revision"].as_str().unwrap().starts_with("sha256:"));
+}
