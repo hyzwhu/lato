@@ -94,6 +94,7 @@ pub struct RuntimeSession {
     hooks_started: AtomicBool,
     hooks_ended: AtomicBool,
     workflow_manager: Arc<std::sync::OnceLock<Arc<crate::workflow::WorkflowManager>>>,
+    agentfield_manager: Arc<std::sync::OnceLock<Arc<crate::agentfield::AgentFieldManager>>>,
 }
 
 struct PromptCleanupGuard {
@@ -236,6 +237,7 @@ impl RuntimeSession {
             hooks_started: AtomicBool::new(false),
             hooks_ended: AtomicBool::new(false),
             workflow_manager: Arc::new(std::sync::OnceLock::new()),
+            agentfield_manager: Arc::new(std::sync::OnceLock::new()),
         }
     }
 
@@ -294,6 +296,7 @@ impl RuntimeSession {
             hooks_started: AtomicBool::new(false),
             hooks_ended: AtomicBool::new(false),
             workflow_manager: Arc::new(std::sync::OnceLock::new()),
+            agentfield_manager: Arc::new(std::sync::OnceLock::new()),
         };
         session
             .stage_plugin_snapshot(config.plugin_snapshot)
@@ -364,6 +367,7 @@ impl RuntimeSession {
             hooks_started: AtomicBool::new(false),
             hooks_ended: AtomicBool::new(false),
             workflow_manager: Arc::new(std::sync::OnceLock::new()),
+            agentfield_manager: Arc::new(std::sync::OnceLock::new()),
         }
     }
 
@@ -614,6 +618,7 @@ impl RuntimeSession {
             hooks_started: AtomicBool::new(false),
             hooks_ended: AtomicBool::new(false),
             workflow_manager: Arc::new(std::sync::OnceLock::new()),
+            agentfield_manager: Arc::new(std::sync::OnceLock::new()),
         })
     }
 
@@ -672,6 +677,16 @@ impl RuntimeSession {
 
     pub fn workflow_manager(&self) -> Option<Arc<crate::workflow::WorkflowManager>> {
         self.workflow_manager.get().cloned()
+    }
+
+    /// Phase 7C2: attach the session-scoped AgentField run manager
+    /// (main-session only; installed at most once by the host).
+    pub fn attach_agentfield_manager(&self, manager: Arc<crate::agentfield::AgentFieldManager>) {
+        let _ = self.agentfield_manager.set(manager);
+    }
+
+    pub fn agentfield_manager(&self) -> Option<Arc<crate::agentfield::AgentFieldManager>> {
+        self.agentfield_manager.get().cloned()
     }
 
     fn require_workflow_manager(
@@ -1356,6 +1371,12 @@ impl RuntimeSession {
 
     pub async fn shutdown(&self) -> Result<(), AgentError> {
         self.workflow_shutdown().await;
+        // Phase 7C2: mark the AgentField manager unavailable. It performs
+        // NO remote cancel — remote executions keep running after session
+        // close (spec §9.2); late tool calls fail closed.
+        if let Some(manager) = self.agentfield_manager() {
+            manager.close();
+        }
         let _gate = self.submission_gate.lock().await;
         if self.hooks_started.load(Ordering::Acquire)
             && !self.hooks_ended.swap(true, Ordering::AcqRel)

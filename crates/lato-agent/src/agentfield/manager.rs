@@ -20,7 +20,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
-use lato_ai::CredentialStore;
 use serde_json::Value;
 use tokio::sync::{Mutex, OnceCell};
 
@@ -167,16 +166,15 @@ pub type ClientFactory = Arc<
 >;
 
 pub fn production_client_factory(
-    store: Option<CredentialStore>,
+    credential: crate::agentfield::client::RedactedToken,
     config: AgentFieldConfig,
 ) -> ClientFactory {
-    let store = Arc::new(store);
     Arc::new(move || {
-        let store = store.clone();
+        let credential = credential.clone();
         let config = config.clone();
         Box::pin(async move {
             let client =
-                crate::agentfield::production_agentfield_client(store.as_ref().as_ref(), &config)
+                crate::agentfield::production_agentfield_client_from_token(credential, &config)
                     .await?;
             Ok(Arc::new(client) as Arc<dyn AgentFieldClient>)
         })
@@ -203,18 +201,20 @@ pub struct AgentFieldManager {
 
 impl AgentFieldManager {
     /// Production constructor: lazy client creation through the unique
-    /// policy factory (`production_client_factory`). Zero network at
-    /// session start.
+    /// policy factory (`production_client_factory`). The credential is
+    /// resolved by the caller at the registration gate — an unresolvable
+    /// reference means zero tool registration and zero network. Client
+    /// creation performs no network at session start.
     pub fn new(
         session_id: &str,
         catalog: AgentFieldCatalog,
-        store: Option<CredentialStore>,
+        credential: crate::agentfield::client::RedactedToken,
         config: AgentFieldConfig,
     ) -> Self {
         Self::with_factory(
             session_id,
             catalog,
-            Some(production_client_factory(store, config)),
+            Some(production_client_factory(credential, config)),
         )
     }
 

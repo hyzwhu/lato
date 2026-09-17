@@ -6,7 +6,12 @@
 use crate::{
     ChildSessionRunner, PreparedModelSwitch, ProfileResultVerifier, RuntimeCompactionOutcome,
     RuntimePromptOutcome, RuntimeSession, SessionPluginSnapshots, SkillRuntimeBinding,
-    ToolApproval, TranscriptStore, import_legacy_if_needed,
+    ToolApproval, TranscriptStore,
+    agentfield::{
+        AgentFieldCatalog, AgentFieldManager, AgentFieldTool, SessionAgentFieldHandle,
+        load_agentfield_config,
+    },
+    import_legacy_if_needed,
     workflow::{
         SessionWorkflowHandle, WorkflowManager, WorkflowTool, list_workflows, resolve_workflow,
     },
@@ -382,8 +387,20 @@ impl AcpHost {
             self.effective_lato_home(),
             self.trust.clone(),
         );
-        let workflow_extra: Vec<Arc<dyn Tool>> =
+        let mut session_extra: Vec<Arc<dyn Tool>> =
             vec![Arc::new(WorkflowTool::new(workflow_handle.clone()))];
+        // Phase 7C2: the main-session `agentfield` tool is registered only
+        // when the adapter is enabled AND the configuration validates.
+        // Unconfigured / disabled / invalid → zero registration, zero
+        // network (AC-01). The manager itself is installed after the session
+        // is assembled and performs no network at registration time.
+        let agentfield_handle = match self.prepare_agentfield(sid) {
+            Some((handle, manager)) => {
+                session_extra.push(Arc::new(AgentFieldTool::new(handle.clone())));
+                Some((handle, manager))
+            }
+            None => None,
+        };
         let skill_runtime = match SkillRuntimeBinding::build(|skill_resolver, mcp_backend| {
             lato_tools::builtin_tool_runtime_with_subagents_and_mcp_extra(
                 lato_tools::BuiltinToolEnvironment {
@@ -394,7 +411,7 @@ impl AcpHost {
                 },
                 backend.into_resource(),
                 mcp_backend,
-                workflow_extra,
+                session_extra,
             )
         }) {
             Ok(runtime) => runtime,
@@ -440,6 +457,10 @@ impl AcpHost {
                     // Phase 7B7: bind the session manager into the main-session
                     // `workflow` tool (construction-safe handle install).
                     workflow_handle.install(manager);
+                    if let Some((handle, manager)) = agentfield_handle.as_ref() {
+                        session.attach_agentfield_manager(manager.clone());
+                        handle.install(manager.clone());
+                    }
                     if let Err(error) = self.attach_session_plugins(sid, &session).await {
                         let _ = self.teardown_task_root(sid).await;
                         return Err(error);
@@ -465,11 +486,41 @@ impl AcpHost {
         let manager =
             self.attach_workflow_manager(sid, &session, self.default_endpoint.stream.clone());
         workflow_handle.install(manager);
+        if let Some((handle, manager)) = agentfield_handle.as_ref() {
+            session.attach_agentfield_manager(manager.clone());
+            handle.install(manager.clone());
+        }
         if let Err(error) = self.attach_session_plugins(sid, &session).await {
             let _ = self.teardown_task_root(sid).await;
             return Err(error);
         }
         Ok(session)
+    }
+
+    /// Phase 7C2 registration gate: build the session `agentfield` handle
+    /// and manager when the adapter is enabled, the config validates, and
+    /// the credential resolves — otherwise `None` (zero tool registration,
+    /// zero network). The manager resolves its client lazily on first use
+    /// through the unique policy factory, so session start never touches
+    /// the network here.
+    fn prepare_agentfield(
+        &self,
+        sid: &str,
+    ) -> Option<(SessionAgentFieldHandle, Arc<AgentFieldManager>)> {
+        let config = load_agentfield_config(&self.effective_lato_home())?;
+        if !config.enabled {
+            return None;
+        }
+        // Credential resolution happens at the registration gate, BEFORE any
+        // transport exists; an unresolvable reference means the adapter is
+        // unconfigured and stays invisible to the model.
+        let credential = crate::agentfield::resolve_agentfield_credential(
+            self.credentials.as_ref(),
+            &config.credential_reference,
+        )?;
+        let catalog = AgentFieldCatalog::from_config(&config);
+        let manager = Arc::new(AgentFieldManager::new(sid, catalog, credential, config));
+        Some((SessionAgentFieldHandle::new(), manager))
     }
 
     fn attach_workflow_manager(
