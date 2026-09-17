@@ -838,15 +838,20 @@ pub fn redact_secrets(text: &str) -> String {
         let mut pos = start + trigger.len();
         out.push_str(&text[start..pos]);
         // Consume separators (`:`, `=`, quotes, whitespace) and remember
-        // whether an assignment shape (`:` or `=`) is present and whether
-        // the value is quote-delimited (a quote is the LAST separator).
+        // whether an assignment shape (`:` or `=`) is present and, when the
+        // value is quote-delimited, WHICH quote opened it (the closing
+        // delimiter must match the opener exactly — Round-5 acceptance P1).
         let mut saw_assignment = false;
-        let mut value_quoted = false;
+        let mut quote_opener: Option<u8> = None;
         while pos < bytes.len() && matches!(bytes[pos], b' ' | b'\t' | b':' | b'=' | b'"' | b'\'') {
             if matches!(bytes[pos], b':' | b'=') {
                 saw_assignment = true;
             }
-            value_quoted = matches!(bytes[pos], b'"' | b'\'');
+            quote_opener = if matches!(bytes[pos], b'"' | b'\'') {
+                Some(bytes[pos])
+            } else {
+                None
+            };
             out.push(bytes[pos] as char);
             pos += 1;
         }
@@ -856,15 +861,37 @@ pub fn redact_secrets(text: &str) -> String {
             cursor = pos;
             continue;
         }
-        if value_quoted {
-            // Quoted value: everything up to the matching closing quote is
-            // credential material — whitespace inside must not split it
-            // (`token="a b"` redacts BOTH tokens). A missing closer fails
-            // safe by redacting to the end of the text.
-            let closing = bytes[pos..]
-                .iter()
-                .position(|byte| *byte == b'"' || *byte == b'\'')
-                .map_or(bytes.len(), |rel| pos + rel);
+        if let Some(opener) = quote_opener {
+            // Quoted value: everything up to the CLOSING QUOTE MATCHING THE
+            // OPENER is credential material — whitespace inside must not
+            // split it (`token="a b"` redacts BOTH tokens) and the other
+            // quote kind must not close it (`token='a"b c'` redacts the
+            // whole value; Round-5 acceptance P1). A backslash-escaped
+            // opener character never closes. A missing closer fails safe
+            // by redacting to the end of the text.
+            let closing = {
+                let mut scan = pos;
+                loop {
+                    match bytes[scan..].iter().position(|byte| *byte == opener) {
+                        None => break bytes.len(),
+                        Some(rel) => {
+                            let at = scan + rel;
+                            // Count the backslashes immediately before the
+                            // candidate closer; an even count means the
+                            // quote is unescaped. The opener itself bounds
+                            // the walk, so this cannot underflow.
+                            let mut slashes = 0usize;
+                            while bytes[at - 1 - slashes] == b'\\' {
+                                slashes += 1;
+                            }
+                            if slashes.is_multiple_of(2) {
+                                break at;
+                            }
+                            scan = at + 1;
+                        }
+                    }
+                }
+            };
             out.push_str("[redacted]");
             if closing < bytes.len() {
                 out.push_str(&text[closing..closing + 1]);
@@ -908,8 +935,15 @@ pub fn redact_secrets(text: &str) -> String {
                 pos += 1;
             }
             out.push_str(&text[term_start..pos]);
-            // A folded continuation line keeps the credential going; a
+            // A folded continuation line keeps the credential going. A line
+            // with leading SP/HTAB is a fold continuation REGARDLESS of any
+            // `key:` shape — `Authorization:\r\n Basic: secret` folds the
+            // credential into a header-shaped continuation and must be
+            // redacted whole (Round-5 acceptance P1). Only a column-0
             // `key:`-shaped line is the next field and survives.
+            if matches!(bytes.get(pos), Some(b' ' | b'\t')) {
+                continue;
+            }
             if line_is_header_shaped(bytes, pos) {
                 break;
             }
@@ -919,9 +953,10 @@ pub fn redact_secrets(text: &str) -> String {
     out
 }
 
-/// True when the line starting at `start` begins with a `key:`-shaped
-/// field (token of `[A-Za-z0-9_-]+`, optional whitespace, then `:`).
-/// Continuation lines of a folded header do not have this shape.
+/// True when the line starting at `start` begins with a column-0
+/// `key:`-shaped field (token of `[A-Za-z0-9_-]+`, optional whitespace, then
+/// `:`). Callers must first treat leading-SP/HTAB lines as fold
+/// continuations of the previous (sensitive) header before consulting this.
 fn line_is_header_shaped(bytes: &[u8], start: usize) -> bool {
     let mut peek = start;
     while peek < bytes.len() && matches!(bytes[peek], b' ' | b'\t') {
@@ -1700,9 +1735,34 @@ mod tests {
                 "Authorization:\r\n Basic QA_FOLDED_SECRET\r\nstatus: failed",
                 "Authorization:\r\n[redacted]\r\nstatus: failed",
             ),
+            // Round-5 (acceptance P1): a header-shaped folded continuation
+            // (`Basic: …` after leading SP) is still credential material.
+            (
+                "Authorization:\r\n Basic: QA_COLON_FOLDED_SECRET\r\nstatus: failed",
+                "Authorization:\r\n[redacted]\r\nstatus: failed",
+            ),
+            (
+                "Authorization:\r\n\tBearer QA_TAB_FOLDED_SECRET\r\nstatus: failed",
+                "Authorization:\r\n[redacted]\r\nstatus: failed",
+            ),
             // Round-4 (acceptance P1-2): quoted value containing whitespace.
             (
                 "token=\"QA_FIRST_SECRET QA_SECOND_SECRET\"",
+                "token=\"[redacted]\"",
+            ),
+            // Round-5 (acceptance P1): the closing delimiter must MATCH THE
+            // OPENER — an inner quote of the other kind never closes, and
+            // escaped openers never close either.
+            (
+                "token='QA_FIRST_PART\" QA_SINGLE_QUOTED_SECRET'",
+                "token='[redacted]'",
+            ),
+            (
+                "token=\"QA_DOUBLE_PART' QA_DOUBLE_QUOTED_SECRET\"",
+                "token=\"[redacted]\"",
+            ),
+            (
+                "token=\"QA_ESCAPED\\\" QA_TAIL_SECRET\"",
                 "token=\"[redacted]\"",
             ),
             // Quoted value without a closer fails safe to end-of-text.
