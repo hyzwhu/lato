@@ -405,7 +405,46 @@ lato doctor --strict
 lato doctor --live
 ```
 
-Default `lato doctor` is offline: it does not contact providers or submit a prompt completion. It reports binary/platform, Lato home, config parsing, selected-model catalog presence, credential presence (not values), ToolCatalog construction, a fixed PolicyEngine self-test, sandbox readiness, and project/plugin trust. `--json` prints a `schema_version: 1` report on stdout. Warnings keep exit status 0; errors return 1. `--strict` upgrades warnings to failure. `--live` is the only Doctor mode allowed to use the network; it runs a bounded catalog/connectivity probe and does not submit an ordinary prompt completion.
+Default `lato doctor` is offline: it does not contact providers or submit a prompt completion. It reports binary/platform, Lato home, config parsing, selected-model catalog presence, credential presence (not values), ToolCatalog construction, a fixed PolicyEngine self-test, sandbox readiness, and project/plugin trust. `--json` prints a `schema_version: 1` report on stdout. Warnings keep exit status 0; errors return 1. `--strict` upgrades warnings to failure. `--live` is the only Doctor mode allowed to use the network; it runs a bounded catalog/connectivity probe and does not submit an ordinary prompt completion. When an AgentField control plane is configured, the offline report additionally covers its configuration state (disabled / unconfigured / invalid), and `--live` performs zero AgentField network requests and reports the production verification as `deferred_to_7c1_1` (Phase 7C1.1).
+
+## AgentField adapter (Phase 7C1 v1.2.1, offline-only foundation)
+
+Lato will eventually act as a client of an organization-deployed [AgentField](https://github.com/Agent-Field/agentfield) control plane. **Phase 7C1 (v1.2.1) is an offline-only foundation and ships no production network capability**: there is no AgentField HTTP transport, no DNS resolution, and no reachable outbound path in the default build. It delivers:
+
+- the configuration model (enabled/baseUrl/credential reference/capability allowlist with alias, count, and size limits) and pure base-URL syntax checks;
+- strict pinned-contract wire types (`v0.1.138`, commit `0aba9d6de1ef2c473070fc329ac7ac63e5d096b9`, fixture SHA-256 `fd524cab…3ae8`) with injectable fake-transport contract tests;
+- the discovery colon→dot execute-target derivation contract;
+- a 30-second health/discovery snapshot state machine (fake client + controllable clock only);
+- static `lato doctor` checks for configuration shape, credential-reference resolvability, and pinned-version configuration.
+
+**No `agentfield` model tool is registered in any state** (enabled/disabled/unconfigured): model tool registration, manager, policy/approval wiring, and production execution arrive in Phase 7C2. **Production transport and network boundaries (HTTPS, address policy, DNS rebinding defense, address pinning, redirect/TLS/proxy, public-seam hardening) are Phase 7C1.1**, which must be independently built and accepted before Phase 7C2. Doctor `--live` therefore performs zero AgentField network requests and reports `deferred_to_7c1_1`.
+
+Configuration lives in the top-level `agentfield` section of `~/.lato/config.json`. The `enabled`, `baseUrl`, and `credential` keys are required — omitting any of them is a parse error reported by `lato doctor`; `allowLoopbackHttp` and `capabilities` are optional and default to `false` / empty; unknown keys are rejected. Set `"enabled": false` to disable the adapter:
+
+```json
+{
+  "agentfield": {
+    "enabled": true,
+    "baseUrl": "https://agents.example.internal",
+    "credential": "agentfield:primary",
+    "capabilities": {
+      "contract-review": {
+        "target": "legal-agent.review_contract",
+        "description": "Review one contract and return structured findings",
+        "inputSchema": { "type": "object", "additionalProperties": false },
+        "risk": "remote_read",
+        "timeoutSeconds": 900,
+        "maxOutputBytes": 65536
+      }
+    }
+  }
+}
+```
+
+Offline guarantees for this slice: `baseUrl` accepts only an absolute HTTP(S) URL without userinfo/query/fragment (plain HTTP only for loopback hosts under the explicit `allowLoopbackHttp` development flag) — this is a syntax check, no connection is ever attempted; `credential` is a reference (`agentfield:<key>` resolved from the Lato credential store or `LATO_AGENTFIELD_CREDENTIAL`), and the token value never appears in logs, errors, doctor output, or `Debug` formatting; envelopes are strictly decoded against the pinned contract with unknown fields ignored and any missing/mistyped required field failing closed; discovery targets must satisfy the colon→dot derivation contract; the pinned async-start endpoint has no idempotency key and Lato adds no retry guarantees. Dual-policy note (spec §8): in Phase 7C2 every AgentField action will pass Lato's policy/approval membrane first; an AgentField-side PASS never upgrades Lato permissions.
+
+Migration and rollback: set `enabled: false` (or delete the `agentfield` section) to deactivate the adapter; unconfigured/disabled states make no network requests and resolve no credentials, and all existing task/workflow behavior is untouched (tool catalog and goldens unchanged). Phase 7C1 registers no tool and writes no journal events, so rolling back the binary is always safe. Once Phase 7C3 introduces versioned AgentField journal events, binary downgrade for sessions containing those events will be blocked by an explicit reader-version gate (frozen spec §10). Run `lato doctor` (offline) after config changes; `lato doctor --live` reports the AgentField checks as deferred to 7C1.1.
+
 
 ## Headless CLI smoke test
 

@@ -1,4 +1,5 @@
 pub mod actor;
+pub mod agentfield;
 pub mod compaction;
 pub mod compaction_input;
 pub mod context_recovery;

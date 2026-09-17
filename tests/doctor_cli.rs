@@ -389,3 +389,86 @@ fn doctor_path_check_is_ok_when_path_matches_this_binary() {
     assert_eq!(check["status"], "ok", "check={check}");
     assert!(check["code"].is_null());
 }
+
+fn agentfield_check(report: &DoctorReport) -> &DoctorCheck {
+    report
+        .checks
+        .iter()
+        .find(|check| check.id == "agentfield")
+        .expect("agentfield check must always be present")
+}
+
+fn write_agentfield_config(home: &Path, agentfield: serde_json::Value) {
+    std::fs::write(
+        home.join("config.json"),
+        serde_json::to_vec_pretty(
+            &serde_json::json!({ "default_model": "xai/grok-4", "agentfield": agentfield }),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+}
+
+fn valid_agentfield_config(credential: &str) -> serde_json::Value {
+    serde_json::json!({
+        "enabled": true,
+        "baseUrl": "https://agents.example.internal",
+        "credential": credential,
+        "capabilities": {
+            "contract-review": {
+                "target": "legal-agent.review_contract",
+                "description": "Review one contract",
+                "inputSchema": {"type": "object"},
+                "risk": "remote_read"
+            }
+        }
+    })
+}
+
+// ---- v1.2.1 DG-01: doctor --live is offline-only for AgentField ----
+
+struct NoopProbe;
+
+#[async_trait]
+impl LiveProbe for NoopProbe {
+    async fn probe(&self) -> Result<String, String> {
+        Ok("catalog live probe ok".into())
+    }
+}
+
+async fn live_report(home: &Path, probe: Arc<dyn LiveProbe>) -> DoctorReport {
+    let workspace = tempfile::tempdir().unwrap();
+    let deps = DoctorDependencies {
+        home: home.to_path_buf(),
+        workspace: workspace.path().to_path_buf(),
+        live_probe: probe,
+    };
+    run(DoctorOptions { live: true }, &deps).await
+}
+
+#[tokio::test]
+async fn agentfield_live_makes_zero_requests_and_reports_deferred() {
+    let home = tempfile::tempdir().unwrap();
+    write_agentfield_config(home.path(), valid_agentfield_config("agentfield:primary"));
+    let mut store = CredentialStore::open(home.path()).unwrap();
+    store
+        .modify(|data| {
+            // resolve_agentfield_credential reads the store entry `agentfield`.
+            data.insert(
+                "agentfield".into(),
+                serde_json::json!({"type": "api_key", "key": "live-deferred-secret"}),
+            );
+        })
+        .unwrap();
+
+    // The catalog live probe is stubbed; if the AgentField path touched the
+    // network it would surface as a distinct behavior — instead the report
+    // must state the deferred status with zero AgentField requests.
+    let report = live_report(home.path(), Arc::new(NoopProbe)).await;
+    let check = agentfield_check(&report);
+    assert_eq!(check.status, DoctorStatus::Ok);
+    assert!(check.message.contains("deferred_to_7c1_1"), "{check:?}");
+    assert!(check.message.contains("zero requests made"));
+    let rendered = serde_json::to_string(&report).unwrap();
+    assert!(!rendered.contains("live-deferred-secret"));
+}

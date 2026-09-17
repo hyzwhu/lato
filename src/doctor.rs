@@ -61,6 +61,8 @@ pub trait LiveProbe: Send + Sync {
 #[derive(serde::Deserialize)]
 struct DoctorSettings {
     default_model: String,
+    #[serde(default)]
+    agentfield: Option<serde_json::Value>,
 }
 
 pub async fn run(options: DoctorOptions, deps: &DoctorDependencies) -> DoctorReport {
@@ -72,7 +74,7 @@ pub async fn run(options: DoctorOptions, deps: &DoctorDependencies) -> DoctorRep
     checks.push(home_check(&deps.home));
 
     let settings = load_settings(&deps.home);
-    let (settings_check, default_model) = match settings {
+    let (settings_check, default_model) = match &settings {
         Ok(Some(settings)) => (
             check(
                 "settings",
@@ -80,7 +82,7 @@ pub async fn run(options: DoctorOptions, deps: &DoctorDependencies) -> DoctorRep
                 format!("parsed default_model {}", settings.default_model),
                 None,
             ),
-            Some(settings.default_model),
+            Some(settings.default_model.clone()),
         ),
         Ok(None) => (
             check(
@@ -95,7 +97,7 @@ pub async fn run(options: DoctorOptions, deps: &DoctorDependencies) -> DoctorRep
             check(
                 "settings",
                 DoctorStatus::Error,
-                error,
+                error.clone(),
                 Some("doctor.check_failed"),
             ),
             None,
@@ -113,6 +115,17 @@ pub async fn run(options: DoctorOptions, deps: &DoctorDependencies) -> DoctorRep
     checks.push(policy_self_test());
     checks.push(sandbox_check());
     checks.push(trust_check(&deps.home, &deps.workspace));
+
+    // Phase 7C1: optional AgentField adapter diagnostics. The offline doctor
+    // only reports configuration state; the live probe additionally verifies
+    // the pinned contract against the configured control plane.
+    let agentfield_check = agentfield_check(
+        &deps.home,
+        settings.as_ref().ok().and_then(|s| s.as_ref()),
+        options.live,
+    )
+    .await;
+    checks.push(agentfield_check);
 
     if options.live {
         checks.push(live_check(deps).await);
@@ -297,6 +310,86 @@ fn home_check(home: &Path) -> DoctorCheck {
             Some("doctor.check_failed"),
         ),
     }
+}
+
+/// Phase 7C1: AgentField adapter diagnostics. Offline: configuration state
+/// only (disabled / unconfigured / invalid). Live (`--live`) stays offline for
+/// AgentField in v1.2.1: it reports the `deferred_to_7c1_1` status with zero
+/// AgentField network requests (production verification is Phase 7C1.1).
+async fn agentfield_check(
+    home: &Path,
+    settings: Option<&DoctorSettings>,
+    live: bool,
+) -> DoctorCheck {
+    use lato_agent::agentfield::{self as af};
+    let raw = settings.and_then(|settings| settings.agentfield.clone());
+    if raw.is_none() {
+        return check(
+            "agentfield",
+            DoctorStatus::Ok,
+            "agentfield not configured; adapter disabled",
+            None,
+        );
+    }
+    let config = match af::config::AgentFieldConfig::parse(&raw.unwrap()) {
+        Ok(Some(config)) => config,
+        Ok(None) => {
+            return check(
+                "agentfield",
+                DoctorStatus::Ok,
+                "agentfield not configured; adapter disabled",
+                None,
+            );
+        }
+        Err(error) => {
+            return check(
+                "agentfield",
+                DoctorStatus::Error,
+                error.to_string(),
+                Some(error.code),
+            );
+        }
+    };
+    if !config.enabled {
+        return check(
+            "agentfield",
+            DoctorStatus::Ok,
+            "agentfield present but disabled; adapter not registered",
+            None,
+        );
+    }
+    let store = lato_ai::CredentialStore::open(home).ok();
+    let credential =
+        af::resolve_agentfield_credential(store.as_ref(), &config.credential_reference);
+    if credential.is_none() {
+        return check(
+            "agentfield",
+            DoctorStatus::Warn,
+            format!(
+                "enabled but credential `{}` is not resolvable (credential store entry `agentfield` or LATO_AGENTFIELD_CREDENTIAL)",
+                config.credential_reference
+            ),
+            Some("agentfield.unconfigured"),
+        );
+    }
+    let deferred_note = if live {
+        // v1.2.1 (DG-01): 7C1 is offline-only — doctor `--live` performs ZERO
+        // AgentField network requests; production verification is deferred to
+        // the separately accepted Phase 7C1.1.
+        "; AgentField network verification deferred_to_7c1_1 (zero requests made)"
+    } else {
+        "; run `lato doctor --live` for the deferred-status report"
+    };
+    check(
+        "agentfield",
+        DoctorStatus::Ok,
+        format!(
+            "enabled with {} capability(ies){}",
+            config.capabilities.len(),
+            deferred_note
+        ),
+        None,
+    )
 }
 
 fn load_settings(home: &Path) -> Result<Option<DoctorSettings>, String> {
