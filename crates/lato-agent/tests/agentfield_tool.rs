@@ -537,6 +537,109 @@ async fn valid_start_reaches_approval_only_after_pre_policy_gates_pass() {
     }
 }
 
+/// Round-3 AC-04: an UNCHANGED multi-source configuration (user + project)
+/// must not false-positive `catalog_changed` — registration and recheck
+/// share the same assembly, so a valid start succeeds.
+#[tokio::test]
+async fn unchanged_project_config_does_not_false_positive_catalog_changed() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let cwd = temp.path().join("cwd");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(cwd.join(".lato")).unwrap();
+    std::fs::write(
+        home.join("config.json"),
+        json!({"agentfield": test_config_value()}).to_string(),
+    )
+    .unwrap();
+    // Same origin + credential, identical capability union: a fully valid,
+    // untouched project source.
+    std::fs::write(
+        cwd.join(".lato").join("config.json"),
+        json!({"agentfield": test_config_value()}).to_string(),
+    )
+    .unwrap();
+    let (manager, fake) = manager_with_sources(&home, &cwd, StartBehavior::Ok("exec-1".into()));
+    let (runtime, _handle) = agentfield_runtime(&temp.path().join("scratch"), manager.clone());
+    let revision = manager.catalog().revision().to_owned();
+
+    let output = approved_start(&runtime, &revision, "call-unchanged")
+        .await
+        .unwrap();
+    assert_eq!(output_json(&output)["run"]["status"], "queued");
+    assert_eq!(fake.start_calls.load(Ordering::SeqCst), 1, "one send");
+}
+
+/// Round-3 AC-04: a project config that becomes MALFORMED after approval is
+/// present-but-invalid, never silently "absent" — the recheck fails closed
+/// with `agentfield.catalog_changed`, the grant is consumed, and there are
+/// zero local runs and zero remote requests.
+#[tokio::test]
+async fn malformed_project_config_after_approval_fails_closed() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let cwd = temp.path().join("cwd");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(cwd.join(".lato")).unwrap();
+    std::fs::write(
+        home.join("config.json"),
+        json!({"agentfield": test_config_value()}).to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        cwd.join(".lato").join("config.json"),
+        json!({"agentfield": test_config_value()}).to_string(),
+    )
+    .unwrap();
+    let (manager, fake) = manager_with_sources(&home, &cwd, StartBehavior::Ok("exec-1".into()));
+    let (runtime, _handle) = agentfield_runtime(&temp.path().join("scratch"), manager.clone());
+    let revision = manager.catalog().revision().to_owned();
+
+    // Corrupt the project source AFTER the session froze its catalog.
+    std::fs::write(cwd.join(".lato").join("config.json"), "{not json").unwrap();
+
+    let context = lato_core::ToolContext {
+        session_id: lato_core::SessionId::from("session"),
+        turn_id: lato_core::TurnId::from("turn"),
+        call_id: lato_core::ToolCallId::from("call-malformed"),
+        cancellation: tokio_util::sync::CancellationToken::new(),
+        execution_grant: None,
+    };
+    let prepared = runtime
+        .prepare_scoped(
+            context,
+            "agentfield",
+            json!({"action":"start","name":"contract-review","revision":revision,"input":{"contract":"acme.pdf"}}),
+            None,
+        )
+        .expect("frozen alias still passes pre-policy gates");
+    let grant = match runtime.decision(&prepared) {
+        PolicyDecision::RequireApproval(request) => runtime.approve(request).unwrap(),
+        other => panic!("unexpected decision {other:?}"),
+    };
+    let error = runtime
+        .execute_authorized(prepared, grant.clone())
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "agentfield.catalog_changed");
+    assert_eq!(manager.run_count().await, 0, "no reservation");
+    assert_eq!(fake.start_calls.load(Ordering::SeqCst), 0, "zero network");
+
+    // The grant is consumed and can never be reused.
+    let context = lato_core::ToolContext {
+        session_id: lato_core::SessionId::from("session"),
+        turn_id: lato_core::TurnId::from("turn"),
+        call_id: lato_core::ToolCallId::from("call-malformed-reuse"),
+        cancellation: tokio_util::sync::CancellationToken::new(),
+        execution_grant: None,
+    };
+    let second = runtime
+        .prepare_scoped(context, "agentfield", json!({"action":"status"}), None)
+        .unwrap();
+    let reuse = runtime.execute_authorized(second, grant).await;
+    assert!(reuse.is_err(), "a consumed grant must not be reusable");
+}
+
 /// AC-04: approval后 revision mismatch ⇒ `agentfield.catalog_changed`,
 /// grant consumed, zero remote requests, zero local runs.
 #[tokio::test]

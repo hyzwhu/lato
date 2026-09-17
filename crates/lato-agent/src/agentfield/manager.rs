@@ -1738,13 +1738,14 @@ mod tests {
                     Err(_) => None,
                 }
             };
-            value
+            let config = value
                 .and_then(|wrapped| wrapped.get("agentfield").cloned())
                 .and_then(|raw| {
                     crate::agentfield::config::AgentFieldConfig::parse(&raw)
                         .ok()
                         .flatten()
-                })
+                });
+            Ok(config)
         });
         let sources_with_plugin = {
             let mut sources =

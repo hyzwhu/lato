@@ -7,10 +7,7 @@ use crate::{
     ChildSessionRunner, PreparedModelSwitch, ProfileResultVerifier, RuntimeCompactionOutcome,
     RuntimePromptOutcome, RuntimeSession, SessionPluginSnapshots, SkillRuntimeBinding,
     ToolApproval, TranscriptStore,
-    agentfield::{
-        AgentFieldCatalog, AgentFieldManager, AgentFieldTool, SessionAgentFieldHandle,
-        load_agentfield_config,
-    },
+    agentfield::{AgentFieldCatalog, AgentFieldManager, AgentFieldTool, SessionAgentFieldHandle},
     import_legacy_if_needed,
     workflow::{
         SessionWorkflowHandle, WorkflowManager, WorkflowTool, list_workflows, resolve_workflow,
@@ -507,7 +504,15 @@ impl AcpHost {
         &self,
         sid: &str,
     ) -> Option<(SessionAgentFieldHandle, Arc<AgentFieldManager>)> {
-        let config = load_agentfield_config(&self.effective_lato_home())?;
+        // Unified multi-source assembly (Round-3): registration and the
+        // post-approval revision recheck share the SAME
+        // `assemble_catalog_config(catalog_sources(home, cwd))` path, so an
+        // unchanged user/project/plugin set cannot false-positive
+        // `catalog_changed`, and any present-but-invalid source fails
+        // closed here as zero tool registration.
+        let sources =
+            crate::agentfield::catalog::catalog_sources(&self.effective_lato_home(), &self.cwd);
+        let config = crate::agentfield::catalog::assemble_catalog_config(&sources)?;
         // Credential resolution happens at the registration gate, BEFORE any
         // transport exists; an unresolvable reference means the adapter is
         // unconfigured and stays invisible to the model.
@@ -517,11 +522,7 @@ impl AcpHost {
         )?;
         let catalog = AgentFieldCatalog::from_config(&config);
         let manager = Arc::new(AgentFieldManager::new(
-            sid,
-            catalog,
-            credential,
-            config,
-            crate::agentfield::catalog::catalog_sources(&self.effective_lato_home(), &self.cwd),
+            sid, catalog, credential, config, sources,
         ));
         Some((SessionAgentFieldHandle::new(), manager))
     }

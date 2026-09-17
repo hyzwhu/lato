@@ -150,19 +150,59 @@ impl AgentFieldCatalog {
 // stages). Sources that are present but disabled contribute nothing, so an
 // `enabled` flip is detectable by the post-approval revision recheck.
 
-/// One reloadable configuration source. `None` means the source currently
-/// contributes nothing (absent, disabled, or invalid — the doctor reports
-/// the details; the adapter fails closed).
-pub type CatalogSource = std::sync::Arc<dyn Fn() -> Option<AgentFieldConfig> + Send + Sync>;
+/// One reloadable configuration source (Round-3 tri-state contract):
+/// - `Ok(None)` — the source legitimately contributes nothing (file absent,
+///   no `agentfield` stanza, or stanza explicitly disabled);
+/// - `Ok(Some(config))` — the source is present, valid, and enabled;
+/// - `Err(CatalogSourceError)` — the source is PRESENT but unusable
+///   (unreadable, malformed JSON, invalid stanza). An invalid source is
+///   never silently treated as absent: assembly fails closed, so
+///   registration sees zero registration and the post-approval recheck
+///   returns `agentfield.catalog_changed`.
+#[derive(Debug, Clone)]
+pub struct CatalogSourceError(pub String);
 
-fn load_config_file(path: &std::path::Path) -> Option<AgentFieldConfig> {
-    let bytes = std::fs::read(path).ok()?;
-    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    let raw = value.get("agentfield")?;
-    crate::agentfield::config::AgentFieldConfig::parse(raw)
-        .ok()
-        .flatten()
-        .filter(|config| config.enabled)
+pub type CatalogSource =
+    std::sync::Arc<dyn Fn() -> Result<Option<AgentFieldConfig>, CatalogSourceError> + Send + Sync>;
+
+fn load_config_file(
+    path: &std::path::Path,
+) -> Result<Option<AgentFieldConfig>, CatalogSourceError> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(CatalogSourceError(format!(
+                "config file {} is present but unreadable: {error}",
+                path.display()
+            )));
+        }
+    };
+    let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
+        CatalogSourceError(format!(
+            "config file {} is present but malformed JSON: {error}",
+            path.display()
+        ))
+    })?;
+    let Some(raw) = value.get("agentfield") else {
+        // No agentfield stanza: the file is a valid config that simply does
+        // not configure this adapter.
+        return Ok(None);
+    };
+    if raw.is_null() {
+        return Ok(None);
+    }
+    match crate::agentfield::config::AgentFieldConfig::parse(raw) {
+        Ok(Some(config)) if config.enabled => Ok(Some(config)),
+        // Disabled stanzas are validated but contribute nothing; the
+        // enabled flip is detectable because an enabled stanza assembles
+        // differently.
+        Ok(_) => Ok(None),
+        Err(error) => Err(CatalogSourceError(format!(
+            "config file {} has an invalid agentfield stanza: {error}",
+            path.display()
+        ))),
+    }
 }
 
 /// The default source set: user, project, plugin (in merge order).
@@ -174,7 +214,7 @@ pub fn catalog_sources(home: &std::path::Path, cwd: &std::path::Path) -> Vec<Cat
         std::sync::Arc::new(move || load_config_file(&project_config)),
         // Plugin slot: no plugin-provided agentfield configuration exists in
         // v1; reserved so a source change can be detected fail-closed.
-        std::sync::Arc::new(|| None),
+        std::sync::Arc::new(|| Ok(None)),
     ]
 }
 
@@ -182,13 +222,18 @@ pub fn catalog_sources(home: &std::path::Path, cwd: &std::path::Path) -> Vec<Cat
 /// every present source must agree on origin and credential reference
 /// (disagreement fails closed), capabilities are unioned by alias (a
 /// conflicting redefinition fails closed), and the merged capability set is
-/// still capped at [`config::MAX_CAPABILITIES`]. `None` = nothing present
-/// or a disagreement.
+/// still capped at [`config::MAX_CAPABILITIES`]. `None` = nothing present,
+/// a disagreement, or ANY source that is present but invalid (fail closed).
 pub fn assemble_catalog_config(sources: &[CatalogSource]) -> Option<AgentFieldConfig> {
     let mut assembled: Option<AgentFieldConfig> = None;
     for source in sources {
-        let Some(config) = source() else {
-            continue;
+        let config = match source() {
+            Ok(Some(config)) => config,
+            Ok(None) => continue,
+            // Present-but-invalid source: never silently skipped. The
+            // message carries only a path and a parse error — no secrets —
+            // and `lato doctor` reports the same diagnostics.
+            Err(CatalogSourceError(_message)) => return None,
         };
         let Some(current) = assembled.as_mut() else {
             assembled = Some(config);
@@ -430,5 +475,103 @@ mod tests {
         // Recursively sorted keys: the nested inputSchema serializes with
         // `additionalProperties` before `type`.
         assert!(text.contains("{\"additionalProperties\":false,\"type\":\"object\"}"));
+    }
+
+    // ---- Round-3 tri-state source semantics --------------------------------
+
+    fn write_config(path: &std::path::Path, value: serde_json::Value) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, value.to_string()).unwrap();
+    }
+
+    fn enabled_capability() -> serde_json::Value {
+        json!({"agentfield": {
+            "enabled": true,
+            "baseUrl": "https://agents.example.internal",
+            "credential": "agentfield:primary",
+            "capabilities": single_capability(),
+        }})
+    }
+
+    #[test]
+    fn absent_sources_contribute_nothing_and_enabled_source_assembles() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let sources = catalog_sources(temp.path(), temp.path());
+        // Nothing present anywhere: nothing to assemble (no registration).
+        assert!(assemble_catalog_config(&sources).is_none());
+
+        // A valid enabled user config assembles.
+        write_config(&temp.path().join("config.json"), enabled_capability());
+        assert!(assemble_catalog_config(&sources).is_some());
+    }
+
+    #[test]
+    fn disabled_stanza_is_legitimately_empty_but_flip_is_detectable() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let sources = catalog_sources(temp.path(), temp.path());
+        let mut disabled = enabled_capability();
+        disabled["agentfield"]["enabled"] = json!(false);
+        write_config(&temp.path().join("config.json"), disabled);
+        assert!(
+            assemble_catalog_config(&sources).is_none(),
+            "disabled contributes nothing"
+        );
+        // Flipping the same stanza to enabled changes the assembled config.
+        write_config(&temp.path().join("config.json"), enabled_capability());
+        assert!(assemble_catalog_config(&sources).is_some());
+    }
+
+    #[test]
+    fn malformed_json_source_fails_closed() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let sources = catalog_sources(temp.path(), temp.path());
+        std::fs::create_dir_all(temp.path().join(".lato")).unwrap();
+        std::fs::write(temp.path().join(".lato").join("config.json"), "{not json").unwrap();
+        assert!(
+            assemble_catalog_config(&sources).is_none(),
+            "present-but-malformed must never be treated as absent"
+        );
+    }
+
+    #[test]
+    fn invalid_stanza_source_fails_closed() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let sources = catalog_sources(temp.path(), temp.path());
+        // Valid JSON, but the stanza is not a valid agentfield config.
+        write_config(
+            &temp.path().join("config.json"),
+            json!({"agentfield": {"enabled": true}}),
+        );
+        assert!(assemble_catalog_config(&sources).is_none());
+    }
+
+    #[test]
+    fn unreadable_source_fails_closed() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let sources = catalog_sources(temp.path(), temp.path());
+        // A directory at the config path is readable-neither: fs::read
+        // fails with a non-NotFound error, which must fail closed.
+        std::fs::create_dir_all(temp.path().join("config.json")).unwrap();
+        assert!(assemble_catalog_config(&sources).is_none());
+    }
+
+    #[test]
+    fn unchanged_multi_source_assembly_is_stable() {
+        let temp = tempfile::TempDir::new().unwrap();
+        write_config(&temp.path().join("config.json"), enabled_capability());
+        write_config(
+            &temp.path().join(".lato").join("config.json"),
+            enabled_capability(),
+        );
+        let sources = catalog_sources(temp.path(), temp.path());
+        // Same origin+credential, identical capability: the union is
+        // deterministic and repeated assemblies agree.
+        let first = assemble_catalog_config(&sources).unwrap();
+        let second = assemble_catalog_config(&sources).unwrap();
+        assert_eq!(
+            AgentFieldCatalog::from_config(&first).revision(),
+            AgentFieldCatalog::from_config(&second).revision(),
+            "unchanged sources must re-assemble to the same revision"
+        );
     }
 }

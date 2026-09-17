@@ -34,13 +34,15 @@ fn agentfield_is_absent_from_every_non_host_wiring_surface() {
 }
 
 /// 7C2: the main-session registration must exist in host.rs, must be gated
-/// on the validated config loader, and must install the manager on the
-/// session so close marks it unavailable.
+/// on the validated multi-source config assembly (Round-3: registration and
+/// the post-approval recheck share `assemble_catalog_config`), and must
+/// install the manager on the session so close marks it unavailable.
 #[test]
 fn host_registers_agentfield_only_behind_the_config_gate() {
     let host = include_str!("../src/host.rs").to_ascii_lowercase();
     for expected in [
-        "load_agentfield_config",
+        "catalog_sources(",
+        "assemble_catalog_config",
         "sessionagentfieldhandle",
         "agentfieldtool::new",
         "attach_agentfield_manager",
