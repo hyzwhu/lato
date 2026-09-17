@@ -438,12 +438,10 @@ mod handle {
             }
             // (3) Deterministic seam on the real production point: old plan
             // isolated, final slot free, nameless inode about to be bound.
-            if let Err(message) = faults.on_post_link(reap_name.as_deref().unwrap_or("")) {
-                // Zero mistaken deletion: if a bystander took the final slot
-                // during the seam, we do NOT restore over it — the old plan
-                // stays under `.reap` for manual recovery.
-                return Err(message);
-            }
+            // Zero mistaken deletion: if a bystander took the final slot
+            // during the seam, we do NOT restore over it — the old plan
+            // stays under `.reap` for manual recovery.
+            faults.on_post_link(reap_name.as_deref().unwrap_or(""))?;
             // (4) Identity-bound publication: bind the NAMELESS inode to
             // `plan.md` directly. `AT_EMPTY_PATH` acts on the descriptor's
             // own inode, so bystander content can never be published; the
