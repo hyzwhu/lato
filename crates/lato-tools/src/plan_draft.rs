@@ -96,13 +96,6 @@ pub trait PlanDraftFaults: Send + Sync {
         Ok(())
     }
     /// Linux-only deterministic seam on the REAL production path: invoked
-    /// AFTER the identity-bound `linkat` created the intermediate link and
-    /// BEFORE the final `renameat` commits. Returning `Err` aborts the
-    /// publication and runs the failure cleanup; the hook may also observe
-    /// or mutate the filesystem (e.g. remove the intermediate link, occupy
-    /// the destination) to drive the REAL `renameat` failure branch through
-    /// genuine syscalls. Production returns `Ok(())`.
-    /// Linux-only deterministic seam on the REAL production path: invoked
     /// BEFORE anything is moved — the previous plan is still on its
     /// ORIGINAL path (`final_name`), untouched. Returning `Err` fails the
     /// publication immediately: the previous plan was never moved, so it
@@ -114,6 +107,15 @@ pub trait PlanDraftFaults: Send + Sync {
         let _ = middle_name;
         Ok(())
     }
+    /// Linux-only deterministic seam on the REAL production path: invoked
+    /// in the STRICT post-move/pre-link window — AFTER the previous plan
+    /// has been atomically moved to its auditable `.reap-<nonce>` name and
+    /// BEFORE the identity-bound `linkat` re-binds the nameless inode to
+    /// `final_name`. Returning `Err` triggers the zero-overwrite restore
+    /// (`renameat2(RENAME_NOREPLACE)`): the old plan goes back onto
+    /// `final_name` when the slot is still free, or stays under `.reap`
+    /// with a recovery hint in the error when a bystander occupies the
+    /// slot. Production returns `Ok(())`.
     fn on_pre_final_link(&self, final_name: &str, reap_name: &str) -> Result<(), String> {
         let _ = (final_name, reap_name);
         Ok(())
@@ -386,8 +388,8 @@ mod handle {
         ///    `.reap-<nonce>` name (`renameat` — a move, nothing deleted);
         /// 4. `linkat(.., AT_EMPTY_PATH)` again onto the now-free slot:
         ///    - success → published; the old plan stays under `.reap` as an
-        ///      auditable backup (residue policy = ruling item A1, decided
-        ///      2026-09-17);
+        ///      auditable backup (residue policy = A1, pending project-
+        ///      owner written ratification);
         ///    - `EEXIST` (a bystander took the freed slot during the seam)
         ///      → fail closed, NEVER overwrite the bystander, and restore
         ///      the previous plan with `renameat2(RENAME_NOREPLACE)`:
@@ -505,8 +507,8 @@ mod handle {
             };
             if linked == 0 {
                 // Published. The old plan stays under the auditable `.reap`
-                // name (residue policy = ruling item A1, decided
-                // 2026-09-17).
+                // name (residue policy = A1, pending project-owner written
+                // ratification).
                 return Ok(());
             }
             let second_error = io::Error::last_os_error();
@@ -2300,13 +2302,28 @@ mod tests {
                 error.contains("preserved under") && error.contains("restored manually"),
                 "attempt {attempt}: the error must carry the recovery hint: {error}"
             );
-            // The bystander in the freed slot survives byte-for-byte: the
+            // The bystander in the freed slot survives byte-for-byte AND
+            // with the exact (dev, ino) captured inside the seam: the
             // zero-overwrite restore did not touch it.
             assert_eq!(
                 std::fs::read(root.join(PLAN_FILE_NAME)).unwrap(),
                 b"pre-final-bystander",
                 "attempt {attempt}: the bystander must survive"
             );
+            // Field-by-field identity review: actually READ the captured
+            // values and assert both files' (dev, ino) are unchanged after
+            // the failure path ran.
+            let (bystander_dev, bystander_ino, reap_dev, reap_ino) =
+                captured.lock().unwrap().unwrap();
+            {
+                use std::os::unix::fs::MetadataExt as _;
+                let bystander_meta = std::fs::metadata(root.join(PLAN_FILE_NAME)).unwrap();
+                assert_eq!(
+                    (bystander_meta.dev(), bystander_meta.ino()),
+                    (bystander_dev, bystander_ino),
+                    "attempt {attempt}: the bystander's (dev, ino) must be unchanged"
+                );
+            }
             // The old plan is preserved under its auditable `.reap` name.
             let reaps: Vec<String> = full_entries(&root)
                 .into_iter()
@@ -2322,6 +2339,15 @@ mod tests {
                 b"previous",
                 "attempt {attempt}: the old plan must be preserved"
             );
+            {
+                use std::os::unix::fs::MetadataExt as _;
+                let reap_meta = std::fs::metadata(root.join(&reaps[0])).unwrap();
+                assert_eq!(
+                    (reap_meta.dev(), reap_meta.ino()),
+                    (reap_dev, reap_ino),
+                    "attempt {attempt}: the old plan's (dev, ino) must be unchanged"
+                );
+            }
             // Full enumeration: exactly plan.md (the bystander) + the .reap
             // backup; the new nameless inode left NO named residue.
             let mut all = full_entries(&root);
@@ -2346,22 +2372,22 @@ mod tests {
             let locks = FileLocks::new();
             plan_draft(&locks, &root, "previous").await.unwrap();
 
-            let bystander_name = format!("swap-in-{attempt}");
-            struct SwapInReap {
+            struct SwapInFinalSlot {
                 workspace_root: PathBuf,
-                bystander_path: PathBuf,
             }
-            impl PlanDraftFaults for SwapInReap {
+            impl PlanDraftFaults for SwapInFinalSlot {
                 fn on_stage(&self, _stage: PlanDraftStage) -> Result<(), String> {
                     Ok(())
                 }
-                fn on_post_link(&self, reap_name: &str) -> Result<(), String> {
-                    // The old plan sits in the isolated `.reap` slot. Swap a
-                    // bystander in (remove + create, like a real swap) and
-                    // abort. The production path must not delete us.
-                    std::fs::remove_file(self.workspace_root.join(reap_name)).unwrap();
-                    std::fs::write(&self.bystander_path, "swapped-in").unwrap();
-                    Err("aborted at the post-link seam".into())
+                fn on_post_link(&self, final_name: &str) -> Result<(), String> {
+                    // Swap a bystander INTO the final slot while the old
+                    // plan is still there (remove + create, like a real
+                    // swap-in) and abort: the publication must fail closed
+                    // and the production path must never delete the
+                    // swapped-in bystander.
+                    std::fs::remove_file(self.workspace_root.join(final_name)).unwrap();
+                    std::fs::write(self.workspace_root.join(final_name), "swapped-in").unwrap();
+                    Err("aborted at the post-move seam".into())
                 }
             }
 
@@ -2369,35 +2395,27 @@ mod tests {
                 &locks,
                 &root,
                 "replacement",
-                &SwapInReap {
+                &SwapInFinalSlot {
                     workspace_root: root.clone(),
-                    bystander_path: root.join(&bystander_name),
                 },
             )
             .await
             .unwrap_err();
             assert!(
-                error.contains("post-link seam"),
+                error.contains("post-move seam"),
                 "attempt {attempt}: {error}"
             );
-            // The swapped-in bystander survives: the production path has no
-            // unlinkat anywhere on this branch.
+            // The swapped-in bystander survives byte-for-byte: the
+            // production path has no unlinkat anywhere on this branch.
             assert_eq!(
-                std::fs::read(root.join(&bystander_name)).unwrap(),
+                std::fs::read(root.join(PLAN_FILE_NAME)).unwrap(),
                 b"swapped-in",
                 "attempt {attempt}: the swapped-in bystander must survive"
             );
-            // The final slot stays FREE: the implementation never restores
-            // over a bystander, and the old plan was removed by the seam
-            // itself (its nameless inode vanished with the descriptor).
-            assert!(
-                !root.join(PLAN_FILE_NAME).exists(),
-                "attempt {attempt}: the final slot must stay free"
-            );
-            // Full enumeration: only the bystander remains (the old plan
-            // was deliberately removed by the seam itself).
+            // No `.reap` was created (the abort happened before the move)
+            // and nothing else was left behind.
             let all = full_entries(&root);
-            assert_eq!(all, vec![bystander_name], "attempt {attempt}");
+            assert_eq!(all, vec![PLAN_FILE_NAME.to_string()], "attempt {attempt}");
         }
     }
 
