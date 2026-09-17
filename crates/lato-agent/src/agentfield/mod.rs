@@ -1,17 +1,19 @@
-// Phase 7C1 (v1.2.1): AgentField OFFLINE-ONLY remote-execution adapter
-// foundation — configuration, strict wire contract for the pinned `v0.1.138`,
-// injectable fake-transport client trait, snapshot state machine, and static
-// doctor diagnostics. Per spec §0.3 there is deliberately NO production
-// transport, no DNS/address policy, and no public network seam in this
-// slice; those arrive in Phase 7C1.1.
+// Phase 7C1.1: AgentField remote-execution adapter — configuration, strict
+// wire contract for the pinned `v0.1.138`, injectable transport client, the
+// production HTTPS transport with its frozen network policy (7C1.1:
+// `transport`, unique policy-enforcing factory, DNS classification and
+// address pinning), snapshot state machine, and doctor diagnostics.
 //
-// Also absent (7C2/7C3): model tool registration, `AgentFieldManager`,
+// Still absent (7C2/7C3): model tool registration, `AgentFieldManager`,
 // policy/approval integration, journal events, and cross-process
 // resume/reconcile.
 
 pub mod client;
 pub mod config;
 pub mod probe;
+#[cfg(test)]
+mod probes_7c1_1;
+pub mod transport;
 pub mod types;
 
 pub use client::{
@@ -25,6 +27,7 @@ pub use config::{
 pub use probe::{
     AgentFieldHealthSnapshot, AgentFieldProbe, AgentFieldProbeCache, HEALTH_SNAPSHOT_TTL,
 };
+pub use transport::ReqwestTransport;
 pub use types::{
     AsyncStartEnvelope, CancelConflictEnvelope, CancelSuccessEnvelope, DiscoveryAgent,
     DiscoveryEnvelope, DiscoveryReasoner, RemoteExecutionStatus, StatusEnvelope,
@@ -57,6 +60,30 @@ pub fn resolve_agentfield_credential(
         .map(client::RedactedToken::new)
 }
 
+/// The unique policy-enforcing production factory (7C1.1): every product
+/// path obtains its AgentField client here and nowhere else. The credential
+/// is resolved BEFORE any transport exists — an unresolvable reference
+/// yields `agentfield.unconfigured` with zero network requests — and the
+/// transport is built through `ReqwestTransport::connect`, the only
+/// constructor that enforces the frozen network policy.
+pub async fn production_agentfield_client(
+    store: Option<&lato_ai::CredentialStore>,
+    config: &config::AgentFieldConfig,
+) -> Result<client::HttpAgentFieldClient<transport::ReqwestTransport>, client::AgentFieldError> {
+    let credential = resolve_agentfield_credential(store, &config.credential_reference)
+        .ok_or_else(|| {
+            client::AgentFieldError::CredentialMissing(config.credential_reference.clone())
+        })?;
+    let transport = transport::ReqwestTransport::connect(&config.origin)
+        .await
+        .map_err(client::map_transport_error)?;
+    Ok(client::HttpAgentFieldClient::new(
+        config.origin.clone(),
+        Some(credential),
+        transport,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -66,5 +93,98 @@ mod tests {
         let token = client::RedactedToken::new("sk-live-123");
         assert!(!format!("{token:?}").contains("sk-live-123"));
         assert!(!format!("{token}").contains("sk-live-123"));
+    }
+
+    /// 7C1.1 AC-07: the token AND the full `Authorization` header value must
+    /// be absent from every printable surface (Debug/Display of the token,
+    /// request, transport and client errors, and health snapshots). Journal
+    /// and doctor surfaces are covered by their own integration tests.
+    #[test]
+    fn credential_and_authorization_value_hit_zero_surfaces() {
+        const SECRET: &str = "sk-live-secret-7c11-redaction-probe";
+        let auth_value = format!("Bearer {SECRET}");
+        let token = client::RedactedToken::new(SECRET);
+        let request = client::OutboundRequest {
+            method: "GET",
+            url: "https://agents.example.com/api/v1/discovery/capabilities".into(),
+            bearer: Some(token.clone()),
+            json_body: None,
+        };
+        let errors = [
+            format!(
+                "{:?}",
+                client::TransportError::Connection("connect failed".into())
+            ),
+            format!(
+                "{}",
+                client::TransportError::Connection("connect failed".into())
+            ),
+            format!("{:?}", client::AgentFieldError::Unauthorized),
+            format!("{}", client::AgentFieldError::Unauthorized),
+            format!(
+                "{:?}",
+                client::AgentFieldError::Unavailable("control plane down".into())
+            ),
+            format!(
+                "{}",
+                client::AgentFieldError::Unavailable("control plane down".into())
+            ),
+            format!(
+                "{:?}",
+                client::AgentFieldError::RemoteProtocol("bad envelope".into())
+            ),
+            format!(
+                "{}",
+                client::AgentFieldError::RemoteProtocol("bad envelope".into())
+            ),
+            format!(
+                "{:?}",
+                client::AgentFieldError::CredentialMissing("agentfield:primary".into())
+            ),
+            format!(
+                "{}",
+                client::AgentFieldError::CredentialMissing("agentfield:primary".into())
+            ),
+        ];
+        let surfaces = [
+            format!("{token:?}"),
+            format!("{token}"),
+            format!("{request:?}"),
+            errors.join("\n"),
+        ];
+        for surface in &surfaces {
+            assert!(!surface.contains(SECRET), "token leaked: {surface}");
+            assert!(
+                !surface.contains(&auth_value),
+                "full Authorization value leaked: {surface}"
+            );
+            assert!(
+                !surface.to_lowercase().contains("authorization: bearer"),
+                "{surface}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unresolvable_credential_means_zero_network_and_a_reference_only_error() {
+        let config = config::AgentFieldConfig::parse(&serde_json::json!({
+            "enabled": true,
+            "baseUrl": "https://agents.example.internal",
+            "credential": "agentfield:primary",
+        }))
+        .unwrap()
+        .unwrap();
+        // No store, no env: the factory must fail before any DNS/connect.
+        let error = match production_agentfield_client(None, &config).await {
+            Err(error) => error,
+            Ok(_) => panic!("unresolvable credential must not produce a client"),
+        };
+        assert!(matches!(
+            error,
+            client::AgentFieldError::CredentialMissing(_)
+        ));
+        let message = error.to_string();
+        assert!(message.contains("agentfield:primary"));
+        assert!(!message.contains("https://agents.example.internal"));
     }
 }

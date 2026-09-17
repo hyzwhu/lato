@@ -421,6 +421,7 @@ fn client_with(transport: Arc<FakeTransport>) -> HttpAgentFieldClient<Arc<FakeTr
     HttpAgentFieldClient::new(
         lato_agent::agentfield::config::ControlPlaneOrigin {
             base: "https://agents.example.internal/".parse().unwrap(),
+            allow_loopback_http: false,
         },
         Some(RedactedToken::new("super-secret-token-value")),
         transport,
@@ -522,6 +523,7 @@ async fn http_status_mapping_is_stable() {
     let html_client = HttpAgentFieldClient::new(
         lato_agent::agentfield::config::ControlPlaneOrigin {
             base: "https://agents.example.internal/".parse().unwrap(),
+            allow_loopback_http: false,
         },
         None,
         Arc::new(FakeHtmlTransport),
@@ -589,6 +591,7 @@ async fn transport_failures_map_to_unavailable_and_never_retry() {
     let client = HttpAgentFieldClient::new(
         lato_agent::agentfield::config::ControlPlaneOrigin {
             base: "https://agents.example.internal/".parse().unwrap(),
+            allow_loopback_http: false,
         },
         None,
         DyingTransport,
@@ -619,6 +622,7 @@ async fn oversized_bodies_are_rejected() {
     let client = HttpAgentFieldClient::new(
         lato_agent::agentfield::config::ControlPlaneOrigin {
             base: "https://agents.example.internal/".parse().unwrap(),
+            allow_loopback_http: false,
         },
         None,
         HugeTransport,
@@ -635,6 +639,7 @@ async fn cancel_rejects_html_and_non_cancelled_success_status() {
     let client = HttpAgentFieldClient::new(
         lato_agent::agentfield::config::ControlPlaneOrigin {
             base: "https://agents.example.internal/".parse().unwrap(),
+            allow_loopback_http: false,
         },
         None,
         Arc::new(FakeHtmlTransport),

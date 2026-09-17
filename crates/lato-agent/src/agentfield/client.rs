@@ -34,6 +34,10 @@ pub enum AgentFieldError {
     /// Response body exceeded the transport cap.
     #[error("agentfield.output_too_large: response body exceeds {0} bytes")]
     BodyTooLarge(usize),
+    /// The credential reference could not be resolved; no network request
+    /// was attempted. The message carries only the reference name.
+    #[error("agentfield.unconfigured: credential `{0}` is not resolvable")]
+    CredentialMissing(String),
 }
 
 /// Redacted Bearer token wrapper: the secret is never printable.
@@ -88,11 +92,36 @@ pub enum TransportError {
     /// redirect, non-HTTPS origin).
     #[error("redirect rejected: {0}")]
     RedirectRejected(String),
+    /// The frozen network policy refused the request before any I/O
+    /// (origin mismatch, address classification, URL shape).
+    #[error("{0}")]
+    PolicyRejected(String),
+    /// The remote answered in violation of the pinned protocol contract
+    /// (header cap, decompression failure).
+    #[error("{0}")]
+    Protocol(String),
+    /// The response exceeded the transport body cap (decompressed stream).
+    #[error("response body exceeds {0} bytes")]
+    BodyTooLarge(usize),
 }
 
 #[async_trait::async_trait]
 pub trait HttpTransport: Send + Sync {
     async fn send(&self, request: OutboundRequest) -> Result<RawResponse, TransportError>;
+}
+
+/// Stable `agentfield.*` mapping for every transport failure. Policy,
+/// protocol, and size violations never echo server-controlled details.
+pub(crate) fn map_transport_error(error: TransportError) -> AgentFieldError {
+    match error {
+        TransportError::Connection(message) => AgentFieldError::Unavailable(message),
+        TransportError::RedirectRejected(message) => {
+            AgentFieldError::Unavailable(format!("redirect rejected: {message}"))
+        }
+        TransportError::PolicyRejected(message) => AgentFieldError::Unavailable(message),
+        TransportError::Protocol(message) => AgentFieldError::RemoteProtocol(message),
+        TransportError::BodyTooLarge(cap) => AgentFieldError::BodyTooLarge(cap),
+    }
 }
 
 #[async_trait::async_trait]
@@ -160,12 +189,7 @@ impl<T: HttpTransport> HttpAgentFieldClient<T> {
                 json_body: body,
             })
             .await
-            .map_err(|error| match error {
-                TransportError::Connection(message) => AgentFieldError::Unavailable(message),
-                TransportError::RedirectRejected(message) => {
-                    AgentFieldError::Unavailable(format!("redirect rejected: {message}"))
-                }
-            })?;
+            .map_err(map_transport_error)?;
         let value = self.check_transport_contract(&response)?;
         if response.status != expected_status {
             return Err(AgentFieldError::RemoteProtocol(format!(
@@ -302,12 +326,7 @@ impl<T: HttpTransport + 'static> AgentFieldClient for HttpAgentFieldClient<T> {
                 json_body: Some(serde_json::json!({ "reason": reason })),
             })
             .await
-            .map_err(|error| match error {
-                TransportError::Connection(message) => AgentFieldError::Unavailable(message),
-                TransportError::RedirectRejected(message) => {
-                    AgentFieldError::Unavailable(format!("redirect rejected: {message}"))
-                }
-            })?;
+            .map_err(map_transport_error)?;
         let parsed = self.check_transport_contract(&response)?;
         match response.status {
             200 => {
