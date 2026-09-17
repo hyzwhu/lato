@@ -387,6 +387,7 @@ mod handle {
         /// atomicity) or leave it under the auditable `.reap` name when a
         /// bystander occupies the original slot (zero mistaken deletion
         /// takes priority; recovery hint included in the error).
+        #[cfg(target_os = "linux")]
         pub fn publish_by_identity(
             &self,
             file: &File,
@@ -1778,6 +1779,7 @@ mod tests {
                 }
             }
 
+            let reap_path = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
             let error = plan_draft_with_faults(
                 &locks,
                 &root,
