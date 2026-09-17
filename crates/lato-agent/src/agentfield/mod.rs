@@ -4,14 +4,15 @@
 // `transport`, unique policy-enforcing factory, DNS classification and
 // address pinning), snapshot state machine, and doctor diagnostics.
 //
-// Phase 7C2 adds: the session-frozen catalog revision (`catalog`). Still
-// absent (later 7C2 commits / 7C3): the session run manager, the
-// main-session model tool, journal events, and cross-process
+// Phase 7C2 adds: the session-frozen catalog revision (`catalog`) and the
+// session-scoped run manager (`manager`). Still absent (later 7C2 commits
+// / 7C3): the main-session model tool, journal events, and cross-process
 // resume/reconcile.
 
 pub mod catalog;
 pub mod client;
 pub mod config;
+pub mod manager;
 pub mod probe;
 #[cfg(test)]
 mod probes_7c1_1;
@@ -27,6 +28,7 @@ pub use config::{
     CapabilityConfig, ConfigError, ControlPlaneOrigin, MAX_CAPABILITIES, MAX_INPUT_BYTES,
     MAX_OUTPUT_BYTES, PINNED_AGENTFIELD_VERSION,
 };
+pub use manager::{AgentFieldManager, CancelOutcome, ManagerError, RunState, RunStatus};
 pub use probe::{
     AgentFieldHealthSnapshot, AgentFieldProbe, AgentFieldProbeCache, HEALTH_SNAPSHOT_TTL,
 };
