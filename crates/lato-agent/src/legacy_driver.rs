@@ -37,6 +37,7 @@ use tokio::sync::{Mutex, mpsc};
 /// Adapts the existing model/tool loop to the typed runtime turn contract.
 pub struct LegacyTurnDriver {
     state: Mutex<LegacyState>,
+    plan_slot: Arc<std::sync::OnceLock<Arc<crate::plan::PlanModeRuntime>>>,
     passthrough: mpsc::UnboundedSender<serde_json::Value>,
     model_port: Arc<SwitchableModelPort>,
     model_stream: Arc<SwitchableModelStream>,
@@ -46,6 +47,15 @@ pub struct LegacyTurnDriver {
 struct LegacyState {
     actor: SessionActor,
     actor_events: mpsc::UnboundedReceiver<serde_json::Value>,
+}
+
+impl LegacyTurnDriver {
+    /// Attaches the session Plan-mode runtime to the turn actor. Synchronous:
+    /// the slot is a `OnceLock` shared with the actor, so constructors of any
+    /// flavor (sync or async) can attach before the first prompt.
+    pub fn attach_plan(&self, plan: Arc<crate::plan::PlanModeRuntime>) {
+        self.plan_slot.set(plan).ok();
+    }
 }
 
 impl LegacyTurnDriver {
@@ -193,6 +203,7 @@ impl LegacyTurnDriver {
                 actor,
                 actor_events,
             }),
+            plan_slot: Arc::new(std::sync::OnceLock::new()),
             passthrough,
             model_port,
             model_stream,
@@ -343,6 +354,13 @@ impl TurnDriver for LegacyTurnDriver {
         events: TurnEventEmitter,
     ) -> Result<TurnOutput, AgentError> {
         let mut state = self.state.lock().await;
+        // Forward the session Plan-mode runtime to the turn actor (A+ Stage
+        // 2): the plan TOCTOU guard, the plan-mode overlay flag, and the
+        // plan_draft publication event must be live on the real turn path.
+        // Idempotent — `attach_plan` only fills an unset slot.
+        if let Some(plan) = self.plan_slot.get() {
+            state.actor.attach_plan(plan.clone());
+        }
         let turn_id = request.turn_id.clone();
         let cancellation = control.cancellation.clone();
         let mut input = request.input;

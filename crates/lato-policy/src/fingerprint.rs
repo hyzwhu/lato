@@ -2,7 +2,9 @@ use lato_core::{ApprovalFingerprint, PolicyRequest};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
-const APPROVAL_FINGERPRINT_DOMAIN: &[u8] = b"lato.policy.approval.v1\0";
+// v2: PolicyRequest gained plan_mode and tool_layer; the domain bump keeps
+// v1-issued grants from ever matching a v2 request fingerprint.
+const APPROVAL_FINGERPRINT_DOMAIN: &[u8] = b"lato.policy.approval.v2\0";
 
 #[derive(Debug, thiserror::Error)]
 pub enum FingerprintError {

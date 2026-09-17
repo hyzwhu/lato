@@ -6,6 +6,7 @@ mod event;
 mod id;
 mod journal;
 mod model;
+mod plan;
 mod policy;
 mod projection;
 mod state;
@@ -13,7 +14,7 @@ mod task;
 mod tool;
 
 pub use budget::*;
-pub use command::{Command, StartBehavior, StartTurn, UserInput};
+pub use command::{Command, PlanModeJournalEvent, StartBehavior, StartTurn, UserInput};
 pub use compaction::*;
 pub use error::{AgentError, ErrorCategory, Retryability};
 pub use event::{
@@ -35,6 +36,10 @@ pub use model::{
     ModelCapabilities, ModelContent, ModelError, ModelErrorKind, ModelEventStream, ModelMessage,
     ModelPort, ModelRequest, ModelRole, ModelSelection, ModelSelectionError, ModelStopReason,
     ModelStreamEvent, ModelUsage, SamplingParameters, ToolCallDelta, ToolChoice,
+};
+pub use plan::{
+    PLAN_APPROVAL_STALE_CODE, PLAN_DRAFT_MAX_BYTES, PLAN_DRAFT_TOOL_NAME, PLAN_FILE_NAME,
+    PLAN_MODE_READONLY_CODE, PlanCommand, PlanPhase, plan_mode_denial, plan_transition,
 };
 pub use policy::{
     ApprovalFingerprint, ApprovalRequest, EnvironmentPolicy, ExecutionGrant, GrantId,

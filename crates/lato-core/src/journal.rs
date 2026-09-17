@@ -249,6 +249,24 @@ pub enum JournalRecord {
         reason: HistoryReplacementReason,
         prior_checkpoint_id: Option<String>,
     },
+    PlanModeTransitioned {
+        activation: u64,
+        from: crate::plan::PlanPhase,
+        to: crate::plan::PlanPhase,
+        command: crate::plan::PlanCommand,
+    },
+    PlanApprovalRecorded {
+        activation: u64,
+        generation: u64,
+        content_hash: String,
+        approver: String,
+        approved_at_ms: u64,
+    },
+    PlanApprovalRevoked {
+        activation: u64,
+        generation: u64,
+        reason: String,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
@@ -473,7 +491,10 @@ pub fn project_journal(
             | JournalRecord::CompactionCancelled { .. }
             | JournalRecord::PluginSnapshotAdopted { .. }
             | JournalRecord::ExtensionAudit { .. }
-            | JournalRecord::LegacyTranscriptImported { .. } => {}
+            | JournalRecord::LegacyTranscriptImported { .. }
+            | JournalRecord::PlanModeTransitioned { .. }
+            | JournalRecord::PlanApprovalRecorded { .. }
+            | JournalRecord::PlanApprovalRevoked { .. } => {}
             JournalRecord::ModelSelected {
                 selection,
                 model_family: family,

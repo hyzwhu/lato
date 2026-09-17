@@ -860,6 +860,49 @@ impl AcpHost {
                     Err(error) => Some(err(id, -32000, error.to_string())),
                 }
             }
+            "lato/plan/status" => {
+                let p = req.params.unwrap_or_default();
+                let sid = p.get("sessionId").and_then(|v| v.as_str()).unwrap_or("s1");
+                let Some(session) = self.sessions.get(sid) else {
+                    return Some(err(id, -32000, "unknown session"));
+                };
+                Some(ok(id, session.plan_status().await))
+            }
+            "lato/plan/enter" | "lato/plan/submit" | "lato/plan/exit" => {
+                let p = req.params.unwrap_or_default();
+                let sid = p.get("sessionId").and_then(|v| v.as_str()).unwrap_or("s1");
+                let Some(session) = self.sessions.get(sid) else {
+                    return Some(err(id, -32000, "unknown session"));
+                };
+                let outcome = match req.method.as_str() {
+                    "lato/plan/enter" => session.plan_enter().await,
+                    "lato/plan/submit" => session.plan_submit().await,
+                    _ => session.plan_exit().await,
+                };
+                match outcome {
+                    Ok(status) => Some(ok(id, status)),
+                    Err(error) => Some(err(id, -32000, error.to_string())),
+                }
+            }
+            "lato/plan/approve" => {
+                let p = req.params.unwrap_or_default();
+                let sid = p.get("sessionId").and_then(|v| v.as_str()).unwrap_or("s1");
+                let Some(session) = self.sessions.get(sid) else {
+                    return Some(err(id, -32000, "unknown session"));
+                };
+                // ACP approval mirrors the TUI confirmation: it arrives only
+                // through this trusted human protocol channel, and it runs the
+                // exact same state-machine checks. Model messages can never
+                // forge it.
+                let approver = p
+                    .get("approver")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("interactive");
+                match session.plan_approve(approver).await {
+                    Ok(status) => Some(ok(id, status)),
+                    Err(error) => Some(err(id, -32000, error.to_string())),
+                }
+            }
             "session/cancel" => {
                 if let Some(sid) = req
                     .params
@@ -1474,6 +1517,33 @@ pub fn default_fake_stream() -> Arc<dyn ModelStream> {
     )]]))
 }
 
+/// Deterministic test stream: the turn issues a real, in-bounds `plan_draft`
+/// tool call, so the session records a genuine draft-publication event.
+pub fn fake_plan_draft_stream() -> Arc<dyn ModelStream> {
+    Arc::new(FakeModelStream::new(vec![vec![
+        StreamPiece::ToolCall {
+            id: "plan-draft-1".into(),
+            name: "plan_draft".into(),
+            arguments: serde_json::json!({"contents": "# implementation plan\n\nstep one: real content\n"}),
+        },
+        StreamPiece::Text("drafted".into()),
+    ]]))
+}
+
+/// Deterministic test stream: the turn calls `plan_draft` with an oversized
+/// payload, so the tool call FAILS closed and nothing is published.
+pub fn fake_plan_draft_failure_stream() -> Arc<dyn ModelStream> {
+    let oversized = "a".repeat(lato_core::PLAN_DRAFT_MAX_BYTES + 1);
+    Arc::new(FakeModelStream::new(vec![vec![
+        StreamPiece::ToolCall {
+            id: "plan-draft-fail-1".into(),
+            name: "plan_draft".into(),
+            arguments: serde_json::json!({ "contents": oversized }),
+        },
+        StreamPiece::Text("tried".into()),
+    ]]))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1504,7 +1574,7 @@ mod tests {
         assert_eq!(source.matches(&boundary_call).count(), 2);
     }
 
-    fn req(id: i32, method: &str, params: serde_json::Value) -> JsonRpcReq {
+    pub fn req(id: i32, method: &str, params: serde_json::Value) -> JsonRpcReq {
         JsonRpcReq {
             jsonrpc: "2.0".into(),
             id: Some(serde_json::json!(id)),

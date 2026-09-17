@@ -85,6 +85,7 @@ pub struct RuntimeSession {
     session_id: SessionId,
     handle: SessionHandle,
     driver: Arc<LegacyTurnDriver>,
+    plan: Arc<crate::plan::PlanModeRuntime>,
     updates: mpsc::UnboundedSender<serde_json::Value>,
     active_operation: Arc<Mutex<Option<ActiveOperation>>>,
     submission_gate: Mutex<()>,
@@ -207,16 +208,18 @@ impl RuntimeSession {
     fn from_driver(
         session_id: SessionId,
         driver: Arc<LegacyTurnDriver>,
+        plan: Arc<crate::plan::PlanModeRuntime>,
         updates: mpsc::UnboundedSender<serde_json::Value>,
     ) -> Self {
         let runtime_driver: Arc<dyn TurnDriver> = driver.clone();
         let handle = spawn_session(session_id.clone(), runtime_driver);
-        Self::from_spawned_driver(session_id, driver, updates, handle)
+        Self::from_spawned_driver(session_id, driver, plan, updates, handle)
     }
 
     fn from_spawned_driver(
         session_id: SessionId,
         driver: Arc<LegacyTurnDriver>,
+        plan: Arc<crate::plan::PlanModeRuntime>,
         updates: mpsc::UnboundedSender<serde_json::Value>,
         handle: SessionHandle,
     ) -> Self {
@@ -224,6 +227,7 @@ impl RuntimeSession {
             session_id,
             handle,
             driver,
+            plan,
             updates,
             active_operation: Arc::new(Mutex::new(None)),
             submission_gate: Mutex::new(()),
@@ -244,6 +248,7 @@ impl RuntimeSession {
                 Retryability::Never,
             )
         })?;
+        let cwd_for_plan = config.cwd.clone();
         let driver = Arc::new(match config.tool_runtime.skills {
             Some(binding) => LegacyTurnDriver::new_with_endpoint_skill_runtime(
                 config.session_id,
@@ -272,12 +277,15 @@ impl RuntimeSession {
         if !config.initial_history.is_empty() {
             driver.replace_history(config.initial_history).await;
         }
+        let plan = Arc::new(crate::plan::PlanModeRuntime::new(&cwd_for_plan));
+        driver.attach_plan(plan.clone());
         let runtime_driver: Arc<dyn TurnDriver> = driver.clone();
         let handle = spawn_session(session_id.clone(), runtime_driver);
         let session = Self {
             session_id,
             handle,
             driver,
+            plan,
             updates: config.updates,
             active_operation: Arc::new(Mutex::new(None)),
             submission_gate: Mutex::new(()),
@@ -325,6 +333,7 @@ impl RuntimeSession {
         approval: Option<Arc<dyn ToolApproval>>,
     ) -> Self {
         let session_id = SessionId::from(session_id);
+        let plan = Arc::new(crate::plan::PlanModeRuntime::new(&cwd));
         let driver = Arc::new(LegacyTurnDriver::new_with_endpoint(
             session_id.to_string(),
             endpoint,
@@ -334,12 +343,19 @@ impl RuntimeSession {
             updates.clone(),
             approval,
         ));
-        let runtime_driver: Arc<dyn TurnDriver> = driver.clone();
-        let handle = spawn_session(session_id.clone(), runtime_driver);
+        let driver_for_attach = driver.clone();
+        let plan_for_attach = plan.clone();
         Self {
-            session_id,
-            handle,
+            session_id: session_id.clone(),
+            handle: {
+                let runtime_driver: Arc<dyn TurnDriver> = driver_for_attach.clone();
+                let handle = spawn_session(session_id.clone(), runtime_driver);
+                // Attach after spawn; attach_plan only locks driver state.
+                driver_for_attach.attach_plan(plan_for_attach);
+                handle
+            },
             driver,
+            plan,
             updates,
             active_operation: Arc::new(Mutex::new(None)),
             submission_gate: Mutex::new(()),
@@ -363,6 +379,7 @@ impl RuntimeSession {
         tool_runtime: Arc<lato_tools::ToolRuntime>,
     ) -> Self {
         let session_id = SessionId::from(session_id);
+        let plan = Arc::new(crate::plan::PlanModeRuntime::new(&cwd));
         let driver = Arc::new(LegacyTurnDriver::new_with_endpoint_and_tool_runtime(
             session_id.to_string(),
             endpoint,
@@ -373,7 +390,7 @@ impl RuntimeSession {
             approval,
             tool_runtime,
         ));
-        Self::from_driver(session_id, driver, updates)
+        Self::from_driver(session_id, driver, plan, updates)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -388,6 +405,7 @@ impl RuntimeSession {
         binding: SkillRuntimeBinding,
     ) -> Self {
         let session_id = SessionId::from(session_id);
+        let plan = Arc::new(crate::plan::PlanModeRuntime::new(&cwd));
         let driver = Arc::new(LegacyTurnDriver::new_with_endpoint_skill_runtime(
             session_id.to_string(),
             endpoint,
@@ -398,9 +416,10 @@ impl RuntimeSession {
             approval,
             binding,
         ));
+        driver.attach_plan(plan.clone());
         let runtime_driver: Arc<dyn TurnDriver> = driver.clone();
         let handle = spawn_session(session_id.clone(), runtime_driver);
-        Self::from_spawned_driver(session_id, driver, updates, handle)
+        Self::from_spawned_driver(session_id, driver, plan, updates, handle)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -531,6 +550,7 @@ impl RuntimeSession {
             }));
         }
         let session_id = SessionId::from(session_id);
+        let cwd_for_plan = cwd.clone();
         let driver = Arc::new(match tool_runtime {
             DriverToolRuntime::Skills(binding) => {
                 LegacyTurnDriver::new_with_endpoint_skill_runtime(
@@ -568,6 +588,8 @@ impl RuntimeSession {
         if !history.is_empty() {
             driver.replace_history(history).await;
         }
+        let plan = Arc::new(crate::plan::PlanModeRuntime::new(&cwd_for_plan));
+        driver.attach_plan(plan.clone());
         let runtime_driver: Arc<dyn TurnDriver> = driver.clone();
         let handle = spawn_session_with_store(
             session_id.clone(),
@@ -583,6 +605,7 @@ impl RuntimeSession {
             session_id,
             handle,
             driver,
+            plan,
             updates,
             active_operation: Arc::new(Mutex::new(None)),
             submission_gate: Mutex::new(()),
@@ -747,6 +770,179 @@ impl RuntimeSession {
         if let Some(manager) = self.workflow_manager() {
             manager.shutdown().await;
         }
+    }
+
+    // ---- Plan mode (Phase 8B) -------------------------------------------------
+
+    fn plan_mode_agent_error(error: crate::plan::PlanModeError) -> AgentError {
+        let (code, message) = match &error {
+            crate::plan::PlanModeError::AlreadyActive => ("plan.already_active", error.to_string()),
+            crate::plan::PlanModeError::TurnInFlight => ("plan.turn_in_flight", error.to_string()),
+            crate::plan::PlanModeError::IllegalEdge(_) => ("plan.illegal_edge", error.to_string()),
+            crate::plan::PlanModeError::DraftUnreadable => {
+                ("plan.draft_unreadable", error.to_string())
+            }
+        };
+        AgentError::new(
+            code,
+            ErrorCategory::InvalidInput,
+            message,
+            Retryability::Never,
+        )
+    }
+
+    /// `/plan status` snapshot, also the payload shape for ACP
+    /// `lato/plan/status`.
+    pub async fn plan_status(&self) -> serde_json::Value {
+        let status = self.plan.status().await;
+        serde_json::json!({
+            "phase": status.phase,
+            "activation": status.activation,
+            "planPath": status.plan_path.to_string_lossy(),
+            "lastDraftHash": status.last_draft_hash,
+            "draftPublished": status.draft_published,
+            "approval": status.approval.map(|approval| serde_json::json!({
+                "activation": approval.activation,
+                "generation": approval.generation,
+                "contentHash": approval.content_hash,
+                "approver": approval.approver,
+                "approvedAtMs": approval.approved_at_ms,
+            })),
+        })
+    }
+
+    async fn commit_plan_event(
+        &self,
+        event: lato_core::PlanModeJournalEvent,
+    ) -> Result<(), AgentError> {
+        self.handle
+            .submit(lato_core::Command::RecordPlanModeEvent { event })
+            .await
+            .map_err(|error| {
+                AgentError::new(
+                    "plan.journal_commit",
+                    ErrorCategory::Storage,
+                    error.to_string(),
+                    Retryability::Never,
+                )
+            })?;
+        Ok(())
+    }
+
+    /// `/plan` — enter Plan mode. Refused while a turn is in flight.
+    pub async fn plan_enter(&self) -> Result<serde_json::Value, AgentError> {
+        let turn_in_flight = self.is_active().await;
+        let (activation, from, to) = self
+            .plan
+            .enter(turn_in_flight)
+            .await
+            .map_err(Self::plan_mode_agent_error)?;
+        self.commit_plan_event(lato_core::PlanModeJournalEvent::Transitioned {
+            activation,
+            from,
+            to,
+            command: lato_core::PlanCommand::Enter,
+        })
+        .await?;
+        Ok(self.plan_status().await)
+    }
+
+    /// `/plan exit`.
+    pub async fn plan_exit(&self) -> Result<serde_json::Value, AgentError> {
+        let turn_in_flight = self.is_active().await;
+        if turn_in_flight {
+            return Err(Self::plan_mode_agent_error(
+                crate::plan::PlanModeError::TurnInFlight,
+            ));
+        }
+        let (activation, from, to) = self
+            .plan
+            .exit()
+            .await
+            .map_err(Self::plan_mode_agent_error)?;
+        self.commit_plan_event(lato_core::PlanModeJournalEvent::Transitioned {
+            activation,
+            from,
+            to,
+            command: lato_core::PlanCommand::Exit,
+        })
+        .await?;
+        Ok(self.plan_status().await)
+    }
+
+    /// `/plan submit` — the only `Drafting|Revising → AwaitingApproval` edge.
+    pub async fn plan_submit(&self) -> Result<serde_json::Value, AgentError> {
+        let turn_in_flight = self.is_active().await;
+        if turn_in_flight {
+            return Err(Self::plan_mode_agent_error(
+                crate::plan::PlanModeError::TurnInFlight,
+            ));
+        }
+        let (activation, from, to) = self
+            .plan
+            .submit()
+            .await
+            .map_err(Self::plan_mode_agent_error)?;
+        self.commit_plan_event(lato_core::PlanModeJournalEvent::Transitioned {
+            activation,
+            from,
+            to,
+            command: lato_core::PlanCommand::Submit,
+        })
+        .await?;
+        Ok(self.plan_status().await)
+    }
+
+    /// User requests edits instead of approving.
+    pub async fn plan_request_revision(&self) -> Result<serde_json::Value, AgentError> {
+        let turn_in_flight = self.is_active().await;
+        if turn_in_flight {
+            return Err(Self::plan_mode_agent_error(
+                crate::plan::PlanModeError::TurnInFlight,
+            ));
+        }
+        let (activation, from, to) = self
+            .plan
+            .request_revision()
+            .await
+            .map_err(Self::plan_mode_agent_error)?;
+        self.commit_plan_event(lato_core::PlanModeJournalEvent::Transitioned {
+            activation,
+            from,
+            to,
+            command: lato_core::PlanCommand::Revise,
+        })
+        .await?;
+        Ok(self.plan_status().await)
+    }
+
+    /// `/plan approve` — human-only approval; records a fresh `PlanApproval`.
+    pub async fn plan_approve(&self, approver: &str) -> Result<serde_json::Value, AgentError> {
+        let turn_in_flight = self.is_active().await;
+        if turn_in_flight {
+            return Err(Self::plan_mode_agent_error(
+                crate::plan::PlanModeError::TurnInFlight,
+            ));
+        }
+        let approval = self
+            .plan
+            .approve(approver)
+            .await
+            .map_err(Self::plan_mode_agent_error)?;
+        self.commit_plan_event(lato_core::PlanModeJournalEvent::ApprovalRecorded {
+            activation: approval.activation,
+            generation: approval.generation,
+            content_hash: approval.content_hash.clone(),
+            approver: approval.approver.clone(),
+            approved_at_ms: approval.approved_at_ms,
+        })
+        .await?;
+        Ok(self.plan_status().await)
+    }
+
+    /// Plan-mode runtime handle (CLI wiring, headless `--plan`).
+    pub fn plan_runtime(&self) -> Arc<crate::plan::PlanModeRuntime> {
+        self.plan.clone()
     }
 
     pub async fn prompt_skill(

@@ -5,6 +5,7 @@ mod context;
 pub mod dialog;
 pub mod i18n;
 pub mod input;
+pub mod plan_review;
 mod progress;
 pub mod render;
 pub mod state;
@@ -37,6 +38,8 @@ pub struct InteractiveBootstrap {
     pub home: PathBuf,
     pub sessions: Vec<SessionSummary>,
     pub resumed: bool,
+    /// Re-enter Plan mode for a resumed session (`lato resume --plan`).
+    pub plan: bool,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -75,6 +78,16 @@ pub async fn run(
     start_file_index(&mut app, &index_tx);
     let mut tick = tokio::time::interval(std::time::Duration::from_millis(250));
     let mut approvals_open = true;
+    if bootstrap.plan {
+        // `lato resume --plan`: re-enter Plan mode; the previous plan.md is
+        // loaded as the starting draft if present (validated fail-closed by
+        // the CLI before startup).
+        if let Err(error) =
+            backend.send(BackendCommand::Plan(crate::tui::backend::PlanAction::Enter))
+        {
+            app.error = Some(error);
+        }
+    }
 
     terminal
         .draw(|frame| render::render(frame, &mut app))
@@ -350,6 +363,45 @@ async fn execute_effects(
                     Err(error) => app.error = Some(error),
                 }
             }
+            Effect::PlanAction(action) => {
+                if app.is_busy() {
+                    app.error = Some(
+                        "Wait for the current response or cancel it first / 请先等待或取消当前回复"
+                            .into(),
+                    );
+                    continue;
+                }
+                app.composer.clear();
+                // `/plan approve` opens the DEDICATED plan review overlay
+                // (spec §2, A+ Stage 2): the plan is shown in a real widget
+                // over the actual content area, paginated by the terminal
+                // size, and the approval action stays locked until the user
+                // has scrolled the viewport to the last display row. An
+                // empty or missing plan cannot be reviewed or approved.
+                if action == crate::tui::backend::PlanAction::Approve {
+                    let plan_path = app.workspace.join("plan.md");
+                    let content = std::fs::read_to_string(&plan_path).unwrap_or_default();
+                    let size = terminal
+                        .size()
+                        .unwrap_or(ratatui::prelude::Size::new(80, 24));
+                    match crate::tui::plan_review::PlanReviewState::open(
+                        &plan_path,
+                        &content,
+                        size.width,
+                        size.height,
+                    ) {
+                        Ok(review) => {
+                            app.plan_review = Some(review);
+                            app.overlay = Some(Overlay::PlanReview);
+                        }
+                        Err(error) => app.error = Some(error),
+                    }
+                    continue;
+                }
+                if let Err(error) = backend.send(BackendCommand::Plan(action)) {
+                    app.error = Some(error);
+                }
+            }
             Effect::ConfirmDeleteSession(session_id) => {
                 if app.is_busy() {
                     app.error = Some(
@@ -395,7 +447,7 @@ fn handle_terminal_event(
 ) -> Vec<Effect> {
     match event {
         Event::Resize(width, height) => app.reduce(AppEvent::Resize(width, height)),
-        Event::Paste(text) if app.approval.is_none() => {
+        Event::Paste(text) if app.approval.is_none() && app.plan_review.is_none() => {
             if app.overlay == Some(Overlay::CommandPalette) {
                 app.palette_query
                     .insert_str(&text.replace(['\n', '\r'], " "));
@@ -433,6 +485,9 @@ fn handle_key(
     }
     if app.approval.is_some() {
         return handle_approval_key(app, key);
+    }
+    if app.plan_review.is_some() {
+        return handle_plan_review_key(app, key, backend);
     }
     if app.overlay == Some(Overlay::CommandPalette) {
         return handle_palette_key(app, key, trust);
@@ -844,6 +899,32 @@ fn submit_or_command(app: &mut AppState, trust: &SessionTrust) -> Vec<Effect> {
             };
             app.reduce(AppEvent::SwitchLanguage(language))
         }
+        "/plan" => {
+            app.composer.clear();
+            let sub = raw_command
+                .find(char::is_whitespace)
+                .map(|index| raw_command[index..].trim())
+                .unwrap_or("");
+            let action = match sub {
+                "" | "enter" => crate::tui::backend::PlanAction::Enter,
+                "status" => crate::tui::backend::PlanAction::Status,
+                "submit" => crate::tui::backend::PlanAction::Submit,
+                "approve" => crate::tui::backend::PlanAction::Approve,
+                "exit" => crate::tui::backend::PlanAction::Exit,
+                other => {
+                    app.error = Some(match app.language {
+                        Language::ZhCn => format!(
+                            "未知的 /plan 子命令：{other}（可用：status/enter/submit/approve/exit）"
+                        ),
+                        Language::En => format!(
+                            "Unknown /plan subcommand: {other} (available: status/enter/submit/approve/exit)"
+                        ),
+                    });
+                    return Vec::new();
+                }
+            };
+            vec![Effect::PlanAction(action)]
+        }
         "/approve" => {
             app.composer.clear();
             trust.allow_once();
@@ -937,6 +1018,65 @@ fn handle_approval_key(app: &mut AppState, key: KeyEvent) -> Vec<Effect> {
         let _ = approval.response.send(decision);
     }
     Vec::new()
+}
+
+/// Keys for the dedicated plan review overlay (Phase 8B spec §2): scroll or
+/// page through the wrapped plan rows; the approval key is only accepted
+/// after the viewport reached the final display row. Esc/`n` closes the
+/// review without approving.
+fn handle_plan_review_key(
+    app: &mut AppState,
+    key: KeyEvent,
+    backend: &BackendHandle,
+) -> Vec<Effect> {
+    if matches!(
+        key.code,
+        KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('q')
+    ) {
+        app.plan_review = None;
+        app.overlay = None;
+        return Vec::new();
+    }
+    let Some(review) = app.plan_review.as_mut() else {
+        return Vec::new();
+    };
+    match key.code {
+        KeyCode::Down | KeyCode::Char('j') => {
+            review.scroll_down(1);
+            Vec::new()
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            review.scroll_up(1);
+            Vec::new()
+        }
+        KeyCode::PageDown | KeyCode::Char(' ') => {
+            review.page_down();
+            Vec::new()
+        }
+        KeyCode::PageUp => {
+            review.page_up();
+            Vec::new()
+        }
+        KeyCode::Home | KeyCode::Char('g') => {
+            review.scroll_to_top();
+            Vec::new()
+        }
+        KeyCode::End | KeyCode::Char('G') => {
+            review.scroll_to_bottom();
+            Vec::new()
+        }
+        KeyCode::Enter | KeyCode::Char('a') | KeyCode::Char('y') if review.can_approve() => {
+            app.plan_review = None;
+            app.overlay = None;
+            if let Err(error) = backend.send(BackendCommand::Plan(
+                crate::tui::backend::PlanAction::Approve,
+            )) {
+                app.error = Some(error);
+            }
+            Vec::new()
+        }
+        _ => Vec::new(),
+    }
 }
 
 fn handle_palette_key(app: &mut AppState, key: KeyEvent, trust: &SessionTrust) -> Vec<Effect> {

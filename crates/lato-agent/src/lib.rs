@@ -11,6 +11,7 @@ pub mod host;
 pub mod journal;
 pub mod legacy_driver;
 pub mod mcp;
+pub mod plan;
 pub mod runtime_session;
 pub mod skills;
 pub mod subagent;

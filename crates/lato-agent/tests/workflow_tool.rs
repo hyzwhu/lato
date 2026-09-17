@@ -456,6 +456,8 @@ fn honest_policy_request() -> lato_core::PolicyRequest {
         mode: PolicyMode::Ask,
         project_trusted: false,
         sandbox: lato_core::SandboxObligation::off("/workspace"),
+        plan_mode: false,
+        tool_layer: lato_core::ToolLayer::Builtin,
         detail: None,
     }
 }

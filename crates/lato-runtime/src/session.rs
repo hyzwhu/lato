@@ -385,6 +385,45 @@ impl SessionLoop {
                 )
                 .await
             }
+            Command::RecordPlanModeEvent { event } => {
+                let record = match &event {
+                    lato_core::PlanModeJournalEvent::Transitioned {
+                        activation,
+                        from,
+                        to,
+                        command,
+                    } => JournalRecord::PlanModeTransitioned {
+                        activation: *activation,
+                        from: *from,
+                        to: *to,
+                        command: *command,
+                    },
+                    lato_core::PlanModeJournalEvent::ApprovalRecorded {
+                        activation,
+                        generation,
+                        content_hash,
+                        approver,
+                        approved_at_ms,
+                    } => JournalRecord::PlanApprovalRecorded {
+                        activation: *activation,
+                        generation: *generation,
+                        content_hash: content_hash.clone(),
+                        approver: approver.clone(),
+                        approved_at_ms: *approved_at_ms,
+                    },
+                    lato_core::PlanModeJournalEvent::ApprovalRevoked {
+                        activation,
+                        generation,
+                        reason,
+                    } => JournalRecord::PlanApprovalRevoked {
+                        activation: *activation,
+                        generation: *generation,
+                        reason: reason.clone(),
+                    },
+                };
+                let turn_id = self.active.as_ref().map(|active| active.id.clone());
+                self.commit(turn_id, record, JournalDurability::Flush).await
+            }
             Command::Shutdown => self.shutdown().await,
         }
     }

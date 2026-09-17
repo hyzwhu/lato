@@ -72,6 +72,7 @@ pub enum Overlay {
     Search,
     WorkflowRuns,
     Configuration,
+    PlanReview,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -248,6 +249,8 @@ pub struct AppState {
     pub scroll_max: u16,
     pub session_index: usize,
     pub armed_session_delete: Option<(String, Instant)>,
+    /// Dedicated paginated plan review (`/plan approve`), Phase 8B spec §2.
+    pub plan_review: Option<crate::tui::plan_review::PlanReviewState>,
     pub should_exit: bool,
     pub exit_action: TuiExit,
 }
@@ -272,6 +275,7 @@ pub enum AppEvent {
 #[derive(Debug)]
 pub enum Effect {
     Backend(BackendCommand),
+    PlanAction(crate::tui::backend::PlanAction),
     PersistLanguage(Language),
     PersistModel(String),
     ConfigureModel,
@@ -350,6 +354,7 @@ impl AppState {
             scroll_max: 0,
             session_index: 0,
             armed_session_delete: None,
+            plan_review: None,
             should_exit: false,
             exit_action: TuiExit::Quit,
         }
@@ -481,6 +486,11 @@ impl AppState {
             }
             AppEvent::Resize(width, height) => {
                 self.layout = LayoutMode::for_size(width, height);
+                // The plan review rewraps to the new content area; the
+                // approval gate resets until the user reaches the new bottom.
+                if let Some(review) = self.plan_review.as_mut() {
+                    review.resize(width, height);
+                }
                 Vec::new()
             }
             AppEvent::FocusNext => {
@@ -670,6 +680,17 @@ impl AppState {
                 self.skills_loading = false;
                 self.skills_error = Some(error);
             }
+            BackendEvent::PlanResult(result) => match result {
+                Ok(text) => {
+                    self.screen = Screen::Main;
+                    self.messages.push(Message {
+                        role: MessageRole::System,
+                        content: text,
+                        expanded: true,
+                    });
+                }
+                Err(error) => self.error = Some(error),
+            },
             BackendEvent::Workflows(response) => {
                 self.workflows = response.workflows;
                 self.screen = Screen::Main;

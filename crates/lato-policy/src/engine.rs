@@ -4,11 +4,16 @@ use crate::{
 };
 use lato_core::{
     ApprovalRequest, ExecutionGrant, PolicyDecision, PolicyDenial, PolicyMode, PolicyRequest,
-    SideEffect, ToolCapability,
+    SideEffect, ToolCapability, plan_mode_denial,
 };
-use std::sync::Arc;
+use std::sync::{
+    Arc, RwLock,
+    atomic::{AtomicBool, Ordering},
+};
 
 const UNTRUSTED_EXTENSION_CODE: &str = "policy.untrusted_extension";
+const PLAN_MODE_READONLY_MESSAGE: &str =
+    "plan mode is read-only: the model may only inspect the workspace and draft plan.md";
 
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum PolicyError {
@@ -42,6 +47,11 @@ impl PolicyError {
 pub struct PolicyEngine {
     ledger: Arc<ApprovalLedger>,
     sink: Arc<dyn PolicyEventSink>,
+    /// Shared Plan-mode overlay flag; flipping it re-trims every subsequent
+    /// evaluation and approval path of this engine (spec §4/§6). The Arc can
+    /// be adopted from a session PlanModeRuntime so a single flag drives the
+    /// policy overlay and the model catalog.
+    plan_mode: RwLock<Arc<AtomicBool>>,
 }
 
 impl std::fmt::Debug for PolicyEngine {
@@ -59,7 +69,36 @@ impl PolicyEngine {
     }
 
     pub fn with_sink(ledger: Arc<ApprovalLedger>, sink: Arc<dyn PolicyEventSink>) -> Self {
-        Self { ledger, sink }
+        Self {
+            ledger,
+            sink,
+            plan_mode: RwLock::new(Arc::new(AtomicBool::new(false))),
+        }
+    }
+
+    /// Replaces the engine's Plan-mode flag with a shared one, so the session
+    /// plan state machine toggles policy and catalog in one store.
+    pub fn adopt_plan_mode_flag(&self, flag: Arc<AtomicBool>) {
+        *self
+            .plan_mode
+            .write()
+            .expect("plan mode flag lock poisoned") = flag;
+    }
+
+    /// Engages or disengages the Plan-mode capability overlay.
+    pub fn set_plan_mode(&self, active: bool) {
+        self.plan_mode
+            .read()
+            .expect("plan mode flag lock poisoned")
+            .store(active, Ordering::Release);
+    }
+
+    /// True while the Plan-mode overlay applies to evaluations.
+    pub fn plan_mode_active(&self) -> bool {
+        self.plan_mode
+            .read()
+            .expect("plan mode flag lock poisoned")
+            .load(Ordering::Acquire)
     }
 
     pub fn evaluate(&self, request: &PolicyRequest) -> PolicyDecision {
@@ -75,7 +114,7 @@ impl PolicyEngine {
         if approval.fingerprint != expected {
             return Err(PolicyError::ApprovalFingerprintMismatch);
         }
-        if let Some(denial) = denial(&approval.request) {
+        if let Some(denial) = denial(&approval.request, self.plan_mode_active()) {
             return Err(PolicyError::Denied(denial.code));
         }
         if !requires_human_approval(&approval.request) {
@@ -103,7 +142,7 @@ impl PolicyEngine {
         if approval.fingerprint != expected {
             return Err(PolicyError::ApprovalFingerprintMismatch);
         }
-        if let Some(denial) = denial(&approval.request) {
+        if let Some(denial) = denial(&approval.request, self.plan_mode_active()) {
             return Err(PolicyError::Denied(denial.code));
         }
         self.ledger
@@ -132,7 +171,7 @@ impl PolicyEngine {
         if let Err(error) = validate_request(request) {
             return PolicyDecision::Deny(PolicyDenial::new(error.code(), error.to_string()));
         }
-        if let Some(denial) = denial(request) {
+        if let Some(denial) = denial(request, self.plan_mode_active()) {
             return PolicyDecision::Deny(denial);
         }
 
@@ -146,7 +185,10 @@ impl PolicyEngine {
             }
         };
 
-        if requires_human_approval(request) {
+        // In Plan mode every mutation-capable call was already denied above;
+        // the sole survivor, `plan_draft`, must not stall planning behind an
+        // interactive approval (headless `--plan` has no approver).
+        if !request.plan_mode && requires_human_approval(request) {
             return PolicyDecision::RequireApproval(ApprovalRequest {
                 request: request.clone(),
                 fingerprint,
@@ -208,7 +250,7 @@ fn validate_request(request: &PolicyRequest) -> Result<(), PolicyError> {
     Ok(())
 }
 
-fn denial(request: &PolicyRequest) -> Option<PolicyDenial> {
+fn denial(request: &PolicyRequest, plan_mode: bool) -> Option<PolicyDenial> {
     if let Err(denial) = validate_sandbox_obligation(&request.sandbox) {
         return Some(denial);
     }
@@ -221,6 +263,16 @@ fn denial(request: &PolicyRequest) -> Option<PolicyDenial> {
             UNTRUSTED_EXTENSION_CODE,
             "untrusted project extensions cannot be invoked",
         ));
+    }
+    if plan_mode
+        && let Some(code) = plan_mode_denial(
+            &request.tool_name,
+            &request.capabilities,
+            request.side_effect,
+            request.tool_layer,
+        )
+    {
+        return Some(PolicyDenial::new(code, PLAN_MODE_READONLY_MESSAGE));
     }
     None
 }

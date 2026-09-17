@@ -443,6 +443,13 @@ fn metadata(name: &str) -> Result<ToolMetadata, BuiltinAdapterError> {
             ToolIdempotency::NonIdempotent,
             ToolCancellation::Cooperative,
         ),
+        "plan_draft" => (
+            vec![ToolCapability::FileWrite],
+            SideEffect::WorkspaceMutation,
+            ToolConcurrency::ResourceKeyed,
+            ToolIdempotency::NonIdempotent,
+            ToolCancellation::Cooperative,
+        ),
         "run_terminal_command" => (
             vec![ToolCapability::ProcessSpawn],
             SideEffect::ExternalMutation,

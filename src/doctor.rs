@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use lato_ai::{CredentialStore, ProviderModelsStore, load_models_json, lookup_model};
 use lato_core::{
     EnvironmentPolicy, NetworkPolicy, PolicyDecision, PolicyMode, PolicyRequest, SandboxObligation,
-    SandboxProfile, SessionId, SideEffect, ToolCallId, ToolCapability, ToolName, TurnId,
+    SandboxProfile, SessionId, SideEffect, ToolCallId, ToolCapability, ToolLayer, ToolName, TurnId,
 };
 use lato_extensions::{ManifestLoadResult, load_manifest};
 use lato_policy::{ApprovalLedger, PolicyEngine, redact_text};
@@ -786,6 +786,8 @@ fn self_test_request(
             environment: EnvironmentPolicy::default(),
         },
         detail: None,
+        plan_mode: false,
+        tool_layer: ToolLayer::Builtin,
     }
 }
 

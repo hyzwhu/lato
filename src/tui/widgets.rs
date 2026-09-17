@@ -770,6 +770,71 @@ pub fn approval(frame: &mut Frame<'_>, app: &AppState) {
     );
 }
 
+/// Dedicated paginated plan review overlay (`/plan approve`, Phase 8B spec
+/// §2). The body renders the pre-wrapped display rows into the ACTUAL content
+/// area (height and width come from the terminal, not a fixed page size), and
+/// the footer carries the page indicator plus the approval gate, which stays
+/// disabled until the viewport shows the final row of the plan.
+pub fn plan_review_overlay(frame: &mut Frame<'_>, app: &mut AppState) {
+    let language = app.language;
+    let Some(review) = app.plan_review.as_mut() else {
+        return;
+    };
+    let bounds = frame.area();
+    let width = bounds.width.saturating_sub(4).clamp(20, 120);
+    let height = bounds.height.saturating_sub(2).max(8);
+    let area = Rect::new(
+        (bounds.width - width) / 2,
+        (bounds.height - height) / 2,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, area);
+    let inner = Rect::new(area.x + 1, area.y + 1, area.width - 2, area.height - 2);
+    let rows = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(inner);
+    // The real content area height drives pagination and the approval gate;
+    // sync it before building the title, footer, and visible slice.
+    review.update_viewport(rows[0].height as usize);
+    let (page, total) = review.page_indicator();
+    let block = Block::default()
+        .title(format!(
+            " {} — Plan review / 计划审阅 · {page}/{total} ",
+            review.plan_path.display()
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(AMBER))
+        .style(Style::default().fg(TEXT).bg(RAISED));
+    frame.render_widget(block, area);
+    let body: Vec<Line<'_>> = review
+        .visible_rows()
+        .iter()
+        .map(|row| Line::raw(row.clone()))
+        .collect();
+    frame.render_widget(
+        Paragraph::new(body).style(Style::default().fg(TEXT).bg(RAISED)),
+        rows[0],
+    );
+    let footer = if review.can_approve() {
+        match language {
+            Language::ZhCn => "已到末尾 · Enter：批准 · Esc：取消",
+            Language::En => "End of plan · Enter: approve · Esc: cancel",
+        }
+    } else {
+        match language {
+            Language::ZhCn => "浏览到末尾后才能批准 · Esc：取消",
+            Language::En => "Reach the end to enable approval · Esc: cancel",
+        }
+    };
+    frame.render_widget(
+        Paragraph::new(footer).style(Style::default().fg(if review.can_approve() {
+            GREEN
+        } else {
+            MUTED
+        })),
+        rows[1],
+    );
+}
+
 pub fn too_small(frame: &mut Frame<'_>, app: &AppState) {
     frame.render_widget(
         Paragraph::new(format!(

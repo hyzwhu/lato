@@ -67,6 +67,7 @@ pub(crate) fn connected_builtin_definitions() -> Vec<serde_json::Value> {
         .cloned()
         .unwrap_or_default();
     definitions.push(serde_json::json!({"type":"function","function":{"name":"web_fetch","description":"Fetch a public HTTP(S) URL with SSRF protection","parameters":{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}}}));
+    definitions.push(serde_json::json!({"type":"function","function":{"name":"plan_draft","description":"Write or replace the implementation plan (plan.md) while Plan mode is active. Accepts Markdown contents only; the target path is fixed and cannot be chosen. This is the only way to save the plan.","parameters":{"type":"object","properties":{"contents":{"type":"string","description":"Full plan document in Markdown"}},"required":["contents"]}}}));
     definitions
 }
 

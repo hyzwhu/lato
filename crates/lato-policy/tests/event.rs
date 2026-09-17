@@ -1,6 +1,6 @@
 use lato_core::{
     EnvironmentPolicy, NetworkPolicy, PolicyDecision, PolicyMode, PolicyRequest, SandboxObligation,
-    SandboxProfile, SessionId, SideEffect, ToolCallId, ToolCapability, ToolName, TurnId,
+    SandboxProfile, SessionId, SideEffect, ToolCallId, ToolCapability, ToolLayer, ToolName, TurnId,
 };
 use lato_policy::{
     ApprovalLedger, PolicyEngine, PolicyEvent, PolicyEventKind, PolicyEventSink,
@@ -55,6 +55,8 @@ fn request(
             environment: EnvironmentPolicy::default(),
         },
         detail: None,
+        plan_mode: false,
+        tool_layer: ToolLayer::Builtin,
     }
 }
 

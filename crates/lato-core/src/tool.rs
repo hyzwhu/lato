@@ -128,10 +128,20 @@ pub enum ToolCancellation {
 }
 
 #[derive(
-    Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    Eq,
+    Ord,
+    PartialEq,
+    PartialOrd,
+    serde::Deserialize,
+    serde::Serialize,
 )]
 #[serde(rename_all = "snake_case")]
 pub enum ToolLayer {
+    #[default]
     Builtin,
     User,
     TrustedProject,

@@ -5,9 +5,10 @@ use crate::{
 };
 use lato_core::{
     ApprovalFingerprint, ApprovalRequest, EnvironmentPolicy, ExecutionGrant, NetworkPolicy,
-    PolicyAuditDecision, PolicyAuditRecord, PolicyAuditStage, PolicyDecision, PolicyMode,
-    PolicyRequest, PreparedToolAudit, Retryability, SandboxObligation, SandboxProfile, Tool,
-    ToolContext, ToolDescriptor, ToolError, ToolName, ToolOutput, journal_request_hash,
+    PLAN_DRAFT_TOOL_NAME, PolicyAuditDecision, PolicyAuditRecord, PolicyAuditStage, PolicyDecision,
+    PolicyMode, PolicyRequest, PreparedToolAudit, Retryability, SandboxObligation, SandboxProfile,
+    Tool, ToolContext, ToolDescriptor, ToolError, ToolName, ToolOutput, journal_request_hash,
+    plan_mode_denial,
 };
 use lato_policy::{
     ApprovalLedger, NoopPolicyEventSink, PolicyEngine, PolicyEvent, PolicyEventKind,
@@ -225,11 +226,28 @@ impl ToolRuntime {
     }
 
     pub fn model_definitions_scoped(&self, scope: Option<&SkillToolScope>) -> Vec<Value> {
+        let plan_mode = self.policy.plan_mode_active();
         self.catalog
             .descriptors()
             .into_iter()
             .filter(|descriptor| {
                 scope.is_none_or(|scope| scope.allows_name(descriptor.name.local_name()))
+            })
+            // Single-source Plan-mode trim (correction #3): the same canonical
+            // decision that policy enforces also narrows the model catalog.
+            // `plan_draft` is invisible outside Plan mode.
+            .filter(|descriptor| {
+                if plan_mode {
+                    plan_mode_denial(
+                        &descriptor.name,
+                        &descriptor.capabilities,
+                        descriptor.side_effect,
+                        descriptor.source.layer,
+                    )
+                    .is_none()
+                } else {
+                    descriptor.name.as_str() != PLAN_DRAFT_TOOL_NAME
+                }
             })
             .map(|descriptor| {
                 json!({
@@ -371,6 +389,8 @@ impl ToolRuntime {
             project_trusted: self.scope.project_trusted,
             sandbox,
             detail: tool.approval_detail(&arguments),
+            plan_mode: self.policy.plan_mode_active(),
+            tool_layer: descriptor.source.layer,
         };
         let fingerprint = approval_fingerprint(&request).map_err(|error| {
             ToolError::new(
@@ -422,6 +442,23 @@ impl ToolRuntime {
 
     pub fn decision<'a>(&self, prepared: &'a PreparedToolCall) -> &'a PolicyDecision {
         &prepared.decision
+    }
+
+    /// Engages or disengages the Plan-mode overlay for this runtime's policy
+    /// engine and model catalog.
+    pub fn set_plan_mode(&self, active: bool) {
+        self.policy.set_plan_mode(active);
+    }
+
+    /// True while the Plan-mode overlay applies.
+    pub fn plan_mode_active(&self) -> bool {
+        self.policy.plan_mode_active()
+    }
+
+    /// Shares the session plan flag with this runtime's policy engine so one
+    /// AtomicBool drives both the overlay and the catalog filter.
+    pub fn adopt_plan_mode_flag(&self, flag: Arc<std::sync::atomic::AtomicBool>) {
+        self.policy.adopt_plan_mode_flag(flag);
     }
 
     pub fn approve(&self, approval: &ApprovalRequest) -> Result<ExecutionGrant, ToolError> {

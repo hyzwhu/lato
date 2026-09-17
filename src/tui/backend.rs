@@ -5,6 +5,15 @@ use lato_agent::{ApprovalRequest, ToolApproval};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlanAction {
+    Status,
+    Enter,
+    Submit,
+    Approve,
+    Exit,
+}
+
 #[derive(Debug)]
 pub enum BackendCommand {
     Submit(String),
@@ -37,6 +46,7 @@ pub enum BackendCommand {
         title: String,
     },
     DeleteSession(String),
+    Plan(PlanAction),
     Shutdown,
 }
 
@@ -63,6 +73,7 @@ pub enum BackendEvent {
         replacement_session_id: Option<String>,
         sessions: Vec<SessionSummary>,
     },
+    PlanResult(Result<String, String>),
     Error(String),
 }
 
@@ -211,6 +222,11 @@ pub fn spawn(
                         }
                         Some(BackendCommand::NewSession) => {
                             let _ = event_tx.send(BackendEvent::Error("cannot clear while a turn is running".into()));
+                        }
+                        Some(BackendCommand::Plan(_)) => {
+                            let _ = event_tx.send(BackendEvent::PlanResult(Err(
+                                "wait for the current turn before plan commands / 请等待当前回复结束后操作 Plan mode".into(),
+                            )));
                         }
                     },
                     result = turn => {
@@ -487,11 +503,56 @@ pub fn spawn(
                         }
                     }
                 }
+                Some(BackendCommand::Plan(action)) => {
+                    let Some(owned) = client.as_mut() else {
+                        let _ = event_tx.send(BackendEvent::PlanResult(Err(
+                            "session is unavailable".into(),
+                        )));
+                        continue;
+                    };
+                    let result = match plan_request(owned, action).await {
+                        Ok(status) => BackendEvent::PlanResult(Ok(format_plan_status(&status))),
+                        Err(error) => BackendEvent::PlanResult(Err(error)),
+                    };
+                    let _ = event_tx.send(result);
+                }
                 Some(BackendCommand::Shutdown) | None => break,
             }
         }
     });
     (handle, event_rx)
+}
+
+async fn plan_request(
+    client: &mut InteractiveAcpClient,
+    action: PlanAction,
+) -> Result<serde_json::Value, String> {
+    let action_name = match action {
+        PlanAction::Status => "status",
+        PlanAction::Enter => "enter",
+        PlanAction::Submit => "submit",
+        PlanAction::Approve => "approve",
+        PlanAction::Exit => "exit",
+    };
+    client
+        .plan_request(action_name, serde_json::json!({}))
+        .await
+}
+
+fn format_plan_status(status: &serde_json::Value) -> String {
+    let phase = status["phase"].as_str().unwrap_or("unknown");
+    let path = status["planPath"].as_str().unwrap_or("plan.md");
+    let approval = status["approval"].as_object();
+    let approval_text = approval
+        .map(|approval| {
+            format!(
+                " · approved generation {} by {}",
+                approval["generation"].as_u64().unwrap_or_default(),
+                approval["approver"].as_str().unwrap_or("user")
+            )
+        })
+        .unwrap_or_default();
+    format!("[Plan mode] {phase} · {path}{approval_text}")
 }
 
 async fn refresh_skills(

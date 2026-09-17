@@ -1,6 +1,6 @@
 use crate::{
-    grep, list_dir, read_file, run_terminal_command_sandboxed, search_replace, todo_write,
-    web_fetch, write_file,
+    grep, list_dir, plan_draft, read_file, run_terminal_command_sandboxed, search_replace,
+    todo_write, web_fetch, write_file,
 };
 use lato_workspace::{ApprovalMode, FileLocks, SessionTrust, deny_write};
 use serde_json::Value;
@@ -95,6 +95,14 @@ pub async fn dispatch(
                 .and_then(|v| v.as_str())
                 .ok_or("missing url")?;
             web_fetch(url, 20_000).await
+        }
+        "plan_draft" => {
+            let contents = call
+                .arguments
+                .get("contents")
+                .and_then(|v| v.as_str())
+                .ok_or("missing contents")?;
+            plan_draft(locks, cwd, contents).await
         }
         "todo_write" => {
             let items: Vec<String> = call
