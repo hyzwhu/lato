@@ -439,6 +439,104 @@ async fn denied_approval_has_zero_manager_and_network_side_effects() {
     assert_eq!(fake.start_calls.load(Ordering::SeqCst), 0, "zero network");
 }
 
+/// Spec §7.2 frozen order — schema → allowlist → policy/approval: a `start`
+/// naming an alias outside the local allowlist is rejected by the
+/// pre-policy membrane hook, BEFORE the policy decision and any approval
+/// request. Zero runs, zero remote requests, stable `agentfield.not_found`.
+#[tokio::test]
+async fn unknown_alias_start_is_rejected_pre_policy_without_approval_prompt() {
+    let temp = TempDir::new().unwrap();
+    let (manager, fake) = manager_with_fake(StartBehavior::Ok("exec-1".into()));
+    let (runtime, _handle) = agentfield_runtime(temp.path(), manager.clone());
+    let revision = manager.catalog().revision().to_owned();
+
+    let context = lato_core::ToolContext {
+        session_id: lato_core::SessionId::from("session"),
+        turn_id: lato_core::TurnId::from("turn"),
+        call_id: lato_core::ToolCallId::from("call-pre-policy-alias"),
+        cancellation: tokio_util::sync::CancellationToken::new(),
+        execution_grant: None,
+    };
+    let error = match runtime.prepare_scoped(
+        context,
+        "agentfield",
+        json!({"action":"start","name":"other.missing","revision":revision,"input":{}}),
+        None,
+    ) {
+        Err(error) => error,
+        Ok(_prepared) => panic!("unallowlisted alias must fail pre-policy"),
+    };
+    assert_eq!(error.code, "agentfield.not_found");
+
+    assert_eq!(manager.run_count().await, 0, "no run reserved");
+    assert_eq!(fake.start_calls.load(Ordering::SeqCst), 0, "zero network");
+}
+
+/// Spec §7.2 frozen order — schema → allowlist → policy/approval: a `start`
+/// whose input violates the capability's frozen `inputSchema` is rejected by
+/// the pre-policy membrane hook, BEFORE the policy decision and any approval
+/// request. Zero runs, zero remote requests, stable
+/// `agentfield.invalid_arguments`.
+#[tokio::test]
+async fn capability_schema_violation_is_rejected_pre_policy_without_approval_prompt() {
+    let temp = TempDir::new().unwrap();
+    let (manager, fake) = manager_with_fake(StartBehavior::Ok("exec-1".into()));
+    let (runtime, _handle) = agentfield_runtime(temp.path(), manager.clone());
+    let revision = manager.catalog().revision().to_owned();
+
+    let context = lato_core::ToolContext {
+        session_id: lato_core::SessionId::from("session"),
+        turn_id: lato_core::TurnId::from("turn"),
+        call_id: lato_core::ToolCallId::from("call-pre-policy-schema"),
+        cancellation: tokio_util::sync::CancellationToken::new(),
+        execution_grant: None,
+    };
+    let error = match runtime.prepare_scoped(
+        context,
+        "agentfield",
+        json!({"action":"start","name":"contract-review","revision":revision,"input":{"contract":123}}),
+        None,
+    ) {
+        Err(error) => error,
+        Ok(_prepared) => panic!("capability-schema violation must fail pre-policy"),
+    };
+    assert_eq!(error.code, "agentfield.invalid_arguments");
+
+    assert_eq!(manager.run_count().await, 0, "no run reserved");
+    assert_eq!(fake.start_calls.load(Ordering::SeqCst), 0, "zero network");
+}
+
+/// Spec §7.2 frozen order — the policy membrane still comes after the
+/// pre-policy gates: a valid `start` in Ask mode reaches RequireApproval
+/// only once allowlist and capability schema have passed.
+#[tokio::test]
+async fn valid_start_reaches_approval_only_after_pre_policy_gates_pass() {
+    let temp = TempDir::new().unwrap();
+    let (manager, _fake) = manager_with_fake(StartBehavior::Ok("exec-1".into()));
+    let (runtime, _handle) = agentfield_runtime(temp.path(), manager.clone());
+    let revision = manager.catalog().revision().to_owned();
+
+    let context = lato_core::ToolContext {
+        session_id: lato_core::SessionId::from("session"),
+        turn_id: lato_core::TurnId::from("turn"),
+        call_id: lato_core::ToolCallId::from("call-pre-policy-order"),
+        cancellation: tokio_util::sync::CancellationToken::new(),
+        execution_grant: None,
+    };
+    let prepared = runtime
+        .prepare_scoped(
+            context,
+            "agentfield",
+            json!({"action":"start","name":"contract-review","revision":revision,"input":{"contract":"acme.pdf"}}),
+            None,
+        )
+        .expect("valid start passes pre-policy gates");
+    match runtime.decision(&prepared) {
+        PolicyDecision::RequireApproval(_request) => {}
+        other => panic!("Ask mode must require approval, got {other:?}"),
+    }
+}
+
 /// AC-04: approval后 revision mismatch ⇒ `agentfield.catalog_changed`,
 /// grant consumed, zero remote requests, zero local runs.
 #[tokio::test]

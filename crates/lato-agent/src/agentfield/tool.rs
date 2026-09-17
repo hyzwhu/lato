@@ -216,6 +216,32 @@ impl Tool for AgentFieldTool {
             _ => None,
         }
     }
+
+    /// Frozen §7.2 order: schema → allowlist → policy/approval. The
+    /// allowlist gate and the capability input-schema / 64 KiB cap run
+    /// BEFORE the policy membrane, so an unallowlisted or schema-invalid
+    /// `start` never reaches an approval prompt. `invoke` repeats every
+    /// check (the catalog can change between approval and execution; the
+    /// post-approval revision recheck below stays the authoritative TOCTOU
+    /// guard). Zero side effects: no run, no reservation, no request.
+    fn validate_pre_policy(&self, arguments: &Value) -> Result<(), ToolError> {
+        let input = parse_input(arguments.clone())?;
+        validate_input(&input)?;
+        let manager = self.handle.manager().ok_or_else(unavailable)?;
+        if manager.is_closed() {
+            return Err(unavailable());
+        }
+        if input.action == "start" {
+            let alias = input.name.as_deref().expect("oneOf requires name");
+            let capability = manager
+                .catalog()
+                .capability(alias)
+                .ok_or_else(|| not_found(&format!("no allowlisted capability named '{alias}'")))?;
+            let args = input.input.clone().unwrap_or_else(|| json!({}));
+            validate_input_against_schema(alias, &capability.input_schema, &args)?;
+        }
+        Ok(())
+    }
 }
 
 impl AgentFieldTool {
@@ -264,8 +290,9 @@ impl AgentFieldTool {
         )
     }
 
-    /// `start` (spec §7.2): allowlist → input schema → 64 KiB input cap →
-    /// revision recheck (constant time) → health gate → exactly one send.
+    /// `start` (spec §7.2): pre-policy allowlist → input schema → 64 KiB
+    /// cap (see `validate_pre_policy`) → policy/approval → revision recheck
+    /// (constant time) → health gate → exactly one send.
     async fn start(
         &self,
         manager: &Arc<AgentFieldManager>,

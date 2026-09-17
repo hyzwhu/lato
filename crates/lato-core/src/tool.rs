@@ -304,6 +304,20 @@ pub trait Tool: Send + Sync {
         None
     }
 
+    /// Optional pre-policy validation. Runs in the ToolRuntime membrane
+    /// BEFORE the policy decision and any approval request, so frozen
+    /// validation orders that place tool-side gates ahead of
+    /// policy/approval (e.g. agentfield `start`: schema → allowlist →
+    /// policy) are observable without prompting the user for a call that
+    /// can never execute. Rejections must use the tool's stable error
+    /// codes and have zero side effects; `invoke` remains authoritative
+    /// and repeats its own checks (state may change between this hook and
+    /// execution).
+    fn validate_pre_policy(&self, arguments: &Value) -> Result<(), ToolError> {
+        let _ = arguments;
+        Ok(())
+    }
+
     async fn invoke(&self, context: ToolContext, arguments: Value)
     -> Result<ToolOutput, ToolError>;
 }
