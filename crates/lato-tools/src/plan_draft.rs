@@ -102,19 +102,18 @@ pub trait PlanDraftFaults: Send + Sync {
     /// or mutate the filesystem (e.g. remove the intermediate link, occupy
     /// the destination) to drive the REAL `renameat` failure branch through
     /// genuine syscalls. Production returns `Ok(())`.
+    /// Linux-only deterministic seam on the REAL production path: invoked
+    /// BEFORE anything is moved — the previous plan is still on its
+    /// ORIGINAL path (`final_name`), untouched. Returning `Err` fails the
+    /// publication immediately: the previous plan was never moved, so it
+    /// stays byte-for-byte on its original path (failure atomicity holds
+    /// structurally and no `.reap` backup is created). The `middle_name`
+    /// parameter is unused in the linkat-direct sequence and is kept only
+    /// for trait compatibility. Production returns `Ok(())`.
     fn on_post_link(&self, middle_name: &str) -> Result<(), String> {
         let _ = middle_name;
         Ok(())
     }
-    /// Linux-only deterministic seam on the REAL production path: invoked
-    /// AFTER the previous plan has been atomically moved to its auditable
-    /// `.reap` name and BEFORE the identity-bound `linkat` binds the
-    /// nameless inode to `final_name` (the strict post-move/pre-link
-    /// window). Returning `Err` runs the zero-overwrite restore
-    /// (`renameat2(RENAME_NOREPLACE)`): the old plan goes back onto
-    /// `final_name` when the slot is still free, or stays under `.reap`
-    /// with a recovery hint in the error when a bystander occupies it.
-    /// Production returns `Ok(())`.
     fn on_pre_final_link(&self, final_name: &str, reap_name: &str) -> Result<(), String> {
         let _ = (final_name, reap_name);
         Ok(())
@@ -387,7 +386,8 @@ mod handle {
         ///    `.reap-<nonce>` name (`renameat` — a move, nothing deleted);
         /// 4. `linkat(.., AT_EMPTY_PATH)` again onto the now-free slot:
         ///    - success → published; the old plan stays under `.reap` as an
-        ///      auditable backup (residue policy = pending ruling item A);
+        ///      auditable backup (residue policy = ruling item A1, decided
+        ///      2026-09-17);
         ///    - `EEXIST` (a bystander took the freed slot during the seam)
         ///      → fail closed, NEVER overwrite the bystander, and restore
         ///      the previous plan with `renameat2(RENAME_NOREPLACE)`:
@@ -505,7 +505,8 @@ mod handle {
             };
             if linked == 0 {
                 // Published. The old plan stays under the auditable `.reap`
-                // name (residue policy = pending ruling item A).
+                // name (residue policy = ruling item A1, decided
+                // 2026-09-17).
                 return Ok(());
             }
             let second_error = io::Error::last_os_error();
@@ -2135,12 +2136,12 @@ mod tests {
 
     /// Round-9: the on_post_link seam returns `Err` (abort) while the
     /// previous plan is STILL on its original path — the failure path must
-    /// keep it there byte-for-byte with zero residue (the Round-7
-    /// `post_link_seam_abort_cleans_middle_link_ten_runs` contract, renamed
-    /// for the linkat-direct sequence). Ten consecutive runs.
+    /// keep it there byte-for-byte with zero residue (the seam-abort
+    /// contract from the earlier intermediate-link design, carried over to
+    /// the linkat-direct sequence). Ten consecutive runs.
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn post_link_seam_abort_keeps_plan_md_intact_ten_runs() {
+    async fn seam_abort_keeps_plan_md_intact_ten_runs() {
         for attempt in 0..10 {
             let directory = temp_workspace("post-link-abort");
             let root = directory.path().to_path_buf();
@@ -2175,7 +2176,7 @@ mod tests {
     /// consecutive runs.
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn post_link_rename_failure_leaves_zero_residue_ten_runs() {
+    async fn pre_commit_move_failure_leaves_zero_residue_ten_runs() {
         for attempt in 0..10 {
             let directory = temp_workspace("post-link");
             let root = directory.path().to_path_buf();
@@ -2241,6 +2242,7 @@ mod tests {
 
             struct SwapInFinalSlot {
                 workspace_root: PathBuf,
+                captured: std::sync::Arc<std::sync::Mutex<Option<(u64, u64, u64, u64)>>>,
             }
             impl PlanDraftFaults for SwapInFinalSlot {
                 fn on_stage(&self, _stage: PlanDraftStage) -> Result<(), String> {
@@ -2249,26 +2251,40 @@ mod tests {
                 fn on_pre_final_link(
                     &self,
                     final_name: &str,
-                    _reap_name: &str,
+                    reap_name: &str,
                 ) -> Result<(), String> {
                     // The old plan is isolated under `.reap` and the final
                     // slot is free. Swap a bystander into the freed slot
-                    // (remove is unnecessary — the slot is empty — but the
-                    // write IS the swap-in) and return Ok: the production
-                    // path proceeds into the REAL second linkat, which must
-                    // genuinely fail with EEXIST.
+                    // (the write IS the swap-in) and return Ok: the
+                    // production path proceeds into the REAL second linkat,
+                    // which must genuinely fail with EEXIST. Capture the
+                    // bystander's AND the old plan's (dev, ino) so the
+                    // post-failure assertions can verify field-by-field
+                    // that the production path never touched either file.
+                    use std::os::unix::fs::MetadataExt as _;
+                    let reap_meta = std::fs::metadata(self.workspace_root.join(reap_name)).unwrap();
                     std::fs::write(self.workspace_root.join(final_name), "pre-final-bystander")
                         .unwrap();
+                    let bystander_meta =
+                        std::fs::metadata(self.workspace_root.join(final_name)).unwrap();
+                    *self.captured.lock().unwrap() = Some((
+                        bystander_meta.dev(),
+                        bystander_meta.ino(),
+                        reap_meta.dev(),
+                        reap_meta.ino(),
+                    ));
                     Ok(())
                 }
             }
 
+            let captured = std::sync::Arc::new(std::sync::Mutex::new(None));
             let outcome = plan_draft_with_faults(
                 &locks,
                 &root,
                 "replacement",
                 &SwapInFinalSlot {
                     workspace_root: root.clone(),
+                    captured: captured.clone(),
                 },
             )
             .await;
@@ -2322,7 +2338,7 @@ mod tests {
     /// by FULL enumeration). Ten consecutive runs.
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn post_link_swap_in_after_identity_check_is_not_unlinked_ten_runs() {
+    async fn final_slot_swap_in_is_not_unlinked_ten_runs() {
         for attempt in 0..10 {
             let directory = temp_workspace("post-link-swap");
             let root = directory.path().to_path_buf();

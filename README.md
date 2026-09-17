@@ -13,17 +13,21 @@ preserved as `plan.md.reap-<nonce>` in the same directory — the nonce keeps
 concurrent backups collision-free, and the `reap-` suffix makes them easy to
 audit with a plain directory scan.
 
-- **When they are created**: after every successful publication of a new plan
-  (the old content is moved aside, never deleted), and after a failed
-  publication whose target slot was occupied by another file.
+- **When they are created**: only when a previous `plan.md` already exists —
+  after a successful publication that replaces it (the old content is moved
+  aside, never deleted), or after a failed publication whose target slot ended
+  up occupied by another file. The very first publication in a directory
+  creates no `.reap` file.
 - **Ownership**: created by Lato itself; anything else found under that name
   was placed there outside Lato and is never touched by it.
 - **Recovery**: move the file back onto `plan.md` manually if you want to
   roll back to the previous plan.
 - **Cleanup**: Lato does NOT reap these backups automatically in this
-  release — they accumulate and manual deletion is safe at any time.
-  Automatic reaping (count/lifetime caps) is planned for spec v1.1 and is
-  tracked as an open item.
+  release — they accumulate. Deleting a Lato-created backup (a
+  `plan.md.reap-<nonce>` file you recognize) is safe; files that you did not
+  create under a similar name are outside this mechanism and are never
+  touched by Lato. Automatic reaping (count/lifetime caps) is planned for
+  spec v1.1 and is tracked as an open item.
 
 ## Install a prebuilt binary
 
