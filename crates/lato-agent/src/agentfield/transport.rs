@@ -225,6 +225,7 @@ pub(crate) fn classify_address_with(
 /// (Round 2/3 probes: a production HTTPS loopback target is rejected even
 /// when a development flag is forged; a development HTTP target outside
 /// loopback is rejected).
+#[cfg(test)]
 pub(crate) fn classify_address(
     ip: IpAddr,
     scheme: &str,
@@ -1694,5 +1695,139 @@ pub(crate) mod tests {
         .unwrap();
         let error = transport.send(tls_request(server.addr.port())).await;
         assert!(error.is_err(), "self-signed certificate was accepted");
+    }
+
+    /// Connect-timeout dynamic case (Linux-only: relies on the kernel
+    /// dropping SYNs once a small accept backlog is full). A listener with
+    /// backlog 1 is pre-filled with raw connections (held by dedicated OS
+    /// threads) that are never accepted; the transport's TCP connect then
+    /// hangs until the configured connect timeout fires. Everything stays
+    /// on loopback — zero public network.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn connect_timeout_fires_when_the_tcp_connect_is_blocked() {
+        use std::net::TcpStream as StdTcpStream;
+
+        let socket = socket2::Socket::new(
+            socket2::Domain::IPV4,
+            socket2::Type::STREAM,
+            Some(socket2::Protocol::TCP),
+        )
+        .unwrap();
+        socket.set_reuse_address(true).unwrap();
+        let bind_addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+        socket.bind(&bind_addr.into()).unwrap();
+        // Deliberately tiny backlog.
+        socket.listen(1).unwrap();
+        let listening: std::net::TcpListener = socket.into();
+        let addr = listening.local_addr().unwrap();
+        // The listener must exist and never accept; hold it for the whole test.
+        listening.set_nonblocking(true).unwrap();
+        let _held_listener = tokio::net::TcpListener::from_std(listening).unwrap();
+
+        // Fill the accept backlog from dedicated OS threads: a blocked
+        // connect must never stall the async runtime.
+        for _ in 0..6 {
+            std::thread::spawn(move || {
+                if let Ok(stream) = StdTcpStream::connect(addr) {
+                    // Hold the connection open; the listener never accepts.
+                    std::thread::sleep(Duration::from_secs(10));
+                    drop(stream);
+                }
+            });
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // Now the transport's connect must hang in SYN until the connect
+        // timeout (500 ms) fires — not the OS-level retry budget (minutes).
+        let origin = ControlPlaneOrigin {
+            base: format!("http://{}", addr).parse().unwrap(),
+            allow_loopback_http: true,
+        };
+        let transport = ReqwestTransport::connect_with_limits(
+            &origin,
+            Limits {
+                connect_timeout: Duration::from_millis(500),
+                ..Limits::default()
+            },
+        )
+        .await
+        .unwrap();
+        let started = std::time::Instant::now();
+        let error = transport.send(send_to(addr, "/x")).await.unwrap_err();
+        let elapsed = started.elapsed();
+        // reqwest classifies the connect timeout as a timeout; the elapsed
+        // bound below is what proves the 500 ms connect budget fired rather
+        // than the OS SYN-retry budget (minutes).
+        assert!(
+            matches!(error, TransportError::Connection(ref message)
+                if message.contains("connect") || message.contains("timed out")),
+            "expected a connect failure, got: {error:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "connect timeout must fire promptly, took {elapsed:?}"
+        );
+    }
+
+    /// Bounded-memory evidence (AC-06): when the streamed body exceeds the
+    /// cap, the transport aborts near the cap instead of draining the whole
+    /// stream. The server counts the bytes it managed to write before the
+    /// client stopped reading; that count must stay within a small multiple
+    /// of the cap even though the advertised stream is 64 MiB.
+    #[tokio::test]
+    async fn oversized_stream_is_aborted_near_the_cap_without_draining() {
+        use tokio::io::AsyncWriteExt as _;
+        const CAP: usize = crate::agentfield::client::MAX_RESPONSE_BODY_BYTES;
+        const TOTAL: usize = 64 * 1024 * 1024;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let written = Arc::new(AtomicUsize::new(0));
+        let counter = written.clone();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            // Chunked framing (no content-length): the streamed counter is
+            // the only bound under test here.
+            let head = "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ntransfer-encoding: chunked\r\n\r\n";
+            if sock.write_all(head.as_bytes()).await.is_err() {
+                return;
+            }
+            let chunk = vec![0u8; 64 * 1024];
+            let mut sent: usize = 0;
+            while sent < TOTAL {
+                let mut frame = format!("{:x}\r\n", chunk.len()).into_bytes();
+                frame.extend_from_slice(&chunk);
+                frame.extend_from_slice(b"\r\n");
+                match tokio::time::timeout(Duration::from_secs(5), sock.write_all(&frame)).await {
+                    Ok(Ok(())) => {
+                        sent += chunk.len();
+                        counter.store(sent, Ordering::SeqCst);
+                    }
+                    // The client stopped reading (aborted at the cap).
+                    _ => break,
+                }
+            }
+        });
+        let transport = ReqwestTransport::connect_with_resolver(
+            &dev_origin_for(addr),
+            Arc::new(FixedResolver(vec![IpAddr::from([127, 0, 0, 1])])),
+        )
+        .await
+        .unwrap();
+        let error = transport.send(send_to(addr, "/x")).await.unwrap_err();
+        assert!(
+            matches!(error, TransportError::BodyTooLarge(_)),
+            "{error:?}"
+        );
+        // Give the server side a moment to observe the aborted stream.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let server_saw = written.load(Ordering::SeqCst);
+        // The advertised stream is 64 MiB; the client must have stopped
+        // reading near the cap instead of draining it (the transport's own
+        // buffer is bounded by CAP + one chunk by construction).
+        assert!(
+            server_saw < 16 * CAP,
+            "client read {server_saw} bytes before aborting; memory is not bounded near the {CAP}-byte cap"
+        );
     }
 }
