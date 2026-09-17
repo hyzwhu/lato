@@ -75,8 +75,7 @@ struct ConstructorGate {
 }
 
 impl ConstructorGate {
-    fn block(&self) {
-        self.entered.store(true, Ordering::Release);
+    fn wait_for_release(&self) {
         let mut released = self.released.lock().unwrap();
         while !*released {
             released = self.wake.wait(released).unwrap();
@@ -99,6 +98,14 @@ impl TaskChildControl for MessageControl {
         delivery: ActiveMessageDelivery,
     ) -> BoxFuture<'static, ActiveMessageAdmission> {
         let (release, response) = oneshot::channel();
+        // Mark the gate BEFORE the admission call becomes observable on the
+        // channel: receiving the call then guarantees `entered` is already
+        // true (channel send is the happens-before edge). Marking it after
+        // the send was a race — the test could observe the call while the
+        // constructor had not yet stored the flag, failing intermittently.
+        if matches!(self.factory_behavior, FactoryBehavior::Block) {
+            self.constructor_gate.entered.store(true, Ordering::Release);
+        }
         let _ = self.admissions.send(AdmissionCall {
             delivery: delivery.clone(),
             release,
@@ -110,7 +117,7 @@ impl TaskChildControl for MessageControl {
                 delivery.commit_admission(|| panic!("constructor panic while claimed"));
                 unreachable!()
             }
-            FactoryBehavior::Block => self.constructor_gate.block(),
+            FactoryBehavior::Block => self.constructor_gate.wait_for_release(),
             FactoryBehavior::DropPanic => return Box::pin(DropPanicsFuture { response }),
         }
         Box::pin(async move {
