@@ -844,7 +844,7 @@ mod tests {
         out
     }
 
-    async fn read_request_headers(sock: &mut tokio::net::TcpStream) {
+    async fn read_request_headers(sock: &mut tokio::net::TcpStream) -> String {
         use tokio::io::AsyncReadExt;
         let mut buf = [0u8; 2048];
         let mut acc: Vec<u8> = Vec::new();
@@ -854,7 +854,7 @@ mod tests {
                 .expect("server read timed out")
                 .expect("server read failed");
             if read == 0 {
-                return;
+                break;
             }
             acc.extend_from_slice(&buf[..read]);
             let header_end = acc
@@ -869,13 +869,23 @@ mod tests {
                     .and_then(|value| value.trim().parse::<usize>().ok())
                     .unwrap_or(0);
                 if acc.len() >= end + content_length {
-                    return;
+                    break;
                 }
             }
         }
+        String::from_utf8_lossy(&acc).to_string()
     }
 
     async fn spawn_canned(responses: Vec<Vec<u8>>) -> CannedServer {
+        spawn_canned_with_capture(responses, None).await
+    }
+
+    /// Canned server with optional request-header capture (the full request
+    /// head of each connection, appended in order).
+    async fn spawn_canned_with_capture(
+        responses: Vec<Vec<u8>>,
+        capture: Option<Arc<Mutex<String>>>,
+    ) -> CannedServer {
         use tokio::io::AsyncWriteExt;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -885,7 +895,13 @@ mod tests {
             let mut queue: std::vec::IntoIter<Vec<u8>> = responses.into_iter();
             while let Ok((mut sock, _)) = listener.accept().await {
                 counter.fetch_add(1, Ordering::SeqCst);
-                read_request_headers(&mut sock).await;
+                let head = read_request_headers(&mut sock).await;
+                if let Some(capture) = &capture {
+                    capture
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .push_str(&head);
+                }
                 let Some(response) = queue.next() else { break };
                 let _ = sock.write_all(&response).await;
                 let _ = sock.shutdown().await;
@@ -1174,6 +1190,58 @@ mod tests {
             matches!(error, TransportError::PolicyRejected(_)),
             "{error:?}"
         );
+    }
+
+    // --- Credential injection (final request construction point) ---
+
+    #[tokio::test]
+    async fn bearer_is_injected_exactly_once_with_the_full_value() {
+        let capture = Arc::new(Mutex::new(String::new()));
+        let server = spawn_canned_with_capture(
+            vec![http_response(
+                "HTTP/1.1 200 OK",
+                &[("content-type", "application/json")],
+                b"{}",
+            )],
+            Some(capture.clone()),
+        )
+        .await;
+        let transport = ReqwestTransport::connect_with_resolver(
+            &dev_origin_for(server.addr),
+            resolver_loopback(),
+        )
+        .await
+        .unwrap();
+        let request = OutboundRequest {
+            method: "GET",
+            url: format!("http://{}/api/v1/x", server.addr),
+            bearer: Some(crate::agentfield::client::RedactedToken::new(
+                "sk-live-secret-123",
+            )),
+            json_body: None,
+        };
+        transport.send(request).await.unwrap();
+        let head = capture
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .to_ascii_lowercase();
+        let auth_lines: Vec<&str> = head
+            .lines()
+            .filter(|line| line.starts_with("authorization:"))
+            .collect();
+        assert_eq!(
+            auth_lines.len(),
+            1,
+            "expected exactly one Authorization header"
+        );
+        assert!(
+            auth_lines[0].contains("bearer sk-live-secret-123"),
+            "{auth_lines:?}"
+        );
+    }
+
+    fn resolver_loopback() -> Arc<dyn AgentFieldDnsResolver> {
+        Arc::new(FixedResolver(vec![IpAddr::from([127, 0, 0, 1])]))
     }
 
     // --- DNS pinning breadth (validated set, re-resolution, TOCTOU) ---

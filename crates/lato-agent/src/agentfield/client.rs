@@ -34,6 +34,10 @@ pub enum AgentFieldError {
     /// Response body exceeded the transport cap.
     #[error("agentfield.output_too_large: response body exceeds {0} bytes")]
     BodyTooLarge(usize),
+    /// The credential reference could not be resolved; no network request
+    /// was attempted. The message carries only the reference name.
+    #[error("agentfield.unconfigured: credential `{0}` is not resolvable")]
+    CredentialMissing(String),
 }
 
 /// Redacted Bearer token wrapper: the secret is never printable.
