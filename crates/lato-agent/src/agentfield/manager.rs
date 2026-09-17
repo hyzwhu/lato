@@ -1726,7 +1726,6 @@ mod tests {
             crate::agentfield::catalog::catalog_sources(temp_home.path(), temp_cwd.path());
         let assembled = crate::agentfield::catalog::assemble_catalog_config(&sources).unwrap();
         let catalog = AgentFieldCatalog::from_config(&assembled);
-        let frozen_revision = catalog.revision().to_owned();
         let fake: Arc<FakeClient> = Arc::new(FakeClient::new(StartBehavior::Ok("exec-1".into())));
         let shared: Arc<dyn AgentFieldClient> = fake.clone();
         let manager = AgentFieldManager::with_factory_and_sources(
@@ -1778,50 +1777,79 @@ mod tests {
         std::fs::remove_file(&project_config).unwrap();
         assert!(manager.recheck_revision_matches());
 
-        // plugin source: flipping the reserved slot from nothing to a
-        // contribution (and back) is detected fail-closed.
-        let plugin_state = Arc::new(tokio::sync::Mutex::new(None::<serde_json::Value>));
-        let plugin_state_for_source = plugin_state.clone();
-        let plugin_source: crate::agentfield::catalog::CatalogSource = Arc::new(move || {
-            let value = {
-                let guard = plugin_state_for_source.try_lock();
-                match guard {
-                    Ok(guard) => guard.clone(),
-                    Err(_) => None,
+        // plugin source (production wiring): the REAL filesystem-backed
+        // plugin source observes manifest additions, edits, and removals.
+        let plugin_dir = temp_home.path().join("plugins").join("alpha");
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        let plugin_manifest = plugin_dir.join("plugin.json");
+        let plugin_config = || {
+            json!({
+                "name": "alpha",
+                "agentfield": {
+                    "enabled": true,
+                    "baseUrl": "https://agents.example.internal",
+                    "credential": "agentfield:primary",
+                    "capabilities": {
+                        "plugin-task": {
+                            "target": "plugin.task",
+                            "description": "Plugin task",
+                            "inputSchema": {"type":"object"},
+                            "risk": "remote_read",
+                        }
+                    }
                 }
-            };
-            let config = value
-                .and_then(|wrapped| wrapped.get("agentfield").cloned())
-                .and_then(|raw| {
-                    crate::agentfield::config::AgentFieldConfig::parse(&raw)
-                        .ok()
-                        .flatten()
-                });
-            Ok(config)
-        });
-        let sources_with_plugin = {
-            let mut sources =
-                crate::agentfield::catalog::catalog_sources(temp_home.path(), temp_cwd.path());
-            sources.pop();
-            sources.push(plugin_source);
-            sources
+            })
         };
-        let assembled =
-            crate::agentfield::catalog::assemble_catalog_config(&sources_with_plugin).unwrap();
-        let catalog = AgentFieldCatalog::from_config(&assembled);
-        assert_eq!(
-            catalog.revision(),
-            frozen_revision,
-            "plugin slot empty ⇒ same revision"
-        );
-        *plugin_state.lock().await =
-            Some(json!({"agentfield": capability("plugin-task", "plugin.task")}));
-        let assembled =
-            crate::agentfield::catalog::assemble_catalog_config(&sources_with_plugin).unwrap();
-        assert_ne!(
-            AgentFieldCatalog::from_config(&assembled).revision(),
-            frozen_revision,
+        std::fs::write(&plugin_manifest, plugin_config().to_string()).unwrap();
+        assert!(
+            !manager.recheck_revision_matches(),
             "plugin contribution changes the revision"
+        );
+        std::fs::write(&plugin_manifest, json!({"name": "alpha"}).to_string()).unwrap();
+        assert!(
+            manager.recheck_revision_matches(),
+            "manifest without an agentfield stanza contributes nothing again"
+        );
+        std::fs::write(&plugin_manifest, "{not json").unwrap();
+        assert!(
+            !manager.recheck_revision_matches(),
+            "malformed plugin manifest fails closed"
+        );
+        std::fs::write(&plugin_manifest, plugin_config().to_string()).unwrap();
+        assert!(!manager.recheck_revision_matches());
+        std::fs::remove_file(&plugin_manifest).unwrap();
+        assert!(
+            manager.recheck_revision_matches(),
+            "plugin removal restores the frozen revision"
+        );
+
+        // Two plugins disagreeing on origin fail closed.
+        std::fs::write(&plugin_manifest, plugin_config().to_string()).unwrap();
+        let plugin_dir_b = temp_home.path().join("plugins").join("beta");
+        std::fs::create_dir_all(&plugin_dir_b).unwrap();
+        std::fs::write(
+            plugin_dir_b.join("plugin.json"),
+            json!({
+                "name": "beta",
+                "agentfield": {
+                    "enabled": true,
+                    "baseUrl": "https://other.example.internal",
+                    "credential": "agentfield:primary",
+                    "capabilities": {}
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(
+            !manager.recheck_revision_matches(),
+            "disagreeing plugin origins fail closed"
+        );
+        std::fs::remove_file(plugin_dir_b.join("plugin.json")).unwrap();
+        std::fs::remove_file(&plugin_manifest).unwrap();
+        assert!(
+            manager.recheck_revision_matches(),
+            "all plugin contributions removed restores the frozen revision"
         );
 
         // Disagreeing origins fail closed.

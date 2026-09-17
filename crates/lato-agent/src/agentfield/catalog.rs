@@ -209,13 +209,105 @@ fn load_config_file(
 pub fn catalog_sources(home: &std::path::Path, cwd: &std::path::Path) -> Vec<CatalogSource> {
     let user_config = home.to_path_buf();
     let project_config = cwd.join(".lato").join("config.json");
+    let plugin_home = home.to_path_buf();
+    let plugin_cwd = cwd.to_path_buf();
     vec![
         std::sync::Arc::new(move || load_config_file(&user_config.join("config.json"))),
         std::sync::Arc::new(move || load_config_file(&project_config)),
-        // Plugin slot: no plugin-provided agentfield configuration exists in
-        // v1; reserved so a source change can be detected fail-closed.
-        std::sync::Arc::new(|| Ok(None)),
+        // Plugin source (Round-3 production wiring): real, filesystem-
+        // backed, and observable — plugin additions, edits, removals, and
+        // malformed manifests are detected at registration and recheck.
+        std::sync::Arc::new(move || load_plugin_contribution(&plugin_home, &plugin_cwd)),
     ]
+}
+
+/// Every discovered plugin manifest path: `<cwd>/.lato/plugins/*/plugin.json`
+/// and `<lato_home>/plugins/*/plugin.json`, sorted for deterministic merge
+/// order (the same roots the plugin system scans).
+fn plugin_manifest_paths(home: &std::path::Path, cwd: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut paths = Vec::new();
+    for root in [cwd.join(".lato").join("plugins"), home.join("plugins")] {
+        let Ok(entries) = std::fs::read_dir(&root) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let manifest = entry.path().join("plugin.json");
+            if manifest.is_file() {
+                paths.push(manifest);
+            }
+        }
+    }
+    paths.sort();
+    paths
+}
+
+/// Merge every plugin manifest's optional `agentfield` stanza into one
+/// plugin contribution. A manifest that is present but unreadable/malformed,
+/// an invalid stanza, or two plugins disagreeing on origin / credential
+/// reference / the same capability alias all fail closed (`Err`). Manifests
+/// without an `agentfield` stanza and disabled stanzas contribute nothing.
+fn load_plugin_contribution(
+    home: &std::path::Path,
+    cwd: &std::path::Path,
+) -> Result<Option<AgentFieldConfig>, CatalogSourceError> {
+    let mut assembled: Option<AgentFieldConfig> = None;
+    for manifest in plugin_manifest_paths(home, cwd) {
+        let bytes = std::fs::read(&manifest).map_err(|error| {
+            CatalogSourceError(format!(
+                "plugin manifest {} is present but unreadable: {error}",
+                manifest.display()
+            ))
+        })?;
+        let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
+            CatalogSourceError(format!(
+                "plugin manifest {} is present but malformed JSON: {error}",
+                manifest.display()
+            ))
+        })?;
+        let Some(raw) = value.get("agentfield") else {
+            continue;
+        };
+        if raw.is_null() {
+            continue;
+        }
+        let config = crate::agentfield::config::AgentFieldConfig::parse(raw).map_err(|error| {
+            CatalogSourceError(format!(
+                "plugin manifest {} has an invalid agentfield stanza: {error}",
+                manifest.display()
+            ))
+        })?;
+        let Some(config) = config.filter(|config| config.enabled) else {
+            continue;
+        };
+        match assembled.as_mut() {
+            None => assembled = Some(config),
+            Some(current) => {
+                if current.origin != config.origin
+                    || current.credential_reference != config.credential_reference
+                {
+                    return Err(CatalogSourceError(
+                        "plugin manifests disagree on origin or credential reference".to_owned(),
+                    ));
+                }
+                for (alias, capability) in config.capabilities {
+                    if let Some((_, existing)) = current
+                        .capabilities
+                        .iter()
+                        .find(|(existing_alias, _)| *existing_alias == alias)
+                    {
+                        if *existing != capability {
+                            return Err(CatalogSourceError(format!(
+                                "plugin manifests disagree on capability '{alias}'"
+                            )));
+                        }
+                    } else {
+                        current.capabilities.push((alias, capability));
+                    }
+                }
+            }
+        }
+    }
+    Ok(assembled)
 }
 
 /// Deterministically merge the present sources into the assembled config:
@@ -573,5 +665,103 @@ mod tests {
             AgentFieldCatalog::from_config(&second).revision(),
             "unchanged sources must re-assemble to the same revision"
         );
+    }
+
+    // ---- Round-4 production plugin source ----------------------------------
+
+    fn write_plugin(
+        home: &std::path::Path,
+        name: &str,
+        agentfield: Option<serde_json::Value>,
+    ) -> std::path::PathBuf {
+        let dir = home.join("plugins").join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut manifest = json!({"name": name});
+        if let Some(agentfield) = agentfield {
+            manifest["agentfield"] = agentfield;
+        }
+        let path = dir.join("plugin.json");
+        std::fs::write(&path, manifest.to_string()).unwrap();
+        path
+    }
+
+    #[test]
+    fn plugin_contribution_is_observed_by_the_production_source() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let sources = catalog_sources(temp.path(), temp.path());
+        assert!(
+            assemble_catalog_config(&sources).is_none(),
+            "no plugins yet"
+        );
+
+        write_plugin(
+            temp.path(),
+            "alpha",
+            Some(enabled_capability()["agentfield"].clone()),
+        );
+        let with_plugin = assemble_catalog_config(&sources).expect("plugin contributes");
+        assert!(
+            with_plugin
+                .capabilities
+                .iter()
+                .any(|(alias, _)| alias == "contract-review"),
+            "plugin capability enters the assembly"
+        );
+
+        // A manifest without the stanza contributes nothing.
+        write_plugin(temp.path(), "beta", None);
+        let again = assemble_catalog_config(&sources).unwrap();
+        assert_eq!(
+            AgentFieldCatalog::from_config(&with_plugin).revision(),
+            AgentFieldCatalog::from_config(&again).revision()
+        );
+    }
+
+    #[test]
+    fn malformed_plugin_manifest_fails_closed() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let sources = catalog_sources(temp.path(), temp.path());
+        let dir = temp.path().join("plugins").join("alpha");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("plugin.json"), "{not json").unwrap();
+        assert!(assemble_catalog_config(&sources).is_none());
+    }
+
+    #[test]
+    fn disagreeing_plugin_origins_fail_closed() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let sources = catalog_sources(temp.path(), temp.path());
+        write_plugin(
+            temp.path(),
+            "alpha",
+            Some(enabled_capability()["agentfield"].clone()),
+        );
+        let mut other = enabled_capability()["agentfield"].clone();
+        other["baseUrl"] = json!("https://other.example.internal");
+        other["capabilities"] = json!({});
+        write_plugin(temp.path(), "beta", Some(other));
+        assert!(assemble_catalog_config(&sources).is_none());
+    }
+
+    #[test]
+    fn plugin_capability_conflict_fails_closed() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let sources = catalog_sources(temp.path(), temp.path());
+        write_plugin(
+            temp.path(),
+            "alpha",
+            Some(enabled_capability()["agentfield"].clone()),
+        );
+        let mut conflicting = enabled_capability()["agentfield"].clone();
+        conflicting["capabilities"] = json!({
+            "contract-review": {
+                "target": "legal.review_other",
+                "description": "Conflicting redefinition",
+                "inputSchema": {"type":"object"},
+                "risk": "remote_read",
+            }
+        });
+        write_plugin(temp.path(), "beta", Some(conflicting));
+        assert!(assemble_catalog_config(&sources).is_none());
     }
 }
