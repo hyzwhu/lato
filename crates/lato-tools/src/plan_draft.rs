@@ -352,102 +352,50 @@ mod handle {
             Ok(unsafe { File::from_raw_fd(fd) })
         }
 
-        /// Linux: publishes the nameless inode onto `final_name` with ZERO
-        /// pathname deletion and ZERO publication pollution (Round 8):
+        /// Linux: publishes the nameless inode onto `plan.md` with the
+        /// Round-9 failure-atomicity contract: **any error before the commit
+        /// leaves the previous `plan.md` exactly where it was**.
         ///
-        /// 1. the OLD `plan.md` (if any) is anchored with a read descriptor
-        ///    and atomically MOVED aside to an auditable `.reap` name —
-        ///    nothing is deleted, the old content stays intact;
-        /// 2. the deterministic `on_post_link` seam runs on this real
-        ///    production point (old plan isolated, slot free);
-        /// 3. `linkat(.., AT_EMPTY_PATH)` binds the NAMELESS inode to
-        ///    `plan.md` directly — it acts on the descriptor's own inode,
-        ///    so bystander content can never be published regardless of
-        ///    any swap-in; `EEXIST` (a bystander took the freed slot)
-        ///    fails closed and NEVER overwrites the bystander;
-        /// 4. there is NO `unlinkat` anywhere on this path: failures leave
-        ///    the old plan under its auditable `.reap` name (no
-        ///    restore-overwrite either) and the nameless inode simply
-        ///    disappears when the descriptor is dropped.
+        /// Sequence (zero mistaken deletion, zero pollution, failure-
+        /// atomic):
         ///
-        /// Platform residue note (project-owner ruling 2026-09-17, extended
-        /// per Round 7 review): Linux normal pre-link failures are truly
-        /// zero-residue; the post-link failure/success paths leave the old
-        /// plan under an auditable `.reap` name — symmetric with macOS.
-        #[cfg(target_os = "linux")]
+        /// 1. FIRST attempt `linkat(.., AT_EMPTY_PATH)` directly onto
+        ///    `plan.md`:
+        ///    - success (no previous plan) → published, ZERO residue;
+        ///    - `EEXIST` (previous plan present) → continue below. Nothing
+        ///      has been touched: the previous plan is still in place.
+        /// 2. run the deterministic `on_post_link` seam with the previous
+        ///    plan still IN PLACE:
+        ///    - `Err` → fail immediately: the previous plan was never
+        ///      moved, so it is still on its original path (failure
+        ///      atomicity holds structurally, no `.reap` was created);
+        ///    - `Ok` → continue below.
+        /// 3. atomically move the previous plan aside to an auditable
+        ///    `.reap-<nonce>` name (`renameat` — a move, nothing deleted);
+        /// 4. `linkat(.., AT_EMPTY_PATH)` again onto the now-free slot:
+        ///    - success → published; the old plan stays under `.reap` as an
+        ///      auditable backup (residue policy = pending ruling item A);
+        ///    - `EEXIST` (a bystander took the freed slot during the seam)
+        ///      → fail closed, NEVER overwrite the bystander, and restore
+        ///      the previous plan with `renameat2(RENAME_NOREPLACE)`:
+        ///      restored into the free slot, or left under `.reap` (with a
+        ///      recovery hint in the error) when a bystander occupies the
+        ///      original path. No pathname unlink exists on any path.
+        ///
+        /// Platform residue note: pre-link failures are truly zero-residue;
+        /// post-move failures either restore the old plan (failure
+        /// atomicity) or leave it under the auditable `.reap` name when a
+        /// bystander occupies the original slot (zero mistaken deletion
+        /// takes priority; recovery hint included in the error).
         pub fn publish_by_identity(
             &self,
             file: &File,
-            middle_name: &str,
             final_name: &str,
             faults: &dyn crate::PlanDraftFaults,
         ) -> Result<(), String> {
-            let _ = middle_name;
             let empty = cstring(b"")?;
             let cfinal = cstring(final_name.as_bytes())?;
-            // (1) Anchor the old plan (if any) with a read descriptor
-            // (O_NOFOLLOW: a swapped-in symlink fails closed).
-            let mut anchor_plan: Option<File> = None;
-            {
-                let mut stat = unsafe { std::mem::zeroed() };
-                // Safe: pure metadata read on a handle-relative name.
-                if unsafe {
-                    libc::fstatat(
-                        self.fd.as_raw_fd(),
-                        cfinal.as_ptr(),
-                        &mut stat,
-                        libc::AT_SYMLINK_NOFOLLOW,
-                    )
-                } == 0
-                {
-                    let fd = unsafe {
-                        libc::openat(
-                            self.fd.as_raw_fd(),
-                            cfinal.as_ptr(),
-                            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                            0,
-                        )
-                    };
-                    if fd >= 0 {
-                        // Safe: freshly opened descriptor owned by us.
-                        anchor_plan = Some(unsafe { File::from_raw_fd(fd) });
-                    }
-                }
-            }
-            let has_old = anchor_plan.is_some();
-            // (2) Move the old plan aside atomically (auditable residue under
-            // `.reap`); nothing is deleted.
-            let mut reap_name: Option<String> = None;
-            if has_old {
-                let name = format!("{final_name}.reap-{}", super::unique_nonce());
-                let creap = cstring(name.as_bytes())?;
-                if unsafe {
-                    libc::renameat(
-                        self.fd.as_raw_fd(),
-                        cfinal.as_ptr(),
-                        self.fd.as_raw_fd(),
-                        creap.as_ptr(),
-                    )
-                } != 0
-                {
-                    return Err(format!(
-                        "plan_draft: could not publish plan: {}",
-                        last_os_error()
-                    ));
-                }
-                reap_name = Some(name);
-            }
-            // (3) Deterministic seam on the real production point: old plan
-            // isolated, final slot free, nameless inode about to be bound.
-            // Zero mistaken deletion: if a bystander took the final slot
-            // during the seam, we do NOT restore over it — the old plan
-            // stays under `.reap` for manual recovery.
-            faults.on_post_link(reap_name.as_deref().unwrap_or(""))?;
-            // (4) Identity-bound publication: bind the NAMELESS inode to
-            // `plan.md` directly. `AT_EMPTY_PATH` acts on the descriptor's
-            // own inode, so bystander content can never be published; the
-            // slot is free, so `EEXIST` means a bystander took it — we fail
-            // closed and never overwrite it.
+            // (1) First identity-bound attempt straight onto `plan.md`.
             let linked = unsafe {
                 libc::linkat(
                     file.as_raw_fd(),
@@ -457,45 +405,118 @@ mod handle {
                     libc::AT_EMPTY_PATH,
                 )
             };
-            if linked != 0 {
-                let error = io::Error::last_os_error();
-                // Some filesystems/containers restrict AT_EMPTY_PATH for
-                // non-O_PATH descriptors; fall back to the /proc magic
-                // symlink, which links the very same inode.
-                if matches!(
-                    error.raw_os_error(),
-                    Some(libc::EPERM)
-                        | Some(libc::EOPNOTSUPP)
-                        | Some(libc::EINVAL)
-                        | Some(libc::ENOENT)
-                ) {
-                    let procpath =
-                        cstring(format!("/proc/self/fd/{}", file.as_raw_fd()).as_bytes())?;
-                    // Safe: links the descriptor's own inode via procfs.
-                    let retry = unsafe {
-                        libc::linkat(
-                            libc::AT_FDCWD,
-                            procpath.as_ptr(),
-                            self.fd.as_raw_fd(),
-                            cfinal.as_ptr(),
-                            libc::AT_SYMLINK_FOLLOW,
-                        )
-                    };
-                    if retry != 0 {
-                        return Err(format!(
-                            "plan_draft: could not publish plan: {}",
-                            last_os_error()
-                        ));
-                    }
-                } else {
-                    return Err(format!("plan_draft: could not publish plan: {error}"));
-                }
+            if linked == 0 {
+                return Ok(()); // published, ZERO residue (no previous plan)
             }
-            // Published: plan.md now refers to the nameless inode. The old
-            // plan stays under its auditable `.reap` name; failures left it
-            // there too. No `unlinkat` was executed on any path.
-            let _ = anchor_plan;
-            Ok(())
+            let first_error = io::Error::last_os_error();
+            if first_error.raw_os_error() != Some(libc::EEXIST) {
+                // Non-EEXIST errors (restricted AT_EMPTY_PATH etc.): retry
+                // once through the /proc magic symlink, which links the very
+                // same inode.
+                let procpath = cstring(format!("/proc/self/fd/{}", file.as_raw_fd()).as_bytes())?;
+                // Safe: links the descriptor's own inode via procfs.
+                let retry = unsafe {
+                    libc::linkat(
+                        libc::AT_FDCWD,
+                        procpath.as_ptr(),
+                        self.fd.as_raw_fd(),
+                        cfinal.as_ptr(),
+                        libc::AT_SYMLINK_FOLLOW,
+                    )
+                };
+                if retry == 0 {
+                    return Ok(()); // published, ZERO residue
+                }
+                return Err(format!(
+                    "plan_draft: could not publish plan: {}",
+                    last_os_error()
+                ));
+            }
+            // `EEXIST`: the previous plan occupies the slot and is still
+            // untouched on its original path.
+            // (2) Deterministic seam with the previous plan still in place —
+            // an `Err` here fails BEFORE anything has been moved.
+            if let Err(message) = faults.on_post_link(final_name) {
+                return Err(format!("plan_draft: could not publish plan: {message}"));
+            }
+            // (3) Atomically move the previous plan aside (auditable
+            // backup); nothing is deleted.
+            let reap_name = format!("{final_name}.reap-{}", super::unique_nonce());
+            let creap = cstring(reap_name.as_bytes())?;
+            if unsafe {
+                libc::renameat(
+                    self.fd.as_raw_fd(),
+                    cfinal.as_ptr(),
+                    self.fd.as_raw_fd(),
+                    creap.as_ptr(),
+                )
+            } != 0
+            {
+                return Err(format!(
+                    "plan_draft: could not publish plan: {}",
+                    last_os_error()
+                ));
+            }
+            // (4) Identity-bound publication onto the now-free slot.
+            let linked = unsafe {
+                libc::linkat(
+                    file.as_raw_fd(),
+                    empty.as_ptr(),
+                    self.fd.as_raw_fd(),
+                    cfinal.as_ptr(),
+                    libc::AT_EMPTY_PATH,
+                )
+            };
+            if linked == 0 {
+                // Published. The old plan stays under the auditable `.reap`
+                // name (residue policy = pending ruling item A).
+                return Ok(());
+            }
+            let second_error = io::Error::last_os_error();
+            if second_error.raw_os_error() == Some(libc::EEXIST) {
+                // A bystander took the freed slot during the seam. Fail
+                // closed: NEVER overwrite it; try to restore the previous
+                // plan atomically (NOREPLACE — the restore itself can never
+                // overwrite the bystander either). If the slot is still
+                // occupied, the old plan remains under `.reap` and the
+                // error carries the recovery hint.
+                let restored = unsafe {
+                    libc::renameat2(
+                        self.fd.as_raw_fd(),
+                        creap.as_ptr(),
+                        self.fd.as_raw_fd(),
+                        cfinal.as_ptr(),
+                        libc::RENAME_NOREPLACE,
+                    )
+                } == 0;
+                if restored {
+                    return Err(format!(
+                        "plan_draft: could not publish plan: {second_error}"
+                    ));
+                }
+                return Err(format!(
+                    "plan_draft: could not publish plan: {second_error}; the previous plan was preserved under `{reap_name}` and can be restored manually"
+                ));
+            }
+            // Other post-move errors: restore the previous plan
+            // (NOREPLACE — same zero-overwrite guarantee).
+            let restored = unsafe {
+                libc::renameat2(
+                    self.fd.as_raw_fd(),
+                    creap.as_ptr(),
+                    self.fd.as_raw_fd(),
+                    cfinal.as_ptr(),
+                    libc::RENAME_NOREPLACE,
+                )
+            } == 0;
+            if restored {
+                return Err(format!(
+                    "plan_draft: could not publish plan: {second_error}"
+                ));
+            }
+            Err(format!(
+                "plan_draft: could not publish plan: {second_error}; the previous plan was preserved under `{reap_name}` and can be restored manually"
+            ))
         }
         /// Atomically renames the temporary name over the final name, both
         /// relative to the pinned handle. If the pinned directory was removed,
@@ -908,10 +929,7 @@ fn publish_locked_nameless(
     // fresh private name (the linkat syscall itself cannot be redirected by
     // any path swap), then atomically move it over plan.md. On any failure
     // the descriptor is simply closed — no unlink of any path.
-    let middle_name = temp_file_name(&format!("link-{}", unique_nonce()));
-    if let Err(error) =
-        handle.publish_by_identity(file.as_ref().unwrap(), &middle_name, PLAN_FILE_NAME, faults)
-    {
+    if let Err(error) = handle.publish_by_identity(file.as_ref().unwrap(), PLAN_FILE_NAME, faults) {
         // Defect #4 (Round 5): on the O_TMPFILE failure path we NEVER unlink
         // by name — the documented contract is close-only. If the
         // intermediate link still exists it is deliberately left in place
@@ -1760,7 +1778,6 @@ mod tests {
                 }
             }
 
-            let reap_path = std::sync::Arc::new(std::sync::Mutex::new(None));
             let error = plan_draft_with_faults(
                 &locks,
                 &root,
@@ -1953,13 +1970,11 @@ mod tests {
         }
     }
 
-    /// Round-8 (01a0ad0d rework pack): the on_post_link seam occupies the
-    /// freed final slot with a bystander AFTER the old plan was isolated —
-    /// the production `linkat` then genuinely fails with EEXIST and the
-    /// implementation must NOT overwrite the bystander, leaving the old
-    /// plan under its auditable `.reap` name. Residue is judged by a FULL
-    /// readdir + lstat enumeration (no `.tmp-` name filtering). Ten
-    /// consecutive runs.
+    /// Round-9: the on_post_link seam swaps a bystander ONTO the final slot
+    /// (overwriting the previous plan content from inside the seam). The
+    /// production sequence isolates that content under an auditable `.reap`
+    /// name and publishes OUR inode — the bystander content is neither
+    /// published nor deleted. Ten consecutive runs.
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn pre_rename_identity_mismatch_rejects_publish_ten_runs() {
@@ -1969,37 +1984,193 @@ mod tests {
             let locks = FileLocks::new();
             plan_draft(&locks, &root, "previous").await.unwrap();
 
-            let occupant_name = PLAN_FILE_NAME.to_string();
+            let bystander_name = format!("slot-occupant-{attempt}");
             struct OccupySlot {
                 workspace_root: PathBuf,
-                reap_path: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+                bystander_name: String,
             }
             impl PlanDraftFaults for OccupySlot {
                 fn on_stage(&self, _stage: PlanDraftStage) -> Result<(), String> {
                     Ok(())
                 }
-                fn on_post_link(&self, reap_name: &str) -> Result<(), String> {
-                    // The old plan is now isolated under `.reap` and the
-                    // final slot is free. Occupy the FINAL slot (plan.md,
-                    // anchored at the workspace root — handle-relative names
-                    // resolve there) with a bystander; the identity-bound
-                    // linkat must fail closed (EEXIST) and never overwrite
-                    // us.
-                    *self.reap_path.lock().unwrap() = Some(reap_name.to_owned());
-                    std::fs::write(self.workspace_root.join(PLAN_FILE_NAME), "slot-occupant")
-                        .unwrap();
+                fn on_post_link(&self, _final_name: &str) -> Result<(), String> {
+                    // Swap a bystander ONTO the final slot (remove the old
+                    // plan content, create the bystander at the same path).
+                    // The production sequence must isolate this content
+                    // under `.reap` and publish OUR inode — never the
+                    // bystander's.
+                    std::fs::remove_file(self.workspace_root.join(PLAN_FILE_NAME)).unwrap();
+                    std::fs::write(
+                        self.workspace_root.join(PLAN_FILE_NAME),
+                        &self.bystander_name,
+                    )
+                    .unwrap();
                     Ok(())
                 }
             }
 
-            let reap_path = std::sync::Arc::new(std::sync::Mutex::new(None));
-            let error = plan_draft_with_faults(
+            let outcome = plan_draft_with_faults(
                 &locks,
                 &root,
                 "replacement",
                 &OccupySlot {
                     workspace_root: root.clone(),
-                    reap_path: reap_path.clone(),
+                    bystander_name: bystander_name.clone(),
+                },
+            )
+            .await;
+            // The publish succeeded — with OUR inode, not the bystander's
+            // content (identity-bound linkat).
+            assert!(
+                outcome.is_ok(),
+                "attempt {attempt}: publication must succeed: {outcome:?}"
+            );
+            assert_eq!(
+                std::fs::read(root.join(PLAN_FILE_NAME)).unwrap(),
+                b"replacement",
+                "attempt {attempt}: the published content must be OURS"
+            );
+            // The bystander content that the seam placed on the final slot
+            // was isolated under an auditable `.reap-<nonce>` name —
+            // preserved, not deleted, not published. The nonce is generated
+            // inside the publication, so scan by the `.reap-` suffix.
+            let reaps: Vec<String> = full_entries(&root)
+                .into_iter()
+                .filter(|name| name.starts_with(&format!("{PLAN_FILE_NAME}.reap-")))
+                .collect();
+            assert_eq!(
+                reaps.len(),
+                1,
+                "attempt {attempt}: exactly one .reap backup"
+            );
+            assert_eq!(
+                std::fs::read(root.join(&reaps[0])).unwrap(),
+                format!("slot-occupant-{attempt}").into_bytes(),
+                "attempt {attempt}: the bystander content must be preserved"
+            );
+            // Full enumeration (no name filtering): exactly plan.md + the
+            // auditable `.reap` remain.
+            let mut all = full_entries(&root);
+            all.sort();
+            let mut expected = vec![PLAN_FILE_NAME.to_string(), reaps[0].clone()];
+            expected.sort();
+            assert_eq!(all, expected, "attempt {attempt}");
+        }
+    }
+
+    /// Round-9 (management rework pack): a failure injected BEFORE the
+    /// commit (on_post_link precedes the final renameat) must keep the
+    /// previous plan.md byte-for-byte on its original path, with NO `.reap`
+    /// created and no unexpected residue (full enumeration). Ten
+    /// consecutive runs.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn commit_pre_failure_keeps_plan_md_intact_ten_runs() {
+        for attempt in 0..10 {
+            let directory = temp_workspace("commit-pre");
+            let root = directory.path().to_path_buf();
+            let locks = FileLocks::new();
+            plan_draft(&locks, &root, "previous").await.unwrap();
+
+            let error = plan_draft_with_faults(
+                &locks,
+                &root,
+                "replacement",
+                &FailAt(PlanDraftStage::SecondDestinationCheck),
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                error.contains("SecondDestinationCheck"),
+                "attempt {attempt}: {error}"
+            );
+            // The previous plan is byte-for-byte intact on its original path.
+            assert_eq!(
+                std::fs::read(root.join(PLAN_FILE_NAME)).unwrap(),
+                b"previous",
+                "attempt {attempt}: plan.md must be intact"
+            );
+            // No `.reap` was created and the disk holds nothing unexpected.
+            let all = full_entries(&root);
+            assert_eq!(all, vec![PLAN_FILE_NAME.to_string()], "attempt {attempt}");
+        }
+    }
+
+    /// Round-9: the on_post_link seam returns `Err` (abort) while the
+    /// previous plan is STILL on its original path — the failure path must
+    /// keep it there byte-for-byte with zero residue (the Round-7
+    /// `post_link_seam_abort_cleans_middle_link_ten_runs` contract, renamed
+    /// for the linkat-direct sequence). Ten consecutive runs.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn post_link_seam_abort_keeps_plan_md_intact_ten_runs() {
+        for attempt in 0..10 {
+            let directory = temp_workspace("post-link-abort");
+            let root = directory.path().to_path_buf();
+            let locks = FileLocks::new();
+            plan_draft(&locks, &root, "previous").await.unwrap();
+
+            let error = plan_draft_with_faults(
+                &locks,
+                &root,
+                "replacement",
+                &FailAt(PlanDraftStage::Rename),
+            )
+            .await
+            .unwrap_err();
+            assert!(error.contains("Rename"), "attempt {attempt}: {error}");
+            // The previous plan is byte-for-byte intact on its original
+            // path (the renameat to `.reap` never ran on this path).
+            assert_eq!(
+                std::fs::read(root.join(PLAN_FILE_NAME)).unwrap(),
+                b"previous",
+                "attempt {attempt}: plan.md must be intact"
+            );
+            let all = full_entries(&root);
+            assert_eq!(all, vec![PLAN_FILE_NAME.to_string()], "attempt {attempt}");
+        }
+    }
+
+    /// Round-9: a REAL `renameat` failure (the seam removes `plan.md`
+    /// through genuine syscalls so the move fails with ENOENT) — the
+    /// failure path must not create any `.reap` residue, and the
+    /// bystander planted by the seam must survive untouched. Ten
+    /// consecutive runs.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn post_link_rename_failure_leaves_zero_residue_ten_runs() {
+        for attempt in 0..10 {
+            let directory = temp_workspace("post-link");
+            let root = directory.path().to_path_buf();
+            let locks = FileLocks::new();
+            plan_draft(&locks, &root, "previous").await.unwrap();
+
+            let bystander_name = format!("post-link-bystander-{attempt}");
+            struct RealPostLinkFailure {
+                workspace_root: PathBuf,
+                bystander_path: PathBuf,
+            }
+            impl PlanDraftFaults for RealPostLinkFailure {
+                fn on_stage(&self, _stage: PlanDraftStage) -> Result<(), String> {
+                    Ok(())
+                }
+                fn on_post_link(&self, final_name: &str) -> Result<(), String> {
+                    // Real failure injection: remove plan.md (genuine
+                    // syscalls) so the final renameat fails with ENOENT,
+                    // and plant a bystander elsewhere.
+                    std::fs::remove_file(self.workspace_root.join(final_name)).unwrap();
+                    std::fs::write(&self.bystander_path, "post-link-bystander").unwrap();
+                    Ok(())
+                }
+            }
+
+            let error = plan_draft_with_faults(
+                &locks,
+                &root,
+                "replacement",
+                &RealPostLinkFailure {
+                    workspace_root: root.clone(),
+                    bystander_path: root.join(&bystander_name),
                 },
             )
             .await
@@ -2008,27 +2179,10 @@ mod tests {
                 error.contains("could not publish plan"),
                 "attempt {attempt}: {error}"
             );
-            // The slot occupant survives byte-for-byte: the publication
-            // never overwrites a bystander.
-            assert_eq!(
-                std::fs::read(root.join(&occupant_name)).unwrap(),
-                b"slot-occupant",
-                "attempt {attempt}: the occupant must survive"
-            );
-            // The old plan is intact under its auditable `.reap` name.
-            let reap = reap_path.lock().unwrap().clone().unwrap();
-            assert_eq!(
-                std::fs::read(root.join(&reap)).unwrap(),
-                b"previous",
-                "attempt {attempt}: the old plan must be preserved"
-            );
-            // Full enumeration (no name filtering): exactly the occupant +
-            // the auditable old plan remain.
-            let mut all = full_entries(&root);
-            all.sort();
-            let mut expected = vec![occupant_name.clone(), reap];
-            expected.sort();
-            assert_eq!(all, expected, "attempt {attempt}");
+            // No `.reap` residue (the move failed before creating it) and
+            // the bystander survives untouched (full enumeration).
+            let all = full_entries(&root);
+            assert_eq!(all, vec![bystander_name], "attempt {attempt}");
         }
     }
 
