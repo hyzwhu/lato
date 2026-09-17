@@ -236,6 +236,30 @@ fn manager_with_fake(start: StartBehavior) -> (Arc<AgentFieldManager>, SharedFak
     (Arc::new(manager), fake)
 }
 
+/// Manager backed by REAL user/project config files under `home`/`cwd`.
+fn manager_with_sources(
+    home: &std::path::Path,
+    cwd: &std::path::Path,
+    start: StartBehavior,
+) -> (Arc<AgentFieldManager>, SharedFake) {
+    let fake: SharedFake = Arc::new(FakeClient::new(start));
+    let shared: Arc<dyn AgentFieldClient> = fake.clone();
+    let sources = lato_agent::agentfield::catalog::catalog_sources(home, cwd);
+    let config = lato_agent::agentfield::catalog::assemble_catalog_config(&sources)
+        .expect("sources assemble");
+    let catalog = AgentFieldCatalog::from_config(&config);
+    let manager = AgentFieldManager::with_factory_and_sources(
+        "session-src",
+        catalog,
+        Some(Arc::new(move || {
+            let shared = shared.clone();
+            Box::pin(async move { Ok(shared.clone()) })
+        })),
+        sources,
+    );
+    (Arc::new(manager), fake)
+}
+
 fn agentfield_runtime(
     root: &std::path::Path,
     manager: Arc<AgentFieldManager>,
@@ -722,4 +746,152 @@ async fn remote_protocol_violations_surface_stably_through_status() {
     assert_eq!(runs[0].status, RunStatus::Unavailable);
     assert!(!runs[0].status.is_terminal(), "unavailable is not terminal");
     assert_eq!(runs[0].last_error, Some("agentfield.unavailable"));
+}
+
+/// Round-1 P1-3 regression: a REAL user-config change after approval makes
+/// the post-approval recheck fail closed — `agentfield.catalog_changed`,
+/// grant consumed, zero additional remote requests, zero new runs.
+#[tokio::test]
+async fn real_user_config_change_after_approval_fails_closed() {
+    let temp_home = TempDir::new().unwrap();
+    let temp_cwd = TempDir::new().unwrap();
+    let user_config = temp_home.path().join("config.json");
+    let config_body = |target: &str| {
+        json!({"agentfield": {
+            "enabled": true,
+            "baseUrl": "https://agents.example.internal",
+            "credential": "agentfield:primary",
+            "capabilities": {
+                "contract-review": {
+                    "target": target,
+                    "description": "Review one contract",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {"contract": {"type": "string"}},
+                        "required": ["contract"],
+                        "additionalProperties": false
+                    },
+                    "risk": "remote_read",
+                }
+            }
+        }})
+    };
+    std::fs::write(
+        &user_config,
+        config_body("legal.review_contract").to_string(),
+    )
+    .unwrap();
+    let (manager, fake) = manager_with_sources(
+        temp_home.path(),
+        temp_cwd.path(),
+        StartBehavior::Ok("exec-1".into()),
+    );
+    let (runtime, _handle) = agentfield_runtime(temp_cwd.path(), manager.clone());
+    let revision = manager.catalog().revision().to_owned();
+
+    // Baseline start with the frozen revision succeeds (exactly one send).
+    approved_start(&runtime, &revision, "call-src-ok")
+        .await
+        .unwrap();
+    assert_eq!(fake.start_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(manager.run_count().await, 1);
+
+    // REAL config change on disk (user source): the execution target moves.
+    std::fs::write(&user_config, config_body("legal.review_other").to_string()).unwrap();
+
+    let error = approved_start(&runtime, &revision, "call-src-changed")
+        .await
+        .expect_err("changed sources must fail closed");
+    assert_eq!(error.code, "agentfield.catalog_changed");
+    assert_eq!(
+        fake.start_calls.load(Ordering::SeqCst),
+        1,
+        "zero additional remote requests"
+    );
+    assert_eq!(manager.run_count().await, 1, "no new run reserved");
+}
+
+/// Round-1 P1-3 regression: a REAL project-config contribution after
+/// approval is also detected.
+#[tokio::test]
+async fn real_project_config_contribution_after_approval_fails_closed() {
+    let temp_home = TempDir::new().unwrap();
+    let temp_cwd = TempDir::new().unwrap();
+    let project_dir = temp_cwd.path().join(".lato");
+    let project_config = project_dir.join("config.json");
+    std::fs::create_dir_all(&project_dir).unwrap();
+    let config_body = |target: &str, alias: &str| {
+        json!({"agentfield": {
+            "enabled": true,
+            "baseUrl": "https://agents.example.internal",
+            "credential": "agentfield:primary",
+            "capabilities": {
+                alias: {
+                    "target": target,
+                    "description": "Review one contract",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {"contract": {"type": "string"}},
+                        "required": ["contract"],
+                        "additionalProperties": false
+                    },
+                    "risk": "remote_read",
+                }
+            }
+        }})
+    };
+    std::fs::write(
+        temp_home.path().join("config.json"),
+        config_body("legal.review_contract", "contract-review").to_string(),
+    )
+    .unwrap();
+    let (manager, fake) = manager_with_sources(
+        temp_home.path(),
+        temp_cwd.path(),
+        StartBehavior::Ok("exec-1".into()),
+    );
+    let (runtime, _handle) = agentfield_runtime(temp_cwd.path(), manager.clone());
+    let revision = manager.catalog().revision().to_owned();
+
+    approved_start(&runtime, &revision, "call-proj-ok")
+        .await
+        .unwrap();
+    // A new project capability appears after approval.
+    std::fs::write(
+        &project_config,
+        config_body("alpha.task", "alpha-task").to_string(),
+    )
+    .unwrap();
+    let error = approved_start(&runtime, &revision, "call-proj-changed")
+        .await
+        .expect_err("project contribution must fail closed");
+    assert_eq!(error.code, "agentfield.catalog_changed");
+    assert_eq!(fake.start_calls.load(Ordering::SeqCst), 1);
+}
+
+/// Round-1 P1-1 regression through the REAL ToolRuntime: aborting the
+/// execute future mid-send leaves NO stranded `queued` run — the drop guard
+/// records the permanent `outcome_unknown` terminal.
+#[tokio::test]
+async fn runtime_abort_mid_send_marks_the_run_outcome_unknown() {
+    let temp = TempDir::new().unwrap();
+    let (manager, fake) = manager_with_fake(StartBehavior::DelayThenOk("exec-1".into(), 5_000));
+    let (runtime, _handle) = agentfield_runtime(temp.path(), manager.clone());
+    let revision = manager.catalog().revision().to_owned();
+    let runtime = Arc::new(runtime);
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        let revision = revision.clone();
+        async move { approved_start(&runtime, &revision, "call-abort").await }
+    });
+    while fake.start_calls.load(Ordering::SeqCst) == 0 {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    task.abort();
+    let _ = task.await;
+    let runs = manager.run_status(None).await.unwrap();
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].status, RunStatus::OutcomeUnknown);
+    assert!(runs[0].execution_id.is_none());
+    assert_eq!(runs[0].last_error, Some("agentfield.outcome_unknown"));
 }

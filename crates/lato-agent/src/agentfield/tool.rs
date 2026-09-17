@@ -276,8 +276,11 @@ impl AgentFieldTool {
 
         // Post-approval TOCTOU guard: the catalog must still be what the
         // model listed. The grant is already consumed at this point and is
-        // never restored — zero reservations, zero remote requests.
-        if !manager.catalog().matches_revision(revision) {
+        // never restored — zero reservations, zero remote requests. Both
+        // the frozen snapshot comparison AND a reload of the real
+        // configuration sources (user / project / plugin) must agree; any
+        // real change since session assembly fails closed.
+        if !manager.catalog().matches_revision(revision) || !manager.recheck_revision_matches() {
             return Err(catalog_changed());
         }
 
