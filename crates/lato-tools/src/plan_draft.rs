@@ -374,6 +374,7 @@ mod handle {
         /// per Round 7 review): Linux normal pre-link failures are truly
         /// zero-residue; the post-link failure/success paths leave the old
         /// plan under an auditable `.reap` name — symmetric with macOS.
+        #[cfg(target_os = "linux")]
         pub fn publish_by_identity(
             &self,
             file: &File,
@@ -1191,6 +1192,7 @@ mod tests {
     /// every entry — no `.tmp-`/`.reap` name filtering, so a bystander
     /// swapped into ANY name (including a middle/.reap path) can never be
     /// missed by a test assertion.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     fn full_entries(root: &Path) -> Vec<String> {
         std::fs::read_dir(root)
             .unwrap()
