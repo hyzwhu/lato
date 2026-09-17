@@ -508,9 +508,6 @@ impl AcpHost {
         sid: &str,
     ) -> Option<(SessionAgentFieldHandle, Arc<AgentFieldManager>)> {
         let config = load_agentfield_config(&self.effective_lato_home())?;
-        if !config.enabled {
-            return None;
-        }
         // Credential resolution happens at the registration gate, BEFORE any
         // transport exists; an unresolvable reference means the adapter is
         // unconfigured and stays invisible to the model.

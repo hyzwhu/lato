@@ -75,7 +75,10 @@ pub fn load_agentfield_config(home: &std::path::Path) -> Option<config::AgentFie
     let bytes = std::fs::read(home.join("config.json")).ok()?;
     let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
     let raw = value.get("agentfield")?;
-    config::AgentFieldConfig::parse(raw).ok().flatten()
+    config::AgentFieldConfig::parse(raw)
+        .ok()
+        .flatten()
+        .filter(|config| config.enabled)
 }
 
 /// The unique policy-enforcing production factory (7C1.1): every product

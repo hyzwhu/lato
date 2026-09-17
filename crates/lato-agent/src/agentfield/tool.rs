@@ -25,7 +25,7 @@ use semver::Version;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::manager::{AgentFieldManager, CancelOutcome, ManagerError, RunState};
+use super::manager::{AgentFieldManager, CancelOutcome, ManagerError, RunState, RunStatus};
 
 /// Wire name visible to the model (`builtin:agentfield` canonical).
 pub const AGENTFIELD_TOOL_WIRE_NAME: &str = "agentfield";
@@ -298,7 +298,33 @@ impl AgentFieldTool {
             .start_run(alias, &capability.target, revision, &args)
             .await
             .map_err(map_manager_error)?;
-        single_run_output("start", &run)
+        match run.status {
+            // Bound and accepted: project the run (asynchronous, no wait).
+            RunStatus::Queued | RunStatus::Running => single_run_output("start", &run),
+            // Permanent local terminal (spec §7.2): the run is recorded, but
+            // the model receives the stable error and the manual
+            // reconciliation guidance — never a fabricated success.
+            RunStatus::OutcomeUnknown => Err(ToolError::new(
+                "agentfield.outcome_unknown",
+                run.summary
+                    .unwrap_or_else(|| "the remote start outcome could not be determined".into()),
+                Retryability::Never,
+            )),
+            // Definitive remote rejection: the run is recorded as failed and
+            // the frozen code surfaces to the model.
+            RunStatus::Failed => {
+                let code = run.last_error.unwrap_or("agentfield.remote_denied");
+                Err(ToolError::new(
+                    code,
+                    "the remote rejected the start",
+                    Retryability::Never,
+                ))
+            }
+            other => Err(map_manager_error(ManagerError::Unavailable(format!(
+                "unexpected post-start status `{}`",
+                other.as_str()
+            )))),
+        }
     }
 
     /// `status` (spec §7.3): one owned run (with remote refresh when
