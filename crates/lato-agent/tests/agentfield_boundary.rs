@@ -112,6 +112,64 @@ fn production_transport_keeps_frozen_policy_and_test_only_seam() {
     );
 }
 
+/// 7C1.1 AC-08: the transport exposes exactly ONE public constructor (the
+/// policy-enforcing factory) and no insecure/proxy/redirect customization
+/// surface anywhere.
+#[test]
+fn production_transport_has_exactly_one_public_constructor_and_no_insecure_path() {
+    let source = include_str!("../src/agentfield/transport.rs");
+    let count = source.matches("pub async fn connect").count();
+    assert_eq!(
+        count, 1,
+        "transport must expose exactly one public constructor"
+    );
+    assert!(
+        !source.contains("pub fn new"),
+        "no raw-client constructor may exist on the transport"
+    );
+    for forbidden in [
+        "danger_",
+        "accept_invalid",
+        "Proxy::",
+        "Policy::custom",
+        "with_pinned_addrs",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "transport must not contain `{forbidden}`"
+        );
+    }
+}
+
+/// 7C1.1 AC-08: the module's public surface routes product construction
+/// through the policy factory, which resolves the credential BEFORE the
+/// transport exists (unresolvable credential ⇒ zero network).
+#[test]
+fn product_construction_reaches_the_transport_only_through_the_policy_factory() {
+    let mod_rs = include_str!("../src/agentfield/mod.rs");
+    assert!(
+        mod_rs.contains("pub async fn production_agentfield_client"),
+        "mod.rs must expose the unique policy-enforcing factory"
+    );
+    let resolve_idx = mod_rs
+        .find("resolve_agentfield_credential")
+        .expect("factory must resolve the credential");
+    let connect_idx = mod_rs
+        .find("ReqwestTransport::connect")
+        .expect("factory must build the pinned transport");
+    assert!(
+        resolve_idx < connect_idx,
+        "credential resolution must precede transport construction"
+    );
+    // The public re-exports must not leak resolver or pinning internals.
+    for forbidden in ["AgentFieldDnsResolver", "PinnedAddresses", "Limits"] {
+        assert!(
+            !mod_rs.contains(&format!("pub use transport::{forbidden}")),
+            "mod.rs must not re-export internal `{forbidden}`"
+        );
+    }
+}
+
 /// The module entry point must stay the v1.2.1 five sub-modules, and the
 /// module must not gain tool-protocol dependencies (`lato_core::Tool` /
 /// `lato_tools`).

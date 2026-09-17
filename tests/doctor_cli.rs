@@ -719,3 +719,21 @@ async fn agentfield_non_live_stays_offline_without_network() {
     let rendered = serde_json::to_string(&report).unwrap();
     assert!(!rendered.contains("offline-secret"));
 }
+
+/// 7C1.1 AC-08: the doctor live path builds its client only through the
+/// unique policy-enforcing factory.
+#[test]
+fn agentfield_live_probe_uses_the_policy_factory() {
+    let source = include_str!("../src/doctor.rs");
+    assert!(
+        source.contains("production_agentfield_client"),
+        "doctor --live must construct the AgentField client via the policy factory"
+    );
+    let factory_idx = source
+        .find("production_agentfield_client")
+        .expect("factory call present");
+    let probe_idx = source
+        .find("AgentFieldProbe::new")
+        .expect("live probe present");
+    assert!(factory_idx < probe_idx, "factory must run before probing");
+}
