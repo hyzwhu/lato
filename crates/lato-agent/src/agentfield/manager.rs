@@ -319,6 +319,19 @@ impl AgentFieldManager {
         }
     }
 
+    /// Healthy execute targets from a fresh (≤ 30 s) snapshot, or `None`
+    /// when health is unknown right now (`list` degrades every capability
+    /// to `available: false`; spec §6.2).
+    pub async fn healthy_targets(&self) -> Option<Vec<String>> {
+        if self.is_closed() {
+            return None;
+        }
+        match self.health_snapshot().await {
+            Ok(snapshot) => Some(snapshot.healthy_execute_targets.clone()),
+            Err(_) => self.probe_cache.lock().await.clone().map(|_| Vec::new()),
+        }
+    }
+
     /// Reserve capacity, perform the exactly-one async execute request, and
     /// bind the remote execution ID. Called only after schema, allowlist,
     /// policy/approval, and revision recheck have all passed.
