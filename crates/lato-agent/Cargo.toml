@@ -33,7 +33,10 @@ futures-util = "0.3"
 
 [dev-dependencies]
 flate2 = "1"
+# ring-only backends: keep the workspace on a single rustls CryptoProvider
+# (reqwest's rustls-tls uses ring) — a second backend would break
+# `ServerConfig::builder()` auto-selection in unrelated tests.
 rcgen = "0.13"
-tokio-rustls = "0.26"
-rustls = "0.23"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 socket2 = "0.6"
