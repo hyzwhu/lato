@@ -313,9 +313,10 @@ fn home_check(home: &Path) -> DoctorCheck {
 }
 
 /// Phase 7C1: AgentField adapter diagnostics. Offline: configuration state
-/// only (disabled / unconfigured / invalid). Live (`--live`) stays offline for
-/// AgentField in v1.2.1: it reports the `deferred_to_7c1_1` status with zero
-/// AgentField network requests (production verification is Phase 7C1.1).
+/// only (disabled / unconfigured / invalid). Phase 7C1.1: `--live` performs
+/// an explicit opt-in discovery probe through the unique policy-enforcing
+/// factory — disabled, unconfigured, and unresolvable-credential paths make
+/// ZERO network requests and resolve zero credentials.
 async fn agentfield_check(
     home: &Path,
     settings: Option<&DoctorSettings>,
@@ -372,24 +373,90 @@ async fn agentfield_check(
             Some("agentfield.unconfigured"),
         );
     }
-    let deferred_note = if live {
-        // v1.2.1 (DG-01): 7C1 is offline-only — doctor `--live` performs ZERO
-        // AgentField network requests; production verification is deferred to
-        // the separately accepted Phase 7C1.1.
-        "; AgentField network verification deferred_to_7c1_1 (zero requests made)"
-    } else {
-        "; run `lato doctor --live` for the deferred-status report"
-    };
-    check(
-        "agentfield",
-        DoctorStatus::Ok,
-        format!(
-            "enabled with {} capability(ies){}",
-            config.capabilities.len(),
-            deferred_note
+    if !live {
+        return check(
+            "agentfield",
+            DoctorStatus::Ok,
+            format!(
+                "enabled with {} capability(ies); run `lato doctor --live` for live AgentField diagnostics",
+                config.capabilities.len()
+            ),
+            None,
+        );
+    }
+    // Explicit opt-in live probe: one discovery request through the frozen
+    // network policy, classified into stable diagnostics.
+    match af::production_agentfield_client(store.as_ref(), &config).await {
+        Err(error) => agentfield_live_error_check(error),
+        Ok(client) => {
+            let probe = af::AgentFieldProbe::new(std::sync::Arc::new(client));
+            match tokio::time::timeout(Duration::from_secs(30), probe.probe()).await {
+                Err(_) => check(
+                    "agentfield",
+                    DoctorStatus::Warn,
+                    "agentfield.unavailable: live probe exceeded the 30s budget".to_string(),
+                    Some("agentfield.unavailable"),
+                ),
+                Ok(Ok(snapshot)) => check(
+                    "agentfield",
+                    DoctorStatus::Ok,
+                    format!(
+                        "live probe ok: discovery answered {} agent(s), {} healthy, pinned contract {}",
+                        snapshot.agent_count, snapshot.healthy_agent_count, snapshot.version
+                    ),
+                    None,
+                ),
+                Ok(Err(error)) => agentfield_live_error_check(error),
+            }
+        }
+    }
+}
+
+/// Stable classification of a failed live probe. Error text comes from the
+/// `agentfield.*` family only: never the server body, the token, or the
+/// resolved address details.
+fn agentfield_live_error_check(
+    error: lato_agent::agentfield::client::AgentFieldError,
+) -> DoctorCheck {
+    use lato_agent::agentfield::client::AgentFieldError as Error;
+    match &error {
+        Error::Unauthorized => check(
+            "agentfield",
+            DoctorStatus::Warn,
+            "agentfield.unauthorized: control plane rejected the credentials (401/403)".to_string(),
+            Some("agentfield.unauthorized"),
         ),
-        None,
-    )
+        Error::Unavailable(_) => check(
+            "agentfield",
+            DoctorStatus::Warn,
+            error.to_string(),
+            Some("agentfield.unavailable"),
+        ),
+        Error::RemoteProtocol(_) => check(
+            "agentfield",
+            DoctorStatus::Error,
+            error.to_string(),
+            Some("agentfield.remote_protocol"),
+        ),
+        Error::BodyTooLarge(_) => check(
+            "agentfield",
+            DoctorStatus::Error,
+            error.to_string(),
+            Some("agentfield.output_too_large"),
+        ),
+        Error::RemoteDenied => check(
+            "agentfield",
+            DoctorStatus::Warn,
+            "agentfield.remote_denied: remote policy denied the probe".to_string(),
+            Some("agentfield.remote_denied"),
+        ),
+        Error::CredentialMissing(_) => check(
+            "agentfield",
+            DoctorStatus::Warn,
+            error.to_string(),
+            Some("agentfield.unconfigured"),
+        ),
+    }
 }
 
 fn load_settings(home: &Path) -> Result<Option<DoctorSettings>, String> {

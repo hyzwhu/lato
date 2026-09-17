@@ -425,7 +425,7 @@ fn valid_agentfield_config(credential: &str) -> serde_json::Value {
     })
 }
 
-// ---- v1.2.1 DG-01: doctor --live is offline-only for AgentField ----
+// ---- Phase 7C1.1: doctor --live opt-in AgentField probe ----
 
 struct NoopProbe;
 
@@ -446,29 +446,276 @@ async fn live_report(home: &Path, probe: Arc<dyn LiveProbe>) -> DoctorReport {
     run(DoctorOptions { live: true }, &deps).await
 }
 
+async fn non_live_report(home: &Path) -> DoctorReport {
+    let workspace = tempfile::tempdir().unwrap();
+    let deps = DoctorDependencies {
+        home: home.to_path_buf(),
+        workspace: workspace.path().to_path_buf(),
+        live_probe: Arc::new(NoopProbe),
+    };
+    run(DoctorOptions { live: false }, &deps).await
+}
+
+/// Minimal canned control plane: serves one JSON response per connection.
+async fn spawn_agentfield_server(status: &str, content_type: &str, body: &str) -> u16 {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let response = format!(
+        "HTTP/1.1 {status}\r\nconnection: close\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    tokio::spawn(async move {
+        let mut queue = std::iter::once(response.into_bytes())
+            .collect::<Vec<_>>()
+            .into_iter();
+        while let Ok((mut sock, _)) = listener.accept().await {
+            // Drain request head, then answer.
+            let mut buf = [0u8; 2048];
+            let _ =
+                tokio::time::timeout(std::time::Duration::from_secs(5), sock.read(&mut buf)).await;
+            let Some(response) = queue.next() else { break };
+            let _ = sock.write_all(&response).await;
+            let _ = sock.shutdown().await;
+        }
+    });
+    port
+}
+
+fn discovery_envelope() -> String {
+    serde_json::json!({
+        "discovered_at": "2026-09-16T00:00:00Z",
+        "total_agents": 1,
+        "total_reasoners": 1,
+        "total_skills": 0,
+        "pagination": {"limit": 100, "offset": 0, "has_more": false},
+        "capabilities": [{
+            "agent_id": "legal-agent",
+            "group_id": "",
+            "base_url": "https://agentfield.invalid",
+            "version": "v0.1.138",
+            "health_status": "healthy",
+            "deployment_type": "service",
+            "last_heartbeat": "2026-09-16T00:00:00Z",
+            "reasoners": [{
+                "id": "review_contract",
+                "invocation_target": "legal-agent:review_contract"
+            }],
+            "skills": []
+        }]
+    })
+    .to_string()
+}
+
+fn write_live_server_config(home: &Path, port: u16) {
+    write_agentfield_config(
+        home,
+        serde_json::json!({
+            "enabled": true,
+            "baseUrl": format!("http://127.0.0.1:{port}"),
+            "allowLoopbackHttp": true,
+            "credential": "agentfield:primary",
+            "capabilities": {
+                "contract-review": {
+                    "target": "legal-agent.review_contract",
+                    "description": "Review one contract",
+                    "inputSchema": {"type": "object"},
+                    "risk": "remote_read"
+                }
+            }
+        }),
+    );
+}
+
 #[tokio::test]
-async fn agentfield_live_makes_zero_requests_and_reports_deferred() {
+async fn agentfield_live_disabled_and_unconfigured_stay_zero_network() {
+    // Unconfigured: no agentfield stanza at all.
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(
+        home.path().join("config.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({"default_model": "xai/grok-4"})).unwrap(),
+    )
+    .unwrap();
+    let report = live_report(home.path(), Arc::new(NoopProbe)).await;
+    let check = agentfield_check(&report);
+    assert_eq!(check.status, DoctorStatus::Ok);
+    assert!(check.message.contains("not configured"), "{check:?}");
+
+    // Disabled stanza: parsed but disabled, zero network, zero credential
+    // resolution.
+    let home = tempfile::tempdir().unwrap();
+    write_agentfield_config(
+        home.path(),
+        serde_json::json!({
+            "enabled": false,
+            "baseUrl": "https://agents.example.internal",
+            "credential": "agentfield:primary",
+        }),
+    );
+    let report = live_report(home.path(), Arc::new(NoopProbe)).await;
+    let check = agentfield_check(&report);
+    assert_eq!(check.status, DoctorStatus::Ok);
+    assert!(check.message.contains("disabled"), "{check:?}");
+
+    // Enabled but credential unresolvable: zero network, reference-only
+    // message.
+    let home = tempfile::tempdir().unwrap();
+    write_agentfield_config(home.path(), valid_agentfield_config("agentfield:primary"));
+    let report = live_report(home.path(), Arc::new(NoopProbe)).await;
+    let check = agentfield_check(&report);
+    assert_eq!(check.status, DoctorStatus::Warn);
+    assert_eq!(check.code.as_deref(), Some("agentfield.unconfigured"));
+    let rendered = serde_json::to_string(&report).unwrap();
+    assert!(
+        !rendered.contains("https://agents.example.internal"),
+        "{rendered}"
+    );
+}
+
+#[tokio::test]
+async fn agentfield_live_success_reports_discovery_snapshot() {
+    let port = spawn_agentfield_server("200 OK", "application/json", &discovery_envelope()).await;
+    let home = tempfile::tempdir().unwrap();
+    write_live_server_config(home.path(), port);
+    let mut store = CredentialStore::open(home.path()).unwrap();
+    store
+        .modify(|data| {
+            data.insert(
+                "agentfield".into(),
+                serde_json::json!({"type": "api_key", "key": "live-secret"}),
+            );
+        })
+        .unwrap();
+    let report = live_report(home.path(), Arc::new(NoopProbe)).await;
+    let check = agentfield_check(&report);
+    assert_eq!(check.status, DoctorStatus::Ok, "{check:?}");
+    assert!(check.message.contains("live probe ok"), "{check:?}");
+    assert!(
+        check.message.contains("pinned contract v0.1.138"),
+        "{check:?}"
+    );
+    let rendered = serde_json::to_string(&report).unwrap();
+    assert!(
+        !rendered.contains("live-secret"),
+        "token leaked into the report"
+    );
+}
+
+#[tokio::test]
+async fn agentfield_live_401_reports_unauthorized() {
+    let port = spawn_agentfield_server(
+        "401 Unauthorized",
+        "application/json",
+        r#"{"error":"invalid_credential"}"#,
+    )
+    .await;
+    let home = tempfile::tempdir().unwrap();
+    write_live_server_config(home.path(), port);
+    let mut store = CredentialStore::open(home.path()).unwrap();
+    store
+        .modify(|data| {
+            data.insert(
+                "agentfield".into(),
+                serde_json::json!({"type": "api_key", "key": "wrong-secret"}),
+            );
+        })
+        .unwrap();
+    let report = live_report(home.path(), Arc::new(NoopProbe)).await;
+    let check = agentfield_check(&report);
+    assert_eq!(check.status, DoctorStatus::Warn, "{check:?}");
+    assert_eq!(check.code.as_deref(), Some("agentfield.unauthorized"));
+}
+
+#[tokio::test]
+async fn agentfield_live_unreachable_reports_unavailable() {
+    // Production HTTPS to a loopback literal: refused by the frozen address
+    // policy before any socket or DNS — deterministic and zero network.
+    let home = tempfile::tempdir().unwrap();
+    write_agentfield_config(
+        home.path(),
+        serde_json::json!({
+            "enabled": true,
+            "baseUrl": "https://127.0.0.1:9",
+            "credential": "agentfield:primary",
+            "capabilities": {
+                "contract-review": {
+                    "target": "legal-agent.review_contract",
+                    "description": "Review one contract",
+                    "inputSchema": {"type": "object"},
+                    "risk": "remote_read"
+                }
+            }
+        }),
+    );
+    let mut store = CredentialStore::open(home.path()).unwrap();
+    store
+        .modify(|data| {
+            data.insert(
+                "agentfield".into(),
+                serde_json::json!({"type": "api_key", "key": "live-secret"}),
+            );
+        })
+        .unwrap();
+    let report = live_report(home.path(), Arc::new(NoopProbe)).await;
+    let check = agentfield_check(&report);
+    assert_eq!(check.status, DoctorStatus::Warn, "{check:?}");
+    assert_eq!(
+        check.code.as_deref(),
+        Some("agentfield.unavailable"),
+        "{check:?}"
+    );
+}
+
+#[tokio::test]
+async fn agentfield_live_protocol_mismatch_reports_error() {
+    let port = spawn_agentfield_server(
+        "200 OK",
+        "text/html",
+        "<html><body>login page</body></html>",
+    )
+    .await;
+    let home = tempfile::tempdir().unwrap();
+    write_live_server_config(home.path(), port);
+    let mut store = CredentialStore::open(home.path()).unwrap();
+    store
+        .modify(|data| {
+            data.insert(
+                "agentfield".into(),
+                serde_json::json!({"type": "api_key", "key": "live-secret"}),
+            );
+        })
+        .unwrap();
+    let report = live_report(home.path(), Arc::new(NoopProbe)).await;
+    let check = agentfield_check(&report);
+    assert_eq!(check.status, DoctorStatus::Error, "{check:?}");
+    assert_eq!(
+        check.code.as_deref(),
+        Some("agentfield.remote_protocol"),
+        "{check:?}"
+    );
+}
+
+#[tokio::test]
+async fn agentfield_non_live_stays_offline_without_network() {
     let home = tempfile::tempdir().unwrap();
     write_agentfield_config(home.path(), valid_agentfield_config("agentfield:primary"));
     let mut store = CredentialStore::open(home.path()).unwrap();
     store
         .modify(|data| {
-            // resolve_agentfield_credential reads the store entry `agentfield`.
             data.insert(
                 "agentfield".into(),
-                serde_json::json!({"type": "api_key", "key": "live-deferred-secret"}),
+                serde_json::json!({"type": "api_key", "key": "offline-secret"}),
             );
         })
         .unwrap();
-
-    // The catalog live probe is stubbed; if the AgentField path touched the
-    // network it would surface as a distinct behavior — instead the report
-    // must state the deferred status with zero AgentField requests.
-    let report = live_report(home.path(), Arc::new(NoopProbe)).await;
+    let report = non_live_report(home.path()).await;
     let check = agentfield_check(&report);
-    assert_eq!(check.status, DoctorStatus::Ok);
-    assert!(check.message.contains("deferred_to_7c1_1"), "{check:?}");
-    assert!(check.message.contains("zero requests made"));
+    assert_eq!(check.status, DoctorStatus::Ok, "{check:?}");
+    assert!(
+        check.message.contains("run `lato doctor --live`"),
+        "{check:?}"
+    );
+    assert!(!check.message.contains("deferred_to_7c1_1"));
     let rendered = serde_json::to_string(&report).unwrap();
-    assert!(!rendered.contains("live-deferred-secret"));
+    assert!(!rendered.contains("offline-secret"));
 }
