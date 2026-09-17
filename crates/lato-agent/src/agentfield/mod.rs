@@ -12,6 +12,7 @@
 pub mod client;
 pub mod config;
 pub mod probe;
+pub(crate) mod transport;
 pub mod types;
 
 pub use client::{
