@@ -43,12 +43,18 @@
 //! * **Windows** keeps the path-based equivalent (create-new plus
 //!   identity-checked cleanup), unchanged.
 //!
-//! Failure semantics: every error before the commit leaves the previous
-//! `plan.md` intact and removes only the temporary file THIS call created —
-//! and on Linux there is never anything to remove. Once the commit has
-//! happened, a later directory-sync failure cannot restore the previous
-//! content; the freshly published plan remains on disk and the error is
-//! reported to the caller instead of being silently swallowed. No
+//! Failure semantics: BEFORE the old plan is moved aside, every error
+//! leaves the previous `plan.md` intact on its original path (B2 main
+//! path) and removes only the temporary file THIS call created — and on
+//! Linux there is never anything to remove. AFTER the old plan has been
+//! moved to its auditable `.reap` name (linkat-direct sequence), a
+//! failure restores it onto `plan.md` with `renameat2(RENAME_NOREPLACE)`;
+//! when a bystander occupies the slot (B3 bounded exception, pending
+//! project-owner ratification) the restore is abandoned and the old plan
+//! is preserved under `.reap` with a recovery hint in the error. Once the
+//! commit has happened, a later directory-sync failure cannot restore the
+//! previous content; the freshly published plan remains on disk and the
+//! error is reported to the caller instead of being silently swallowed. No
 //! `create_dir_all`, no canonicalization through symlinks, no
 //! cross-directory temporary file, no in-place truncate, no silent content
 //! truncation.
@@ -2359,7 +2365,7 @@ mod tests {
     }
 
     /// Round-8 (3.3): the on_post_link seam swaps a bystander INTO the
-    /// isolated `.reap` slot after the identity check — under the
+    /// final slot BEFORE the old plan is moved — under the
     /// zero-mistaken-deletion ruling the production path performs NO
     /// unlinkat at all, so the swapped-in bystander must survive (verified
     /// by FULL enumeration). Ten consecutive runs.
@@ -2387,7 +2393,7 @@ mod tests {
                     // swapped-in bystander.
                     std::fs::remove_file(self.workspace_root.join(final_name)).unwrap();
                     std::fs::write(self.workspace_root.join(final_name), "swapped-in").unwrap();
-                    Err("aborted at the post-move seam".into())
+                    Err("aborted at the pre-move seam".into())
                 }
             }
 
@@ -2402,7 +2408,7 @@ mod tests {
             .await
             .unwrap_err();
             assert!(
-                error.contains("post-move seam"),
+                error.contains("pre-move seam"),
                 "attempt {attempt}: {error}"
             );
             // The swapped-in bystander survives byte-for-byte: the
