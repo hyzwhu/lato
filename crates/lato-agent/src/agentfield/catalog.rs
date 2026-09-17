@@ -224,21 +224,87 @@ pub fn catalog_sources(home: &std::path::Path, cwd: &std::path::Path) -> Vec<Cat
 /// Every discovered plugin manifest path: `<cwd>/.lato/plugins/*/plugin.json`
 /// and `<lato_home>/plugins/*/plugin.json`, sorted for deterministic merge
 /// order (the same roots the plugin system scans).
-fn plugin_manifest_paths(home: &std::path::Path, cwd: &std::path::Path) -> Vec<std::path::PathBuf> {
+///
+/// Enumeration is strict (fail closed): a plugin root that is present but
+/// unreadable, an entry that cannot be read, or a manifest that exists but
+/// is not a readable regular file (directory-shaped, broken symlink, …)
+/// are all errors — never silently treated as "no plugins". Only a
+/// genuinely absent manifest (or a plugin directory without one) skips.
+fn plugin_manifest_paths(
+    home: &std::path::Path,
+    cwd: &std::path::Path,
+) -> Result<Vec<std::path::PathBuf>, CatalogSourceError> {
     let mut paths = Vec::new();
     for root in [cwd.join(".lato").join("plugins"), home.join("plugins")] {
-        let Ok(entries) = std::fs::read_dir(&root) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let manifest = entry.path().join("plugin.json");
-            if manifest.is_file() {
-                paths.push(manifest);
+        let entries = match std::fs::read_dir(&root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(CatalogSourceError(format!(
+                    "plugin root {} is present but unreadable: {error}",
+                    root.display()
+                )));
             }
+        };
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                CatalogSourceError(format!(
+                    "plugin root {} has an unreadable entry: {error}",
+                    root.display()
+                ))
+            })?;
+            let plugin_dir = entry.path();
+            if !entry
+                .file_type()
+                .map_err(|error| {
+                    CatalogSourceError(format!(
+                        "plugin entry {} has an unreadable type: {error}",
+                        plugin_dir.display()
+                    ))
+                })?
+                .is_dir()
+            {
+                // Not a plugin directory: no manifest can live under it.
+                continue;
+            }
+            let manifest = plugin_dir.join("plugin.json");
+            // Presence and type are resolved strictly: symlink_metadata
+            // distinguishes "truly absent" from "present but unusable"
+            // (directory-shaped manifest, broken or non-file symlink).
+            let meta = match std::fs::symlink_metadata(&manifest) {
+                Ok(meta) => meta,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(CatalogSourceError(format!(
+                        "plugin manifest {} is present but unreadable: {error}",
+                        manifest.display()
+                    )));
+                }
+            };
+            if meta.is_symlink() {
+                let target = std::fs::metadata(&manifest).map_err(|error| {
+                    CatalogSourceError(format!(
+                        "plugin manifest {} is present but unreadable: {error}",
+                        manifest.display()
+                    ))
+                })?;
+                if !target.is_file() {
+                    return Err(CatalogSourceError(format!(
+                        "plugin manifest {} is present but not a regular file",
+                        manifest.display()
+                    )));
+                }
+            } else if !meta.is_file() {
+                return Err(CatalogSourceError(format!(
+                    "plugin manifest {} is present but not a regular file",
+                    manifest.display()
+                )));
+            }
+            paths.push(manifest);
         }
     }
     paths.sort();
-    paths
+    Ok(paths)
 }
 
 /// Merge every plugin manifest's optional `agentfield` stanza into one
@@ -251,7 +317,7 @@ fn load_plugin_contribution(
     cwd: &std::path::Path,
 ) -> Result<Option<AgentFieldConfig>, CatalogSourceError> {
     let mut assembled: Option<AgentFieldConfig> = None;
-    for manifest in plugin_manifest_paths(home, cwd) {
+    for manifest in plugin_manifest_paths(home, cwd)? {
         let bytes = std::fs::read(&manifest).map_err(|error| {
             CatalogSourceError(format!(
                 "plugin manifest {} is present but unreadable: {error}",
@@ -724,6 +790,44 @@ mod tests {
         let dir = temp.path().join("plugins").join("alpha");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("plugin.json"), "{not json").unwrap();
+        assert!(assemble_catalog_config(&sources).is_none());
+    }
+
+    #[test]
+    fn directory_shaped_plugin_manifest_fails_closed() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let sources = catalog_sources(temp.path(), temp.path());
+        // Round-5 (acceptance P1): a manifest that exists but is a
+        // directory is present-but-unusable — never silently "absent".
+        std::fs::create_dir_all(
+            temp.path()
+                .join("plugins")
+                .join("broken")
+                .join("plugin.json"),
+        )
+        .unwrap();
+        assert!(assemble_catalog_config(&sources).is_none());
+    }
+
+    #[test]
+    fn broken_symlink_plugin_manifest_fails_closed() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let sources = catalog_sources(temp.path(), temp.path());
+        let dir = temp.path().join("plugins").join("alpha");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::os::unix::fs::symlink(temp.path().join("missing.json"), dir.join("plugin.json"))
+            .unwrap();
+        assert!(assemble_catalog_config(&sources).is_none());
+    }
+
+    #[test]
+    fn plugin_directory_without_manifest_and_stray_entries_contribute_nothing() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let sources = catalog_sources(temp.path(), temp.path());
+        // A plugin directory without a manifest legitimately contributes
+        // nothing, and so does a non-directory entry at the plugin root.
+        std::fs::create_dir_all(temp.path().join("plugins").join("empty")).unwrap();
+        std::fs::write(temp.path().join("plugins").join("stray.txt"), "x").unwrap();
         assert!(assemble_catalog_config(&sources).is_none());
     }
 

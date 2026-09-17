@@ -1889,6 +1889,19 @@ mod tests {
             !manager.recheck_revision_matches(),
             "malformed plugin manifest fails closed"
         );
+        // Round-5 (acceptance P1): a directory-shaped manifest is
+        // present-but-unusable and fails closed on the recheck path too.
+        std::fs::remove_file(&plugin_manifest).unwrap();
+        std::fs::create_dir_all(plugin_dir.join("plugin.json")).unwrap();
+        assert!(
+            !manager.recheck_revision_matches(),
+            "directory-shaped plugin manifest fails closed"
+        );
+        std::fs::remove_dir(plugin_dir.join("plugin.json")).unwrap();
+        assert!(
+            manager.recheck_revision_matches(),
+            "removing the unusable manifest restores the frozen revision"
+        );
         std::fs::write(&plugin_manifest, plugin_config().to_string()).unwrap();
         assert!(!manager.recheck_revision_matches());
         std::fs::remove_file(&plugin_manifest).unwrap();
