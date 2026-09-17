@@ -2240,9 +2240,10 @@ mod tests {
             let locks = FileLocks::new();
             plan_draft(&locks, &root, "previous").await.unwrap();
 
+            type CapturedIds = std::sync::Arc<std::sync::Mutex<Option<(u64, u64, u64, u64)>>>;
             struct SwapInFinalSlot {
                 workspace_root: PathBuf,
-                captured: std::sync::Arc<std::sync::Mutex<Option<(u64, u64, u64, u64)>>>,
+                captured: CapturedIds,
             }
             impl PlanDraftFaults for SwapInFinalSlot {
                 fn on_stage(&self, _stage: PlanDraftStage) -> Result<(), String> {
