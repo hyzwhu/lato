@@ -809,6 +809,11 @@ mod tests {
         assert!(assemble_catalog_config(&sources).is_none());
     }
 
+    // Unix-only: symlink creation has no portable std API (Windows needs
+    // privileges). The directory-shaped-manifest test above keeps the
+    // "present but not a regular file" fail-closed contract covered on
+    // every platform; this adds the broken-symlink variant where available.
+    #[cfg(unix)]
     #[test]
     fn broken_symlink_plugin_manifest_fails_closed() {
         let temp = tempfile::TempDir::new().unwrap();
