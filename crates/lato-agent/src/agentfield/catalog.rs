@@ -141,6 +141,86 @@ impl AgentFieldCatalog {
     }
 }
 
+// ---- Configuration sources (Round-1 acceptance P1-3) ----------------------
+//
+// The frozen catalog is assembled from ordered real configuration sources:
+// the user config (`$LATO_HOME/config.json`), the project config
+// (`<cwd>/.lato/config.json`, same `agentfield` stanza shape), and a
+// reserved plugin slot (v1: always `None`; the wiring point for later
+// stages). Sources that are present but disabled contribute nothing, so an
+// `enabled` flip is detectable by the post-approval revision recheck.
+
+/// One reloadable configuration source. `None` means the source currently
+/// contributes nothing (absent, disabled, or invalid — the doctor reports
+/// the details; the adapter fails closed).
+pub type CatalogSource = std::sync::Arc<dyn Fn() -> Option<AgentFieldConfig> + Send + Sync>;
+
+fn load_config_file(path: &std::path::Path) -> Option<AgentFieldConfig> {
+    let bytes = std::fs::read(path).ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    let raw = value.get("agentfield")?;
+    crate::agentfield::config::AgentFieldConfig::parse(raw)
+        .ok()
+        .flatten()
+        .filter(|config| config.enabled)
+}
+
+/// The default source set: user, project, plugin (in merge order).
+pub fn catalog_sources(home: &std::path::Path, cwd: &std::path::Path) -> Vec<CatalogSource> {
+    let user_config = home.to_path_buf();
+    let project_config = cwd.join(".lato").join("config.json");
+    vec![
+        std::sync::Arc::new(move || load_config_file(&user_config.join("config.json"))),
+        std::sync::Arc::new(move || load_config_file(&project_config)),
+        // Plugin slot: no plugin-provided agentfield configuration exists in
+        // v1; reserved so a source change can be detected fail-closed.
+        std::sync::Arc::new(|| None),
+    ]
+}
+
+/// Deterministically merge the present sources into the assembled config:
+/// every present source must agree on origin and credential reference
+/// (disagreement fails closed), capabilities are unioned by alias (a
+/// conflicting redefinition fails closed), and the merged capability set is
+/// still capped at [`config::MAX_CAPABILITIES`]. `None` = nothing present
+/// or a disagreement.
+pub fn assemble_catalog_config(sources: &[CatalogSource]) -> Option<AgentFieldConfig> {
+    let mut assembled: Option<AgentFieldConfig> = None;
+    for source in sources {
+        let Some(config) = source() else {
+            continue;
+        };
+        let Some(current) = assembled.as_mut() else {
+            assembled = Some(config);
+            continue;
+        };
+        if current.origin != config.origin
+            || current.credential_reference != config.credential_reference
+        {
+            return None;
+        }
+        for (alias, capability) in config.capabilities {
+            if let Some((_, existing)) = current
+                .capabilities
+                .iter()
+                .find(|(existing_alias, _)| *existing_alias == alias)
+            {
+                if *existing != capability {
+                    return None;
+                }
+            } else {
+                current.capabilities.push((alias, capability));
+            }
+        }
+    }
+    let mut assembled = assembled?;
+    if assembled.capabilities.len() > crate::agentfield::config::MAX_CAPABILITIES {
+        return None;
+    }
+    assembled.capabilities.sort_by(|a, b| a.0.cmp(&b.0));
+    Some(assembled)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -516,7 +516,13 @@ impl AcpHost {
             &config.credential_reference,
         )?;
         let catalog = AgentFieldCatalog::from_config(&config);
-        let manager = Arc::new(AgentFieldManager::new(sid, catalog, credential, config));
+        let manager = Arc::new(AgentFieldManager::new(
+            sid,
+            catalog,
+            credential,
+            config,
+            crate::agentfield::catalog::catalog_sources(&self.effective_lato_home(), &self.cwd),
+        ));
         Some((SessionAgentFieldHandle::new(), manager))
     }
 

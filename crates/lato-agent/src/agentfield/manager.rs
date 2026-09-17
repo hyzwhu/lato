@@ -216,12 +216,18 @@ impl Drop for SendGuard {
     }
 }
 
-/// Session-scoped run manager. All mutating transitions serialize on
-/// `inner`; the remote send happens outside the lock so one slow request
-/// never blocks state reads, but capacity is consumed inside the lock.
+/// Session-scoped run manager. All mutating transitions serialize on the
+/// synchronous `inner` lock (short, await-free critical sections) so the
+/// send-time drop guard can also run synchronously; the remote send happens
+/// outside the lock so one slow request never blocks state reads, but
+/// capacity is consumed inside the lock.
 pub struct AgentFieldManager {
     session_id: String,
     catalog: AgentFieldCatalog,
+    /// Real configuration sources backing the frozen catalog (user /
+    /// project / plugin). Empty ⇒ the revision recheck trivially matches
+    /// (no source to reload — programmatic/injected setups).
+    catalog_sources: Vec<crate::agentfield::catalog::CatalogSource>,
     factory: Option<ClientFactory>,
     client: OnceCell<Arc<dyn AgentFieldClient>>,
     probe_cache: Mutex<Option<(Instant, AgentFieldHealthSnapshot)>>,
@@ -241,24 +247,37 @@ impl AgentFieldManager {
         catalog: AgentFieldCatalog,
         credential: crate::agentfield::client::RedactedToken,
         config: AgentFieldConfig,
+        catalog_sources: Vec<crate::agentfield::catalog::CatalogSource>,
     ) -> Self {
-        Self::with_factory(
+        Self::with_factory_and_sources(
             session_id,
             catalog,
             Some(production_client_factory(credential, config)),
+            catalog_sources,
         )
     }
 
-    /// Test/injection constructor: `None` factory means every client use
-    /// fails closed with `agentfield.unavailable`.
+    /// Test/injection constructor with no configuration sources: the
+    /// revision recheck trivially matches. `None` factory means every
+    /// client use fails closed with `agentfield.unavailable`.
     pub fn with_factory(
         session_id: &str,
         catalog: AgentFieldCatalog,
         factory: Option<ClientFactory>,
     ) -> Self {
+        Self::with_factory_and_sources(session_id, catalog, factory, Vec::new())
+    }
+
+    pub fn with_factory_and_sources(
+        session_id: &str,
+        catalog: AgentFieldCatalog,
+        factory: Option<ClientFactory>,
+        catalog_sources: Vec<crate::agentfield::catalog::CatalogSource>,
+    ) -> Self {
         Self {
             session_id: session_id.to_owned(),
             catalog,
+            catalog_sources,
             factory,
             client: OnceCell::new(),
             probe_cache: Mutex::new(None),
@@ -360,6 +379,38 @@ impl AgentFieldManager {
         match self.health_snapshot().await {
             Ok(snapshot) => Some(snapshot.healthy_execute_targets.clone()),
             Err(_) => self.probe_cache.lock().await.clone().map(|_| Vec::new()),
+        }
+    }
+
+    /// The last VERIFIED discovery snapshot without probing (fresh or
+    /// stale). `list` intersects the local allowlist against its execute
+    /// targets; `None` means no verified discovery exists at all.
+    pub async fn verified_discovery_snapshot(&self) -> Option<AgentFieldHealthSnapshot> {
+        self.probe_cache
+            .lock()
+            .await
+            .clone()
+            .map(|(_, snapshot)| snapshot)
+    }
+
+    /// Post-approval TOCTOU recheck (Round-1 acceptance P1-3): recompute
+    /// the merged catalog from the real configuration sources and compare
+    /// against the session-frozen revision. `true` only when the sources
+    /// still yield the frozen revision; any change — capability edits,
+    /// enabled flips, sources disappearing, or disagreeing origins — fails
+    /// closed to `false` (the caller returns `agentfield.catalog_changed`).
+    /// With no sources wired (programmatic/injected setups) the frozen
+    /// revision trivially matches.
+    pub fn recheck_revision_matches(&self) -> bool {
+        if self.catalog_sources.is_empty() {
+            return true;
+        }
+        match crate::agentfield::catalog::assemble_catalog_config(&self.catalog_sources) {
+            Some(config) => {
+                let current = AgentFieldCatalog::from_config(&config);
+                current.revision() == self.catalog.revision()
+            }
+            None => false,
         }
     }
 
@@ -733,10 +784,10 @@ fn apply_remote_status(run: &mut RunState, status: RunStatus, envelope: &StatusE
 }
 
 /// Redact credential-shaped material from remote-controlled text before it
-/// reaches a summary, log, or model projection: `Authorization`/`Bearer`
-/// header values and `token`/`secret`/`password`/`api[-_]key` assignments.
-/// The redaction is value-agnostic (whatever follows the separator is
-/// replaced), so unknown credential shapes fail safe.
+/// reaches a summary, log, or model projection: `Authorization`/
+/// `Bearer` header values and `token`/`secret`/`password`/`api[-_]key`
+/// assignments. The redaction is value-agnostic (whatever follows the
+/// separator is replaced), so unknown credential shapes fail safe.
 pub fn redact_secrets(text: &str) -> String {
     const TRIGGERS: [&str; 8] = [
         "authorization",
@@ -761,10 +812,7 @@ pub fn redact_secrets(text: &str) -> String {
                 let start = from + rel;
                 let end = start + trigger.len();
                 let before_ok = start == 0
-                    || !matches!(
-                        bytes[start - 1],
-                        b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'-'
-                    );
+                    || !matches!(bytes[start - 1], b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'-');
                 let after_ok = end == bytes.len()
                     || !matches!(bytes[end], b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_');
                 if before_ok && after_ok && hit.is_none_or(|(offset, _)| start < offset) {
@@ -788,14 +836,19 @@ pub fn redact_secrets(text: &str) -> String {
             pos += 1;
         }
         // For `authorization`, a following `bearer` word is part of the
-        // scheme, not the secret — keep it, then redact the token value.
-        if trigger == "authorization" && lower[pos..].starts_with("bearer") {
-            let bearer_end = pos + "bearer".len();
-            out.push_str(&text[pos..bearer_end]);
-            pos = bearer_end;
-            while pos < bytes.len() && matches!(bytes[pos], b' ' | b'\t') {
-                out.push(bytes[pos] as char);
-                pos += 1;
+        // scheme, not the secret — keep it, then redact the token.
+        if trigger == "authorization" {
+            let rest_lower = lower[pos..].to_string();
+            if rest_lower.starts_with("bearer") {
+                let bearer_end = pos + "bearer".len();
+                if bearer_end <= bytes.len() {
+                    out.push_str(&text[pos..bearer_end]);
+                    pos = bearer_end;
+                    while pos < bytes.len() && matches!(bytes[pos], b' ' | b'\t') {
+                        out.push(bytes[pos] as char);
+                        pos += 1;
+                    }
+                }
             }
         }
         // Redact the value: everything until whitespace or a JSON-ish closer.
@@ -1544,6 +1597,7 @@ mod tests {
         for (input, expected) in cases {
             assert_eq!(redact_secrets(input), expected, "input: {input}");
         }
+        assert!(redact_secrets("Authorization: Bearer QA_SUPER_SECRET keep").contains("keep"));
         assert!(
             !redact_secrets("Authorization: Bearer QA_SUPER_SECRET").contains("QA_SUPER_SECRET")
         );
@@ -1586,5 +1640,147 @@ mod tests {
         assert!(summary.contains("done."));
         assert!(!summary.contains("QA_SUPER_SECRET"), "{summary}");
         assert!(summary.contains("Bearer [redacted]"), "{summary}");
+    }
+
+    #[tokio::test]
+    async fn recheck_detects_user_and_project_and_plugin_source_changes() {
+        let temp_home = tempfile::TempDir::new().unwrap();
+        let temp_cwd = tempfile::TempDir::new().unwrap();
+        let user_config = temp_home.path().join("config.json");
+        let project_config = temp_cwd.path().join(".lato").join("config.json");
+        std::fs::create_dir_all(project_config.parent().unwrap()).unwrap();
+        let capability = |alias: &str, target: &str| {
+            json!({
+                "enabled": true,
+                "baseUrl": "https://agents.example.internal",
+                "credential": "agentfield:primary",
+                "capabilities": {
+                    alias: {
+                        "target": target,
+                        "description": "Review one contract",
+                        "inputSchema": {"type":"object"},
+                        "risk": "remote_read",
+                    }
+                }
+            })
+        };
+        std::fs::write(
+            &user_config,
+            json!({"agentfield": capability("contract-review", "legal.review_contract")})
+                .to_string(),
+        )
+        .unwrap();
+        let sources =
+            crate::agentfield::catalog::catalog_sources(temp_home.path(), temp_cwd.path());
+        let assembled = crate::agentfield::catalog::assemble_catalog_config(&sources).unwrap();
+        let catalog = AgentFieldCatalog::from_config(&assembled);
+        let frozen_revision = catalog.revision().to_owned();
+        let fake: Arc<FakeClient> = Arc::new(FakeClient::new(StartBehavior::Ok("exec-1".into())));
+        let shared: Arc<dyn AgentFieldClient> = fake.clone();
+        let manager = AgentFieldManager::with_factory_and_sources(
+            "session-src",
+            catalog,
+            Some(Arc::new(move || {
+                let shared = shared.clone();
+                Box::pin(async move { Ok(shared.clone()) })
+            })),
+            sources,
+        );
+        assert!(
+            manager.recheck_revision_matches(),
+            "unchanged sources match"
+        );
+
+        // user source: target change ⇒ revision change.
+        std::fs::write(
+            &user_config,
+            json!({"agentfield": capability("contract-review", "legal.review_other")}).to_string(),
+        )
+        .unwrap();
+        assert!(!manager.recheck_revision_matches());
+        std::fs::write(
+            &user_config,
+            json!({"agentfield": capability("contract-review", "legal.review_contract")})
+                .to_string(),
+        )
+        .unwrap();
+        assert!(manager.recheck_revision_matches());
+
+        // user source: capability removed (config.json deleted) ⇒ changed.
+        std::fs::remove_file(&user_config).unwrap();
+        assert!(!manager.recheck_revision_matches());
+
+        // project source: adding a project capability ⇒ changed.
+        std::fs::write(
+            &user_config,
+            json!({"agentfield": capability("contract-review", "legal.review_contract")})
+                .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            &project_config,
+            json!({"agentfield": capability("alpha-task", "alpha.task")}).to_string(),
+        )
+        .unwrap();
+        assert!(!manager.recheck_revision_matches());
+        std::fs::remove_file(&project_config).unwrap();
+        assert!(manager.recheck_revision_matches());
+
+        // plugin source: flipping the reserved slot from nothing to a
+        // contribution (and back) is detected fail-closed.
+        let plugin_state = Arc::new(tokio::sync::Mutex::new(None::<serde_json::Value>));
+        let plugin_state_for_source = plugin_state.clone();
+        let plugin_source: crate::agentfield::catalog::CatalogSource = Arc::new(move || {
+            let value = {
+                let guard = plugin_state_for_source.try_lock();
+                match guard {
+                    Ok(guard) => guard.clone(),
+                    Err(_) => None,
+                }
+            };
+            value
+                .and_then(|wrapped| wrapped.get("agentfield").cloned())
+                .and_then(|raw| {
+                    crate::agentfield::config::AgentFieldConfig::parse(&raw)
+                        .ok()
+                        .flatten()
+                })
+        });
+        let sources_with_plugin = {
+            let mut sources =
+                crate::agentfield::catalog::catalog_sources(temp_home.path(), temp_cwd.path());
+            sources.pop();
+            sources.push(plugin_source);
+            sources
+        };
+        let assembled =
+            crate::agentfield::catalog::assemble_catalog_config(&sources_with_plugin).unwrap();
+        let catalog = AgentFieldCatalog::from_config(&assembled);
+        assert_eq!(
+            catalog.revision(),
+            frozen_revision,
+            "plugin slot empty ⇒ same revision"
+        );
+        *plugin_state.lock().await =
+            Some(json!({"agentfield": capability("plugin-task", "plugin.task")}));
+        let assembled =
+            crate::agentfield::catalog::assemble_catalog_config(&sources_with_plugin).unwrap();
+        assert_ne!(
+            AgentFieldCatalog::from_config(&assembled).revision(),
+            frozen_revision,
+            "plugin contribution changes the revision"
+        );
+
+        // Disagreeing origins fail closed.
+        let disagree = json!({
+            "enabled": true,
+            "baseUrl": "https://other.example.internal",
+            "credential": "agentfield:primary",
+            "capabilities": {}
+        });
+        std::fs::write(&project_config, json!({"agentfield": disagree}).to_string()).unwrap();
+        let sources =
+            crate::agentfield::catalog::catalog_sources(temp_home.path(), temp_cwd.path());
+        assert!(crate::agentfield::catalog::assemble_catalog_config(&sources).is_none());
     }
 }
