@@ -162,13 +162,18 @@ struct CreatedTemp {
     full_path: PathBuf,
 }
 
-/// Removes the temporary file created by this call. A bystander that
-/// collided with the temporary path is never touched (nothing was created,
-/// so there is nothing to clean), and a file swapped in over the temporary
-/// path after creation is left alone (its identity no longer matches).
+/// Windows cleanup, aligned with the project-owner ruling of 2026-09-17:
+/// **zero mistaken deletion takes priority over zero residue**. The
+/// temporary file created by this call is deliberately left in place as an
+/// auditable residue — `remove_file` is a by-name removal with the same
+/// check-to-delete window the reviewer flagged on Unix, so the Windows path
+/// no longer performs it at all. A bystander that collided with the
+/// temporary path is untouched by definition (nothing was created), and a
+/// file swapped in over the temporary path can never be deleted by this
+/// call.
 #[cfg(not(unix))]
 fn cleanup_temp(created: &CreatedTemp) {
-    let _ = std::fs::remove_file(&created.full_path);
+    let _ = &created.full_path; // auditable residue: deliberately kept
 }
 
 fn stage_error(stage: PlanDraftStage, message: String) -> String {
@@ -1258,9 +1263,17 @@ mod tests {
                     "stage {stage:?}: exactly the auditable .reap file may remain: {residue:?}"
                 );
                 let isolated = root.join(&residue[0]);
+                // The Write-stage injection fires BEFORE any bytes were
+                // written, so the auditable file is empty there; from Flush
+                // onward it carries the full payload.
+                let expected: &[u8] = if stage == PlanDraftStage::Write {
+                    b""
+                } else {
+                    b"replacement"
+                };
                 assert_eq!(
                     std::fs::read(&isolated).unwrap(),
-                    b"replacement",
+                    expected,
                     "stage {stage:?}: the isolated file must be intact"
                 );
             } else {
