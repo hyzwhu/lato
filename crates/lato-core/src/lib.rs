@@ -26,11 +26,15 @@ pub use id::{
     TaskId, ToolCallId, TurnId,
 };
 pub use journal::{
-    EventStore, ExtensionAuditRecord, HookAuditOutcome, HookAuditPhase, JOURNAL_SCHEMA_VERSION,
-    JournalDurability, JournalEnvelope, JournalError, JournalRecord, JournalReplay,
-    JournalTerminal, McpAuditOutcome, PolicyAuditDecision, PolicyAuditRecord, PolicyAuditStage,
-    PreparedToolAudit, SessionProjection, SkillInvocationOrigin, UnresolvedToolCall,
-    canonical_json, journal_request_hash, project_journal, projection_message, validate_journal,
+    AGENTFIELD_JOURNAL_SCHEMA_VERSION, AGENTFIELD_MAX_ALIAS_BYTES, AGENTFIELD_MAX_DIGEST_BYTES,
+    AGENTFIELD_MAX_ERROR_CODE_BYTES, AGENTFIELD_MAX_ID_BYTES, AGENTFIELD_MAX_REVISION_BYTES,
+    AGENTFIELD_MAX_SUMMARY_BYTES, AgentFieldJournalEvent, AgentFieldRecoveredRun,
+    AgentFieldRunStatus, EventStore, ExtensionAuditRecord, HookAuditOutcome, HookAuditPhase,
+    JOURNAL_SCHEMA_VERSION, JournalDurability, JournalEnvelope, JournalError, JournalRecord,
+    JournalReplay, JournalTerminal, McpAuditOutcome, PolicyAuditDecision, PolicyAuditRecord,
+    PolicyAuditStage, PreparedToolAudit, SessionProjection, SkillInvocationOrigin,
+    UnresolvedToolCall, canonical_json, decode_journal_envelope, journal_request_hash,
+    project_journal, projection_message, validate_agentfield_event, validate_journal,
 };
 pub use model::{
     ModelCapabilities, ModelContent, ModelError, ModelErrorKind, ModelEventStream, ModelMessage,
