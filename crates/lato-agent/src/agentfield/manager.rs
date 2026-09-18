@@ -74,6 +74,32 @@ impl RunStatus {
             Self::Completed | Self::Failed | Self::Cancelled | Self::OutcomeUnknown
         )
     }
+
+    fn to_journal(self) -> lato_core::AgentFieldRunStatus {
+        match self {
+            Self::Queued => lato_core::AgentFieldRunStatus::Queued,
+            Self::Running => lato_core::AgentFieldRunStatus::Running,
+            Self::Paused => lato_core::AgentFieldRunStatus::Paused,
+            Self::Completed => lato_core::AgentFieldRunStatus::Completed,
+            Self::Failed => lato_core::AgentFieldRunStatus::Failed,
+            Self::Cancelled => lato_core::AgentFieldRunStatus::Cancelled,
+            Self::OutcomeUnknown => lato_core::AgentFieldRunStatus::OutcomeUnknown,
+            Self::Unavailable => lato_core::AgentFieldRunStatus::Unavailable,
+        }
+    }
+
+    fn from_journal(status: lato_core::AgentFieldRunStatus) -> Self {
+        match status {
+            lato_core::AgentFieldRunStatus::Queued => Self::Queued,
+            lato_core::AgentFieldRunStatus::Running => Self::Running,
+            lato_core::AgentFieldRunStatus::Paused => Self::Paused,
+            lato_core::AgentFieldRunStatus::Completed => Self::Completed,
+            lato_core::AgentFieldRunStatus::Failed => Self::Failed,
+            lato_core::AgentFieldRunStatus::Cancelled => Self::Cancelled,
+            lato_core::AgentFieldRunStatus::OutcomeUnknown => Self::OutcomeUnknown,
+            lato_core::AgentFieldRunStatus::Unavailable => Self::Unavailable,
+        }
+    }
 }
 
 /// One owned run. Everything here is safe to project to the model: no
@@ -112,6 +138,13 @@ pub enum ManagerError {
     /// Unknown or foreign run id — indistinguishable by design (AC-07).
     #[error("agentfield.not_found")]
     NotFound,
+    /// Journal append failed (fail closed, spec item 4 of the
+    /// single-writer contract): the corresponding durable state was NOT
+    /// committed, so the caller must never treat the operation as
+    /// persisted. Zero remote side effects are produced after a failed
+    /// pre-send append.
+    #[error("agentfield.journal_unavailable: {0}")]
+    JournalUnavailable(String),
     /// Pass-through client error (`agentfield.*` family).
     #[error("{0}")]
     Client(#[from] AgentFieldError),
@@ -123,6 +156,7 @@ impl ManagerError {
             Self::Unavailable(_) => "agentfield.unavailable",
             Self::LimitExceeded(_) => "agentfield.limit_exceeded",
             Self::NotFound => "agentfield.not_found",
+            Self::JournalUnavailable(_) => "agentfield.journal_unavailable",
             Self::Client(error) => client_error_code(error),
         }
     }
@@ -234,6 +268,10 @@ pub struct AgentFieldManager {
     inner: Arc<StdMutex<Inner>>,
     seq: AtomicU64,
     closed: AtomicBool,
+    /// Phase 7C3: durable journal sink routed through the SessionLoop
+    /// (single sequence owner). `None` only in no-journal deployments —
+    /// every remote side effect fails closed without it.
+    journal: Option<Arc<dyn crate::agentfield::journal::AgentFieldJournalSink>>,
 }
 
 impl AgentFieldManager {
@@ -241,19 +279,23 @@ impl AgentFieldManager {
     /// policy factory (`production_client_factory`). The credential is
     /// resolved by the caller at the registration gate — an unresolvable
     /// reference means zero tool registration and zero network. Client
-    /// creation performs no network at session start.
+    /// creation performs no network at session start. The journal sink
+    /// MUST be attached (the SessionLoop-backed implementation); remote
+    /// side effects fail closed without durable journaling.
     pub fn new(
         session_id: &str,
         catalog: AgentFieldCatalog,
         credential: crate::agentfield::client::RedactedToken,
         config: AgentFieldConfig,
         catalog_sources: Vec<crate::agentfield::catalog::CatalogSource>,
+        journal: Option<Arc<dyn crate::agentfield::journal::AgentFieldJournalSink>>,
     ) -> Self {
         Self::with_factory_and_sources(
             session_id,
             catalog,
             Some(production_client_factory(credential, config)),
             catalog_sources,
+            journal,
         )
     }
 
@@ -264,8 +306,9 @@ impl AgentFieldManager {
         session_id: &str,
         catalog: AgentFieldCatalog,
         factory: Option<ClientFactory>,
+        journal: Option<Arc<dyn crate::agentfield::journal::AgentFieldJournalSink>>,
     ) -> Self {
-        Self::with_factory_and_sources(session_id, catalog, factory, Vec::new())
+        Self::with_factory_and_sources(session_id, catalog, factory, Vec::new(), journal)
     }
 
     pub fn with_factory_and_sources(
@@ -273,6 +316,7 @@ impl AgentFieldManager {
         catalog: AgentFieldCatalog,
         factory: Option<ClientFactory>,
         catalog_sources: Vec<crate::agentfield::catalog::CatalogSource>,
+        journal: Option<Arc<dyn crate::agentfield::journal::AgentFieldJournalSink>>,
     ) -> Self {
         Self {
             session_id: session_id.to_owned(),
@@ -284,6 +328,7 @@ impl AgentFieldManager {
             inner: Arc::new(StdMutex::new(Inner { runs: Vec::new() })),
             seq: AtomicU64::new(1),
             closed: AtomicBool::new(false),
+            journal,
         }
     }
 
@@ -310,6 +355,113 @@ impl AgentFieldManager {
             return Err(ManagerError::Unavailable("this session has closed".into()));
         }
         Ok(())
+    }
+
+    fn journal_sink(
+        &self,
+    ) -> Result<Arc<dyn crate::agentfield::journal::AgentFieldJournalSink>, ManagerError> {
+        self.journal.clone().ok_or_else(|| {
+            ManagerError::JournalUnavailable("no journal sink attached to this session".into())
+        })
+    }
+
+    /// Durable journal append through the SessionLoop. Resolves only after
+    /// the event is committed (SyncData); any failure is a fail-closed
+    /// `agentfield.journal_unavailable`.
+    async fn append_event(
+        journal: &Arc<dyn crate::agentfield::journal::AgentFieldJournalSink>,
+        event: lato_core::AgentFieldJournalEvent,
+    ) -> Result<(), ManagerError> {
+        journal.append(event).await.map_err(|error| {
+            ManagerError::JournalUnavailable(format!("{}: {}", error.code, error.message))
+        })
+    }
+
+    /// Install runs recovered from a journal replay (Phase 7C3 resume).
+    /// Zero network by construction; the install is atomic with respect to
+    /// the tool surface because the session tool handle is only installed
+    /// AFTER this returns. Requires an empty manager (first-install-wins).
+    pub fn restore_runs(
+        &self,
+        runs: Vec<lato_core::AgentFieldRecoveredRun>,
+    ) -> Result<usize, ManagerError> {
+        self.ensure_open()?;
+        let mut inner = self.inner.lock().expect("agentfield run state lock");
+        if !inner.runs.is_empty() {
+            return Err(ManagerError::Unavailable(
+                "agentfield runs can only be restored into an empty manager".into(),
+            ));
+        }
+        let mut max_seq = 0u64;
+        for run in runs {
+            // Recover the sequence component of `afrun_{now:x}-{seq:x}` so
+            // freshly generated run ids never collide with restored ones.
+            if let Some(seq_part) = run.run_id.rsplit('-').next()
+                && let Ok(value) = u64::from_str_radix(seq_part, 16)
+            {
+                max_seq = max_seq.max(value);
+            }
+            let mut status = RunStatus::from_journal(run.status);
+            let mut last_error = run.last_error.clone();
+            let mut summary = run.summary.clone();
+            // Crash rule (frozen): intent committed but bind not committed —
+            // the remote outcome is undecidable — the run restores as the
+            // PERMANENT local terminal `outcome_unknown` with the manual
+            // control-plane verification guidance. No auto retry, query, or
+            // reconcile ever happens for it.
+            if !status.is_terminal() && run.execution_id.is_none() {
+                status = RunStatus::OutcomeUnknown;
+                last_error = Some("agentfield.outcome_unknown".to_owned());
+                summary = Some(
+                    "the start outcome could not be determined because the session was \
+                     interrupted before the execution id was durably bound; the execution may \
+                     have started. Verify manually in the AgentField control plane (by time, \
+                     target, and audit records). Do NOT start again unless accepting \
+                     duplicate-execution risk."
+                        .to_owned(),
+                );
+            }
+            inner.runs.push(RunState {
+                run_id: run.run_id,
+                alias: run.alias,
+                execute_target: run.execute_target,
+                revision: run.revision,
+                input_digest: run.input_digest,
+                execution_id: run.execution_id,
+                status,
+                created_at_ms: run.created_at_ms,
+                updated_at_ms: run.updated_at_ms,
+                summary,
+                summary_truncated: run.summary_truncated,
+                last_error: last_error.map(|error| -> &'static str {
+                    // Stable frozen codes round-trip to their static
+                    // originals; anything else falls back to a safe code.
+                    const KNOWN: [&str; 10] = [
+                        "agentfield.unavailable",
+                        "agentfield.unauthorized",
+                        "agentfield.remote_protocol",
+                        "agentfield.remote_denied",
+                        "agentfield.output_too_large",
+                        "agentfield.unconfigured",
+                        "agentfield.outcome_unknown",
+                        "agentfield.limit_exceeded",
+                        "agentfield.not_found",
+                        "agentfield.journal_unavailable",
+                    ];
+                    KNOWN
+                        .iter()
+                        .copied()
+                        .find(|code| *code == error)
+                        .unwrap_or("agentfield.unavailable")
+                }),
+            });
+        }
+        let restored = inner.runs.len();
+        drop(inner);
+        if max_seq > 0 {
+            self.seq.store(max_seq + 1, Ordering::Relaxed);
+        }
+        Ok(restored)
     }
 
     async fn client(&self) -> Result<Arc<dyn AgentFieldClient>, ManagerError> {
@@ -414,9 +566,18 @@ impl AgentFieldManager {
         }
     }
 
-    /// Reserve capacity, perform the exactly-one async execute request, and
-    /// bind the remote execution ID. Called only after schema, allowlist,
-    /// policy/approval, and revision recheck have all passed.
+    /// Reserve capacity, durably record the start intent, perform the
+    /// exactly-one async execute request, durably bind the remote
+    /// execution id, and only then return. Called only after schema,
+    /// allowlist, policy/approval, and revision recheck have all passed.
+    ///
+    /// Persistence order (Phase 7C3, frozen): capacity/revision checks →
+    /// `RunIntentRecorded` durable → AT MOST one execute →
+    /// `ExecutionBound` durable → later observations/terminal appended.
+    /// A failed intent append means ZERO remote requests (AC-02); a failed
+    /// bind/terminal append leaves the run in the crash-equivalent
+    /// conservative state (`outcome_unknown` — a replay of an intent-only
+    /// journal yields exactly that) and fails closed.
     ///
     /// Send-outcome mapping (spec §7.2):
     /// - 202 envelope with a non-empty execution ID → bound, status `queued`;
@@ -433,11 +594,12 @@ impl AgentFieldManager {
         input: &Value,
     ) -> Result<RunState, ManagerError> {
         self.ensure_open()?;
+        let journal = self.journal_sink()?;
         // Obtain the client BEFORE the reservation: a client failure means
         // NO request was attempted and nothing needs rolling back.
         let client = self.client().await?;
         let input_digest = digest_hex(&canonical_input(input));
-        let run_id = {
+        let (run_id, created_at_ms) = {
             let mut inner = self.inner.lock().expect("agentfield run state lock");
             let nonterminal = inner
                 .runs
@@ -464,11 +626,18 @@ impl AgentFieldManager {
                 }
             }
             let now = epoch_ms();
-            let run_id = format!(
-                "afrun_{:x}-{:x}",
-                now,
-                self.seq.fetch_add(1, Ordering::Relaxed)
-            );
+            // Freshly generated ids must never collide with runs restored
+            // from a journal replay (7C3).
+            let run_id = loop {
+                let candidate = format!(
+                    "afrun_{:x}-{:x}",
+                    now,
+                    self.seq.fetch_add(1, Ordering::Relaxed)
+                );
+                if !inner.runs.iter().any(|run| run.run_id == candidate) {
+                    break candidate;
+                }
+            };
             inner.runs.push(RunState {
                 run_id: run_id.clone(),
                 alias: alias.to_owned(),
@@ -483,10 +652,31 @@ impl AgentFieldManager {
                 summary_truncated: false,
                 last_error: None,
             });
-            run_id
+            (run_id, now)
         };
+        // 7C3: the durable intent MUST be committed before the remote
+        // execute. Failure here removes the reservation: zero requests.
+        let intent = lato_core::AgentFieldJournalEvent::AgentFieldRunIntentRecorded {
+            run_id: run_id.clone(),
+            session_id: self.session_id.clone(),
+            alias: alias.to_owned(),
+            execute_target: execute_target.to_owned(),
+            catalog_revision: revision.to_owned(),
+            input_digest: digest_hex(&canonical_input(input)),
+            created_at_ms,
+        };
+        if let Err(error) = Self::append_event(&journal, intent).await {
+            self.inner
+                .lock()
+                .expect("agentfield run state lock")
+                .runs
+                .retain(|run| run.run_id != run_id);
+            return Err(error);
+        }
         // Disarmed on every deliberate resolution path; fires only when the
-        // future is dropped mid-send (cancel/timeout/abort).
+        // future is dropped mid-send (cancel/timeout/abort). The drop path
+        // leaves the journal intent-only, which replays as exactly the
+        // conservative `outcome_unknown` the drop guard writes locally.
         let mut guard = SendGuard {
             inner: self.inner.clone(),
             run_id: run_id.clone(),
@@ -499,8 +689,32 @@ impl AgentFieldManager {
             Ok(envelope) => {
                 if envelope.execution_id.is_empty() {
                     let run = self.mark_outcome_unknown(&run_id).await;
+                    let terminal = self.run_terminal_event(&run);
+                    if let Err(error) = Self::append_event(&journal, terminal).await {
+                        guard.resolved = true;
+                        // The local state IS the crash-equivalent terminal;
+                        // never claim the durable terminal though.
+                        return Err(error);
+                    }
                     guard.resolved = true;
                     return Ok(run);
+                }
+                let bind = lato_core::AgentFieldJournalEvent::AgentFieldExecutionBound {
+                    run_id: run_id.clone(),
+                    session_id: self.session_id.clone(),
+                    execution_id: envelope.execution_id.clone(),
+                    alias: alias.to_owned(),
+                    catalog_revision: revision.to_owned(),
+                    input_digest: digest_hex(&canonical_input(input)),
+                    bound_at_ms: epoch_ms(),
+                };
+                if let Err(error) = Self::append_event(&journal, bind).await {
+                    // Crash-equivalent: an intent-only journal replays as
+                    // permanent `outcome_unknown` — mirror that locally and
+                    // fail closed (no durable bind was committed).
+                    guard.resolved = true;
+                    self.mark_outcome_unknown(&run_id).await;
+                    return Err(error);
                 }
                 let mut inner = self.inner.lock().expect("agentfield run state lock");
                 if let Some(run) = inner.runs.iter_mut().find(|run| run.run_id == run_id) {
@@ -515,10 +729,33 @@ impl AgentFieldManager {
                 }
             }
             Err(error) => {
-                let result = self.finish_failed_send(&run_id, error).await;
+                let result = self.finish_failed_send(&run_id, &error).await;
+                // Journal the terminal outcome of the failed send.
+                if let Ok(run) = result.as_ref() {
+                    let terminal = self.run_terminal_event(run);
+                    if let Err(append_error) = Self::append_event(&journal, terminal).await {
+                        guard.resolved = true;
+                        return Err(append_error);
+                    }
+                }
                 guard.resolved = true;
                 result
             }
+        }
+    }
+
+    /// The terminal journal event for a run that already carries its final
+    /// local state (outcome_unknown / failed).
+    fn run_terminal_event(&self, run: &RunState) -> lato_core::AgentFieldJournalEvent {
+        lato_core::AgentFieldJournalEvent::AgentFieldRunTerminal {
+            run_id: run.run_id.clone(),
+            session_id: self.session_id.clone(),
+            execution_id: run.execution_id.clone(),
+            status: run.status.to_journal(),
+            observed_at_ms: epoch_ms(),
+            summary: run.summary.clone(),
+            summary_truncated: run.summary_truncated,
+            last_error: run.last_error.map(str::to_owned),
         }
     }
 
@@ -528,7 +765,7 @@ impl AgentFieldManager {
     async fn finish_failed_send(
         &self,
         run_id: &str,
-        error: AgentFieldError,
+        error: &AgentFieldError,
     ) -> Result<RunState, ManagerError> {
         let definitive = matches!(
             error,
@@ -541,7 +778,7 @@ impl AgentFieldManager {
         run.updated_at_ms = epoch_ms();
         if definitive {
             run.status = RunStatus::Failed;
-            run.last_error = Some(client_error_code(&error));
+            run.last_error = Some(client_error_code(error));
         } else {
             // Transport failure, timeout, undecodable body: the request may
             // have reached the control plane. Permanent local terminal —
@@ -619,6 +856,36 @@ impl AgentFieldManager {
         match envelope {
             Ok(envelope) => {
                 let status = map_remote_status(&envelope)?;
+                // 7C3 (designer constraint 3): the observation becomes the
+                // externally visible durable state ONLY after its journal
+                // event committed. A failed append keeps the last durable
+                // state and fails closed.
+                let journal = self.journal_sink()?;
+                let (summary, truncated) = observation_summary(status, &envelope);
+                let event = if status.is_terminal() {
+                    lato_core::AgentFieldJournalEvent::AgentFieldRunTerminal {
+                        run_id: run_id.to_owned(),
+                        session_id: self.session_id.clone(),
+                        execution_id: Some(execution_id.clone()),
+                        status: status.to_journal(),
+                        observed_at_ms: epoch_ms(),
+                        summary: summary.clone(),
+                        summary_truncated: truncated,
+                        last_error: None,
+                    }
+                } else {
+                    lato_core::AgentFieldJournalEvent::AgentFieldStatusObserved {
+                        run_id: run_id.to_owned(),
+                        session_id: self.session_id.clone(),
+                        execution_id: Some(execution_id.clone()),
+                        status: status.to_journal(),
+                        observed_at_ms: epoch_ms(),
+                        summary: summary.clone(),
+                        summary_truncated: truncated,
+                        last_error: None,
+                    }
+                };
+                Self::append_event(&journal, event).await?;
                 let mut inner = self.inner.lock().expect("agentfield run state lock");
                 let Some(run) = inner.runs.iter_mut().find(|run| run.run_id == run_id) else {
                     return Err(ManagerError::NotFound);
@@ -649,8 +916,10 @@ impl AgentFieldManager {
     }
 
     /// Cancel an owned run (spec §7.4). Terminal runs answer
-    /// `already_terminal` with zero network. An unconfirmed request is
-    /// NEVER reported as a successful cancellation.
+    /// `already_terminal` with zero network. The cancel intent is durably
+    /// journaled BEFORE the single send (designer constraint 2), and the
+    /// `cancelled` terminal is journaled before it becomes visible. An
+    /// unconfirmed request is NEVER reported as a successful cancellation.
     pub async fn cancel_run(
         &self,
         run_id: &str,
@@ -678,10 +947,32 @@ impl AgentFieldManager {
                 .ok_or(ManagerError::NotFound)?;
             return Ok((run.clone(), CancelOutcome::Unavailable));
         };
+        let journal = self.journal_sink()?;
+        // Durable-before-send: a failed append means ZERO remote cancels.
+        let request = lato_core::AgentFieldJournalEvent::AgentFieldCancelRequested {
+            run_id: run_id.to_owned(),
+            session_id: self.session_id.clone(),
+            execution_id: Some(execution_id.clone()),
+            requested_at_ms: epoch_ms(),
+        };
+        Self::append_event(&journal, request).await?;
         let client = self.client().await?;
         let result = client.cancel(&execution_id, reason).await;
         match result {
             Ok(Some(_envelope)) => {
+                let terminal = lato_core::AgentFieldJournalEvent::AgentFieldRunTerminal {
+                    run_id: run_id.to_owned(),
+                    session_id: self.session_id.clone(),
+                    execution_id: Some(execution_id.clone()),
+                    status: lato_core::AgentFieldRunStatus::Cancelled,
+                    observed_at_ms: epoch_ms(),
+                    summary: None,
+                    summary_truncated: false,
+                    last_error: None,
+                };
+                // Never claim a durable cancellation whose terminal event
+                // did not commit (designer constraint 2).
+                Self::append_event(&journal, terminal).await?;
                 let mut inner = self.inner.lock().expect("agentfield run state lock");
                 let Some(run) = inner.runs.iter_mut().find(|run| run.run_id == run_id) else {
                     return Err(ManagerError::NotFound);
@@ -743,6 +1034,43 @@ fn map_remote_status(envelope: &StatusEnvelope) -> Result<RunStatus, ManagerErro
     })
 }
 
+/// Extract the redacted, bounded summary an observation would contribute
+/// ( Completed result / Failed detail); shared by the journal event
+/// builder and the local state application so both surfaces stay
+/// byte-identical.
+fn observation_summary(status: RunStatus, envelope: &StatusEnvelope) -> (Option<String>, bool) {
+    match status {
+        RunStatus::Completed => envelope
+            .optional_ignored
+            .result
+            .as_deref()
+            .map(|result| {
+                // Remote-controlled content is redacted BEFORE it can reach
+                // any summary/projection surface (Round-1 acceptance P1-2).
+                let (summary, truncated) =
+                    truncate_utf8(&redact_secrets(result), MAX_SUMMARY_BYTES);
+                (Some(summary), truncated)
+            })
+            .unwrap_or((None, false)),
+        RunStatus::Failed => {
+            let detail = envelope
+                .optional_ignored
+                .error
+                .as_deref()
+                .or(envelope.optional_ignored.error_details.as_deref())
+                .or(envelope.optional_ignored.status_reason.as_deref());
+            detail
+                .map(|detail| {
+                    let (summary, truncated) =
+                        truncate_utf8(&redact_secrets(detail), MAX_SUMMARY_BYTES);
+                    (Some(summary), truncated)
+                })
+                .unwrap_or((None, false))
+        }
+        _ => (None, false),
+    }
+}
+
 /// Monotonic state application (AC-08): terminal states are never
 /// overwritten by late arrivals; `unavailable` never masks a known state
 /// (the previous status is kept as `last_known` in the projection via
@@ -754,32 +1082,10 @@ fn apply_remote_status(run: &mut RunState, status: RunStatus, envelope: &StatusE
     }
     run.status = status;
     run.updated_at_ms = epoch_ms();
-    match status {
-        RunStatus::Completed => {
-            if let Some(result) = envelope.optional_ignored.result.as_deref() {
-                // Remote-controlled content is redacted BEFORE it can reach
-                // any summary/projection surface (Round-1 acceptance P1-2).
-                let (summary, truncated) =
-                    truncate_utf8(&redact_secrets(result), MAX_SUMMARY_BYTES);
-                run.summary = Some(summary);
-                run.summary_truncated = truncated;
-            }
-        }
-        RunStatus::Failed => {
-            let detail = envelope
-                .optional_ignored
-                .error
-                .as_deref()
-                .or(envelope.optional_ignored.error_details.as_deref())
-                .or(envelope.optional_ignored.status_reason.as_deref());
-            if let Some(detail) = detail {
-                let (summary, truncated) =
-                    truncate_utf8(&redact_secrets(detail), MAX_SUMMARY_BYTES);
-                run.summary = Some(summary);
-                run.summary_truncated = truncated;
-            }
-        }
-        _ => {}
+    let (summary, truncated) = observation_summary(status, envelope);
+    if summary.is_some() {
+        run.summary = summary;
+        run.summary_truncated = truncated;
     }
 }
 
@@ -1196,7 +1502,12 @@ mod tests {
         }
     }
 
-    fn manager_with(start: StartBehavior) -> (AgentFieldManager, Arc<FakeClient>) {
+    type SharedJournal = Arc<crate::agentfield::journal::MemoryAgentFieldJournal>;
+
+    fn manager_with_journal(
+        start: StartBehavior,
+        journal: SharedJournal,
+    ) -> (AgentFieldManager, Arc<FakeClient>) {
         let client = Arc::new(FakeClient::new(start));
         let shared: Arc<dyn AgentFieldClient> = client.clone();
         let manager = AgentFieldManager::with_factory(
@@ -1206,8 +1517,13 @@ mod tests {
                 let shared = shared.clone();
                 Box::pin(async move { Ok(shared.clone()) })
             })),
+            Some(journal),
         );
         (manager, client)
+    }
+
+    fn manager_with(start: StartBehavior) -> (AgentFieldManager, Arc<FakeClient>) {
+        manager_with_journal(start, crate::agentfield::journal::memory_journal())
     }
 
     fn input() -> Value {
@@ -1608,7 +1924,12 @@ mod tests {
 
     #[tokio::test]
     async fn missing_factory_fails_closed() {
-        let manager = AgentFieldManager::with_factory("s", catalog(), None);
+        let manager = AgentFieldManager::with_factory(
+            "s",
+            catalog(),
+            None,
+            Some(crate::agentfield::journal::memory_journal()),
+        );
         let error = manager
             .start_run(
                 "contract-review",
@@ -1870,6 +2191,7 @@ mod tests {
                 Box::pin(async move { Ok(shared.clone()) })
             })),
             sources,
+            Some(crate::agentfield::journal::memory_journal()),
         );
         assert!(
             manager.recheck_revision_matches(),
@@ -2010,5 +2332,390 @@ mod tests {
         let sources =
             crate::agentfield::catalog::catalog_sources(temp_home.path(), temp_cwd.path());
         assert!(crate::agentfield::catalog::assemble_catalog_config(&sources).is_none());
+    }
+
+    struct JournalProbeClient {
+        start_calls: AtomicUsize,
+        journal: SharedJournal,
+        intent_count_at_send: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl AgentFieldClient for JournalProbeClient {
+        async fn discovery(&self) -> Result<DiscoveryEnvelope, AgentFieldError> {
+            unreachable!("discovery is not part of this probe")
+        }
+
+        async fn start_async(
+            &self,
+            _execute_target: &str,
+            _input: &Value,
+        ) -> Result<AsyncStartEnvelope, AgentFieldError> {
+            self.start_calls.fetch_add(1, Ordering::SeqCst);
+            self.intent_count_at_send.store(
+                self.journal
+                    .events()
+                    .iter()
+                    .filter(|event| {
+                        matches!(
+                            event,
+                            lato_core::AgentFieldJournalEvent::AgentFieldRunIntentRecorded { .. }
+                        )
+                    })
+                    .count(),
+                Ordering::SeqCst,
+            );
+            Ok(start_envelope("exec-1"))
+        }
+
+        async fn status(&self, execution_id: &str) -> Result<StatusEnvelope, AgentFieldError> {
+            Ok(status_envelope(execution_id, "running"))
+        }
+
+        async fn cancel(
+            &self,
+            _execution_id: &str,
+            _reason: &str,
+        ) -> Result<Option<CancelSuccessEnvelope>, AgentFieldError> {
+            Ok(Some(
+                CancelSuccessEnvelope::decode(&serde_json::json!({
+                    "execution_id": "exec-1",
+                    "status": "cancelled",
+                    "previous_status": "running",
+                    "cancelled_at": "2026-09-17T00:00:02Z",
+                }))
+                .unwrap(),
+            ))
+        }
+    }
+
+    fn probe_manager(journal: &SharedJournal) -> (AgentFieldManager, Arc<JournalProbeClient>) {
+        let client = Arc::new(JournalProbeClient {
+            start_calls: AtomicUsize::new(0),
+            journal: journal.clone(),
+            intent_count_at_send: AtomicUsize::new(0),
+        });
+        let shared: Arc<dyn AgentFieldClient> = client.clone();
+        let sink: Arc<dyn crate::agentfield::journal::AgentFieldJournalSink> = journal.clone();
+        let manager = AgentFieldManager::with_factory(
+            "session-test",
+            catalog(),
+            Some(Arc::new(move || {
+                let shared = shared.clone();
+                Box::pin(async move { Ok(shared.clone()) })
+            })),
+            Some(sink),
+        );
+        (manager, client)
+    }
+
+    #[tokio::test]
+    async fn intent_is_durable_before_the_remote_send() {
+        let journal = crate::agentfield::journal::memory_journal();
+        let (manager, client) = probe_manager(&journal);
+        let run = manager
+            .start_run(
+                "contract-review",
+                "legal.review_contract",
+                "sha256:x",
+                &input(),
+            )
+            .await
+            .unwrap();
+        // The intent event was already committed when the single send fired.
+        assert_eq!(client.intent_count_at_send.load(Ordering::SeqCst), 1);
+        // After the send: intent then bind, in order.
+        let events = journal.events();
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            events[0],
+            lato_core::AgentFieldJournalEvent::AgentFieldRunIntentRecorded { .. }
+        ));
+        match &events[1] {
+            lato_core::AgentFieldJournalEvent::AgentFieldExecutionBound {
+                run_id,
+                execution_id,
+                session_id,
+                ..
+            } => {
+                assert_eq!(run_id, &run.run_id);
+                assert_eq!(execution_id, "exec-1");
+                assert_eq!(session_id, "session-test");
+            }
+            other => panic!("expected bind event, got {other:?}"),
+        }
+        assert_eq!(client.start_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_intent_append_produces_zero_remote_requests() {
+        let journal = crate::agentfield::journal::memory_journal();
+        journal.set_failing(true);
+        let (manager, client) = probe_manager(&journal);
+        let error = manager
+            .start_run(
+                "contract-review",
+                "legal.review_contract",
+                "sha256:x",
+                &input(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), "agentfield.journal_unavailable");
+        // AC-02: no durable intent ⇒ zero remote requests, no stranded run.
+        assert_eq!(client.start_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(client.intent_count_at_send.load(Ordering::SeqCst), 0);
+        assert_eq!(manager.run_count().await, 0);
+        assert_eq!(journal.event_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn missing_journal_sink_fails_start_closed() {
+        let client = Arc::new(FakeClient::new(StartBehavior::Ok("exec-1".into())));
+        let shared: Arc<dyn AgentFieldClient> = client.clone();
+        let manager = AgentFieldManager::with_factory(
+            "session-test",
+            catalog(),
+            Some(Arc::new(move || {
+                let shared = shared.clone();
+                Box::pin(async move { Ok(shared.clone()) })
+            })),
+            None,
+        );
+        let error = manager
+            .start_run(
+                "contract-review",
+                "legal.review_contract",
+                "sha256:x",
+                &input(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), "agentfield.journal_unavailable");
+        assert_eq!(client.start_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn cancel_is_durable_before_send_and_terminal_after_confirmation() {
+        let journal = crate::agentfield::journal::memory_journal();
+        let (manager, client) =
+            manager_with_journal(StartBehavior::Ok("exec-1".into()), journal.clone());
+        let run = manager
+            .start_run(
+                "contract-review",
+                "legal.review_contract",
+                "sha256:x",
+                &input(),
+            )
+            .await
+            .unwrap();
+        // A failing journal means ZERO remote cancel requests.
+        journal.set_failing(true);
+        let error = manager.cancel_run(&run.run_id, "user").await.unwrap_err();
+        assert_eq!(error.code(), "agentfield.journal_unavailable");
+        assert_eq!(client.cancel_calls.load(Ordering::SeqCst), 0);
+        // The local state is untouched (still queued).
+        assert_eq!(
+            manager.run(&run.run_id).await.unwrap().status,
+            RunStatus::Queued
+        );
+        // With the journal healthy: cancel intent, send, durable terminal.
+        journal.set_failing(false);
+        let (run, outcome) = manager.cancel_run(&run.run_id, "user").await.unwrap();
+        assert_eq!(outcome, CancelOutcome::Cancelled);
+        assert_eq!(run.status, RunStatus::Cancelled);
+        let events = journal.events();
+        assert!(matches!(
+            events[events.len() - 2],
+            lato_core::AgentFieldJournalEvent::AgentFieldCancelRequested { .. }
+        ));
+        match &events[events.len() - 1] {
+            lato_core::AgentFieldJournalEvent::AgentFieldRunTerminal { status, .. } => {
+                assert_eq!(*status, lato_core::AgentFieldRunStatus::Cancelled);
+            }
+            other => panic!("expected terminal event, got {other:?}"),
+        }
+        assert_eq!(client.cancel_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn status_observation_is_journaled_and_terminal_is_monotonic() {
+        let journal = crate::agentfield::journal::memory_journal();
+        let (manager, client) =
+            manager_with_journal(StartBehavior::Ok("exec-1".into()), journal.clone());
+        let run = manager
+            .start_run(
+                "contract-review",
+                "legal.review_contract",
+                "sha256:x",
+                &input(),
+            )
+            .await
+            .unwrap();
+        let runs = manager.run_status(Some(&run.run_id)).await.unwrap();
+        assert_eq!(runs[0].status, RunStatus::Running);
+        assert!(matches!(
+            journal.events().last(),
+            Some(
+                lato_core::AgentFieldJournalEvent::AgentFieldStatusObserved {
+                    status: lato_core::AgentFieldRunStatus::Running,
+                    ..
+                }
+            )
+        ));
+        // Terminal observation is journaled as a terminal event.
+        *client.status_behavior.lock().await = StatusBehavior::Ok("completed".into());
+        let runs = manager.run_status(Some(&run.run_id)).await.unwrap();
+        assert_eq!(runs[0].status, RunStatus::Completed);
+        assert!(matches!(
+            journal.events().last(),
+            Some(lato_core::AgentFieldJournalEvent::AgentFieldRunTerminal {
+                status: lato_core::AgentFieldRunStatus::Completed,
+                ..
+            })
+        ));
+        // A late running observation can neither query nor overwrite.
+        *client.status_behavior.lock().await = StatusBehavior::Ok("running".into());
+        let runs = manager.run_status(Some(&run.run_id)).await.unwrap();
+        assert_eq!(runs[0].status, RunStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn failed_observation_append_keeps_the_last_durable_state() {
+        let journal = crate::agentfield::journal::memory_journal();
+        let (manager, client) =
+            manager_with_journal(StartBehavior::Ok("exec-1".into()), journal.clone());
+        let run = manager
+            .start_run(
+                "contract-review",
+                "legal.review_contract",
+                "sha256:x",
+                &input(),
+            )
+            .await
+            .unwrap();
+        let runs = manager.run_status(Some(&run.run_id)).await.unwrap();
+        assert_eq!(runs[0].status, RunStatus::Running);
+        // Append failure after the remote answer: fail closed, keep the
+        // last durable state visible.
+        journal.set_failing(true);
+        *client.status_behavior.lock().await = StatusBehavior::Ok("completed".into());
+        let error = manager.run_status(Some(&run.run_id)).await.unwrap_err();
+        assert_eq!(error.code(), "agentfield.journal_unavailable");
+        let last = manager.run(&run.run_id).await.unwrap();
+        assert_eq!(last.status, RunStatus::Running, "last durable state kept");
+    }
+
+    fn recovered_run(
+        run_id: &str,
+        status: lato_core::AgentFieldRunStatus,
+        execution_id: Option<&str>,
+    ) -> lato_core::AgentFieldRecoveredRun {
+        lato_core::AgentFieldRecoveredRun {
+            run_id: run_id.into(),
+            alias: "contract-review".into(),
+            execute_target: "legal.review_contract".into(),
+            revision: "sha256:rev-1".into(),
+            input_digest: "a".repeat(64),
+            execution_id: execution_id.map(str::to_owned),
+            status,
+            created_at_ms: 1_000,
+            updated_at_ms: 1_300,
+            summary: None,
+            summary_truncated: false,
+            last_error: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn restore_recovers_terminals_offline_and_intent_only_as_outcome_unknown() {
+        // No client factory: ANY network attempt would fail — proving the
+        // restore path is purely local (AC-04/AC-05).
+        let manager = AgentFieldManager::with_factory("session-test", catalog(), None, None);
+        let restored = manager
+            .restore_runs(vec![
+                recovered_run(
+                    "afrun_1",
+                    lato_core::AgentFieldRunStatus::Completed,
+                    Some("exec-1"),
+                ),
+                recovered_run(
+                    "afrun_2",
+                    lato_core::AgentFieldRunStatus::OutcomeUnknown,
+                    None,
+                ),
+                // Intent-only crash point: unbound nonterminal restores as
+                // the permanent local terminal outcome_unknown.
+                recovered_run("afrun_3", lato_core::AgentFieldRunStatus::Queued, None),
+                // Bound nonterminal restores as the last known state.
+                recovered_run(
+                    "afrun_4",
+                    lato_core::AgentFieldRunStatus::Running,
+                    Some("exec-4"),
+                ),
+            ])
+            .unwrap();
+        assert_eq!(restored, 4);
+        // Terminal: pure offline restore, zero network on status.
+        let runs = manager.run_status(Some("afrun_1")).await.unwrap();
+        assert_eq!(runs[0].status, RunStatus::Completed);
+        // Intent-only: permanent outcome_unknown with manual guidance.
+        let runs = manager.run_status(Some("afrun_3")).await.unwrap();
+        assert_eq!(runs[0].status, RunStatus::OutcomeUnknown);
+        assert!(
+            runs[0]
+                .summary
+                .as_deref()
+                .unwrap()
+                .contains("control plane")
+        );
+        // Bound nonterminal: last known state, first explicit status would
+        // reconcile lazily (here it fails with no client, keeping state).
+        let error = manager.run_status(Some("afrun_4")).await.unwrap_err();
+        assert_eq!(error.code(), "agentfield.unavailable");
+        assert_eq!(
+            manager.run("afrun_4").await.unwrap().status,
+            RunStatus::Running
+        );
+        // Restore is first-install-wins.
+        assert!(manager.restore_runs(vec![]).is_err());
+    }
+
+    #[tokio::test]
+    async fn restored_run_ids_never_collide_with_new_ones() {
+        let manager = AgentFieldManager::with_factory("session-test", catalog(), None, None);
+        manager
+            .restore_runs(vec![recovered_run(
+                "afrun_5-1",
+                lato_core::AgentFieldRunStatus::Completed,
+                Some("exec-1"),
+            )])
+            .unwrap();
+        let run_id = {
+            let mut inner = manager.inner.lock().expect("lock");
+            let now = epoch_ms();
+            let candidate = format!(
+                "afrun_{now:x}-{:x}",
+                manager.seq.fetch_add(1, Ordering::Relaxed)
+            );
+            assert_ne!(candidate, "afrun_5-1");
+            inner.runs.push(RunState {
+                run_id: candidate.clone(),
+                alias: "x".into(),
+                execute_target: "t".into(),
+                revision: "rev".into(),
+                input_digest: "d".repeat(64),
+                execution_id: None,
+                status: RunStatus::Queued,
+                created_at_ms: now,
+                updated_at_ms: now,
+                summary: None,
+                summary_truncated: false,
+                last_error: None,
+            });
+            candidate
+        };
+        assert_eq!(manager.run_count().await, 2);
+        assert!(run_id.starts_with("afrun_"));
     }
 }

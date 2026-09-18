@@ -232,6 +232,7 @@ fn manager_with_fake(start: StartBehavior) -> (Arc<AgentFieldManager>, SharedFak
             let shared = shared.clone();
             Box::pin(async move { Ok(shared.clone()) })
         })),
+        Some(lato_agent::agentfield::journal::memory_journal()),
     );
     (Arc::new(manager), fake)
 }
@@ -256,6 +257,7 @@ fn manager_with_sources(
             Box::pin(async move { Ok(shared.clone()) })
         })),
         sources,
+        Some(lato_agent::agentfield::journal::memory_journal()),
     );
     (Arc::new(manager), fake)
 }
@@ -1292,6 +1294,7 @@ async fn list_without_verified_discovery_is_empty() {
             let client = client.clone();
             Box::pin(async move { Ok(client.clone()) })
         })),
+        Some(lato_agent::agentfield::journal::memory_journal()),
     );
     let manager = Arc::new(manager);
     let handle = SessionAgentFieldHandle::new();
