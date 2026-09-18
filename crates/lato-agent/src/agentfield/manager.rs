@@ -2718,4 +2718,62 @@ mod tests {
         assert_eq!(manager.run_count().await, 2);
         assert!(run_id.starts_with("afrun_"));
     }
+    #[tokio::test]
+    async fn eviction_order_is_deterministic_across_restart() {
+        // Journal commit order: t1 completed, r2 running, t3 completed, and
+        // enough terminals to fill capacity. After restore, admitting a new
+        // run must evict the OLDEST terminal by committed sequence (t1),
+        // never the newer t3 and never a nonterminal — deterministically.
+        let runs = {
+            let mut runs = vec![recovered_run(
+                "afrun_t1",
+                lato_core::AgentFieldRunStatus::Completed,
+                Some("exec-1"),
+            )];
+            runs[0].created_at_ms = 1_000;
+            runs.push(recovered_run(
+                "afrun_r2",
+                lato_core::AgentFieldRunStatus::Running,
+                Some("exec-2"),
+            ));
+            runs.push(recovered_run(
+                "afrun_t3",
+                lato_core::AgentFieldRunStatus::Completed,
+                Some("exec-3"),
+            ));
+            for index in 4..=MAX_RETAINED_RUNS {
+                runs.push(recovered_run(
+                    &format!("afrun_t{index}"),
+                    lato_core::AgentFieldRunStatus::Completed,
+                    Some(&format!("exec-{index}")),
+                ));
+            }
+            runs
+        };
+        let (manager, client) = manager_with(StartBehavior::Ok("exec-new".into()));
+        manager.restore_runs(runs).unwrap();
+        assert_eq!(manager.run_count().await, MAX_RETAINED_RUNS);
+        manager
+            .start_run(
+                "contract-review",
+                "legal.review_contract",
+                "sha256:x",
+                &input(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(manager.run_count().await, MAX_RETAINED_RUNS);
+        // run_status(None) shows only the 20 most recent; identity checks
+        // use the direct getter.
+        assert!(
+            manager.run("afrun_t1").await.is_none(),
+            "oldest terminal evicted"
+        );
+        assert!(
+            manager.run("afrun_t3").await.is_some(),
+            "newer terminal kept"
+        );
+        assert!(manager.run("afrun_r2").await.is_some(), "nonterminal kept");
+        assert_eq!(client.start_calls.load(Ordering::SeqCst), 1);
+    }
 }
