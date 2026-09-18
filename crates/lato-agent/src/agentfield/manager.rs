@@ -138,6 +138,12 @@ pub enum ManagerError {
     /// Unknown or foreign run id — indistinguishable by design (AC-07).
     #[error("agentfield.not_found")]
     NotFound,
+    /// Configuration lost (config deleted / adapter disabled / credential
+    /// unresolvable) while historical runs remain journaled. The run
+    /// history and journal are preserved; remote-facing queries answer
+    /// this stable code with zero network (AC-08).
+    #[error("agentfield.unconfigured")]
+    Unconfigured,
     /// Journal append failed (fail closed, spec item 4 of the
     /// single-writer contract): the corresponding durable state was NOT
     /// committed, so the caller must never treat the operation as
@@ -156,6 +162,7 @@ impl ManagerError {
             Self::Unavailable(_) => "agentfield.unavailable",
             Self::LimitExceeded(_) => "agentfield.limit_exceeded",
             Self::NotFound => "agentfield.not_found",
+            Self::Unconfigured => "agentfield.unconfigured",
             Self::JournalUnavailable(_) => "agentfield.journal_unavailable",
             Self::Client(error) => client_error_code(error),
         }
@@ -272,6 +279,10 @@ pub struct AgentFieldManager {
     /// (single sequence owner). `None` only in no-journal deployments —
     /// every remote side effect fails closed without it.
     journal: Option<Arc<dyn crate::agentfield::journal::AgentFieldJournalSink>>,
+    /// Phase 7C3 (AC-08): configuration lost while historical runs remain
+    /// journaled. Local reads still work; every remote-facing operation
+    /// answers `agentfield.unconfigured` with zero network.
+    unconfigured: bool,
 }
 
 impl AgentFieldManager {
@@ -329,7 +340,23 @@ impl AgentFieldManager {
             seq: AtomicU64::new(1),
             closed: AtomicBool::new(false),
             journal,
+            unconfigured: false,
         }
+    }
+
+    /// AC-08 recovery constructor: the adapter's configuration has
+    /// disappeared (config deleted / disabled / credential unresolvable)
+    /// but the session journal still holds runs. The manager restores and
+    /// exposes the run history locally; every remote-facing operation
+    /// answers the stable `agentfield.unconfigured` with zero network and
+    /// the journal is never rewritten.
+    pub fn unconfigured(
+        session_id: &str,
+        journal: Option<Arc<dyn crate::agentfield::journal::AgentFieldJournalSink>>,
+    ) -> Self {
+        let mut manager = Self::with_factory(session_id, AgentFieldCatalog::empty(), None, journal);
+        manager.unconfigured = true;
+        manager
     }
 
     pub fn catalog(&self) -> &AgentFieldCatalog {
@@ -466,6 +493,9 @@ impl AgentFieldManager {
 
     async fn client(&self) -> Result<Arc<dyn AgentFieldClient>, ManagerError> {
         self.ensure_open()?;
+        if self.unconfigured {
+            return Err(ManagerError::Unconfigured);
+        }
         let Some(factory) = self.factory.as_ref() else {
             return Err(ManagerError::Unavailable("no control-plane client".into()));
         };
@@ -594,6 +624,9 @@ impl AgentFieldManager {
         input: &Value,
     ) -> Result<RunState, ManagerError> {
         self.ensure_open()?;
+        if self.unconfigured {
+            return Err(ManagerError::Unconfigured);
+        }
         let journal = self.journal_sink()?;
         // Obtain the client BEFORE the reservation: a client failure means
         // NO request was attempted and nothing needs rolling back.
@@ -663,7 +696,12 @@ impl AgentFieldManager {
             execute_target: execute_target.to_owned(),
             catalog_revision: revision.to_owned(),
             input_digest: digest_hex(&canonical_input(input)),
-            created_at_ms,
+            execution_id: None,
+            status: lato_core::AgentFieldRunStatus::Queued,
+            timestamp_ms: created_at_ms,
+            summary: None,
+            summary_truncated: false,
+            last_error: None,
         };
         if let Err(error) = Self::append_event(&journal, intent).await {
             self.inner
@@ -702,11 +740,16 @@ impl AgentFieldManager {
                 let bind = lato_core::AgentFieldJournalEvent::AgentFieldExecutionBound {
                     run_id: run_id.clone(),
                     session_id: self.session_id.clone(),
-                    execution_id: envelope.execution_id.clone(),
                     alias: alias.to_owned(),
+                    execute_target: execute_target.to_owned(),
                     catalog_revision: revision.to_owned(),
                     input_digest: digest_hex(&canonical_input(input)),
-                    bound_at_ms: epoch_ms(),
+                    execution_id: Some(envelope.execution_id.clone()),
+                    status: lato_core::AgentFieldRunStatus::Queued,
+                    timestamp_ms: epoch_ms(),
+                    summary: None,
+                    summary_truncated: false,
+                    last_error: None,
                 };
                 if let Err(error) = Self::append_event(&journal, bind).await {
                     // Crash-equivalent: an intent-only journal replays as
@@ -750,9 +793,13 @@ impl AgentFieldManager {
         lato_core::AgentFieldJournalEvent::AgentFieldRunTerminal {
             run_id: run.run_id.clone(),
             session_id: self.session_id.clone(),
+            alias: run.alias.clone(),
+            execute_target: run.execute_target.clone(),
+            catalog_revision: run.revision.clone(),
+            input_digest: run.input_digest.clone(),
             execution_id: run.execution_id.clone(),
             status: run.status.to_journal(),
-            observed_at_ms: epoch_ms(),
+            timestamp_ms: epoch_ms(),
             summary: run.summary.clone(),
             summary_truncated: run.summary_truncated,
             last_error: run.last_error.map(str::to_owned),
@@ -823,7 +870,7 @@ impl AgentFieldManager {
             let runs: Vec<RunState> = inner.runs.iter().rev().take(20).cloned().collect();
             return Ok(runs);
         };
-        let execution_id = {
+        let (execution_id, run_identity) = {
             let inner = self.inner.lock().expect("agentfield run state lock");
             let run = inner
                 .runs
@@ -837,7 +884,15 @@ impl AgentFieldManager {
                 | RunStatus::Completed
                 | RunStatus::Failed
                 | RunStatus::Cancelled => return Ok(vec![run.clone()]),
-                _ => run.execution_id.clone(),
+                _ => (
+                    run.execution_id.clone(),
+                    (
+                        run.alias.clone(),
+                        run.execute_target.clone(),
+                        run.revision.clone(),
+                        run.input_digest.clone(),
+                    ),
+                ),
             }
         };
         let Some(execution_id) = execution_id else {
@@ -862,13 +917,18 @@ impl AgentFieldManager {
                 // state and fails closed.
                 let journal = self.journal_sink()?;
                 let (summary, truncated) = observation_summary(status, &envelope);
+                let (alias, execute_target, revision, input_digest) = &run_identity;
                 let event = if status.is_terminal() {
                     lato_core::AgentFieldJournalEvent::AgentFieldRunTerminal {
                         run_id: run_id.to_owned(),
                         session_id: self.session_id.clone(),
+                        alias: alias.clone(),
+                        execute_target: execute_target.clone(),
+                        catalog_revision: revision.clone(),
+                        input_digest: input_digest.clone(),
                         execution_id: Some(execution_id.clone()),
                         status: status.to_journal(),
-                        observed_at_ms: epoch_ms(),
+                        timestamp_ms: epoch_ms(),
                         summary: summary.clone(),
                         summary_truncated: truncated,
                         last_error: None,
@@ -877,9 +937,13 @@ impl AgentFieldManager {
                     lato_core::AgentFieldJournalEvent::AgentFieldStatusObserved {
                         run_id: run_id.to_owned(),
                         session_id: self.session_id.clone(),
+                        alias: alias.clone(),
+                        execute_target: execute_target.clone(),
+                        catalog_revision: revision.clone(),
+                        input_digest: input_digest.clone(),
                         execution_id: Some(execution_id.clone()),
                         status: status.to_journal(),
-                        observed_at_ms: epoch_ms(),
+                        timestamp_ms: epoch_ms(),
                         summary: summary.clone(),
                         summary_truncated: truncated,
                         last_error: None,
@@ -926,7 +990,7 @@ impl AgentFieldManager {
         reason: &str,
     ) -> Result<(RunState, CancelOutcome), ManagerError> {
         self.ensure_open()?;
-        let execution_id = {
+        let (execution_id, run_identity, last_status) = {
             let inner = self.inner.lock().expect("agentfield run state lock");
             let run = inner
                 .runs
@@ -936,7 +1000,16 @@ impl AgentFieldManager {
             if run.status.is_terminal() {
                 return Ok((run.clone(), CancelOutcome::AlreadyTerminal));
             }
-            run.execution_id.clone()
+            (
+                run.execution_id.clone(),
+                (
+                    run.alias.clone(),
+                    run.execute_target.clone(),
+                    run.revision.clone(),
+                    run.input_digest.clone(),
+                ),
+                run.status,
+            )
         };
         let Some(execution_id) = execution_id else {
             let inner = self.inner.lock().expect("agentfield run state lock");
@@ -947,25 +1020,45 @@ impl AgentFieldManager {
                 .ok_or(ManagerError::NotFound)?;
             return Ok((run.clone(), CancelOutcome::Unavailable));
         };
+        // Configuration loss: the cancel send is impossible, so no durable
+        // cancel intent is recorded either — stable `agentfield.unconfigured`
+        // with zero journal changes and zero network.
+        if self.unconfigured {
+            return Err(ManagerError::Unconfigured);
+        }
         let journal = self.journal_sink()?;
         // Durable-before-send: a failed append means ZERO remote cancels.
+        let (alias, execute_target, revision, input_digest) = &run_identity;
         let request = lato_core::AgentFieldJournalEvent::AgentFieldCancelRequested {
             run_id: run_id.to_owned(),
             session_id: self.session_id.clone(),
+            alias: alias.clone(),
+            execute_target: execute_target.clone(),
+            catalog_revision: revision.clone(),
+            input_digest: input_digest.clone(),
             execution_id: Some(execution_id.clone()),
-            requested_at_ms: epoch_ms(),
+            status: last_status.to_journal(),
+            timestamp_ms: epoch_ms(),
+            summary: None,
+            summary_truncated: false,
+            last_error: None,
         };
         Self::append_event(&journal, request).await?;
         let client = self.client().await?;
         let result = client.cancel(&execution_id, reason).await;
         match result {
             Ok(Some(_envelope)) => {
+                let (alias, execute_target, revision, input_digest) = &run_identity;
                 let terminal = lato_core::AgentFieldJournalEvent::AgentFieldRunTerminal {
                     run_id: run_id.to_owned(),
                     session_id: self.session_id.clone(),
+                    alias: alias.clone(),
+                    execute_target: execute_target.clone(),
+                    catalog_revision: revision.clone(),
+                    input_digest: input_digest.clone(),
                     execution_id: Some(execution_id.clone()),
                     status: lato_core::AgentFieldRunStatus::Cancelled,
-                    observed_at_ms: epoch_ms(),
+                    timestamp_ms: epoch_ms(),
                     summary: None,
                     summary_truncated: false,
                     last_error: None,
@@ -2439,7 +2532,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(run_id, &run.run_id);
-                assert_eq!(execution_id, "exec-1");
+                assert_eq!(execution_id.as_deref(), Some("exec-1"));
                 assert_eq!(session_id, "session-test");
             }
             other => panic!("expected bind event, got {other:?}"),

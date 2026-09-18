@@ -506,7 +506,7 @@ Lato acts as a client of an organization-deployed [AgentField](https://github.co
 - **持久 journal 事件**：每次 AgentField run 的启动意图（`agentfield_run_intent_recorded`）、远端执行绑定（`agentfield_execution_bound`）、状态观察（`agentfield_status_observed`）、取消请求（`agentfield_cancel_requested`）与终态（`agentfield_run_terminal`）都会通过会话 journal 持久化（agentfield envelope 使用 journal schema version 2）。事件只包含关联信息与 ≤8 KiB 的脱敏有界摘要——绝无 token、凭据、原始输入、完整远端输出或 transcript。
 - **远端在 Lato 退出后继续运行**：session close / 进程退出只关闭本地 client，绝不隐式取消远端 execution。重启后 `lato resume` 仍能看到本会话的 run；已绑定 execution id 的非终态 run 在首次显式 `status` 时惰性查询一次（不创建新 execution），查询失败显示 `agentfield.unavailable` 并保留最后已知状态。
 - **人工对账**：启动意图已持久化但执行 id 未绑定（响应丢失/断线/中断）的 run 恢复为永久本地终态 `outcome_unknown`，自动 retry/query/reconcile 次数恒为 0。此时只能由人工到 AgentField 控制面按时间、target 与审计记录核对，除非接受重复执行风险，否则不要重新 start。
-- **配置消失**：`agentfield` 配置被删除、adapter disabled 或 credential 缺失时，历史 run 与 journal 一律保留、绝不改写；已启用会话内配置被冻结（旧 revision 不能用于新 start）。重新启用后 resume 会照常恢复 run。
+- **配置消失**：`agentfield` 配置被删除、adapter disabled 或 credential 缺失时，历史 run 与 journal 一律保留、绝不改写；resume 仍会安装只读恢复面（无 7C 历史的未配置会话保持零注册），`status`/`cancel` 等远端操作稳定返回 `agentfield.unconfigured`（零网络），终态 run 仍可本地查询；已启用会话内配置被冻结（旧 revision 不能用于新 start）。重新启用后 resume 会照常恢复完整功能。
 - **Retention**：每 session 内存最多保留 32 个 run，只淘汰最老终态（按提交顺序，必要时以 local run id 稳定 tie-break），非终态 run 永不被静默淘汰；journal 历史事件不因内存淘汰被删除，重放为 O(events) 且受 store 的 64 MiB / 100k 记录上限约束。
 - **Schema migration 与不可降级**：不含 7C 事件的旧 journal 完全兼容。首次写入 agentfield 事件后，旧二进制会在该记录处显式 fail closed（reader-version 门禁），因此**对这些 session 二进制降级不安全**——必须保留新 reader，或先完成导出/迁移；尚未产生 7C 事件的 session 仍可按既有路径回滚。`lato doctor` 的 `agentfield_journal` 检查会报告磁盘上哪些 session 已含 7C 事件。
 

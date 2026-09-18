@@ -480,3 +480,103 @@ async fn resumed_cancel_reuses_the_original_remote_execution_id() {
         }
     ));
 }
+
+// ---- D-7C3-01: configuration loss keeps the history queryable ----------
+
+#[tokio::test]
+async fn unconfigured_manager_preserves_history_and_answers_unconfigured() {
+    let directory = TempDir::new().unwrap();
+    let session_id = "config-loss";
+    let session = SessionId::from(session_id);
+    let journal_file = journal_path(&directory, session_id);
+    // Seed: a configured session started and observed a bound running run.
+    {
+        let store = Arc::new(FileEventStore::open(directory.path()).unwrap());
+        let sink = FileJournalSink::resumed(&store, &session).await;
+        let client = Arc::new(FakeClient::new());
+        let manager = manager_with(
+            session_id,
+            Some(client as Arc<dyn AgentFieldClient>),
+            Arc::new(sink),
+        );
+        let run = manager
+            .start_run(
+                "contract-review",
+                "legal.review_contract",
+                "sha256:rev-1",
+                &serde_json::json!({"contract": "v1"}),
+            )
+            .await
+            .unwrap();
+        manager.run_status(Some(&run.run_id)).await.unwrap();
+    }
+    let journal_len_after_seed = std::fs::metadata(&journal_file).unwrap().len();
+    // "Restart" with the configuration GONE (deleted config / disabled /
+    // missing credential all reduce to the unconfigured recovery surface).
+    let store = Arc::new(FileEventStore::open(directory.path()).unwrap());
+    let replay = store.replay(&session).await.unwrap();
+    let projection = project_journal(&session, &replay.envelopes).unwrap();
+    assert_eq!(projection.agentfield_runs.len(), 1);
+    let run_id = projection.agentfield_runs[0].run_id.clone();
+    let sink = FileJournalSink::resumed(&store, &session).await;
+    let manager = AgentFieldManager::unconfigured(session_id, Some(Arc::new(sink)));
+    manager
+        .restore_runs(projection.agentfield_runs.clone())
+        .unwrap();
+    // Local reads still work (history preserved, zero network).
+    let restored = manager.run(&run_id).await.expect("history preserved");
+    assert_eq!(restored.status, RunStatus::Running);
+    // A remote-facing status query answers the stable unconfigured code and
+    // keeps the last known state — never a fabricated terminal.
+    let error = manager.run_status(Some(&run_id)).await.unwrap_err();
+    assert_eq!(error.code(), "agentfield.unconfigured");
+    assert_eq!(
+        manager.run(&run_id).await.unwrap().status,
+        RunStatus::Running
+    );
+    // Cancel of the nonterminal run is refused without recording a durable
+    // cancel intent (the send is impossible) and without network.
+    let error = manager.cancel_run(&run_id, "user").await.unwrap_err();
+    assert_eq!(error.code(), "agentfield.unconfigured");
+    // A new start is refused as well.
+    let error = manager
+        .start_run(
+            "contract-review",
+            "legal.review_contract",
+            "sha256:rev-1",
+            &serde_json::json!({"contract": "v2"}),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), "agentfield.unconfigured");
+    // The journal was never rewritten: byte length identical to the seed.
+    assert_eq!(
+        std::fs::metadata(&journal_file).unwrap().len(),
+        journal_len_after_seed
+    );
+    // Terminal runs of the same history still answer locally (AC-05 keeps
+    // working on the unconfigured surface): seed a completed run restore.
+    let store = Arc::new(FileEventStore::open(directory.path()).unwrap());
+    let replay = store.replay(&session).await.unwrap();
+    let projection = project_journal(&session, &replay.envelopes).unwrap();
+    let sink = FileJournalSink::resumed(&store, &session).await;
+    let manager = AgentFieldManager::unconfigured(session_id, Some(Arc::new(sink)));
+    let mut recovered = projection.agentfield_runs.clone();
+    recovered.push(lato_core::AgentFieldRecoveredRun {
+        run_id: "afrun_completed-1".into(),
+        alias: "contract-review".into(),
+        execute_target: "legal.review_contract".into(),
+        revision: "sha256:rev-1".into(),
+        input_digest: "a".repeat(64),
+        execution_id: Some("exec-done".into()),
+        status: lato_core::AgentFieldRunStatus::Completed,
+        created_at_ms: 900,
+        updated_at_ms: 1_400,
+        summary: Some("done".into()),
+        summary_truncated: false,
+        last_error: None,
+    });
+    manager.restore_runs(recovered).unwrap();
+    let done = manager.run_status(Some("afrun_completed-1")).await.unwrap();
+    assert_eq!(done[0].status, RunStatus::Completed);
+}

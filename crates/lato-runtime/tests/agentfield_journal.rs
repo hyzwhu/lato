@@ -39,7 +39,12 @@ fn intent_event(session_id: &str) -> AgentFieldJournalEvent {
         execute_target: "legal.review_contract".into(),
         catalog_revision: "sha256:rev-1".into(),
         input_digest: "a".repeat(64),
-        created_at_ms: 1_000,
+        execution_id: None,
+        status: AgentFieldRunStatus::Queued,
+        timestamp_ms: 1_000,
+        summary: None,
+        summary_truncated: false,
+        last_error: None,
     }
 }
 
@@ -79,11 +84,16 @@ async fn agentfield_events_are_appended_by_the_session_loop_with_schema_v2() {
             event: AgentFieldJournalEvent::AgentFieldExecutionBound {
                 run_id: "afrun_probe-1".into(),
                 session_id: sid.as_str().to_owned(),
-                execution_id: "exec-1".into(),
                 alias: "contract-review".into(),
+                execute_target: "legal.review_contract".into(),
                 catalog_revision: "sha256:rev-1".into(),
                 input_digest: "a".repeat(64),
-                bound_at_ms: 1_100,
+                execution_id: Some("exec-1".into()),
+                status: AgentFieldRunStatus::Queued,
+                timestamp_ms: 1_100,
+                summary: None,
+                summary_truncated: false,
+                last_error: None,
             },
         })
         .await

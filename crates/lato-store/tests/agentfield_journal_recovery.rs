@@ -91,7 +91,12 @@ fn intent(session: &str) -> AgentFieldJournalEvent {
         execute_target: "legal.review_contract".into(),
         catalog_revision: "sha256:rev-1".into(),
         input_digest: "a".repeat(64),
-        created_at_ms: 1_000,
+        execution_id: None,
+        status: AgentFieldRunStatus::Queued,
+        timestamp_ms: 1_000,
+        summary: None,
+        summary_truncated: false,
+        last_error: None,
     }
 }
 
@@ -99,9 +104,13 @@ fn terminal(session: &str) -> AgentFieldJournalEvent {
     AgentFieldJournalEvent::AgentFieldRunTerminal {
         run_id: "afrun_crash-1".into(),
         session_id: session.to_owned(),
+        alias: "contract-review".into(),
+        execute_target: "legal.review_contract".into(),
+        catalog_revision: "sha256:rev-1".into(),
+        input_digest: "a".repeat(64),
         execution_id: Some("exec-1".into()),
         status: AgentFieldRunStatus::Completed,
-        observed_at_ms: 1_300,
+        timestamp_ms: 1_300,
         summary: Some("done".into()),
         summary_truncated: false,
         last_error: None,
@@ -228,7 +237,12 @@ async fn concurrent_agentfield_appends_keep_exactly_one_sequence_per_event() {
         execute_target: "legal.review_contract".into(),
         catalog_revision: "sha256:rev-1".into(),
         input_digest: "a".repeat(64),
-        created_at_ms: 1_000 + index as u64,
+        execution_id: None,
+        status: AgentFieldRunStatus::Queued,
+        timestamp_ms: 1_000 + index as u64,
+        summary: None,
+        summary_truncated: false,
+        last_error: None,
     };
     for sequence in 1..=2usize {
         let handles: Vec<_> = (0..2usize)

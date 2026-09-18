@@ -192,10 +192,15 @@ pub enum ExtensionAuditRecord {
 }
 
 /// Phase 7C3: versioned AgentField run journal events (spec §"Journal
-/// 事件与最小字段"). Every variant carries the schema-relevant fields:
-/// local run id, session id, alias, catalog revision, input digest, the
-/// remote execution id (ONLY when known), normalized status/timestamps,
-/// a bounded (≤ 8 KiB) result summary and the last stable error code.
+/// 事件与最小字段"). Every variant carries the SAME complete minimal
+/// field set: local run id, session id, alias, execute target, catalog
+/// revision, input digest, the remote execution id (Option — present
+/// ONLY when known), normalized status, timestamp, a bounded (≤ 8 KiB)
+/// result summary with its truncation flag, and the last stable error
+/// code. Only the semantic tag differs between variants. Field values
+/// that do not apply to a variant's semantics are filled with their
+/// neutral value (e.g. an intent carries `status: queued`, a null
+/// summary, and no execution id).
 ///
 /// Secrets are structurally excluded: no token, authorization value,
 /// credential, base-URL userinfo, raw input, full remote result,
@@ -214,7 +219,12 @@ pub enum AgentFieldJournalEvent {
         execute_target: String,
         catalog_revision: String,
         input_digest: String,
-        created_at_ms: u64,
+        execution_id: Option<String>,
+        status: AgentFieldRunStatus,
+        timestamp_ms: u64,
+        summary: Option<String>,
+        summary_truncated: bool,
+        last_error: Option<String>,
     },
     /// Appended after the remote execution id was received AND strictly
     /// validated; the durable witness of "one execution was started".
@@ -222,11 +232,16 @@ pub enum AgentFieldJournalEvent {
     AgentFieldExecutionBound {
         run_id: String,
         session_id: String,
-        execution_id: String,
         alias: String,
+        execute_target: String,
         catalog_revision: String,
         input_digest: String,
-        bound_at_ms: u64,
+        execution_id: Option<String>,
+        status: AgentFieldRunStatus,
+        timestamp_ms: u64,
+        summary: Option<String>,
+        summary_truncated: bool,
+        last_error: Option<String>,
     },
     /// A remote status observation for a bound run. Appended BEFORE the
     /// observed state becomes externally visible (designer constraint 3).
@@ -234,31 +249,48 @@ pub enum AgentFieldJournalEvent {
     AgentFieldStatusObserved {
         run_id: String,
         session_id: String,
+        alias: String,
+        execute_target: String,
+        catalog_revision: String,
+        input_digest: String,
         execution_id: Option<String>,
         status: AgentFieldRunStatus,
-        observed_at_ms: u64,
+        timestamp_ms: u64,
         summary: Option<String>,
         summary_truncated: bool,
         last_error: Option<String>,
     },
     /// Durable cancel intent, appended BEFORE the single cancel send
     /// (designer constraint 2: durable-before-send, same discipline as
-    /// the start intent).
+    /// the start intent). `status` is the last known status at request
+    /// time; the outcome arrives via a later observed/terminal event.
     #[serde(rename = "agentfield_cancel_requested")]
     AgentFieldCancelRequested {
         run_id: String,
         session_id: String,
+        alias: String,
+        execute_target: String,
+        catalog_revision: String,
+        input_digest: String,
         execution_id: Option<String>,
-        requested_at_ms: u64,
+        status: AgentFieldRunStatus,
+        timestamp_ms: u64,
+        summary: Option<String>,
+        summary_truncated: bool,
+        last_error: Option<String>,
     },
     /// The run reached a terminal state. Terminal is monotonic on replay.
     #[serde(rename = "agentfield_run_terminal")]
     AgentFieldRunTerminal {
         run_id: String,
         session_id: String,
+        alias: String,
+        execute_target: String,
+        catalog_revision: String,
+        input_digest: String,
         execution_id: Option<String>,
         status: AgentFieldRunStatus,
-        observed_at_ms: u64,
+        timestamp_ms: u64,
         summary: Option<String>,
         summary_truncated: bool,
         last_error: Option<String>,
@@ -295,25 +327,11 @@ impl AgentFieldJournalEvent {
     }
 }
 
-/// The remote execution id carried by an event, if any (intent and bind
-/// carry it structurally; the bind's id is the required witness).
-fn agentfield_event_execution_id(event: &AgentFieldJournalEvent) -> Option<&str> {
-    match event {
-        AgentFieldJournalEvent::AgentFieldRunIntentRecorded { .. } => None,
-        AgentFieldJournalEvent::AgentFieldExecutionBound { execution_id, .. } => {
-            Some(execution_id.as_str())
-        }
-        AgentFieldJournalEvent::AgentFieldStatusObserved { execution_id, .. }
-        | AgentFieldJournalEvent::AgentFieldCancelRequested { execution_id, .. }
-        | AgentFieldJournalEvent::AgentFieldRunTerminal { execution_id, .. } => {
-            execution_id.as_deref()
-        }
-    }
-}
-
 /// Byte-cap and content-shape validation for AgentField journal events.
-/// Replay fails closed ([`JournalError::Corrupt`]) on any violation, so
-/// oversized or malformed payloads can never be restored into a manager.
+/// All five variants share the same uniform field set, so the checks are
+/// uniform too. Replay fails closed ([`JournalError::Corrupt`]) on any
+/// violation, so oversized or malformed payloads can never be restored
+/// into a manager.
 pub fn validate_agentfield_event(event: &AgentFieldJournalEvent) -> Result<(), JournalError> {
     let corrupt = |message: String| JournalError::Corrupt {
         message: format!("agentfield event {}: {message}", event.run_id()),
@@ -325,94 +343,179 @@ pub fn validate_agentfield_event(event: &AgentFieldJournalEvent) -> Result<(), J
             }
             Ok(())
         };
-    let bounded_opt =
-        |name: &str, value: &Option<String>, cap: usize| -> Result<(), JournalError> {
-            if let Some(value) = value {
-                return bounded(name, value, cap, false);
-            }
-            Ok(())
-        };
-    bounded("run_id", event.run_id(), AGENTFIELD_MAX_ID_BYTES, true)?;
+    let fields = agentfield_event_fields(event);
+    bounded("run_id", fields.run_id, AGENTFIELD_MAX_ID_BYTES, true)?;
     bounded(
         "session_id",
-        event.session_id(),
+        fields.session_id,
         AGENTFIELD_MAX_ID_BYTES,
         true,
     )?;
-    if let Some(execution_id) = agentfield_event_execution_id(event) {
-        bounded("execution_id", execution_id, AGENTFIELD_MAX_ID_BYTES, false)?;
+    bounded("alias", fields.alias, AGENTFIELD_MAX_ALIAS_BYTES, true)?;
+    bounded(
+        "execute_target",
+        fields.execute_target,
+        AGENTFIELD_MAX_ID_BYTES,
+        true,
+    )?;
+    bounded(
+        "catalog_revision",
+        fields.catalog_revision,
+        AGENTFIELD_MAX_REVISION_BYTES,
+        true,
+    )?;
+    bounded(
+        "input_digest",
+        fields.input_digest,
+        AGENTFIELD_MAX_DIGEST_BYTES,
+        true,
+    )?;
+    // The bind event is the durable witness: its execution id is REQUIRED.
+    let is_bind = matches!(
+        event,
+        AgentFieldJournalEvent::AgentFieldExecutionBound { .. }
+    );
+    match (fields.execution_id, is_bind) {
+        (Some(execution_id), _) => {
+            bounded("execution_id", execution_id, AGENTFIELD_MAX_ID_BYTES, true)?;
+        }
+        (None, true) => {
+            return Err(corrupt("execution_bound requires an execution id".into()));
+        }
+        (None, false) => {}
     }
+    if let Some(summary) = fields.summary {
+        bounded("summary", summary, AGENTFIELD_MAX_SUMMARY_BYTES, false)?;
+    }
+    if let Some(last_error) = fields.last_error {
+        bounded(
+            "last_error",
+            last_error,
+            AGENTFIELD_MAX_ERROR_CODE_BYTES,
+            false,
+        )?;
+    }
+    // A terminal event must carry a terminal status; the intent must carry
+    // the neutral queued status.
+    let is_terminal_event = matches!(event, AgentFieldJournalEvent::AgentFieldRunTerminal { .. });
+    if is_terminal_event && !fields.status.is_terminal() {
+        return Err(corrupt(format!(
+            "terminal event carries non-terminal status {}",
+            fields.status.as_str()
+        )));
+    }
+    let is_intent = matches!(
+        event,
+        AgentFieldJournalEvent::AgentFieldRunIntentRecorded { .. }
+    );
+    if is_intent && fields.status != AgentFieldRunStatus::Queued {
+        return Err(corrupt("intent event must carry the queued status".into()));
+    }
+    Ok(())
+}
+
+/// Uniform access to the shared minimal field set of any event variant.
+struct AgentFieldEventFields<'a> {
+    run_id: &'a str,
+    session_id: &'a str,
+    alias: &'a str,
+    execute_target: &'a str,
+    catalog_revision: &'a str,
+    input_digest: &'a str,
+    execution_id: Option<&'a str>,
+    status: AgentFieldRunStatus,
+    timestamp_ms: u64,
+    summary: Option<&'a str>,
+    summary_truncated: bool,
+    last_error: Option<&'a str>,
+}
+
+fn agentfield_event_fields(event: &AgentFieldJournalEvent) -> AgentFieldEventFields<'_> {
     match event {
         AgentFieldJournalEvent::AgentFieldRunIntentRecorded {
+            run_id,
+            session_id,
             alias,
             execute_target,
             catalog_revision,
             input_digest,
-            ..
-        } => {
-            bounded("alias", alias, AGENTFIELD_MAX_ALIAS_BYTES, true)?;
-            bounded(
-                "execute_target",
-                execute_target,
-                AGENTFIELD_MAX_ID_BYTES,
-                true,
-            )?;
-            bounded(
-                "catalog_revision",
-                catalog_revision,
-                AGENTFIELD_MAX_REVISION_BYTES,
-                true,
-            )?;
-            bounded(
-                "input_digest",
-                input_digest,
-                AGENTFIELD_MAX_DIGEST_BYTES,
-                true,
-            )?;
-        }
-        AgentFieldJournalEvent::AgentFieldExecutionBound {
             execution_id,
+            status,
+            timestamp_ms,
+            summary,
+            summary_truncated,
+            last_error,
+        }
+        | AgentFieldJournalEvent::AgentFieldExecutionBound {
+            run_id,
+            session_id,
             alias,
+            execute_target,
             catalog_revision,
             input_digest,
-            ..
-        } => {
-            bounded("execution_id", execution_id, AGENTFIELD_MAX_ID_BYTES, true)?;
-            bounded("alias", alias, AGENTFIELD_MAX_ALIAS_BYTES, true)?;
-            bounded(
-                "catalog_revision",
-                catalog_revision,
-                AGENTFIELD_MAX_REVISION_BYTES,
-                true,
-            )?;
-            bounded(
-                "input_digest",
-                input_digest,
-                AGENTFIELD_MAX_DIGEST_BYTES,
-                true,
-            )?;
-        }
-        AgentFieldJournalEvent::AgentFieldStatusObserved {
             execution_id,
+            status,
+            timestamp_ms,
             summary,
+            summary_truncated,
             last_error,
-            ..
+        }
+        | AgentFieldJournalEvent::AgentFieldStatusObserved {
+            run_id,
+            session_id,
+            alias,
+            execute_target,
+            catalog_revision,
+            input_digest,
+            execution_id,
+            status,
+            timestamp_ms,
+            summary,
+            summary_truncated,
+            last_error,
+        }
+        | AgentFieldJournalEvent::AgentFieldCancelRequested {
+            run_id,
+            session_id,
+            alias,
+            execute_target,
+            catalog_revision,
+            input_digest,
+            execution_id,
+            status,
+            timestamp_ms,
+            summary,
+            summary_truncated,
+            last_error,
         }
         | AgentFieldJournalEvent::AgentFieldRunTerminal {
+            run_id,
+            session_id,
+            alias,
+            execute_target,
+            catalog_revision,
+            input_digest,
             execution_id,
+            status,
+            timestamp_ms,
             summary,
+            summary_truncated,
             last_error,
-            ..
-        } => {
-            bounded_opt("execution_id", execution_id, AGENTFIELD_MAX_ID_BYTES)?;
-            bounded_opt("summary", summary, AGENTFIELD_MAX_SUMMARY_BYTES)?;
-            bounded_opt("last_error", last_error, AGENTFIELD_MAX_ERROR_CODE_BYTES)?;
-        }
-        AgentFieldJournalEvent::AgentFieldCancelRequested { execution_id, .. } => {
-            bounded_opt("execution_id", execution_id, AGENTFIELD_MAX_ID_BYTES)?;
-        }
+        } => AgentFieldEventFields {
+            run_id,
+            session_id,
+            alias,
+            execute_target,
+            catalog_revision,
+            input_digest,
+            execution_id: execution_id.as_deref(),
+            status: *status,
+            timestamp_ms: *timestamp_ms,
+            summary: summary.as_deref(),
+            summary_truncated: *summary_truncated,
+            last_error: last_error.as_deref(),
+        },
     }
-    Ok(())
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
@@ -1042,9 +1145,10 @@ pub fn project_journal(
 }
 
 /// Replay state machine for AgentField journal events (Phase 7C3,
-/// "单写者、顺序与原子性合同" item 5). Idempotent for duplicated
-/// observations; fail closed on illegal transitions, missing intents,
-/// conflicting remote bindings, or oversized payloads. Zero network by
+/// "单写者、顺序与原子性合同" item 5). Idempotent for exact duplicates
+/// (byte-identical intents, rebound execution ids, repeated identical
+/// terminals, late observations); fail closed on field conflicts, illegal
+/// transitions, missing intents, or oversized payloads. Zero network by
 /// construction — this function never leaves the caller's process.
 fn project_agentfield_event(
     session_id: &SessionId,
@@ -1053,126 +1157,125 @@ fn project_agentfield_event(
     order: &mut Vec<String>,
 ) -> Result<(), JournalError> {
     validate_agentfield_event(event)?;
+    let fields = agentfield_event_fields(event);
     let run_id = event.run_id().to_owned();
     // The event session must match the journal session (fail closed on
     // cross-session replay; installing a foreign run is refused).
-    if event.session_id() != session_id.as_str() {
+    if fields.session_id != session_id.as_str() {
         return Err(JournalError::SessionMismatch {
             expected: session_id.clone(),
-            actual: SessionId::from(event.session_id().to_owned()),
+            actual: SessionId::from(fields.session_id.to_owned()),
         });
     }
     let corrupt = |message: String| JournalError::Corrupt {
         message: format!("agentfield run {run_id}: {message}"),
     };
+    // Identity fields recorded by the intent are immutable: any later
+    // event that disagrees with them is an illegal replay (AC "字段冲突
+    // fail closed").
+    let check_identity = |run: &AgentFieldRecoveredRun| -> Result<(), JournalError> {
+        if run.alias != fields.alias
+            || run.execute_target != fields.execute_target
+            || run.revision != fields.catalog_revision
+            || run.input_digest != fields.input_digest
+        {
+            return Err(corrupt(
+                "event identity fields conflict with the recorded intent".into(),
+            ));
+        }
+        Ok(())
+    };
     match event {
-        AgentFieldJournalEvent::AgentFieldRunIntentRecorded {
-            alias,
-            execute_target,
-            catalog_revision,
-            input_digest,
-            created_at_ms,
-            ..
-        } => {
-            if runs.contains_key(&run_id) {
-                // Duplicate intent after any follow-up event is an illegal
-                // replay; a duplicated intent with nothing in between is
-                // treated idempotently below only if byte-identical.
-                return Err(corrupt("intent recorded twice".into()));
+        AgentFieldJournalEvent::AgentFieldRunIntentRecorded { .. } => {
+            if let Some(existing) = runs.get(&run_id) {
+                // Exact duplicate intent (identical minimal fields) is
+                // idempotent; any conflicting field fails closed.
+                let identical = existing.alias == fields.alias
+                    && existing.execute_target == fields.execute_target
+                    && existing.revision == fields.catalog_revision
+                    && existing.input_digest == fields.input_digest
+                    && existing.created_at_ms == fields.timestamp_ms
+                    && existing.execution_id.is_none();
+                if identical {
+                    return Ok(());
+                }
+                return Err(corrupt(
+                    "intent conflict for an already recorded run".into(),
+                ));
             }
             runs.insert(
                 run_id.clone(),
                 AgentFieldRecoveredRun {
                     run_id: run_id.clone(),
-                    alias: alias.clone(),
-                    execute_target: execute_target.clone(),
-                    revision: catalog_revision.clone(),
-                    input_digest: input_digest.clone(),
+                    alias: fields.alias.to_owned(),
+                    execute_target: fields.execute_target.to_owned(),
+                    revision: fields.catalog_revision.to_owned(),
+                    input_digest: fields.input_digest.to_owned(),
                     execution_id: None,
-                    status: AgentFieldRunStatus::Queued,
-                    created_at_ms: *created_at_ms,
-                    updated_at_ms: *created_at_ms,
-                    summary: None,
-                    summary_truncated: false,
-                    last_error: None,
+                    status: fields.status,
+                    created_at_ms: fields.timestamp_ms,
+                    updated_at_ms: fields.timestamp_ms,
+                    summary: fields.summary.map(str::to_owned),
+                    summary_truncated: fields.summary_truncated,
+                    last_error: fields.last_error.map(str::to_owned),
                 },
             );
             order.push(run_id);
         }
-        AgentFieldJournalEvent::AgentFieldExecutionBound {
-            execution_id,
-            bound_at_ms,
-            ..
-        } => {
+        AgentFieldJournalEvent::AgentFieldExecutionBound { .. } => {
             let Some(run) = runs.get_mut(&run_id) else {
                 return Err(corrupt("bind event has no prior intent".into()));
             };
+            check_identity(run)?;
             match &run.execution_id {
-                Some(existing) if existing != execution_id => {
+                Some(existing) if Some(existing.as_str()) != fields.execution_id => {
                     return Err(corrupt(
                         "run bound to a different remote execution id".into(),
                     ));
                 }
                 Some(_) => {}
                 None => {
-                    run.execution_id = Some(execution_id.clone());
-                    run.status = AgentFieldRunStatus::Queued;
-                    run.updated_at_ms = *bound_at_ms;
+                    run.execution_id = fields.execution_id.map(str::to_owned);
+                    run.status = fields.status;
+                    run.updated_at_ms = fields.timestamp_ms;
                 }
             }
         }
-        AgentFieldJournalEvent::AgentFieldStatusObserved {
-            status,
-            observed_at_ms,
-            summary,
-            summary_truncated,
-            last_error,
-            ..
-        } => {
+        AgentFieldJournalEvent::AgentFieldStatusObserved { .. } => {
             let Some(run) = runs.get_mut(&run_id) else {
                 return Err(corrupt("status observation has no prior intent".into()));
             };
+            check_identity(run)?;
             // Late observation never overwrites a terminal (spec item 3).
             if run.status.is_terminal() {
                 return Ok(());
             }
-            run.status = *status;
-            run.updated_at_ms = *observed_at_ms;
-            if summary.is_some() {
-                run.summary = summary.clone();
-                run.summary_truncated = *summary_truncated;
+            run.status = fields.status;
+            run.updated_at_ms = fields.timestamp_ms;
+            if let Some(summary) = fields.summary {
+                run.summary = Some(summary.to_owned());
+                run.summary_truncated = fields.summary_truncated;
             }
-            if let Some(error) = last_error {
-                run.last_error = Some(error.clone());
+            if let Some(error) = fields.last_error {
+                run.last_error = Some(error.to_owned());
             }
         }
         AgentFieldJournalEvent::AgentFieldCancelRequested { .. } => {
             // A cancel request does not change the status by itself; the
             // outcome arrives via a later observed/terminal event. Missing
             // intent or a terminal run makes it a no-op (idempotent).
-            if !runs.contains_key(&run_id) {
+            let Some(run) = runs.get(&run_id) else {
                 return Err(corrupt("cancel request has no prior intent".into()));
-            }
+            };
+            check_identity(run)?;
         }
-        AgentFieldJournalEvent::AgentFieldRunTerminal {
-            status,
-            observed_at_ms,
-            summary,
-            summary_truncated,
-            last_error,
-            ..
-        } => {
+        AgentFieldJournalEvent::AgentFieldRunTerminal { .. } => {
             let Some(run) = runs.get_mut(&run_id) else {
                 return Err(corrupt("terminal event has no prior intent".into()));
             };
-            if !status.is_terminal() {
-                return Err(corrupt(format!(
-                    "terminal event carries non-terminal status {}",
-                    status.as_str()
-                )));
-            }
+            check_identity(run)?;
             if run.status.is_terminal() {
-                if run.status == *status {
+                if run.status == fields.status {
                     // Idempotent duplicate terminal.
                     return Ok(());
                 }
@@ -1180,14 +1283,14 @@ fn project_agentfield_event(
                     "terminal state changed after being committed".into(),
                 ));
             }
-            run.status = *status;
-            run.updated_at_ms = *observed_at_ms;
-            if summary.is_some() {
-                run.summary = summary.clone();
-                run.summary_truncated = *summary_truncated;
+            run.status = fields.status;
+            run.updated_at_ms = fields.timestamp_ms;
+            if let Some(summary) = fields.summary {
+                run.summary = Some(summary.to_owned());
+                run.summary_truncated = fields.summary_truncated;
             }
-            if let Some(error) = last_error {
-                run.last_error = Some(error.clone());
+            if let Some(error) = fields.last_error {
+                run.last_error = Some(error.to_owned());
             }
         }
     }
