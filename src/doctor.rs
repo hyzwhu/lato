@@ -126,6 +126,9 @@ pub async fn run(options: DoctorOptions, deps: &DoctorDependencies) -> DoctorRep
     )
     .await;
     checks.push(agentfield_check);
+    // Phase 7C3: bounded offline journal-compat scan. Reports whether the
+    // binary downgrade path is safe given the journals already on disk.
+    checks.push(agentfield_journal_check(&deps.home));
 
     if options.live {
         checks.push(live_check(deps).await);
@@ -413,6 +416,63 @@ async fn agentfield_check(
                 Ok(Err(error)) => agentfield_live_error_check(error),
             }
         }
+    }
+}
+
+/// Phase 7C3: bounded offline journal-compatibility scan. Counts session
+/// journals that already contain 7C3 AgentField events so the operator
+/// knows binary downgrade is no longer safe for those sessions (frozen
+/// spec §10). Zero network; journals are read-only here and never
+/// rewritten. The scan is byte-bounded by the store's own 64 MiB journal
+/// cap, and the exact serialized tag `"type":"agentfield"` can only
+/// originate from a version-2 envelope.
+fn agentfield_journal_check(home: &std::path::Path) -> DoctorCheck {
+    const AGENTFIELD_RECORD_TAG: &[u8] = b"\"type\":\"agentfield\"";
+    let sessions_dir = home.join("sessions");
+    let mut scanned = 0usize;
+    let mut with_7c_events: Vec<String> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&sessions_dir) {
+        for entry in entries.flatten() {
+            let journal = entry.path().join("events.jsonl");
+            let Ok(metadata) = std::fs::metadata(&journal) else {
+                continue;
+            };
+            if !metadata.is_file() || metadata.len() == 0 {
+                continue;
+            }
+            scanned += 1;
+            let Ok(bytes) = std::fs::read(&journal) else {
+                continue;
+            };
+            let has_7c_events = bytes
+                .windows(AGENTFIELD_RECORD_TAG.len())
+                .any(|window| window == AGENTFIELD_RECORD_TAG);
+            if has_7c_events && let Some(name) = entry.file_name().to_str() {
+                with_7c_events.push(name.to_owned());
+            }
+        }
+    }
+    if with_7c_events.is_empty() {
+        check(
+            "agentfield_journal",
+            DoctorStatus::Ok,
+            format!(
+                "no 7C AgentField journal events on disk across {scanned} session journal(s); binary downgrade is currently safe"
+            ),
+            None,
+        )
+    } else {
+        check(
+            "agentfield_journal",
+            DoctorStatus::Ok,
+            format!(
+                "{} session journal(s) contain 7C AgentField events ({}/{} scanned); binary downgrade is NOT safe for those sessions (reader-version gate)",
+                with_7c_events.len(),
+                with_7c_events.len(),
+                scanned
+            ),
+            None,
+        )
     }
 }
 

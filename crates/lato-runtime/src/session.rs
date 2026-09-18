@@ -8,11 +8,11 @@ use crate::driver::{
     DriverEvent, DriverMessage, TurnControl, TurnDriver, TurnEventEmitter, TurnRequest,
 };
 use lato_core::{
-    AgentError, CancelReason, Command, CompactSession, CompactionError, CompactionId,
-    CompactionPolicy, ErrorCategory, EventEnvelope, EventId, EventPayload,
-    HistoryReplacementReason, JOURNAL_SCHEMA_VERSION, JournalDurability, JournalEnvelope,
-    JournalError, JournalRecord, JournalRecordId, JournalReplay, ProjectionError, Retryability,
-    SessionId, SessionMachine, SessionPhase, SessionStore, StartDecision, StartTurn,
+    AGENTFIELD_JOURNAL_SCHEMA_VERSION, AgentError, CancelReason, Command, CompactSession,
+    CompactionError, CompactionId, CompactionPolicy, ErrorCategory, EventEnvelope, EventId,
+    EventPayload, HistoryReplacementReason, JOURNAL_SCHEMA_VERSION, JournalDurability,
+    JournalEnvelope, JournalError, JournalRecord, JournalRecordId, JournalReplay, ProjectionError,
+    Retryability, SessionId, SessionMachine, SessionPhase, SessionStore, StartDecision, StartTurn,
     TransitionError, TurnId, UserInput,
 };
 use lato_store::MemoryEventStore;
@@ -423,6 +423,26 @@ impl SessionLoop {
                 };
                 let turn_id = self.active.as_ref().map(|active| active.id.clone());
                 self.commit(turn_id, record, JournalDurability::Flush).await
+            }
+            Command::RecordAgentFieldEvent { event } => {
+                // Phase 7C3: the SessionLoop is the ONLY journal writer for
+                // AgentField run events. Validation runs before the append
+                // so an oversized/malformed payload can never reach disk.
+                lato_core::validate_agentfield_event(&event).map_err(|error| {
+                    AgentError::new(
+                        error.code(),
+                        lato_core::ErrorCategory::Storage,
+                        error.to_string(),
+                        lato_core::Retryability::Never,
+                    )
+                })?;
+                let turn_id = self.active.as_ref().map(|active| active.id.clone());
+                self.commit(
+                    turn_id,
+                    JournalRecord::AgentField { event },
+                    JournalDurability::SyncData,
+                )
+                .await
             }
             Command::Shutdown => self.shutdown().await,
         }
@@ -1350,8 +1370,16 @@ impl SessionLoop {
         durability: JournalDurability,
     ) -> Result<(), AgentError> {
         let sequence = self.journal_sequence;
+        // Phase 7C3: AgentField run events always carry the 7C3 schema
+        // version so old readers fail closed at the first such envelope,
+        // while every other record stays at version 1 (old-session
+        // compatibility, spec §"Schema 版本、兼容与迁移").
+        let schema_version = match &record {
+            JournalRecord::AgentField { .. } => AGENTFIELD_JOURNAL_SCHEMA_VERSION,
+            _ => JOURNAL_SCHEMA_VERSION,
+        };
         let envelope = JournalEnvelope {
-            schema_version: JOURNAL_SCHEMA_VERSION,
+            schema_version,
             record_id: JournalRecordId::from(format!("{}-journal-{sequence}", self.session_id)),
             session_id: self.session_id.clone(),
             turn_id,

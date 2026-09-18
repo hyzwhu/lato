@@ -41,6 +41,17 @@ use lato_workspace::{
 };
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
+/// Registration material collected at the 7C2 registration gate; the
+/// manager is constructed from it only once the runtime session (and its
+/// 7C3 journal sink) exists.
+struct AgentFieldRegistration {
+    session_id: String,
+    catalog: AgentFieldCatalog,
+    credential: crate::agentfield::client::RedactedToken,
+    config: crate::agentfield::config::AgentFieldConfig,
+    sources: Vec<crate::agentfield::catalog::CatalogSource>,
+}
+
 pub struct AcpHost {
     sessions: HashMap<String, Arc<RuntimeSession>>,
     pub updates: tokio::sync::mpsc::UnboundedSender<serde_json::Value>,
@@ -386,18 +397,30 @@ impl AcpHost {
         );
         let mut session_extra: Vec<Arc<dyn Tool>> =
             vec![Arc::new(WorkflowTool::new(workflow_handle.clone()))];
-        // Phase 7C2: the main-session `agentfield` tool is registered only
-        // when the adapter is enabled AND the configuration validates.
-        // Unconfigured / disabled / invalid → zero registration, zero
-        // network (AC-01). The manager itself is installed after the session
-        // is assembled and performs no network at registration time.
-        let agentfield_handle = match self.prepare_agentfield(sid) {
-            Some((handle, manager)) => {
-                session_extra.push(Arc::new(AgentFieldTool::new(handle.clone())));
-                Some((handle, manager))
-            }
+        // Phase 7C3: resolve the journal replay BEFORE tool registration so
+        // the AC-08 recovery surface can be decided: the `agentfield` tool
+        // is registered when the adapter is configured (7C2 gate) OR when
+        // the journal carries historical runs whose configuration has since
+        // disappeared (unconfigured recovery). A session with no 7C
+        // history and no configuration keeps ZERO registration (AC-01).
+        let agentfield_replay = match self.events.as_ref() {
+            Some(events) => Some(match replay {
+                Some(replay) => replay,
+                None => events
+                    .replay(&SessionId::from(sid))
+                    .await
+                    .map_err(|error| error.to_string())?,
+            }),
             None => None,
         };
+        let has_agentfield_history = agentfield_replay
+            .as_ref()
+            .is_some_and(|replay| !replay.projection.agentfield_runs.is_empty());
+        let agentfield_registration = self.prepare_agentfield(sid);
+        let agentfield_handle = SessionAgentFieldHandle::new();
+        if agentfield_registration.is_some() || has_agentfield_history {
+            session_extra.push(Arc::new(AgentFieldTool::new(agentfield_handle.clone())));
+        }
         let skill_runtime = match SkillRuntimeBinding::build(|skill_resolver, mcp_backend| {
             lato_tools::builtin_tool_runtime_with_subagents_and_mcp_extra(
                 lato_tools::BuiltinToolEnvironment {
@@ -418,13 +441,11 @@ impl AcpHost {
             }
         };
         if let Some(events) = self.events.clone() {
-            let replay = match replay {
-                Some(replay) => replay,
-                None => events
-                    .replay(&SessionId::from(sid))
-                    .await
-                    .map_err(|error| error.to_string())?,
-            };
+            let replay = agentfield_replay.expect("journal replay resolved before registration");
+            // 7C3: runs recovered from the journal replay are restored into
+            // the manager BEFORE the tool handle is installed — zero
+            // network, atomic install (AC-04/AC-06).
+            let restored_runs = replay.projection.agentfield_runs.clone();
             let store: Arc<dyn SessionStore> = events;
             let endpoint = match replay.projection.model_selection.as_ref() {
                 Some(selection) => self
@@ -454,9 +475,35 @@ impl AcpHost {
                     // Phase 7B7: bind the session manager into the main-session
                     // `workflow` tool (construction-safe handle install).
                     workflow_handle.install(manager);
-                    if let Some((handle, manager)) = agentfield_handle.as_ref() {
+                    if let Some(registration) = agentfield_registration.as_ref() {
+                        let journal = session.agentfield_journal_sink();
+                        let manager = match self.build_agentfield_manager(
+                            registration,
+                            Some(journal),
+                            restored_runs,
+                        ) {
+                            Ok(manager) => manager,
+                            Err(error) => {
+                                let _ = self.teardown_task_root(sid).await;
+                                return Err(error);
+                            }
+                        };
                         session.attach_agentfield_manager(manager.clone());
-                        handle.install(manager.clone());
+                        agentfield_handle.install(manager.clone());
+                    } else if !restored_runs.is_empty() {
+                        // AC-08: configuration lost but historical runs are
+                        // journaled — build the unconfigured recovery
+                        // manager so status/cancel answer the stable
+                        // `agentfield.unconfigured` and the history stays
+                        // queryable with zero network.
+                        let journal = session.agentfield_journal_sink();
+                        let manager = Arc::new(AgentFieldManager::unconfigured(sid, Some(journal)));
+                        if let Err(error) = manager.restore_runs(restored_runs) {
+                            let _ = self.teardown_task_root(sid).await;
+                            return Err(error.to_string());
+                        }
+                        session.attach_agentfield_manager(manager.clone());
+                        agentfield_handle.install(manager.clone());
                     }
                     if let Err(error) = self.attach_session_plugins(sid, &session).await {
                         let _ = self.teardown_task_root(sid).await;
@@ -483,9 +530,12 @@ impl AcpHost {
         let manager =
             self.attach_workflow_manager(sid, &session, self.default_endpoint.stream.clone());
         workflow_handle.install(manager);
-        if let Some((handle, manager)) = agentfield_handle.as_ref() {
+        if let Some(registration) = agentfield_registration.as_ref() {
+            // No event store ⇒ no journal ⇒ every remote side effect fails
+            // closed inside the manager (durable-before-send is impossible).
+            let manager = self.build_agentfield_manager(registration, None, Vec::new())?;
             session.attach_agentfield_manager(manager.clone());
-            handle.install(manager.clone());
+            agentfield_handle.install(manager.clone());
         }
         if let Err(error) = self.attach_session_plugins(sid, &session).await {
             let _ = self.teardown_task_root(sid).await;
@@ -494,16 +544,14 @@ impl AcpHost {
         Ok(session)
     }
 
-    /// Phase 7C2 registration gate: build the session `agentfield` handle
-    /// and manager when the adapter is enabled, the config validates, and
-    /// the credential resolves — otherwise `None` (zero tool registration,
-    /// zero network). The manager resolves its client lazily on first use
-    /// through the unique policy factory, so session start never touches
-    /// the network here.
-    fn prepare_agentfield(
-        &self,
-        sid: &str,
-    ) -> Option<(SessionAgentFieldHandle, Arc<AgentFieldManager>)> {
+    /// Phase 7C2 registration gate: collect the registration material when
+    /// the adapter is enabled, the config validates, and the credential
+    /// resolves — otherwise `None` (zero tool registration, zero network).
+    /// The manager itself is constructed only AFTER the runtime session
+    /// exists, so the 7C3 journal sink (SessionLoop-backed) can be attached
+    /// at construction and replayed runs restored before the tool becomes
+    /// callable.
+    fn prepare_agentfield(&self, sid: &str) -> Option<AgentFieldRegistration> {
         // Unified multi-source assembly (Round-3): registration and the
         // post-approval revision recheck share the SAME
         // `assemble_catalog_config(catalog_sources(home, cwd))` path, so an
@@ -521,10 +569,37 @@ impl AcpHost {
             &config.credential_reference,
         )?;
         let catalog = AgentFieldCatalog::from_config(&config);
-        let manager = Arc::new(AgentFieldManager::new(
-            sid, catalog, credential, config, sources,
+        Some(AgentFieldRegistration {
+            session_id: sid.to_owned(),
+            catalog,
+            credential,
+            config,
+            sources,
+        })
+    }
+
+    /// Construct the manager from the registration material with the
+    /// SessionLoop-backed journal sink attached, then restore runs
+    /// recovered from the journal replay (zero network) before the tool
+    /// handle is installed (atomic install, AC-06).
+    fn build_agentfield_manager(
+        &self,
+        registration: &AgentFieldRegistration,
+        journal: Option<std::sync::Arc<dyn crate::agentfield::AgentFieldJournalSink>>,
+        restored_runs: Vec<lato_core::AgentFieldRecoveredRun>,
+    ) -> Result<std::sync::Arc<AgentFieldManager>, String> {
+        let manager = std::sync::Arc::new(AgentFieldManager::new(
+            &registration.session_id,
+            registration.catalog.clone(),
+            registration.credential.clone(),
+            registration.config.clone(),
+            registration.sources.clone(),
+            journal,
         ));
-        Some((SessionAgentFieldHandle::new(), manager))
+        manager
+            .restore_runs(restored_runs)
+            .map_err(|error| error.to_string())?;
+        Ok(manager)
     }
 
     fn attach_workflow_manager(

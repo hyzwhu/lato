@@ -68,6 +68,18 @@ impl AgentFieldCatalog {
         }
     }
 
+    /// Phase 7C3 (AC-08): the recovery catalog for a session whose
+    /// configuration has disappeared. Zero capabilities — no new run can
+    /// ever be admitted — and a stable placeholder revision; historical
+    /// runs keep the alias/revision recorded in their journal events.
+    pub fn empty() -> Self {
+        Self {
+            revision: "sha256:unconfigured".to_owned(),
+            origin: "unconfigured".to_owned(),
+            entries: Vec::new(),
+        }
+    }
+
     /// `sha256:<64 lowercase hex>` (spec §6.2 / §7.1 output shape).
     pub fn revision(&self) -> &str {
         &self.revision

@@ -846,6 +846,7 @@ mod tests {
                 let client = client.clone();
                 Box::pin(async move { Ok(client.clone()) })
             })),
+            Some(crate::agentfield::journal::memory_journal()),
         );
         let manager = Arc::new(manager);
         let handle = SessionAgentFieldHandle::new();
@@ -1090,7 +1091,12 @@ mod tests {
 
     fn tool_without() -> (AgentFieldTool, ()) {
         let catalog = AgentFieldCatalog::from_config(&test_config());
-        let manager = AgentFieldManager::with_factory("other-session", catalog, None);
+        let manager = AgentFieldManager::with_factory(
+            "other-session",
+            catalog,
+            None,
+            Some(crate::agentfield::journal::memory_journal()),
+        );
         let manager = Arc::new(manager);
         let handle = SessionAgentFieldHandle::new();
         handle.install(manager);
@@ -1208,6 +1214,7 @@ mod tests {
                 let client = client.clone();
                 Box::pin(async move { Ok(client.clone()) })
             })),
+            Some(crate::agentfield::journal::memory_journal()),
         );
         let manager = Arc::new(manager);
         let handle = SessionAgentFieldHandle::new();

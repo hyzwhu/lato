@@ -8,7 +8,7 @@ use fs2::FileExt;
 use lato_core::{
     EventStore, HistoryProjectionMetadata, HistoryProjectionStore, HistoryReplacementReason,
     JournalDurability, JournalEnvelope, JournalError, JournalReplay, ModelMessage, ProjectionError,
-    SessionId, project_journal,
+    SessionId, decode_journal_envelope, project_journal,
 };
 use std::{
     collections::BTreeMap,
@@ -430,13 +430,18 @@ fn decode_and_repair(path: &Path, content: &[u8]) -> Result<Vec<JournalEnvelope>
                 truncate_and_sync(path, offset as u64)?;
                 break;
             }
-            match serde_json::from_slice::<JournalEnvelope>(tail) {
+            match decode_journal_envelope(tail) {
                 Ok(envelope) => {
                     ensure_record_count(envelopes.len() + 1, envelope.journal_sequence)?;
                     envelopes.push(envelope);
                     terminate_and_sync(path)?;
                 }
-                Err(_) => truncate_and_sync(path, offset as u64)?,
+                // Only a genuinely unparseable unterminated tail is
+                // repaired (frozen WIN-26 behavior). Reader-version gate
+                // failures (future/unsupported schema) fail closed WITHOUT
+                // truncation — data of an unreadable version is preserved.
+                Err(JournalError::Parse { .. }) => truncate_and_sync(path, offset as u64)?,
+                Err(error) => return Err(error),
             }
             break;
         };
@@ -447,9 +452,12 @@ fn decode_and_repair(path: &Path, content: &[u8]) -> Result<Vec<JournalEnvelope>
             continue;
         }
         let envelope: JournalEnvelope =
-            serde_json::from_slice(line).map_err(|error| JournalError::Parse {
-                line: line_number,
-                message: error.to_string(),
+            decode_journal_envelope(line).map_err(|error| match error {
+                JournalError::Parse { message, .. } => JournalError::Parse {
+                    line: line_number,
+                    message,
+                },
+                other => other,
             })?;
         ensure_record_count(envelopes.len() + 1, envelope.journal_sequence)?;
         envelopes.push(envelope);
