@@ -787,3 +787,40 @@ fn agentfield_live_probe_uses_the_policy_factory() {
         .expect("live probe present");
     assert!(factory_idx < probe_idx, "factory must run before probing");
 }
+
+#[tokio::test]
+async fn agentfield_journal_check_reports_downgrade_safety_offline() {
+    let home = tempfile::tempdir().unwrap();
+    // Without journals the offline doctor reports downgrade-safe.
+    let report = offline_report(home.path()).await;
+    let check = report
+        .checks
+        .iter()
+        .find(|check| check.id == "agentfield_journal")
+        .expect("agentfield_journal check must always be present");
+    assert_eq!(check.status, DoctorStatus::Ok);
+    assert!(check.message.contains("downgrade is currently safe"));
+    // A session journal carrying a 7C agentfield envelope flips the report.
+    let session_dir = home.path().join("sessions").join("s-7c");
+    std::fs::create_dir_all(&session_dir).unwrap();
+    let line = serde_json::json!({
+        "schema_version": 2,
+        "record_id": "s-7c-record-0",
+        "session_id": "s-7c",
+        "turn_id": null,
+        "journal_sequence": 0,
+        "timestamp_ms": 0,
+        "record": {"type": "agentfield", "event": {"type": "agentfield_run_intent_recorded", "run_id": "afrun_1", "session_id": "s-7c", "alias": "a", "execute_target": "t", "catalog_revision": "rev", "input_digest": "d", "created_at_ms": 1}},
+    });
+    std::fs::write(session_dir.join("events.jsonl"), format!("{line}\n")).unwrap();
+    let report = offline_report(home.path()).await;
+    let check = report
+        .checks
+        .iter()
+        .find(|check| check.id == "agentfield_journal")
+        .unwrap();
+    assert_eq!(check.status, DoctorStatus::Ok);
+    assert!(check.message.contains("NOT safe"), "{}", check.message);
+    // The scan itself is read-only: the journal is byte-identical.
+    assert!(session_dir.join("events.jsonl").exists());
+}
