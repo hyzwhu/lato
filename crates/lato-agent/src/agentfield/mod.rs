@@ -6,12 +6,17 @@
 //
 // Phase 7C2 adds: the session-frozen catalog revision (`catalog`), the
 // session-scoped run manager (`manager`), and the main-session model tool
-// (`tool`). Still absent (7C3): journal events and cross-process
-// resume/reconcile.
+// (`tool`).
+//
+// Phase 7C3 adds: versioned journal events and cross-process
+// resume/reconcile (`journal`: the durable sink routed through the
+// SessionLoop single sequence owner; manager intent/bind/terminal
+// persistence and restored-run install).
 
 pub mod catalog;
 pub mod client;
 pub mod config;
+pub mod journal;
 pub mod manager;
 pub mod probe;
 #[cfg(test)]
@@ -29,6 +34,7 @@ pub use config::{
     CapabilityConfig, ConfigError, ControlPlaneOrigin, MAX_CAPABILITIES, MAX_INPUT_BYTES,
     MAX_OUTPUT_BYTES, PINNED_AGENTFIELD_VERSION,
 };
+pub use journal::{AgentFieldJournalSink, JournalSinkError, MemoryAgentFieldJournal};
 pub use manager::{AgentFieldManager, CancelOutcome, ManagerError, RunState, RunStatus};
 pub use probe::{
     AgentFieldHealthSnapshot, AgentFieldProbe, AgentFieldProbeCache, HEALTH_SNAPSHOT_TTL,

@@ -29,6 +29,12 @@ pub enum Command {
     RecordPlanModeEvent {
         event: PlanModeJournalEvent,
     },
+    /// Phase 7C3: append one AgentField run event through the SessionLoop —
+    /// the only writer allowed to allocate a journal sequence. The manager,
+    /// host helpers, and HTTP futures must never append directly.
+    RecordAgentFieldEvent {
+        event: crate::journal::AgentFieldJournalEvent,
+    },
     Shutdown,
 }
 

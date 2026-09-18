@@ -51,6 +51,33 @@ pub enum RuntimeCompactionOutcome {
     Cancelled,
 }
 
+/// Phase 7C3: production [`crate::agentfield::AgentFieldJournalSink`].
+/// Routes AgentField run events into the session's SessionLoop — the
+/// single journal sequence owner — as `Command::RecordAgentFieldEvent`
+/// and resolves only after the durable commit reply arrives.
+struct SessionJournalSink {
+    handle: SessionHandle,
+}
+
+impl crate::agentfield::AgentFieldJournalSink for SessionJournalSink {
+    fn append(
+        &self,
+        event: lato_core::AgentFieldJournalEvent,
+    ) -> futures_util::future::BoxFuture<'static, Result<(), crate::agentfield::JournalSinkError>>
+    {
+        let handle = self.handle.clone();
+        Box::pin(async move {
+            handle
+                .submit(lato_core::Command::RecordAgentFieldEvent { event })
+                .await
+                .map_err(|error| crate::agentfield::JournalSinkError {
+                    code: "journal.unavailable",
+                    message: error.to_string(),
+                })
+        })
+    }
+}
+
 pub struct PreparedModelSwitch {
     pub active: ActiveModelStream,
 }
@@ -683,6 +710,16 @@ impl RuntimeSession {
     /// (main-session only; installed at most once by the host).
     pub fn attach_agentfield_manager(&self, manager: Arc<crate::agentfield::AgentFieldManager>) {
         let _ = self.agentfield_manager.set(manager);
+    }
+
+    /// Phase 7C3: the SessionLoop-backed durable journal sink for
+    /// AgentField run events. Appends resolve only after the SessionLoop
+    /// committed the event (SyncData); failures surface as stable
+    /// `journal.unavailable` errors and fail closed at the caller.
+    pub fn agentfield_journal_sink(&self) -> Arc<dyn crate::agentfield::AgentFieldJournalSink> {
+        Arc::new(SessionJournalSink {
+            handle: self.handle.clone(),
+        })
     }
 
     pub fn agentfield_manager(&self) -> Option<Arc<crate::agentfield::AgentFieldManager>> {
