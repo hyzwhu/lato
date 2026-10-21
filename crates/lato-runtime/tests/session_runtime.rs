@@ -230,6 +230,86 @@ impl TurnDriver for EchoDriver {
 }
 
 #[tokio::test]
+async fn application_initialization_is_durable_once_and_locked_after_start() {
+    let sid = SessionId::from("application-initialization");
+    let store = Arc::new(MemoryEventStore::new());
+    let session = spawn_session_with_store(
+        sid.clone(),
+        Arc::new(EchoDriver),
+        store.clone(),
+        bootstrap(&sid),
+    );
+    session
+        .submit(Command::InitializeApplication {
+            system_prompt: "business identity".into(),
+        })
+        .await
+        .unwrap();
+    let replay = store.replay(&sid).await.unwrap();
+    assert_eq!(
+        replay.projection.messages,
+        vec![ModelMessage {
+            role: ModelRole::System,
+            content: vec![ModelContent::Text {
+                text: "business identity".into()
+            }],
+        }]
+    );
+    assert_eq!(
+        session
+            .submit(Command::InitializeApplication {
+                system_prompt: "changed".into()
+            })
+            .await
+            .unwrap_err()
+            .code,
+        "agent.configuration_locked"
+    );
+    session.submit(Command::Shutdown).await.unwrap();
+    let replay = store.replay(&sid).await.unwrap();
+    let resumed = spawn_session_with_store(
+        sid,
+        Arc::new(EchoDriver),
+        store,
+        SessionBootstrap { replay },
+    );
+    assert_eq!(
+        resumed
+            .submit(Command::InitializeApplication {
+                system_prompt: "changed".into()
+            })
+            .await
+            .unwrap_err()
+            .code,
+        "agent.configuration_locked"
+    );
+    resumed.submit(Command::Shutdown).await.unwrap();
+
+    let session = spawn_session(
+        SessionId::from("application-after-turn"),
+        Arc::new(EchoDriver),
+    );
+    session
+        .submit(Command::StartTurn(StartTurn {
+            input: UserInput::text("hello"),
+            behavior: StartBehavior::Reject,
+        }))
+        .await
+        .unwrap();
+    assert_eq!(
+        session
+            .submit(Command::InitializeApplication {
+                system_prompt: "late".into()
+            })
+            .await
+            .unwrap_err()
+            .code,
+        "agent.configuration_locked"
+    );
+    session.submit(Command::Shutdown).await.unwrap();
+}
+
+#[tokio::test]
 async fn plugin_snapshot_adoption_is_committed_before_publication() {
     let sid = SessionId::from("plugin-adoption-order");
     let store = Arc::new(MemoryEventStore::new());

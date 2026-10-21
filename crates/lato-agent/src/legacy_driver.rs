@@ -215,6 +215,22 @@ impl LegacyTurnDriver {
         self.state.lock().await.actor.history().to_vec()
     }
 
+    pub(crate) async fn set_agent_mode(&self, mode: crate::AgentMode) {
+        self.state.lock().await.actor.set_agent_mode(mode);
+    }
+
+    pub(crate) async fn initialize_application(
+        &self,
+        cwd: &std::path::Path,
+        config: &crate::AgentConfiguration,
+    ) -> String {
+        let mut state = self.state.lock().await;
+        // Only called by the host before publishing a freshly constructed session.
+        let prompt = crate::actor::build_world_state_for_agent(cwd, config);
+        *state.actor.history_mut() = vec![HistoryItem::System(prompt.clone())];
+        prompt
+    }
+
     pub async fn replace_history(&self, history: Vec<HistoryItem>) {
         *self.state.lock().await.actor.history_mut() = history;
     }

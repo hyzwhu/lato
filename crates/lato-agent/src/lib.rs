@@ -1,4 +1,7 @@
 pub mod actor;
+mod application;
+pub mod configuration;
+pub use configuration::{AgentConfiguration, AgentMode};
 pub mod agentfield;
 pub mod compaction;
 pub mod compaction_input;

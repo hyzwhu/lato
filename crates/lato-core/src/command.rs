@@ -6,6 +6,10 @@ use crate::{
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Command {
+    /// Host-only initialization, accepted once before the first turn.
+    InitializeApplication {
+        system_prompt: String,
+    },
     StartTurn(StartTurn),
     SteerTurn(UserInput),
     CancelTurn {

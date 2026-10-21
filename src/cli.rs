@@ -212,6 +212,7 @@ pub async fn run(args: Vec<String>) -> i32 {
         Invocation::Login { provider, method } => login(provider, method).await,
         Invocation::Doctor(args) => doctor_cmd(args).await,
         Invocation::Acp { plugin_dirs } => crate::stdio::run(plugin_dirs).await,
+        Invocation::Serve(args) => crate::service::run(args).await,
         Invocation::Workflow(command) => crate::workflow::run(command).await,
     }
 }
@@ -247,6 +248,10 @@ fn canonicalize_invocation_plugin_dirs(invocation: Invocation) -> Result<Invocat
         Invocation::Acp { plugin_dirs } => Invocation::Acp {
             plugin_dirs: canonicalize_plugin_dirs(plugin_dirs)?,
         },
+        Invocation::Serve(mut args) => {
+            args.plugin_dirs = canonicalize_plugin_dirs(args.plugin_dirs)?;
+            Invocation::Serve(args)
+        }
         Invocation::Workflow(command) => Invocation::Workflow(match command {
             WorkflowCommand::List { json, plugin_dirs } => WorkflowCommand::List {
                 json,

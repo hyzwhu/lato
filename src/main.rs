@@ -3,6 +3,7 @@ mod cli;
 mod client;
 mod permissions;
 mod resume;
+mod service;
 mod sessions;
 mod stdio;
 mod tui;

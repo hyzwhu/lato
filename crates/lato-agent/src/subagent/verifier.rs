@@ -10,6 +10,15 @@ pub struct ProfileResultVerifier;
 impl TaskVerifier for ProfileResultVerifier {
     async fn verify(&self, request: VerificationRequest) -> VerificationOutcome {
         let result = match request.node.profile.name.as_str() {
+            "application-worker" | "application-explorer" | "application-reviewer" => {
+                if request.result.output.trim().is_empty() {
+                    Err("application result must not be empty".into())
+                } else if request.result.output.len() > 2 * 1024 * 1024 {
+                    Err("application result exceeds 2 MiB".into())
+                } else {
+                    Ok(())
+                }
+            }
             "explorer" => verify_explorer(&request),
             "worker" => verify_worker(&request),
             "reviewer" => verify_reviewer(&request),

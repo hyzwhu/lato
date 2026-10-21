@@ -2,8 +2,8 @@ use crate::args::{SandboxArg, WorkflowCommand};
 use crate::cli::{configured_stream, lato_home};
 use lato_agent::default_fake_stream;
 use lato_agent::workflow::{
-    WorkflowHostParams, list_workflows, resolve_workflow, spawn_workflow_host_service,
-    workflow_max_concurrent_agents,
+    WorkflowHostParams, list_workflows, resolve_workflow,
+    spawn_workflow_host_service_with_configuration, workflow_max_concurrent_agents,
 };
 use lato_core::SessionId;
 use lato_extensions::{DiscoveryConfig, PluginConfig, build_snapshot, discover_plugins};
@@ -179,6 +179,13 @@ async fn execute(
         trust.sandbox = crate::permissions::profile(sandbox);
     }
     let model = model.or_else(|| std::env::var("LATO_MODEL").ok());
+    let configuration = match lato_agent::AgentConfiguration::from_home(&lato_home()) {
+        Ok(configuration) => configuration,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return 1;
+        }
+    };
     let stream = match model {
         Some(selection) => match configured_stream(&selection).await {
             Ok(stream) => stream,
@@ -198,7 +205,7 @@ async fn execute(
         signal_cancel.cancel();
     });
     let run_id = "wf-1".to_string();
-    let host = spawn_workflow_host_service(
+    let host = match spawn_workflow_host_service_with_configuration(
         WorkflowHostParams {
             run_id: run_id.clone(),
             session_id: SessionId::from("cli-workflow"),
@@ -216,7 +223,14 @@ async fn execute(
             scratch_dir: None,
         },
         host_rx,
-    );
+        configuration,
+    ) {
+        Ok(host) => host,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return 1;
+        }
+    };
     let outcome = tokio::task::spawn_blocking(move || {
         run_workflow(WorkflowRunParams {
             script: resolved.script,

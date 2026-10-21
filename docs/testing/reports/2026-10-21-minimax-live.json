@@ -1,0 +1,147 @@
+{
+  "model": "MiniMax-M3.1-Flash",
+  "binary": "/Users/huangyongzhao/.cargo/bin/lato",
+  "tests": [
+    {
+      "case": "CLI real-model handshake",
+      "endpoint": "https://api.minimax.cn/v1",
+      "exitCode": 0,
+      "seconds": 3.36,
+      "output": "LATO_REAL_OK\n",
+      "error": ""
+    },
+    {
+      "case": "CLI natural-language business modules",
+      "exitCode": 0,
+      "seconds": 17.08,
+      "output": "I'll start by loading the skill and discovering the available business tools.**Acme 客户报告已生成**\n\n| 指标 | 值 |\n|---|---|\n| 客户 | Acme (ID: `acme`) |\n| 统计周期 | 2026-09 |\n| 收入 | 42,000 CNY |\n| 订单数 | 12 |\n| 报告路径 | `/private/var/folders/r5/rgd8pqws17q18qk9blh46n5r0000gn/T/lato-minimax-live-4n80s5ye/business-plugin/outputs/acme-report.md` |\n| 文件大小 | 143 bytes |\n\n执行过程：`lookup_customer` → `create_customer_report`，两步均调用成功。\n\n⚠️ **演示数据说明**：以上收入、订单数及报告内容均来自 business-demo 模块的 **synthetic demonstration fixtures（合成演示数据）**，工具返回中明确标注 \"not real customer data\"。这些数字不代表 Acme 的真实经营业绩，仅用于功能演示。\n\n报告实际路径如上，为工具写入的真实文件位置。\n",
+      "error": "",
+      "artifactVerified": true,
+      "passed": true
+    },
+    {
+      "case": "CLI serve explicit business Skill",
+      "seconds": 33.16,
+      "operation": {
+        "apiVersion": "v1",
+        "operationId": "op-18e0816cf699b528-1",
+        "sessionId": "s1792574956694-1",
+        "status": "completed",
+        "result": {
+          "originalBytes": 714,
+          "text": "I'll start by loading the skill instructions and discovering the available tools.Report generated successfully for **Acme**.\n\n**Artifact path:**\n`/private/var/folders/r5/rgd8pqws17q18qk9blh46n5r0000gn/T/lato-minimax-live-4n80s5ye/business-plugin/outputs/acme-report.md` (143 bytes)\n\n**Verified metrics** (as returned by `lookup_customer` and echoed by `create_customer_report`):\n\n| Metric | Value |\n|---|---|\n| Customer ID | `acme` |\n| Name | Acme |\n| Period | 2026-09 |\n| Revenue | 42,000 CNY |\n| Orders | 12 |\n\n⚠️ Note: This customer record and its revenue/order figures come from **synthetic demonstration fixtures**, not real customer data — as confirmed by the `dataSource` field returned by both tools.",
+          "truncated": false
+        },
+        "error": null
+      },
+      "runs": [],
+      "approvals": [
+        {
+          "tool": "builtin:use_tool",
+          "arguments": {
+            "arguments": {
+              "customer": "Acme"
+            },
+            "tool": "business-demo__lookup_customer"
+          },
+          "executionSessionId": "s1792574956694-1"
+        },
+        {
+          "tool": "builtin:use_tool",
+          "arguments": {
+            "arguments": {
+              "customerId": "acme"
+            },
+            "tool": "business-demo__create_customer_report"
+          },
+          "executionSessionId": "s1792574956694-1"
+        }
+      ],
+      "artifactVerified": true,
+      "passed": true
+    },
+    {
+      "case": "CLI serve natural-language Workflow",
+      "seconds": 31.42,
+      "operation": {
+        "apiVersion": "v1",
+        "operationId": "op-18e0816cf699b528-2",
+        "sessionId": "s1792574991913-2",
+        "status": "completed",
+        "result": {
+          "originalBytes": 388,
+          "text": "已启动 customer-report Workflow。\n\n- Workflow：customer-report（revision `89d8c7e958f9a19e7d746bcde71ed4fddf12916689233d39702e5359a1325a49`）\n- args：`{\"customer\": \"Acme\"}`，agentBudget：2\n- Run ID：`wf_1a15dcbcc0b-0`，状态：active\n\n运行会在后台自行推进并输出更新，报告生成完成后会确认结果与产物路径（数据为 synthetic 演示数据）。",
+          "truncated": false
+        },
+        "error": null
+      },
+      "runs": [
+        {
+          "agentBudget": 2,
+          "agentsUsed": 2,
+          "displayName": "customer-report",
+          "elapsedMsFloor": 23802,
+          "pauseMessage": null,
+          "phase": "Generate report",
+          "result": {
+            "customer": "Acme",
+            "lookup": "I'll start by loading the skill instructions and discovering the available tools.**LOOKUP_PHASE complete** — `business-demo__lookup_customer` with `customer=\"Acme\"` succeeded.\n\n| Field | Value |\n|---|---|\n| Customer ID | `acme` |\n| Revenue | `42000` |\n| Currency | `CNY` |\n\nAdditional fields returned: name `Acme`, period `2026-09`, orders `12`. Data source reported by the tool: \"synthetic demonstration fixtures; not real customer data\".\n\nNote: only the lookup was executed per this phase's scope — `create_customer_report` was not called, so no artifact was produced.",
+            "report": "I'll load the skill instructions and discover the available tools first.**REPORT_PHASE complete** — `business-demo__create_customer_report` with `customerId=\"acme\"` succeeded.\n\n| Field | Value |\n|---|---|\n| Artifact path | `/private/var/folders/r5/rgd8pqws17q18qk9blh46n5r0000gn/T/lato-minimax-live-4n80s5ye/business-plugin/outputs/acme-report.md` |\n| Report size | 143 bytes |\n| Customer ID | `acme` |\n| Name | `Acme` |\n| Period | `2026-09` |\n| Revenue | `42000` |\n| Currency | `CNY` |\n| Orders | `12` |\n| Data source | synthetic demonstration fixtures; not real customer data |\n\nThe report was created only after the `create_customer_report` tool returned success; the path above is the exact value returned by that tool (no artifact was produced in the earlier lookup phase). All figures are synthetic demo data, not real customer records."
+          },
+          "resultTruncated": false,
+          "runId": "wf_1a15dcbcc0b-0",
+          "status": "complete"
+        }
+      ],
+      "approvals": [
+        {
+          "tool": "builtin:workflow",
+          "arguments": {
+            "action": "list"
+          },
+          "executionSessionId": "s1792574991913-2"
+        },
+        {
+          "tool": "builtin:workflow",
+          "arguments": {
+            "action": "start",
+            "agentBudget": 2,
+            "args": {
+              "customer": "Acme"
+            },
+            "name": "customer-report",
+            "revision": "89d8c7e958f9a19e7d746bcde71ed4fddf12916689233d39702e5359a1325a49"
+          },
+          "executionSessionId": "s1792574991913-2"
+        },
+        {
+          "tool": "builtin:use_tool",
+          "arguments": {
+            "arguments": {
+              "customer": "Acme"
+            },
+            "tool": "business-demo__lookup_customer"
+          },
+          "executionSessionId": "wf-agent-wf_1a15dcbcc0b-0-1"
+        },
+        {
+          "tool": "builtin:use_tool",
+          "arguments": {
+            "arguments": {
+              "customerId": "acme"
+            },
+            "tool": "business-demo__create_customer_report"
+          },
+          "executionSessionId": "wf-agent-wf_1a15dcbcc0b-0-2"
+        }
+      ],
+      "artifactVerified": true,
+      "passed": true
+    }
+  ],
+  "transport": "real MiniMax HTTPS; no scripted provider",
+  "data": "synthetic business fixtures",
+  "endpoint": "https://api.minimax.cn/v1",
+  "status": "passed",
+  "artifactContent": "# Acme customer report\n\nPeriod: 2026-09\n\nRevenue: 42000 CNY\n\nOrders: 12\n\nData source: synthetic demonstration fixtures; not real customer data\n"
+}

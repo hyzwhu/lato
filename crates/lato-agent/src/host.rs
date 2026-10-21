@@ -54,6 +54,10 @@ pub struct AcpHost {
     events: Option<Arc<FileEventStore>>,
     credentials: Option<CredentialStore>,
     custom_models: Vec<CustomModel>,
+    agent_configuration: Result<crate::AgentConfiguration, String>,
+    business_tools: Vec<Arc<dyn Tool>>,
+    application_locked: bool,
+    application: crate::application::ApplicationSlot,
     lato_home: PathBuf,
     plugin_registry: SharedPluginRegistryHandle,
     plugin_config: PluginConfig,
@@ -69,6 +73,73 @@ pub struct AcpHost {
 }
 
 impl AcpHost {
+    /// Returns the validated immutable application configuration, including load errors.
+    pub fn agent_configuration(&self) -> Result<crate::AgentConfiguration, String> {
+        self.agent_configuration.clone()
+    }
+
+    /// Clones a session handle for concurrent prompts, cancellation, and inspection.
+    /// Transport adapters should release their host lock before awaiting session work.
+    pub fn runtime_session(&self, session_id: &str) -> Option<Arc<RuntimeSession>> {
+        self.sessions.get(session_id).cloned()
+    }
+
+    /// Synchronizes plugin adoption and automatic titles after a transport runs
+    /// a prompt directly through a cloned runtime handle.
+    pub async fn record_prompt_metadata(&mut self, session_id: &str, text: &str) {
+        if let Some(session) = self.sessions.get(session_id) {
+            self.session_plugins
+                .adopt(SessionId::from(session_id), session.plugin_snapshot().await)
+                .await;
+        }
+        if let Some(events) = &self.events {
+            let _ = events
+                .ensure_automatic_title(&SessionId::from(session_id), text)
+                .await;
+        }
+    }
+
+    /// Configures a trusted application before creating any sessions.
+    pub fn configure_agent(
+        &mut self,
+        configuration: crate::AgentConfiguration,
+    ) -> Result<(), String> {
+        if self.application_locked {
+            return Err("agent.configuration_locked: configure before creating sessions".into());
+        }
+        configuration.validate()?;
+        self.agent_configuration = Ok(configuration);
+        Ok(())
+    }
+
+    /// Registers an application-owned tool. It uses the ordinary schema and policy membrane.
+    /// Tools may not replace builtins; each application tool needs a distinct canonical name.
+    pub fn register_business_tool(&mut self, tool: Arc<dyn Tool>) -> Result<(), String> {
+        if self.application_locked {
+            return Err(
+                "agent.configuration_locked: register tools before creating sessions".into(),
+            );
+        }
+        let descriptor = tool.descriptor();
+        lato_core::ToolName::parse(descriptor.name.as_str())
+            .map_err(|_| "agent.invalid_tool: invalid canonical tool name".to_owned())?;
+        descriptor
+            .validate()
+            .map_err(|e| format!("agent.invalid_tool: {e}"))?;
+        if descriptor.name.namespace() == "builtin" || descriptor.source.replacement.is_some() {
+            return Err("agent.invalid_tool: business tools cannot replace builtins".into());
+        }
+        if self
+            .business_tools
+            .iter()
+            .any(|t| t.descriptor().name == descriptor.name)
+        {
+            return Err("agent.invalid_tool: duplicate business tool".into());
+        }
+        self.business_tools.push(tool);
+        Ok(())
+    }
+
     pub fn new(
         cwd: PathBuf,
         trust: SessionTrust,
@@ -202,6 +273,7 @@ impl AcpHost {
             .and_then(|home| load_models_json(&home.join("models.json")).ok())
             .unwrap_or_default();
         let lato_home_path = lato_home.clone().unwrap_or_default();
+        let agent_configuration = crate::AgentConfiguration::load(lato_home.as_deref());
         let plugin_config = load_plugin_config(lato_home.as_deref());
         let initial_discovery = discover_plugins(&DiscoveryConfig {
             cwd: cwd.clone(),
@@ -213,6 +285,7 @@ impl AcpHost {
             .unwrap_or_else(|_| PluginSnapshot::empty());
         let plugin_registry = SharedPluginRegistryHandle::new(Some(initial_snapshot));
         let session_plugins = SessionPluginSnapshots::default();
+        let application = Arc::new(std::sync::OnceLock::new());
         let runner = Arc::new(
             ChildSessionRunner::new(
                 default_endpoint.stream.clone(),
@@ -221,7 +294,8 @@ impl AcpHost {
                 updates.clone(),
                 tool_approval.clone(),
             )
-            .with_session_plugins(session_plugins.clone()),
+            .with_session_plugins(session_plugins.clone())
+            .with_application(application.clone()),
         );
         let verifier = Arc::new(ProfileResultVerifier);
         let sink = Arc::new(NoopTaskEventSink);
@@ -303,6 +377,10 @@ impl AcpHost {
             events,
             credentials,
             custom_models,
+            agent_configuration,
+            business_tools: Vec::new(),
+            application_locked: false,
+            application,
             lato_home: lato_home_path,
             plugin_registry,
             plugin_config,
@@ -376,6 +454,31 @@ impl AcpHost {
         sid: &str,
         replay: Option<JournalReplay>,
     ) -> Result<Arc<RuntimeSession>, String> {
+        let result = self.assemble_runtime_session(sid, replay).await;
+        if result.is_err() {
+            let _ = self.teardown_task_root(sid).await;
+            self.session_plugins.remove(&SessionId::from(sid)).await;
+        }
+        result
+    }
+
+    async fn assemble_runtime_session(
+        &mut self,
+        sid: &str,
+        replay: Option<JournalReplay>,
+    ) -> Result<Arc<RuntimeSession>, String> {
+        self.application_locked = true;
+        let configuration = self.agent_configuration.clone()?;
+        let _ = self
+            .application
+            .set(Arc::new(crate::application::ApplicationBinding {
+                configuration: configuration.clone(),
+                tools: self.business_tools.clone(),
+                updates: Some(self.updates.clone()),
+            }));
+        if let Some(replay) = &replay {
+            configuration.verify_replay(&replay.projection.messages)?;
+        }
         let backend = self.ensure_task_root(sid).await?;
         // Phase 7B7: the main-session catalog carries exactly one session-bound
         // `workflow` tool. Subagent and headless catalogs never receive it.
@@ -386,6 +489,7 @@ impl AcpHost {
         );
         let mut session_extra: Vec<Arc<dyn Tool>> =
             vec![Arc::new(WorkflowTool::new(workflow_handle.clone()))];
+        session_extra.extend(self.business_tools.iter().cloned());
         // Phase 7C2: the main-session `agentfield` tool is registered only
         // when the adapter is enabled AND the configuration validates.
         // Unconfigured / disabled / invalid → zero registration, zero
@@ -410,6 +514,10 @@ impl AcpHost {
                 mcp_backend,
                 session_extra,
             )
+        })
+        .and_then(|binding| match configuration.tools.as_deref() {
+            Some(tools) => binding.restrict_tools(tools),
+            None => Ok(binding),
         }) {
             Ok(runtime) => runtime,
             Err(error) => {
@@ -425,6 +533,11 @@ impl AcpHost {
                     .await
                     .map_err(|error| error.to_string())?,
             };
+            if let Err(error) = configuration.verify_replay(&replay.projection.messages) {
+                let _ = self.teardown_task_root(sid).await;
+                return Err(error);
+            }
+            let fresh_history = replay.projection.messages.is_empty();
             let store: Arc<dyn SessionStore> = events;
             let endpoint = match replay.projection.model_selection.as_ref() {
                 Some(selection) => self
@@ -449,6 +562,17 @@ impl AcpHost {
             .await;
             return match session {
                 Ok(session) => {
+                    session.set_agent_mode(configuration.mode).await;
+                    if fresh_history
+                        && !configuration.is_legacy_default()
+                        && let Err(error) = session
+                            .initialize_application(&self.cwd, &configuration)
+                            .await
+                    {
+                        let _ = session.shutdown().await;
+                        let _ = self.teardown_task_root(sid).await;
+                        return Err(error.to_string());
+                    }
                     let session = Arc::new(session);
                     let manager = self.attach_workflow_manager(sid, &session, endpoint_stream);
                     // Phase 7B7: bind the session manager into the main-session
@@ -480,6 +604,16 @@ impl AcpHost {
             self.tool_approval.clone(),
             skill_runtime,
         ));
+        session.set_agent_mode(configuration.mode).await;
+        if !configuration.is_legacy_default()
+            && let Err(error) = session
+                .initialize_application(&self.cwd, &configuration)
+                .await
+        {
+            let _ = session.shutdown().await;
+            let _ = self.teardown_task_root(sid).await;
+            return Err(error.to_string());
+        }
         let manager =
             self.attach_workflow_manager(sid, &session, self.default_endpoint.stream.clone());
         workflow_handle.install(manager);
@@ -541,7 +675,7 @@ impl AcpHost {
                 .join(sid)
                 .join("workflows"),
         );
-        let manager = Arc::new(WorkflowManager::new(
+        let manager = Arc::new(WorkflowManager::new_with_application(
             sid,
             self.cwd.clone(),
             self.trust.clone(),
@@ -549,6 +683,7 @@ impl AcpHost {
             stream,
             self.tool_approval.clone(),
             workflows_dir,
+            self.application.get().cloned(),
         ));
         session.attach_workflow_manager(manager.clone());
         manager
@@ -1235,6 +1370,20 @@ impl AcpHost {
                         && let Some(store) = &self.transcripts
                         && let Ok(Some(history)) = store.load_optional(sid)
                     {
+                        let valid = crate::history_to_model_messages(&history)
+                            .map_err(|error| error.to_string())
+                            .and_then(|messages| {
+                                self.agent_configuration
+                                    .as_ref()
+                                    .map_err(Clone::clone)?
+                                    .verify_replay(&messages)
+                            });
+                        if let Err(error) = valid {
+                            let _ = session.shutdown().await;
+                            let _ = self.teardown_task_root(sid).await;
+                            self.session_plugins.remove(&SessionId::from(sid)).await;
+                            return Some(err(id, -32000, error));
+                        }
                         session.replace_history(history).await;
                     }
                     self.sessions.insert(sid.into(), session);
@@ -1335,7 +1484,17 @@ impl AcpHost {
                 })));
                 Some(ok(id, serde_json::json!({"models":models})))
             }
-            "lato/session/info" => Some(ok(id, serde_json::json!({"cwd": self.cwd}))),
+            "lato/session/info" => match &self.agent_configuration {
+                Ok(configuration) => Some(ok(
+                    id,
+                    serde_json::json!({
+                        "cwd": self.cwd,
+                        "agent": {"mode": configuration.mode, "tools": configuration.tools,
+                            "workspaceInstructions": configuration.loads_workspace_instructions()}
+                    }),
+                )),
+                Err(error) => Some(err(id, -32000, error)),
+            },
             "lato/auth/login" => {
                 let p = req.params.unwrap_or_default();
                 let provider = p.get("provider").and_then(|v| v.as_str()).unwrap_or("");

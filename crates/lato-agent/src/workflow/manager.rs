@@ -30,7 +30,7 @@ use super::host_service::DEFAULT_WORKFLOW_MAX_CONCURRENT_AGENTS;
 use super::persist::{self, PersistedRun, RUN_RECORD_VERSION, RestoredRun};
 use super::{
     RunEvent, WorkflowHostParams, WorkflowRunState, WorkflowRunStatus, WorkflowTracker,
-    spawn_workflow_host_service, workflow_max_concurrent_agents,
+    workflow_max_concurrent_agents,
 };
 use crate::ToolApproval;
 
@@ -47,6 +47,8 @@ pub struct LaunchSpec {
 
 #[derive(Debug, thiserror::Error)]
 pub enum LaunchError {
+    #[error("workflow manager is closed")]
+    Closed,
     #[error("workflow run '{0}' was not found")]
     UnknownRun(String),
     #[error("workflow run '{0}' cannot be resumed")]
@@ -95,6 +97,7 @@ struct ManagerCore {
     /// `Some` enables cross-process journal resume (Phase 7B5); `None` keeps
     /// the 7B4 purely in-memory behavior.
     workflows_dir: Option<PathBuf>,
+    application: Option<Arc<crate::application::ApplicationBinding>>,
 }
 
 pub struct WorkflowManager {
@@ -112,6 +115,29 @@ impl WorkflowManager {
         approval: Option<Arc<dyn ToolApproval>>,
         workflows_dir: Option<PathBuf>,
     ) -> Self {
+        Self::new_with_application(
+            session_id,
+            cwd,
+            trust,
+            locks,
+            stream,
+            approval,
+            workflows_dir,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_with_application(
+        session_id: &str,
+        cwd: PathBuf,
+        trust: SessionTrust,
+        locks: Arc<FileLocks>,
+        stream: Arc<dyn ModelStream>,
+        approval: Option<Arc<dyn ToolApproval>>,
+        workflows_dir: Option<PathBuf>,
+        application: Option<Arc<crate::application::ApplicationBinding>>,
+    ) -> Self {
         let core = Arc::new(ManagerCore {
             session_id: lato_core::SessionId::from(session_id.to_owned()),
             cwd,
@@ -127,6 +153,7 @@ impl WorkflowManager {
             inner: Mutex::new(Inner::default()),
             closed: std::sync::atomic::AtomicBool::new(false),
             workflows_dir,
+            application,
         });
         restore_runs(&core);
         Self { core }
@@ -168,7 +195,11 @@ impl WorkflowManager {
             spec.agent_budget
                 .unwrap_or(u64::from(resolved.agent_budget)),
         );
+        lato_workflow::clamp_agent_budget(budget)?;
         let mut inner = self.core.inner.lock().unwrap();
+        if self.is_closed() {
+            return Err(LaunchError::Closed);
+        }
         if inner.tracker.active_count() >= super::WORKFLOW_MAX_ACTIVE_RUNS_PER_SESSION {
             return Err(LaunchError::TooManyActiveRuns);
         }
@@ -293,6 +324,15 @@ impl WorkflowManager {
         agent_budget: Option<u64>,
     ) -> Result<WorkflowRunState, LaunchError> {
         let mut inner = self.core.inner.lock().unwrap();
+        if self.is_closed() {
+            return Err(LaunchError::Closed);
+        }
+        if inner.tracker.active_count() >= super::WORKFLOW_MAX_ACTIVE_RUNS_PER_SESSION {
+            return Err(LaunchError::TooManyActiveRuns);
+        }
+        if agent_budget.is_some() {
+            lato_workflow::clamp_agent_budget(agent_budget)?;
+        }
         let state = inner
             .tracker
             .by_display_name(display_name)
@@ -349,6 +389,7 @@ impl WorkflowManager {
     pub async fn shutdown(&self) {
         let triggers: Vec<(String, ActiveRun)> = {
             let inner = self.core.inner.lock().unwrap();
+            self.core.closed.store(true, Ordering::Release);
             inner
                 .active
                 .iter()
@@ -376,9 +417,6 @@ impl WorkflowManager {
                 emit(&self.core, &stamp(&inner, updated));
             }
         }
-        self.core
-            .closed
-            .store(true, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -409,7 +447,19 @@ fn persist_run(core: &ManagerCore, inner: &Inner, state: &WorkflowRunState) -> s
         return Ok(());
     };
     let record = PersistedRun {
-        version: RUN_RECORD_VERSION,
+        result: state.result.clone(),
+        result_truncated: state.result_truncated,
+        version: if core
+            .application
+            .as_ref()
+            .and_then(|a| a.fingerprint())
+            .is_some()
+        {
+            super::persist::APPLICATION_RUN_RECORD_VERSION
+        } else {
+            RUN_RECORD_VERSION
+        },
+        application_fingerprint: core.application.as_ref().and_then(|a| a.fingerprint()),
         run_id: state.run_id.clone(),
         display_name: state.display_name.clone(),
         status: state.status,
@@ -442,6 +492,10 @@ fn restore_runs(core: &ManagerCore) {
     let mut inner = core.inner.lock().unwrap();
     for restored in candidates {
         let record = restored.record;
+        if record.application_fingerprint != core.application.as_ref().and_then(|a| a.fingerprint())
+        {
+            continue;
+        }
         let Some(script) = persist::read_script(&restored.dir) else {
             continue;
         };
@@ -450,6 +504,8 @@ fn restore_runs(core: &ManagerCore) {
             Err(_) => continue,
         };
         let mut state = WorkflowRunState {
+            result: record.result.clone(),
+            result_truncated: record.result_truncated,
             run_id: record.run_id.clone(),
             display_name: record.display_name.clone(),
             status: record.status,
@@ -561,7 +617,7 @@ fn spawn_run_task(core: Arc<ManagerCore>, run_id: String) {
             .unwrap()
             .clone()
             .unwrap_or_else(PluginSnapshot::empty);
-        let host = spawn_workflow_host_service(
+        let host = super::host_service::spawn_workflow_host_service_for_application(
             WorkflowHostParams {
                 run_id: run_id.clone(),
                 session_id: session_id.clone(),
@@ -584,6 +640,7 @@ fn spawn_run_task(core: Arc<ManagerCore>, run_id: String) {
                     .map(|root| persist::run_dir(root, &run_id).join("scratch")),
             },
             host_rx,
+            core.application.clone(),
         );
         // Forward live phase / agent-spawn progress into the tracker until the
         // host service task ends (it owns the notify sender).
@@ -666,6 +723,64 @@ fn spawn_run_task(core: Arc<ManagerCore>, run_id: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn persisted_business_runs_require_the_same_application_identity() {
+        use crate::application::ApplicationBinding;
+        let home = tempfile::tempdir().unwrap();
+        let binding = |instructions: &str| {
+            Arc::new(ApplicationBinding {
+                configuration: serde_json::from_value(
+                    serde_json::json!({"mode":"general","instructions":instructions,"tools":[]}),
+                )
+                .unwrap(),
+                tools: vec![],
+                updates: None,
+            })
+        };
+        let create = |application| {
+            WorkflowManager::new_with_application(
+                "owner",
+                home.path().into(),
+                SessionTrust::for_headless_prompt(home.path()),
+                Arc::new(FileLocks::new()),
+                crate::default_fake_stream(),
+                None,
+                Some(home.path().join("runs")),
+                application,
+            )
+        };
+        let first = create(Some(binding("Sales application")));
+        first.launch(super::super::ResolvedWorkflow {
+            id:"user/pause".into(), display_name:"pause".into(), description:"pause for input".into(),
+            script:r#"let meta = #{name:"pause",description:"d"}; await_user("user","approve report"); complete("ok");"#.into(),
+            agent_budget:2,source:"user",compiled:false,
+        }, LaunchSpec {args:serde_json::json!({}),agent_budget:Some(2),resume_display_name:None}).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while first.list()[0].status != WorkflowRunStatus::UserPaused {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        first.shutdown().await;
+        let id = first.list()[0].run_id.clone();
+        let record = persist::read_run_record(&home.path().join("runs").join(id)).unwrap();
+        assert_eq!(record.version, persist::APPLICATION_RUN_RECORD_VERSION);
+        assert_eq!(
+            record.application_fingerprint,
+            binding("Sales application").fingerprint()
+        );
+        let same = create(Some(binding("Sales application")));
+        assert_eq!(same.list()[0].status, WorkflowRunStatus::UserPaused);
+        assert!(
+            create(Some(binding("Different application")))
+                .list()
+                .is_empty()
+        );
+        assert!(create(None).list().is_empty());
+        same.shutdown().await;
+    }
 
     #[tokio::test]
     async fn manager_starts_and_shuts_down() {

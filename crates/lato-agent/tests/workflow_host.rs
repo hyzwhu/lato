@@ -630,3 +630,205 @@ async fn fork_context_is_still_unsupported_after_helpers() {
     ));
     shutdown_host(tx, join).await;
 }
+
+#[tokio::test]
+async fn general_children_use_business_contracts_and_cannot_forge_coding_tools() {
+    use lato_agent::{
+        AgentConfiguration, workflow::spawn_workflow_host_service_with_configuration,
+    };
+    use serde_json::json;
+    let cwd = tempfile::tempdir().unwrap();
+    let contexts = Arc::new(Mutex::new(Vec::new()));
+    struct ContractModel {
+        contexts: Arc<Mutex<Vec<serde_json::Value>>>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait]
+    impl ModelStream for ContractModel {
+        async fn stream(
+            &self,
+            _: usize,
+            context: serde_json::Value,
+            tx: mpsc::Sender<StreamPiece>,
+        ) -> Result<(), ModelError> {
+            self.contexts.lock().unwrap().push(context.clone());
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let piece = match n {
+                0 => StreamPiece::ToolCall {
+                    id: "forged".into(),
+                    name: "bash".into(),
+                    arguments: json!({"command":"touch FORBIDDEN"}),
+                },
+                1 => {
+                    assert!(
+                        context["messages"].to_string().contains("tool.not_found"),
+                        "{context}"
+                    );
+                    StreamPiece::Text("invalid contracted value".into())
+                }
+                _ => StreamPiece::Text("```json\n{\"customer\":\"Acme\"}\n```".into()),
+            };
+            tx.send(piece).await.map_err(|_| ModelError::cancelled())?;
+            Ok(())
+        }
+    }
+    let stream = Arc::new(ContractModel {
+        contexts: contexts.clone(),
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let (tx, rx) = mpsc::unbounded_channel();
+    let join = spawn_workflow_host_service_with_configuration(
+        WorkflowHostParams {
+            run_id: "business-1".into(),
+            session_id: SessionId::from("owner"),
+            max_concurrent_agents: 1,
+            agent_budget: 1,
+            cwd: cwd.path().into(),
+            stream,
+            locks: Arc::new(FileLocks::new()),
+            trust: SessionTrust::for_headless_prompt(cwd.path()),
+            snapshot: PluginSnapshot::empty(),
+            cancel: CancellationToken::new(),
+            approval: None,
+            notify: None,
+            scratch_dir: None,
+        },
+        rx,
+        serde_json::from_value::<AgentConfiguration>(
+            json!({"mode":"general","instructions":"Sell only approved products.","tools":[]}),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let (reserved, receive_reservation) = oneshot::channel();
+    tx.send(WorkflowHostRequest::ReserveAgentCalls {
+        count: 1,
+        reply: reserved,
+    })
+    .unwrap();
+    receive_reservation.await.unwrap().unwrap();
+    let (reply, receive) = oneshot::channel();
+    tx.send(WorkflowHostRequest::SpawnAgent{opts:AgentOpts{prompt:"Return customer".into(),output_schema:Some(json!({"type":"object","properties":{"customer":{"type":"string"}},"required":["customer"],"additionalProperties":false})),..Default::default()},reply}).unwrap();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(8), receive)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(result.success, "{result:?}");
+    assert_eq!(result.output, json!({"customer":"Acme"}));
+    assert!(!cwd.path().join("FORBIDDEN").exists());
+    for context in contexts.lock().unwrap().iter() {
+        assert_eq!(context["tools"], json!([]));
+        assert!(
+            context["messages"]
+                .to_string()
+                .contains("Sell only approved products.")
+        );
+    }
+    let (reply, receive) = oneshot::channel();
+    tx.send(WorkflowHostRequest::BudgetQuery { reply }).unwrap();
+    assert_eq!(
+        receive.await.unwrap().unwrap().spent,
+        1,
+        "schema retry counts as one logical agent"
+    );
+    shutdown_host(tx, join).await;
+}
+
+#[tokio::test]
+async fn application_children_retain_sandbox_and_role_restrictions() {
+    use lato_agent::{
+        AgentConfiguration, workflow::spawn_workflow_host_service_with_configuration,
+    };
+    use lato_core::SandboxProfile;
+    use serde_json::json;
+    for read_only_role in [false, true] {
+        let cwd = tempfile::tempdir().unwrap();
+        let contexts = Arc::new(Mutex::new(Vec::new()));
+        struct WriteProbe {
+            contexts: Arc<Mutex<Vec<serde_json::Value>>>,
+        }
+        #[async_trait]
+        impl ModelStream for WriteProbe {
+            async fn stream(
+                &self,
+                _: usize,
+                context: serde_json::Value,
+                tx: mpsc::Sender<StreamPiece>,
+            ) -> Result<(), ModelError> {
+                self.contexts.lock().unwrap().push(context.clone());
+                let tool_result = context["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|m| m["role"] == "tool");
+                let piece = if let Some(result) = tool_result {
+                    assert!(result["content"].as_str().unwrap().contains("ERROR"));
+                    StreamPiece::Text("The requested write was denied.".into())
+                } else {
+                    StreamPiece::ToolCall {
+                        id: "write".into(),
+                        name: "write_file".into(),
+                        arguments: json!({"path":"forbidden.txt","contents":"must not exist"}),
+                    }
+                };
+                tx.send(piece).await.map_err(|_| ModelError::cancelled())?;
+                Ok(())
+            }
+        }
+        let mut trust = SessionTrust::for_headless_prompt(cwd.path());
+        if !read_only_role {
+            trust.sandbox = SandboxProfile::ReadOnly;
+        }
+        let (tx, rx) = mpsc::unbounded_channel();
+        let join = spawn_workflow_host_service_with_configuration(
+            WorkflowHostParams {
+                run_id: format!("sandbox-{read_only_role}"),
+                session_id: SessionId::from("owner"),
+                max_concurrent_agents: 1,
+                agent_budget: 1,
+                cwd: cwd.path().into(),
+                stream: Arc::new(WriteProbe {
+                    contexts: contexts.clone(),
+                }),
+                locks: Arc::new(FileLocks::new()),
+                trust,
+                snapshot: PluginSnapshot::empty(),
+                cancel: CancellationToken::new(),
+                approval: None,
+                notify: None,
+                scratch_dir: None,
+            },
+            rx,
+            serde_json::from_value::<AgentConfiguration>(
+                json!({"mode":"general","tools":["builtin:write_file"]}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let (reply, receive) = oneshot::channel();
+        tx.send(WorkflowHostRequest::SpawnAgent {
+            opts: AgentOpts {
+                prompt: "Try requested write and report its actual outcome".into(),
+                capability_mode: read_only_role.then(|| "read-only".into()),
+                ..Default::default()
+            },
+            reply,
+        })
+        .unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(8), receive)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(result.success, "{result:?}");
+        assert!(!cwd.path().join("forbidden.txt").exists());
+        let catalog = contexts.lock().unwrap()[0]["tools"].clone();
+        if read_only_role {
+            assert_eq!(catalog, json!([]));
+        } else {
+            assert!(catalog.to_string().contains("write_file"));
+        }
+        shutdown_host(tx, join).await;
+    }
+}

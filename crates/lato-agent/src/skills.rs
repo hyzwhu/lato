@@ -85,6 +85,23 @@ impl SkillRuntimeBinding {
         (self.runtime, self.handle, self.mcp_handle)
     }
 
+    pub(crate) fn restrict_tools(
+        mut self,
+        names: &[lato_core::ToolName],
+    ) -> Result<Self, RuntimeBuildError> {
+        self.runtime = Arc::new(self.runtime.restricted_to(names)?);
+        Ok(self)
+    }
+
+    pub(crate) fn restrict_application(
+        mut self,
+        binding: &crate::application::ApplicationBinding,
+        capabilities: &[ToolCapability],
+    ) -> Result<Self, RuntimeBuildError> {
+        self.runtime = binding.restrict(&self.runtime, capabilities)?;
+        Ok(self)
+    }
+
     pub fn mcp_handle(&self) -> &SessionMcpHandle {
         &self.mcp_handle
     }

@@ -56,6 +56,10 @@ impl WorkflowRunStatus {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkflowRunState {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<serde_json::Value>,
+    #[serde(default)]
+    pub result_truncated: bool,
     pub run_id: String,
     pub display_name: String,
     pub status: WorkflowRunStatus,
@@ -90,6 +94,8 @@ impl WorkflowTracker {
     ) -> WorkflowRunState {
         let display_name = self.allocate_display_name(&meta_name);
         let state = WorkflowRunState {
+            result: None,
+            result_truncated: false,
             run_id,
             display_name,
             status: WorkflowRunStatus::Active,
@@ -159,6 +165,23 @@ impl WorkflowTracker {
     }
 
     pub fn apply_outcome(&mut self, run_id: &str, outcome: &ScriptOutcome) {
+        if let Some(run) = self.runs.iter_mut().find(|run| run.run_id == run_id) {
+            run.result = None;
+            run.result_truncated = false;
+            if let ScriptOutcome::Completed { result } = outcome {
+                let bytes = serde_json::to_vec(result)
+                    .map(|b| b.len())
+                    .unwrap_or(usize::MAX);
+                if bytes <= 256 * 1024 {
+                    run.result = Some(result.clone());
+                } else {
+                    run.result_truncated = true;
+                    run.result = Some(
+                        serde_json::json!({"originalBytes":bytes,"message":"Workflow result exceeds 256 KiB; return bounded summaries or artifact references."}),
+                    );
+                }
+            }
+        }
         let (status, pause_message) = match outcome {
             ScriptOutcome::Completed { .. } => (WorkflowRunStatus::Complete, None),
             ScriptOutcome::Paused { kind, message } => (pause_status(*kind), Some(message.clone())),
@@ -388,5 +411,37 @@ mod tests {
             );
         }
         assert_eq!(tracker.list().len(), WORKFLOW_HISTORY_MAX);
+    }
+
+    #[test]
+    fn completed_results_are_retained_and_oversized_values_are_explicit() {
+        let mut tracker = WorkflowTracker::new();
+        tracker.start_run("r".into(), "business".into(), Some(1));
+        tracker.apply_outcome(
+            "r",
+            &ScriptOutcome::Completed {
+                result: json!({"revenue":42}),
+            },
+        );
+        assert_eq!(
+            tracker.get("r").unwrap().result,
+            Some(json!({"revenue":42}))
+        );
+        tracker.apply_outcome(
+            "r",
+            &ScriptOutcome::Completed {
+                result: json!("x".repeat(256 * 1024)),
+            },
+        );
+        let state = tracker.get("r").unwrap();
+        assert!(state.result_truncated);
+        assert_eq!(state.result.unwrap()["originalBytes"], 256 * 1024 + 2);
+        tracker.apply_outcome(
+            "r",
+            &ScriptOutcome::Failed {
+                error: "failure".into(),
+            },
+        );
+        assert!(tracker.get("r").unwrap().result.is_none());
     }
 }

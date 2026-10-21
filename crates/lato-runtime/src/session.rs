@@ -167,6 +167,7 @@ struct SessionLoop {
     sequence: u64,
     journal_sequence: u64,
     journal_exists: bool,
+    application_initializable: bool,
     started_emitted: bool,
     current_checkpoint_id: Option<String>,
     started_tx: Option<tokio::sync::watch::Sender<Option<Result<(), AgentError>>>>,
@@ -200,6 +201,7 @@ impl SessionLoop {
             sequence: 0,
             journal_sequence: bootstrap.replay.projection.next_journal_sequence,
             journal_exists: bootstrap.replay.exists,
+            application_initializable: bootstrap.replay.projection.messages.is_empty(),
             started_emitted: false,
             current_checkpoint_id,
             started_tx,
@@ -284,7 +286,36 @@ impl SessionLoop {
 
     async fn handle_command(&mut self, command: Command) -> Result<(), AgentError> {
         match command {
-            Command::StartTurn(start) => self.request_start(start).await,
+            Command::InitializeApplication { system_prompt } => {
+                if !self.application_initializable
+                    || self.active.is_some()
+                    || self.active_compaction.is_some()
+                {
+                    return Err(invalid_state(
+                        "agent.configuration_locked",
+                        "application initialization requires a fresh session",
+                    ));
+                }
+                self.commit(
+                    None,
+                    JournalRecord::ConversationItemCommitted {
+                        message: lato_core::ModelMessage {
+                            role: lato_core::ModelRole::System,
+                            content: vec![lato_core::ModelContent::Text {
+                                text: system_prompt,
+                            }],
+                        },
+                    },
+                    JournalDurability::SyncData,
+                )
+                .await?;
+                self.application_initializable = false;
+                Ok(())
+            }
+            Command::StartTurn(start) => {
+                self.application_initializable = false;
+                self.request_start(start).await
+            }
             Command::SteerTurn(input) => {
                 let active = self.active.as_ref().ok_or_else(|| {
                     invalid_state("runtime.no_active_turn", "cannot steer an idle session")

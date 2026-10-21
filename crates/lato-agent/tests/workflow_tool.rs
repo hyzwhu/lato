@@ -160,7 +160,8 @@ fn only_the_main_session_host_registers_the_workflow_tool() {
     assert!(host_source.contains("workflow_handle.install(manager)"));
 
     let runner_source = include_str!("../src/subagent/runner.rs");
-    assert!(!runner_source.contains("subagents_and_mcp_extra"));
+    assert!(runner_source.contains("runtime.restrict_application(binding"));
+    assert!(include_str!("../src/application.rs").contains("n.as_str() != \"builtin:workflow\""));
     let skills_source = include_str!("../src/skills.rs");
     assert!(!skills_source.contains("subagents_and_mcp_extra"));
 }

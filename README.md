@@ -80,6 +80,87 @@ lato --version
 
 ## Quick Start
 
+### Use Lato as a general business agent
+
+Lato's existing runtime can now host a general agent with application instructions
+and an explicit tool catalog. The coding CLI remains the default. Place a trusted
+`agent.json` in `$LATO_HOME` (normally `~/.lato`) to select the application:
+
+```json
+{
+  "mode": "general",
+  "instructions": "Help the sales team. Use verified business data and ask for missing required information.",
+  "tools": ["builtin:search_tool", "builtin:use_tool", "builtin:skill"],
+  "workspaceInstructions": false
+}
+```
+
+This example enables discovery/calls for your **separately configured MCP business
+servers** and existing trusted plugin skills; it does not install business modules.
+Use `"tools": []` for a conversation-only agent. Run `lato`, `lato -p ...`, or
+`lato acp` with the same Lato home and select a real model as usual. Invalid
+configuration or an unknown tool fails session creation. General mode does not
+load repository `AGENTS.md` / `CLAUDE.md` unless `workspaceInstructions` is true.
+Custom coding instructions or workspace-instruction settings also require an
+explicit `tools` list; omit `agent.json` to retain the original coding defaults.
+`lato doctor` checks this configuration offline.
+
+To embed Rust business modules directly, create `lato_agent::AcpHost`, call
+`configure_agent(AgentConfiguration { .. })` and `register_business_tool(Arc<dyn Tool>)`
+before starting sessions, then use the existing `session/new`, `session/prompt`,
+`session/cancel`, and `session/close` ACP operations. Updates arrive on the host's
+event channel. A business tool declares its description, JSON input schema,
+capabilities, side effects, and execution limits and implements `Tool::invoke`.
+Its adapter should call your business API and enforce user/tenant authorization.
+
+An executable, credential-free embedding demo registers customer lookup and report
+formatting modules and exercises both through the real host/runtime/policy path:
+
+```bash
+cargo run -p lato-agent --example business_agent
+```
+
+The demo uses **scripted model decisions and fixture data**, so it verifies wiring,
+not real-model task accuracy. Replace its `FakeModelStream` with your model endpoint
+for live inference. See [`business_agent.rs`](crates/lato-agent/examples/business_agent.rs)
+and [`agent.json`](examples/general-agent/agent.json).
+
+Application configuration is immutable for a host after session creation begins.
+Configured sessions persist their initial system message and configuration
+fingerprint; resume requires the same configuration, including tool-list order.
+Restore the original configuration or start a new session after changes. Legacy
+coding sessions continue to resume with the default configuration.
+
+Tool allowlists restrict actual model calls, including forged canonical names;
+they do not replace existing tool approvals or sandbox policy. Explicitly allowing
+`builtin:use_tool` grants access to the full MCP surface of the configured trusted
+plugins, subject to existing MCP policy and remote authorization. Trusted plugin
+hooks retain their existing behavior. General applications can enable `builtin:workflow` for bounded business
+orchestration. Workflow workers inherit the application's instructions, exact tool
+catalog, sandbox and approvals. Results, child progress and approvals remain visible
+through the owning session's [HTTP API](docs/agent-http-api.md). Starts require the
+listed content revision and an explicit agent budget. Generic child-task and
+AgentField tools remain unavailable in custom configurations; tenant authorization
+and a desktop business workbench remain product integration work.
+
+To run the two-agent customer report example, copy
+[`customer-report.rhai`](examples/general-agent/customer-report.rhai) into
+`$LATO_HOME/workflows/`, then use the HTTP client with a prompt such as
+`使用 customer-report Workflow 为 Acme 生成报告`. Verify the installed executable
+without credentials with:
+
+```bash
+python3 examples/general-agent/smoke_http.py --binary "$HOME/.cargo/bin/lato" --workflow
+```
+
+### Interactive coding assistant
+
+For product/backend integration, `lato serve --model provider/model` now exposes
+authenticated asynchronous HTTP operations, SSE progress/replay, cancellation, and
+exact-call tool approvals. Set `LATO_SERVICE_TOKEN` before starting it; the listener
+is loopback-only. See the [HTTP API v1 guide](docs/agent-http-api.md) and the
+[Python client](examples/general-agent/http_client.py).
+
 Run `lato` without arguments:
 
 ```bash
