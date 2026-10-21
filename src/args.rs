@@ -56,6 +56,7 @@ pub enum Invocation {
     Acp {
         plugin_dirs: Vec<PathBuf>,
     },
+    Serve(ServeArgs),
     Workflow(WorkflowCommand),
 }
 
@@ -64,6 +65,17 @@ pub enum SessionCommand {
     List { json: bool },
     Rename { session_id: String, title: String },
     Delete { session_id: String, yes: bool },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ServeArgs {
+    pub listen: std::net::SocketAddr,
+    pub model: String,
+    pub auto_approve: bool,
+    pub trust_workspace: bool,
+    pub agent_config: Option<PathBuf>,
+    pub sandbox: SandboxArg,
+    pub plugin_dirs: Vec<PathBuf>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -89,7 +101,7 @@ pub enum WorkflowCommand {
     version,
     about = "Public Beta coding agent",
     after_help = "Run without arguments for the interactive coding CLI.\n\nInteractive: lato [--sandbox off|workspace|read-only]\nResume: lato resume ID|TITLE [--sandbox off|workspace|read-only]\nHeadless: lato -p [--ask] [--plan] [--sandbox off|workspace|read-only] [--model provider/model] TEXT
-Plan mode: lato -p --plan TEXT (exit code 3 when a plan was drafted but not approved); lato resume ID|TITLE --plan\nWorkflows: lato workflow list|run ID [--input JSON] [--model provider/model] [--sandbox off|workspace|read-only] [--validate-only] [--agent-budget N] [--plugin-dir PATH]\nDoctor: lato doctor [--json] [--strict] [--live]"
+Plan mode: lato -p --plan TEXT (exit code 3 when a plan was drafted but not approved); lato resume ID|TITLE --plan\nWorkflows: lato workflow list|run ID [--input JSON] [--model provider/model] [--sandbox off|workspace|read-only] [--validate-only] [--agent-budget N] [--plugin-dir PATH]\nServe: lato serve --model provider/model [--listen 127.0.0.1:8765] [--sandbox workspace] [--trust-workspace] [--auto-approve] (requires LATO_SERVICE_TOKEN)\nDoctor: lato doctor [--json] [--strict] [--live]"
 )]
 struct Cli {
     /// Interface language for interactive mode
@@ -175,6 +187,23 @@ enum Command {
     },
     /// Serve the Agent Client Protocol over stdio
     Acp,
+    /// Serve authenticated, asynchronous local HTTP and SSE agent APIs
+    Serve {
+        #[arg(long, default_value = "127.0.0.1:8765")]
+        listen: std::net::SocketAddr,
+        /// Explicit provider/model selection (uses existing login credentials)
+        #[arg(long)]
+        model: String,
+        /// Automatically approve permitted calls; deny rules and sandbox still apply
+        #[arg(long,action=ArgAction::SetTrue)]
+        auto_approve: bool,
+        /// Trust this workspace and permit its enabled extensions
+        #[arg(long, action = ArgAction::SetTrue)]
+        trust_workspace: bool,
+        /// Application configuration for this service process (overrides agent.json)
+        #[arg(long, value_name = "PATH")]
+        agent_config: Option<PathBuf>,
+    },
     /// List or run plugin workflow descriptors
     Workflow {
         #[command(subcommand)]
@@ -243,6 +272,7 @@ impl Cli {
                 && !matches!(
                     &command,
                     Command::Resume { .. }
+                        | Command::Serve { .. }
                         | Command::Workflow {
                             action: WorkflowAction::Run { .. },
                         }
@@ -250,7 +280,7 @@ impl Cli {
             {
                 return Err(semantic_error(
                     ErrorKind::ArgumentConflict,
-                    "--sandbox is only available in interactive mode, resume, -p, or workflow run",
+                    "--sandbox is only available in interactive mode, resume, -p, serve, or workflow run",
                 ));
             }
             if self.plan && !matches!(&command, Command::Resume { .. }) {
@@ -262,12 +292,15 @@ impl Cli {
             if !self.plugin_dirs.is_empty()
                 && !matches!(
                     &command,
-                    Command::Resume { .. } | Command::Acp | Command::Workflow { .. }
+                    Command::Resume { .. }
+                        | Command::Acp
+                        | Command::Serve { .. }
+                        | Command::Workflow { .. }
                 )
             {
                 return Err(semantic_error(
                     ErrorKind::ArgumentConflict,
-                    "--plugin-dir is only available in interactive mode, resume, -p, acp, or workflow",
+                    "--plugin-dir is only available in interactive mode, resume, -p, acp, serve, or workflow",
                 ));
             }
             return Ok(match command {
@@ -317,6 +350,29 @@ impl Cli {
                 Command::Acp => Invocation::Acp {
                     plugin_dirs: self.plugin_dirs,
                 },
+                Command::Serve {
+                    listen,
+                    model,
+                    auto_approve,
+                    trust_workspace,
+                    agent_config,
+                } => {
+                    if !listen.ip().is_loopback() {
+                        return Err(semantic_error(
+                            ErrorKind::InvalidValue,
+                            "serve requires a loopback listen address",
+                        ));
+                    }
+                    Invocation::Serve(ServeArgs {
+                        listen,
+                        model,
+                        auto_approve,
+                        trust_workspace,
+                        agent_config,
+                        sandbox: self.sandbox.unwrap_or(SandboxArg::Workspace),
+                        plugin_dirs: self.plugin_dirs,
+                    })
+                }
                 Command::Workflow { action } => Invocation::Workflow(match action {
                     WorkflowAction::List { json } => WorkflowCommand::List {
                         json,
@@ -395,6 +451,48 @@ pub fn parse(args: Vec<String>) -> Result<Invocation, clap::Error> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn serves_an_explicit_model_with_scoped_runtime_options() {
+        let super::Invocation::Serve(args) = super::parse(
+            vec![
+                "serve",
+                "--model",
+                "local/business",
+                "--listen",
+                "127.0.0.1:0",
+                "--sandbox",
+                "read-only",
+                "--auto-approve",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect(),
+        )
+        .unwrap() else {
+            panic!("expected serve");
+        };
+        assert_eq!(args.model, "local/business");
+        assert_eq!(args.listen.port(), 0);
+        assert_eq!(args.sandbox, super::SandboxArg::ReadOnly);
+        assert!(args.auto_approve);
+        assert!(super::parse(vec!["serve".into()]).is_err());
+        assert!(
+            super::parse(
+                vec![
+                    "serve",
+                    "--model",
+                    "local/business",
+                    "--listen",
+                    "0.0.0.0:8765"
+                ]
+                .into_iter()
+                .map(String::from)
+                .collect()
+            )
+            .is_err()
+        );
+    }
+
     use super::{
         Invocation, LoginMethod, PathBuf, PromptArgs, SandboxArg, SessionCommand, WorkflowCommand,
         parse,

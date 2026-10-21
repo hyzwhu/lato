@@ -91,10 +91,37 @@ fn workflow_max_concurrent_agents_from(configured: usize, parallelism: usize) ->
 
 pub fn spawn_workflow_host_service(
     params: WorkflowHostParams,
+    rx: mpsc::UnboundedReceiver<WorkflowHostRequest>,
+) -> tokio::task::JoinHandle<()> {
+    spawn_workflow_host_service_for_application(params, rx, None)
+}
+
+/// Standalone Workflow entry point honoring an application's model tool scope.
+pub fn spawn_workflow_host_service_with_configuration(
+    params: WorkflowHostParams,
+    rx: mpsc::UnboundedReceiver<WorkflowHostRequest>,
+    configuration: crate::AgentConfiguration,
+) -> Result<tokio::task::JoinHandle<()>, String> {
+    configuration.validate()?;
+    let binding = (!configuration.is_legacy_default()).then(|| {
+        Arc::new(crate::application::ApplicationBinding {
+            configuration,
+            tools: Vec::new(),
+            updates: None,
+        })
+    });
+    Ok(spawn_workflow_host_service_for_application(
+        params, rx, binding,
+    ))
+}
+
+pub(crate) fn spawn_workflow_host_service_for_application(
+    params: WorkflowHostParams,
     mut rx: mpsc::UnboundedReceiver<WorkflowHostRequest>,
+    application: Option<Arc<crate::application::ApplicationBinding>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let (service, actor) = match setup_host(params).await {
+        let (service, actor) = match setup_host(params, application).await {
             Ok(pair) => pair,
             Err(_) => {
                 while let Some(req) = rx.recv().await {
@@ -126,12 +153,21 @@ pub fn spawn_workflow_host_service(
 
 async fn setup_host(
     params: WorkflowHostParams,
+    application: Option<Arc<crate::application::ApplicationBinding>>,
 ) -> Result<(Arc<HostService>, tokio::task::JoinHandle<()>), HostError> {
     let session_plugins = SessionPluginSnapshots::default();
     session_plugins
         .register(params.session_id.clone(), Arc::clone(&params.snapshot))
         .await;
-    let (updates, _) = mpsc::unbounded_channel();
+    let (unused_updates, _) = mpsc::unbounded_channel();
+    let updates = application
+        .as_ref()
+        .and_then(|a| a.updates.clone())
+        .unwrap_or(unused_updates);
+    let slot = Arc::new(std::sync::OnceLock::new());
+    if let Some(binding) = &application {
+        let _ = slot.set(binding.clone());
+    }
     let runner = Arc::new(
         ChildSessionRunner::new(
             Arc::clone(&params.stream),
@@ -140,7 +176,8 @@ async fn setup_host(
             updates,
             params.approval.clone(),
         )
-        .with_session_plugins(session_plugins),
+        .with_session_plugins(session_plugins)
+        .with_application(slot),
     );
     let verifier = Arc::new(ProfileResultVerifier);
     let sink = Arc::new(NoopTaskEventSink);
@@ -182,6 +219,10 @@ async fn setup_host(
             .agent_budget
             .saturating_mul(u64::from(SCHEMA_CONTRACT_RETRIES.saturating_add(1))),
     );
+    let mut root_profile = workflow_root_profile();
+    if crate::application::general_application(application.as_deref()) {
+        root_profile.workspace = WorkspaceIntent::SharedSerializedWrite;
+    }
     let scoped = coordinator
         .register_root(TaskRootRequest {
             task_id: root_id.clone(),
@@ -189,7 +230,7 @@ async fn setup_host(
                 run_id: params.run_id.clone(),
                 session_id: params.session_id.clone(),
             },
-            profile: workflow_root_profile(),
+            profile: root_profile,
             permissions: AgentProfile::worker().capabilities,
             budget,
         })
@@ -206,6 +247,7 @@ async fn setup_host(
             root_id,
             params,
             scratch,
+            application,
         }),
         actor,
     ))
@@ -331,6 +373,7 @@ fn reply_failed(req: WorkflowHostRequest, message: &str) {
 }
 
 struct HostService {
+    application: Option<Arc<crate::application::ApplicationBinding>>,
     agent_runs: AtomicU32,
     agent_seq: AtomicU64,
     spent: AtomicU64,
@@ -432,7 +475,7 @@ impl HostService {
         }
         let _ = self
             .spent
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |spent| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |spent| {
                 Some(spent.saturating_sub(count))
             });
         Ok(())
@@ -495,11 +538,32 @@ impl HostService {
 
         let mut profile =
             resolve_child_profile(opts.agent_type.as_deref(), opts.capability_mode.as_deref())?;
+        if crate::application::general_application(self.application.as_deref()) {
+            if opts.isolation_worktree {
+                return Err(HostError::Unsupported("general application workflows use the inherited workspace; isolated coding worktrees require coding mode".into()));
+            }
+            profile = crate::application::application_profile(profile);
+        }
         if opts.isolation_worktree {
             profile.workspace = WorkspaceIntent::IsolatedWorktree;
         }
-        let requested_capabilities =
+        let mut requested_capabilities =
             requested_capabilities_for_mode(&profile, opts.capability_mode.as_deref())?;
+        // In business applications, read/write includes external modules. The
+        // application catalog remains an independent, exact authority ceiling.
+        if crate::application::general_application(self.application.as_deref())
+            && opts.capability_mode.as_deref() == Some("read-write")
+            && let Some(caps) = &mut requested_capabilities
+        {
+            for capability in [
+                ToolCapability::NetworkWrite,
+                ToolCapability::ExtensionInvoke,
+            ] {
+                if profile.capabilities.contains(&capability) {
+                    caps.push(capability);
+                }
+            }
+        }
 
         let schema_validator = match &opts.output_schema {
             None => None,
@@ -519,7 +583,8 @@ impl HostService {
         };
 
         let id = format!(
-            "wf-agent-{}",
+            "wf-agent-{}-{}",
+            self.params.run_id,
             self.agent_seq.fetch_add(1, Ordering::Relaxed)
         );
         let mut attempts: u32 = 0;
@@ -539,7 +604,8 @@ impl HostService {
                 id.clone()
             } else {
                 format!(
-                    "wf-agent-{}",
+                    "wf-agent-{}-{}",
+                    self.params.run_id,
                     self.agent_seq.fetch_add(1, Ordering::Relaxed)
                 )
             };

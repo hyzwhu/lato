@@ -367,7 +367,10 @@ async fn active_on_disk_restores_as_interrupted() {
     lato_agent::workflow::persist::write_run_record(
         &run_dir,
         &lato_agent::workflow::PersistedRun {
+            result: None,
+            result_truncated: false,
             version: lato_agent::workflow::RUN_RECORD_VERSION,
+            application_fingerprint: None,
             run_id: "wf_manual-0".into(),
             display_name: "crashed".into(),
             status: lato_agent::workflow::WorkflowRunStatus::Active,
@@ -533,4 +536,41 @@ async fn scratch_written_before_pause_is_live_after_restore() {
         std::fs::read_to_string(run_dir.join("scratch").join("echo.md")).unwrap(),
         "persisted body"
     );
+}
+
+#[tokio::test]
+async fn resume_obeys_active_capacity_budget_and_closed_admission() {
+    let manager = manager(Arc::new(HangingStream));
+    manager.launch(resolved("parked",r#"let meta=#{name:"parked",description:"d"}; await_user("user","hold"); complete("done");"#),spec(serde_json::json!({}))).unwrap();
+    wait_for(&manager, "parked", WorkflowRunStatus::UserPaused).await;
+    for budget in [0, 1025] {
+        assert!(matches!(
+            manager.resume("parked", Some(budget)),
+            Err(LaunchError::Resolve(_))
+        ));
+    }
+    for _ in 0..4 {
+        manager.launch(resolved("hang",r#"let meta=#{name:"hang",description:"d"}; let r=agent("hold"); complete(r.output);"#),spec(serde_json::json!({}))).unwrap();
+    }
+    assert!(matches!(
+        manager.resume("parked", None),
+        Err(LaunchError::TooManyActiveRuns)
+    ));
+    manager.stop("hang").await.unwrap();
+    assert!(manager.resume("parked", None).is_ok());
+    manager.shutdown().await;
+    assert!(matches!(
+        manager.resume("hang", None),
+        Err(LaunchError::Closed)
+    ));
+    assert!(matches!(
+        manager.launch(
+            resolved(
+                "late",
+                r#"let meta=#{name:"late",description:"d"}; complete("bad");"#
+            ),
+            spec(serde_json::json!({}))
+        ),
+        Err(LaunchError::Closed)
+    ));
 }

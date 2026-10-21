@@ -12,7 +12,7 @@ pub struct Auth {
 pub async fn get_auth_refreshing(
     store: &mut CredentialStore,
     provider_id: &str,
-    env: &dyn Fn(&str) -> Option<String>,
+    env: &(dyn Fn(&str) -> Option<String> + Sync),
     override_key: Option<String>,
     client: &reqwest::Client,
 ) -> Result<Option<Auth>, String> {
@@ -71,7 +71,7 @@ pub async fn get_auth_refreshing(
 pub async fn get_auth(
     store: &CredentialStore,
     provider_id: &str,
-    env: &dyn Fn(&str) -> Option<String>,
+    env: &(dyn Fn(&str) -> Option<String> + Sync),
     override_key: Option<String>,
 ) -> Option<Auth> {
     if let Some(k) = override_key {

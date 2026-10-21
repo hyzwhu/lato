@@ -1,0 +1,21 @@
+{
+  "source": "synthetic demonstration fixtures; not real customer data",
+  "customers": {
+    "acme": {
+      "id": "acme",
+      "name": "Acme",
+      "period": "2026-09",
+      "currency": "CNY",
+      "revenue": 42000,
+      "orders": 12
+    },
+    "northwind": {
+      "id": "northwind",
+      "name": "Northwind",
+      "period": "2026-09",
+      "currency": "CNY",
+      "revenue": 18000,
+      "orders": 6
+    }
+  }
+}

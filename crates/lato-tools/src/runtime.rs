@@ -73,6 +73,11 @@ struct SkillScopeGuard {
 }
 
 impl PreparedToolCall {
+    /// Canonical arguments after validation and any pre-tool hook rewrite.
+    pub fn arguments(&self) -> &Value {
+        &self.arguments
+    }
+
     pub fn audit(&self) -> PreparedToolAudit {
         self.audit.clone()
     }
@@ -103,6 +108,8 @@ impl PreparedToolCall {
 
 #[derive(Debug, thiserror::Error)]
 pub enum RuntimeBuildError {
+    #[error("agent tool allowlist references an unregistered tool: {name}")]
+    UnknownAllowedTool { name: ToolName },
     #[error(transparent)]
     Catalog(#[from] CatalogError),
     #[error(transparent)]
@@ -200,6 +207,47 @@ impl ToolRuntimeBuilder {
 }
 
 impl ToolRuntime {
+    /// Intersects an existing catalog with a delegated capability ceiling.
+    pub fn restricted_for_capabilities(
+        &self,
+        capabilities: &[lato_core::ToolCapability],
+        read_only: bool,
+    ) -> Result<Self, RuntimeBuildError> {
+        let names = self
+            .catalog
+            .descriptors()
+            .into_iter()
+            .filter(|d| {
+                d.capabilities.iter().all(|c| capabilities.contains(c))
+                    && (!read_only
+                        || matches!(
+                            d.side_effect,
+                            lato_core::SideEffect::None | lato_core::SideEffect::ReadOnly
+                        ))
+            })
+            .map(|d| d.name)
+            .collect::<Vec<_>>();
+        self.restricted_to(&names)
+    }
+
+    /// Builds a physically restricted catalog while preserving the policy membrane.
+    /// Excluded tools cannot resolve through either canonical or model-facing names.
+    pub fn restricted_to(&self, names: &[ToolName]) -> Result<Self, RuntimeBuildError> {
+        let mut builder = ToolRuntimeBuilder::new(self.policy.clone(), self.scope.clone())
+            .with_sink(self.sink.clone());
+        for name in names {
+            let tool = self
+                .catalog
+                .resolve(name)
+                .ok_or_else(|| RuntimeBuildError::UnknownAllowedTool { name: name.clone() })?;
+            if let Some(code) = self.argument_error_codes.get(name) {
+                builder.set_argument_error_code(name.clone(), code.clone());
+            }
+            builder.register(tool)?;
+        }
+        builder.build()
+    }
+
     pub fn hook_approval_request(
         &self,
         prepared: &PreparedToolCall,
@@ -647,6 +695,10 @@ impl ToolRuntime {
 
     fn resolve_wire_name(&self, wire_name: &str) -> Option<ToolName> {
         let normalized = wire_name.strip_prefix("Lato:").unwrap_or(wire_name);
+        // Exact registered application names take precedence over legacy aliases.
+        if let Some(name) = self.wire_names.get(normalized) {
+            return Some(name.clone());
+        }
         let normalized = if normalized == "write" {
             "write_file"
         } else {

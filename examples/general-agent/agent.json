@@ -1,0 +1,11 @@
+{
+  "mode": "general",
+  "instructions": "你是业务助手。通过已配置的 MCP 业务模块完成用户任务，缺少必填信息时先询问。仅根据工具返回的数据作答，说明失败或不确定性。",
+  "tools": [
+    "builtin:search_tool",
+    "builtin:use_tool",
+    "builtin:skill",
+    "builtin:workflow"
+  ],
+  "workspaceInstructions": false
+}

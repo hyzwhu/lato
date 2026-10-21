@@ -192,7 +192,7 @@ impl MemoryWorkspaceAllocator {
 
     fn next_lease_id(&self) -> Result<LeaseId, TaskError> {
         let sequence = NEXT_MEMORY_LEASE_ID
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 current.checked_add(1)
             })
             .map_err(|_| {

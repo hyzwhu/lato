@@ -339,7 +339,7 @@ pub async fn run_prompt_over_acp_with_plan(
         .handle(req(2, "session/new", serde_json::json!({})))
         .await
         .ok_or("no response")?;
-    let sid = new["result"]["sessionId"]
+    let sid = response_result(&new)?["sessionId"]
         .as_str()
         .ok_or("no session")?
         .to_string();
@@ -766,7 +766,7 @@ impl InteractiveAcpClient {
             .handle(req(id, "session/new", serde_json::json!({})))
             .await
             .ok_or("no response")?;
-        self.session_id = response["result"]["sessionId"]
+        self.session_id = response_result(&response)?["sessionId"]
             .as_str()
             .ok_or("no session")?
             .to_string();

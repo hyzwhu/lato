@@ -190,3 +190,44 @@ pause("user", "need human");
         "pause must not masquerade as failed: {err}"
     );
 }
+
+#[test]
+fn workflow_run_rejects_invalid_application_instead_of_falling_back_to_coding() {
+    let fixture = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    fs::create_dir_all(home.path().join("workflows")).unwrap();
+    fs::write(
+        home.path().join("workflows/business.rhai"),
+        r#"let meta=#{name:"business",description:"d"}; complete("business result");"#,
+    )
+    .unwrap();
+    fs::write(home.path().join("agent.json"), r#"{"mode":"general"}"#).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_lato"))
+        .current_dir(fixture.path())
+        .env("LATO_HOME", home.path())
+        .env_remove("LATO_MODEL")
+        .args(["workflow", "run", "business"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("agent.invalid_configuration"));
+    fs::write(
+        home.path().join("agent.json"),
+        r#"{"mode":"general","tools":[]}"#,
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_lato"))
+        .current_dir(fixture.path())
+        .env("LATO_HOME", home.path())
+        .env_remove("LATO_MODEL")
+        .args(["workflow", "run", "business"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let body: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(body["output"], "business result");
+}

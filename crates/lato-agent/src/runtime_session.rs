@@ -206,6 +206,21 @@ impl From<SkillRuntimeBinding> for ChildToolRuntime {
 }
 
 impl RuntimeSession {
+    pub(crate) async fn set_agent_mode(&self, mode: crate::AgentMode) {
+        self.driver.set_agent_mode(mode).await;
+    }
+
+    pub(crate) async fn initialize_application(
+        &self,
+        cwd: &std::path::Path,
+        config: &crate::AgentConfiguration,
+    ) -> Result<(), AgentError> {
+        let system_prompt = self.driver.initialize_application(cwd, config).await;
+        self.handle
+            .submit(Command::InitializeApplication { system_prompt })
+            .await
+    }
+
     fn from_driver(
         session_id: SessionId,
         driver: Arc<LegacyTurnDriver>,

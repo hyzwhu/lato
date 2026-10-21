@@ -283,3 +283,58 @@ async fn invoke_only_executes_automatic_allow_decisions() {
     assert_eq!(error.code, "policy.approval_required");
     assert_eq!(calls.load(Ordering::Acquire), 0);
 }
+
+#[test]
+fn read_only_catalog_excludes_mutations_even_without_declared_capabilities() {
+    struct CapabilitylessMutation;
+    #[async_trait]
+    impl Tool for CapabilitylessMutation {
+        fn descriptor(&self) -> ToolDescriptor {
+            let mut d = CountingTool {
+                calls: Arc::new(AtomicUsize::new(0)),
+            }
+            .descriptor();
+            d.name = ToolName::parse("business:mutate").unwrap();
+            d.capabilities.clear();
+            d.side_effect = SideEffect::ExternalMutation;
+            d
+        }
+        async fn invoke(
+            &self,
+            _: ToolContext,
+            _: serde_json::Value,
+        ) -> Result<ToolOutput, lato_core::ToolError> {
+            unreachable!("restricted tool must not execute")
+        }
+    }
+    let root = tempfile::tempdir().unwrap();
+    let policy = Arc::new(PolicyEngine::new(Arc::new(ApprovalLedger::new(
+        Duration::from_secs(60),
+    ))));
+    let mut builder = ToolRuntimeBuilder::new(
+        policy,
+        PolicyScope {
+            workspace_root: root.path().into(),
+            mode: PolicyMode::Ask,
+            project_trusted: true,
+            sandbox_profile: SandboxProfile::Workspace,
+        },
+    );
+    builder.register(Arc::new(CapabilitylessMutation)).unwrap();
+    let runtime = builder.build().unwrap();
+    assert_eq!(
+        runtime
+            .restricted_for_capabilities(&[], false)
+            .unwrap()
+            .model_definitions()
+            .len(),
+        1
+    );
+    assert!(
+        runtime
+            .restricted_for_capabilities(&[], true)
+            .unwrap()
+            .model_definitions()
+            .is_empty()
+    );
+}

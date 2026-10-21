@@ -1,0 +1,24 @@
+[package]
+name = "lato-service"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+async-trait = "0.1"
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query"] }
+futures-util = "0.3"
+lato-agent = { path = "../lato-agent" }
+lato-ai = { path = "../lato-ai" }
+lato-core = { path = "../lato-core" }
+lato-protocol = { path = "../lato-protocol" }
+lato-workspace = { path = "../lato-workspace" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+subtle = "2"
+tokio = { version = "1", features = ["net", "rt", "sync", "time", "macros"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+
+[dev-dependencies]
+reqwest = { version = "0.12", features = ["json", "stream"] }
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util"] }

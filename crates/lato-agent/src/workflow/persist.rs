@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use super::tracker::{WORKFLOW_HISTORY_MAX, WorkflowRunStatus};
 
 pub const RUN_RECORD_VERSION: u32 = 1;
+pub const APPLICATION_RUN_RECORD_VERSION: u32 = 2;
 pub const MAX_WORKFLOW_SOURCE_BYTES: u64 = 1024 * 1024;
 pub const RUN_RECORD_FILE: &str = "run.json";
 pub const SCRIPT_FILE: &str = "script.rhai";
@@ -21,7 +22,13 @@ pub const JOURNAL_FILE: &str = "journal.jsonl";
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PersistedRun {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<serde_json::Value>,
+    #[serde(default)]
+    pub result_truncated: bool,
     pub version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub application_fingerprint: Option<String>,
     pub run_id: String,
     pub display_name: String,
     pub status: WorkflowRunStatus,
@@ -69,7 +76,10 @@ pub fn write_script(dir: &Path, script: &str) -> std::io::Result<()> {
 pub fn read_run_record(dir: &Path) -> Option<PersistedRun> {
     let body = std::fs::read(dir.join(RUN_RECORD_FILE)).ok()?;
     let record: PersistedRun = serde_json::from_slice(&body).ok()?;
-    (record.version == RUN_RECORD_VERSION).then_some(record)
+    (record.version == RUN_RECORD_VERSION
+        || (record.version == APPLICATION_RUN_RECORD_VERSION
+            && record.application_fingerprint.is_some()))
+    .then_some(record)
 }
 
 /// Read the captured script; `None` when missing, symlinked, not a regular
@@ -123,7 +133,10 @@ mod tests {
 
     fn sample(run_id: &str, display_name: &str, status: WorkflowRunStatus) -> PersistedRun {
         PersistedRun {
+            result: None,
+            result_truncated: false,
             version: RUN_RECORD_VERSION,
+            application_fingerprint: None,
             run_id: run_id.to_owned(),
             display_name: display_name.to_owned(),
             status,

@@ -61,7 +61,7 @@ impl ApprovalLedger {
     ) -> Result<ExecutionGrant, ApprovalError> {
         let id = self
             .next_id
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
                 next.checked_add(1)
             })
             .map(GrantId)

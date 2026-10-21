@@ -9,7 +9,8 @@ pub mod tool;
 pub mod tracker;
 
 pub use host_service::{
-    RunEvent, WorkflowHostParams, spawn_workflow_host_service, workflow_max_concurrent_agents,
+    RunEvent, WorkflowHostParams, spawn_workflow_host_service,
+    spawn_workflow_host_service_with_configuration, workflow_max_concurrent_agents,
 };
 pub use manager::{LaunchError, LaunchSpec, WorkflowManager};
 pub use persist::{MAX_WORKFLOW_SOURCE_BYTES, PersistedRun, RUN_RECORD_VERSION};

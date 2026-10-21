@@ -104,6 +104,7 @@ pub async fn run(options: DoctorOptions, deps: &DoctorDependencies) -> DoctorRep
         ),
     };
     checks.push(settings_check);
+    checks.push(agent_configuration_check(&deps.home));
 
     let configured_provider = default_model.as_deref().and_then(split_model);
     checks.push(model_check(&deps.home, configured_provider));
@@ -139,6 +140,49 @@ pub async fn run(options: DoctorOptions, deps: &DoctorDependencies) -> DoctorRep
         schema_version: DOCTOR_SCHEMA_VERSION,
         status: overall_status(&checks),
         checks,
+    }
+}
+
+fn agent_configuration_check(home: &Path) -> DoctorCheck {
+    let path = home.join("agent.json");
+    match std::fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => check(
+            "agent_configuration",
+            DoctorStatus::Ok,
+            "default coding agent",
+            None,
+        ),
+        Err(_) => check(
+            "agent_configuration",
+            DoctorStatus::Error,
+            "cannot inspect agent.json",
+            Some("agent.configuration_read"),
+        ),
+        Ok(_) => match lato_agent::AgentConfiguration::from_file(&path) {
+            Ok(config) => check(
+                "agent_configuration",
+                DoctorStatus::Ok,
+                format!(
+                    "{:?} agent; {}",
+                    config.mode,
+                    config
+                        .tools
+                        .as_ref()
+                        .map(|tools| format!(
+                            "{} selected tools; registration checked at session start",
+                            tools.len()
+                        ))
+                        .unwrap_or_else(|| "default tool catalog".into())
+                ),
+                None,
+            ),
+            Err(error) => check(
+                "agent_configuration",
+                DoctorStatus::Error,
+                error,
+                Some("agent.invalid_configuration"),
+            ),
+        },
     }
 }
 

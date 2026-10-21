@@ -40,6 +40,7 @@ pub struct ChildSessionRunner {
     shutdown_timeout: Duration,
     session_plugins: SessionPluginSnapshots,
     empty_snapshot: Arc<PluginSnapshot>,
+    application: crate::application::ApplicationSlot,
 }
 
 impl ChildSessionRunner {
@@ -61,11 +62,20 @@ impl ChildSessionRunner {
             shutdown_timeout: Duration::from_secs(5),
             session_plugins: SessionPluginSnapshots::default(),
             empty_snapshot: PluginSnapshot::empty(),
+            application: Arc::new(std::sync::OnceLock::new()),
         }
     }
 
     pub fn with_session_plugins(mut self, session_plugins: SessionPluginSnapshots) -> Self {
         self.session_plugins = session_plugins;
+        self
+    }
+
+    pub(crate) fn with_application(
+        mut self,
+        application: crate::application::ApplicationSlot,
+    ) -> Self {
+        self.application = application;
         self
     }
 
@@ -90,6 +100,9 @@ impl ChildSessionRunner {
             }
             WorkspaceMode::ExternalLease => SandboxProfile::ReadOnly,
         };
+        if self.trust.sandbox == SandboxProfile::ReadOnly {
+            trust.sandbox = SandboxProfile::ReadOnly;
+        }
         trust
     }
 
@@ -125,18 +138,33 @@ impl ChildSessionRunner {
             workflows: Default::default(),
         });
         let trust = self.child_trust(&request);
+        let application = self.application.get().cloned();
         let skill_runtime = SkillRuntimeBinding::build(|skill_resolver, mcp_backend| {
-            lato_tools::builtin_tool_runtime_for_capabilities_with_subagents_and_mcp(
-                BuiltinToolEnvironment {
-                    cwd: request.workspace_lease.root.clone(),
-                    locks: Arc::clone(&self.locks),
-                    trust: trust.clone(),
-                    skill_resolver: Some(skill_resolver),
-                },
-                Some(&request.node.permissions),
-                ChannelBackend::new(request.scoped_handle.clone()).into_resource(),
-                mcp_backend,
-            )
+            let environment = BuiltinToolEnvironment {
+                cwd: request.workspace_lease.root.clone(),
+                locks: Arc::clone(&self.locks),
+                trust: trust.clone(),
+                skill_resolver: Some(skill_resolver),
+            };
+            let backend = ChannelBackend::new(request.scoped_handle.clone()).into_resource();
+            match &application {
+                Some(binding) => lato_tools::builtin_tool_runtime_with_subagents_and_mcp_extra(
+                    environment,
+                    backend,
+                    mcp_backend,
+                    binding.tools.clone(),
+                ),
+                None => lato_tools::builtin_tool_runtime_for_capabilities_with_subagents_and_mcp(
+                    environment,
+                    Some(&request.node.permissions),
+                    backend,
+                    mcp_backend,
+                ),
+            }
+        })
+        .and_then(|runtime| match &application {
+            Some(binding) => runtime.restrict_application(binding, &request.node.permissions),
+            None => Ok(runtime),
         })
         .map_err(|error| task_error(TaskErrorCode::RunnerInitialization, error))?;
 
@@ -165,6 +193,25 @@ impl ChildSessionRunner {
             .remaining_budget(BudgetAmount::ZERO)
             .build()?;
 
+        let initial_history = match &application {
+            Some(binding) if !binding.configuration.is_legacy_default() => {
+                vec![HistoryItem::System(format!(
+                    "{}\n\nDelegated task context:\n{}",
+                    crate::actor::build_world_state_for_agent(
+                        &request.workspace_lease.root,
+                        &binding.configuration
+                    ),
+                    package.render()
+                ))]
+            }
+            _ => vec![HistoryItem::System(package.render())],
+        };
+        let approval = self.approval.as_ref().map(|inner| {
+            Arc::new(crate::application::OwnerApproval {
+                inner: inner.clone(),
+                owner: request.node.owner.session_id().clone(),
+            }) as Arc<dyn ToolApproval>
+        });
         let (child_updates_tx, child_updates_rx) = mpsc::unbounded_channel();
         let session = Arc::new(
             RuntimeSession::new_child(ChildSessionConfig {
@@ -174,14 +221,17 @@ impl ChildSessionRunner {
                 trust,
                 cwd: request.workspace_lease.root.clone(),
                 updates: child_updates_tx,
-                approval: self.approval.clone(),
+                approval,
                 tool_runtime: ChildToolRuntime::from(skill_runtime),
-                initial_history: vec![HistoryItem::System(package.render())],
+                initial_history,
                 plugin_snapshot: Arc::clone(&child_plugins),
             })
             .await
             .map_err(|error| task_error(TaskErrorCode::RunnerInitialization, error))?,
         );
+        if let Some(binding) = &application {
+            session.set_agent_mode(binding.configuration.mode).await;
+        }
         let child_session_id = session.session_id().clone();
         self.session_plugins
             .register(child_session_id.clone(), child_plugins)
@@ -214,9 +264,25 @@ impl ChildSessionRunner {
 
         let usage = Arc::new(Mutex::new(TaskUsage::default()));
         let (relay_stop, relay_stop_rx) = tokio::sync::oneshot::channel();
+        // Delegated events are explicitly tagged and owned by the parent session.
+        // Old TUI clients may ignore this event family instead of merging child IDs.
+        let (mapped_tx, mut mapped_rx) = mpsc::unbounded_channel();
+        let owner = request.node.owner.session_id().to_string();
+        let outward = self.updates.clone();
+        let general = crate::application::general_application(application.as_deref());
+        let mut map_updates = tokio::spawn(async move {
+            while let Some(update) = mapped_rx.recv().await {
+                let value = if general {
+                    serde_json::json!({"jsonrpc":"2.0","method":"lato/delegated/update","params":{"sessionId":owner,"update":update}})
+                } else {
+                    update
+                };
+                let _ = outward.send(value);
+            }
+        });
         let mut relay = tokio::spawn(relay_child_events(
             child_updates_rx,
-            self.updates.clone(),
+            mapped_tx,
             reporter.clone(),
             progress,
             Arc::clone(&usage),
@@ -259,6 +325,13 @@ impl ChildSessionRunner {
             relay.abort();
             let _ = relay.await;
         }
+        if tokio::time::timeout(Duration::from_millis(250), &mut map_updates)
+            .await
+            .is_err()
+        {
+            map_updates.abort();
+            let _ = map_updates.await;
+        }
         if let Err(error) = shutdown {
             return Err(task_error(TaskErrorCode::RunnerProtocolViolation, error));
         }
@@ -286,6 +359,7 @@ fn workspace_capabilities(
 
 fn result_contract_instruction(profile: &AgentProfile) -> String {
     match profile.name.as_str() {
+        name if name.starts_with("application-") => "Return the format required by this delegated task or its explicit output contract; support claims with actual tool results.".into(),
         "explorer" => "Return exactly one JSON object: {\"answer\":string,\"evidence\":[{\"id\":string,\"summary\":string,\"location\":string}],\"citations\":[string]}. Every citation must name an evidence id.".into(),
         "worker" => "Return exactly one JSON object: {\"summary\":string,\"changed_files\":[relative_path],\"tests\":[{\"command\":string,\"passed\":boolean,\"summary\":string}],\"artifacts\":[relative_path]}.".into(),
         "reviewer" => "Return exactly one JSON object: {\"summary\":string,\"findings\":[{\"severity\":\"critical\"|\"major\"|\"minor\",\"message\":string,\"evidence\":string,\"file\":relative_path|null,\"line\":positive_integer|null}]} .".into(),
@@ -326,6 +400,28 @@ impl TaskRunner for ChildSessionRunner {
     }
 
     async fn validate_profile(&self, profile: &AgentProfile) -> Result<(), TaskError> {
+        if let Some(name) = profile.name.strip_prefix("application-") {
+            if !crate::application::general_application(self.application.get().map(Arc::as_ref)) {
+                return Err(TaskError::new(
+                    TaskErrorCode::InvalidProfile,
+                    "application profiles require an inherited application binding",
+                ));
+            }
+            let mut expected = crate::application::application_profile(
+                BuiltinProfileName::try_from(name)?.resolve(),
+            );
+            if profile.workspace == WorkspaceIntent::IsolatedWorktree {
+                expected.workspace = WorkspaceIntent::IsolatedWorktree;
+            }
+            return if *profile == expected {
+                Ok(())
+            } else {
+                Err(TaskError::new(
+                    TaskErrorCode::InvalidProfile,
+                    "application task profiles cannot be overridden",
+                ))
+            };
+        }
         let name = BuiltinProfileName::try_from(profile.name.as_str())?;
         let expected = name.resolve();
         if *profile == expected {
