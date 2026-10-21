@@ -486,7 +486,7 @@ impl TurnDriver for LegacyTurnDriver {
         let prefire_limit = max_attempts.saturating_sub(1);
         if self
             .prefire_model_attempts
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 (current < prefire_limit).then_some(current.saturating_add(1))
             })
             .is_err()

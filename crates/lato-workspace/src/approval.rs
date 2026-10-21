@@ -65,7 +65,7 @@ impl SessionTrust {
     }
     pub fn consume_allow_once(&self) -> bool {
         self.approvals_once
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
                 count.checked_sub(1)
             })
             .is_ok()

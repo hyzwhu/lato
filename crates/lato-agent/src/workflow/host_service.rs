@@ -475,7 +475,7 @@ impl HostService {
         }
         let _ = self
             .spent
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |spent| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |spent| {
                 Some(spent.saturating_sub(count))
             });
         Ok(())
